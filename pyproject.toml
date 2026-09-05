@@ -1,0 +1,18 @@
+[build-system]
+requires = ["setuptools>=64"]
+build-backend = "setuptools.build_meta"
+
+[project]
+name = "decision-engine-client"
+version = "0.2.78"
+description = "Decision Engine thin client"
+requires-python = ">=3.12"
+dependencies = ["certifi>=2024.0.0"]
+
+[tool.setuptools.packages.find]
+include = ["client*"]
+exclude = ["client*.tests", "client*.tests.*"]
+
+[project.scripts]
+audit = "client.runner:main"
+decision-engine-popup = "client.popup.launcher:main"

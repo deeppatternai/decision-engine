@@ -1,0 +1,48 @@
+# Python
+__pycache__/
+*.py[cod]
+*.egg-info/
+.pytest_cache/
+.mypy_cache/
+build/
+dist/
+
+# Per-device config the installer/activation writes (never commit — carries
+# your endpoint, activation key during legacy setup, device fingerprint, and device token).
+config.json
+/.managed-install.json
+/bundle/
+
+# Managed-install runtime state.  The root-level entries are retained for one
+# previous-stable compatibility window while current clients dual-write under
+# .runtime; none of these files are source or user-authored configuration.
+/.runtime/
+/active-run.json
+/active-runs.json
+/active-runs.json.lock
+/config.json.activation.lock
+/stopper-panel.lock
+/stopper.log
+/active-run.json.*.tmp
+/active-runs.json.*.tmp
+/config.json.*.tmp
+/config.json.tmp
+
+# OS/editor metadata that may appear when a managed checkout is opened locally.
+/Thumbs.db
+/desktop.ini
+/.DS_Store
+/*.swp
+/*.swo
+/*~
+
+# Local leak-scan denylist (private internal identifiers injected at clean-room
+# scan time; must never be committed to the public shell).
+denylist.txt
+.env
+.aqg/
+.workbuddy/
+
+# Internal development documentation (design/reviews/decisions/evidence/
+# research/plans). Kept locally; never part of the public release surface.
+/docs/

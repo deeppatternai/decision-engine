@@ -1,0 +1,204 @@
+{
+  "activation_required": {
+    "name": "activation_required",
+    "description": "Activate this device before using Decision Engine tools.",
+    "inputSchema": {
+      "type": "object",
+      "properties": {}
+    }
+  },
+  "audit_skill_submit": {
+    "name": "audit_skill_submit",
+    "description": "Start an advisory-only DE Lite local defect review in the current interactive agent session. This does not contact Decision Engine Hub.",
+    "inputSchema": {
+      "type": "object",
+      "properties": {
+        "skill_name": {
+          "type": "string",
+          "enum": [
+            "audit"
+          ]
+        },
+        "args": {
+          "type": "object",
+          "properties": {
+            "title": {
+              "type": "string"
+            },
+            "content": {
+              "type": "string"
+            },
+            "context": {
+              "type": "string"
+            },
+            "artifact_intent": {
+              "type": "string",
+              "enum": [
+                "prescriptive"
+              ]
+            },
+            "accept_degrade": {
+              "type": "boolean",
+              "enum": [
+                true
+              ]
+            },
+            "ui_locale": {
+              "type": "string",
+              "enum": [
+                "zh-CN",
+                "en-US"
+              ]
+            }
+          },
+          "required": [
+            "title",
+            "content"
+          ]
+        }
+      },
+      "required": [
+        "skill_name",
+        "args"
+      ]
+    }
+  },
+  "audit_skill_complete": {
+    "name": "audit_skill_complete",
+    "description": "Finish the current DE Lite local advisory. This updates only the local stopper state, does not contact Decision Engine Hub, and never closes an audit gate.",
+    "inputSchema": {
+      "type": "object",
+      "properties": {
+        "local_id": {
+          "type": "string",
+          "pattern": "^local_.+"
+        },
+        "status": {
+          "type": "string",
+          "enum": [
+            "completed",
+            "partial",
+            "failed"
+          ]
+        }
+      },
+      "required": [
+        "local_id",
+        "status"
+      ]
+    }
+  },
+  "service_unavailable": {
+    "name": "service_unavailable",
+    "description": "The Decision Engine Hub is unreachable. Reconnect and retry.",
+    "inputSchema": {
+      "type": "object",
+      "properties": {}
+    }
+  },
+  "display_schemas": [
+    {
+      "name": "open_ge_popup",
+      "description": "Open the server-rendered graphic-explanation artifact (by run_id) in a native popup on the user's machine. Returns {status, popup_id}. The image bytes are fetched client-side and never returned to you — do not inline.",
+      "inputSchema": {
+        "type": "object",
+        "properties": {
+          "run_id": {
+            "type": "string",
+            "description": "The visual_render run_id."
+          },
+          "title": {
+            "type": "string",
+            "description": "Short window title (optional)."
+          },
+          "context": {
+            "type": "string",
+            "description": "Conversation context for the in-popup follow-up chat (optional; slice ③)."
+          }
+        },
+        "required": [
+          "run_id"
+        ]
+      }
+    },
+    {
+      "name": "open_ge",
+      "description": "Open a server-rendered graphic-explanation in a native popup in ONE call: for comic, infographic, or diagram, this tool submits the render, waits for it, fetches the finished artifact client-side, and opens the popup — you do NOT poll or call open_ge_popup. Returns {status, popup_id} when opened; the artifact bytes are never returned to you — do not inline. This call waits up to 10 minutes for a terminal server status. Only if the run is still pending after that ceiling does it return {status:'scheduled', run_id} and continue in a bounded best-effort worker. If submission outcome is unknown, it returns {status:'request_outcome_unknown', retryable:true, client_request_id}; retry only with that exact client_request_id. After submission, any failed result includes run_id for diagnosis and recovery.",
+      "inputSchema": {
+        "type": "object",
+        "properties": {
+          "mode": {
+            "type": "string",
+            "enum": [
+              "comic",
+              "infographic",
+              "diagram"
+            ],
+            "description": "The server render mode; every mode uses the one-call open_ge flow."
+          },
+          "spec": {
+            "type": "object",
+            "description": "The user-content spec for the mode — see the visual_render tool's inputSchema."
+          },
+          "client_request_id": {
+            "type": "string",
+            "minLength": 1,
+            "maxLength": 128,
+            "description": "Optional DE idempotency key; surrounding whitespace is removed before first use. After an uncertain submit, reuse the exact normalized value returned by the response."
+          },
+          "title": {
+            "type": "string",
+            "description": "Short window title (optional)."
+          },
+          "context": {
+            "type": "string",
+            "description": "Conversation context for the in-popup follow-up chat (optional)."
+          }
+        },
+        "required": [
+          "mode",
+          "spec"
+        ]
+      }
+    },
+    {
+      "name": "open_db_board",
+      "description": "Open a discussion board (user-content spec) as an interactive native popup for hand-editing. Returns {status, popup_id}; poll db_board_result for the edited board.",
+      "inputSchema": {
+        "type": "object",
+        "properties": {
+          "spec": {
+            "type": "object",
+            "description": "The board spec (columns/notes/etc.) — user content only."
+          },
+          "title": {
+            "type": "string",
+            "description": "Short window title (optional)."
+          }
+        },
+        "required": [
+          "spec"
+        ]
+      }
+    },
+    {
+      "name": "db_board_result",
+      "description": "Bounded poll (≤55s) for a discussion-board popup's outcome. Returns {status:'open'} (poll again), {status:'done', board} (the user's edits), {status:'dismissed'}, or {status:'unknown'}. The board stays retrievable by popup_id until it expires.",
+      "inputSchema": {
+        "type": "object",
+        "properties": {
+          "popup_id": {
+            "type": "string"
+          },
+          "wait_s": {
+            "type": "number",
+            "description": "Max seconds to block (default 50, capped < 60)."
+          }
+        },
+        "required": [
+          "popup_id"
+        ]
+      }
+    }
+  ]
+}

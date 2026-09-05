@@ -1,0 +1,55 @@
+name: macOS Stopper binaries
+
+on:
+  workflow_dispatch:
+  push:
+    paths:
+      - client/runner.py
+      - desktop/macos/DecisionEngineStopper.swift
+      - desktop/macos/build_stopper_binaries.sh
+      - desktop/macos/bin/decision-engine-stopper-*
+      - installer/stopper_launch_agent.py
+      - installer/tests/test_macos_stopper_source.py
+      - installer/tests/test_macos_stopper_build.py
+      - installer/tests/test_stopper_fallback.py
+      - installer/tests/test_stopper_launch_agent.py
+      - installer/tests/test_stopper_panel.py
+      - skills/audit/scripts/de_lite_local_bridge.py
+      - skills/audit/tests/test_de_lite_local_bridge.py
+      - .github/workflows/macos-stopper-binaries.yml
+
+permissions:
+  contents: read
+
+jobs:
+  build:
+    runs-on: macos-15-intel
+    steps:
+      - uses: actions/checkout@d23441a48e516b6c34aea4fa41551a30e30af803 # v6
+      - name: Build and ad-hoc sign both architecture slices
+        run: bash desktop/macos/build_stopper_binaries.sh "$RUNNER_TEMP/stopper-bin"
+      - name: Upload signed Stopper binaries
+        uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02 # v4
+        with:
+          name: decision-engine-stopper-binaries
+          path: |
+            ${{ runner.temp }}/stopper-bin/decision-engine-stopper-arm64
+            ${{ runner.temp }}/stopper-bin/decision-engine-stopper-x86_64
+          if-no-files-found: error
+      - name: Verify fresh build matches committed artifacts
+        run: |
+          cmp "$RUNNER_TEMP/stopper-bin/decision-engine-stopper-arm64" \
+            desktop/macos/bin/decision-engine-stopper-arm64
+          cmp "$RUNNER_TEMP/stopper-bin/decision-engine-stopper-x86_64" \
+            desktop/macos/bin/decision-engine-stopper-x86_64
+      - name: Verify committed artifacts and architecture consumers
+        env:
+          PYTHONWARNINGS: ignore::ResourceWarning
+        run: |
+          python3 -m unittest \
+            installer.tests.test_macos_stopper_build \
+            installer.tests.test_macos_stopper_source \
+            installer.tests.test_stopper_fallback \
+            installer.tests.test_stopper_launch_agent \
+            installer.tests.test_stopper_panel \
+            skills.audit.tests.test_de_lite_local_bridge

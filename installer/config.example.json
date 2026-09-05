@@ -1,0 +1,9 @@
+{
+  "server_endpoint": "https://REPLACE_WITH_OWNER_ISSUED_ENDPOINT",
+  "invite_code": "REPLACE_WITH_OWNER_ISSUED_INVITE_CODE",
+  "device_id": "",
+  "device_fingerprint": "",
+  "access_token": "",
+  "device_name": "",
+  "client_version": "0.2.78"
+}
