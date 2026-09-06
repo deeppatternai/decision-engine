@@ -118,6 +118,37 @@ def bounded_plist_metadata(
     return ProductMetadataProbe("matched", parsed_version)
 
 
+def bounded_plist_identifier(
+    info: Path,
+    *,
+    expected_bundle_identifier: str,
+) -> ProductMetadataProbe:
+    """Read a bounded macOS bundle identifier record without requiring a version.
+
+    Distinct from ``bounded_plist_metadata``: some bundles have no confirmed
+    version-format contract, so this probe verifies ``CFBundleIdentifier``
+    alone and never returns ``malformed`` for an absent/non-semver version.
+    """
+
+    try:
+        if not info.is_file() or info.is_symlink():
+            return ProductMetadataProbe("unavailable")
+        with info.open("rb") as handle:
+            if os.fstat(handle.fileno()).st_size > MAX_PRODUCT_METADATA_BYTES:
+                return ProductMetadataProbe("unavailable")
+            raw = handle.read(MAX_PRODUCT_METADATA_BYTES + 1)
+        if len(raw) > MAX_PRODUCT_METADATA_BYTES:
+            return ProductMetadataProbe("unavailable")
+        root = plistlib.loads(raw)
+    except (OSError, plistlib.InvalidFileException, ValueError, TypeError):
+        return ProductMetadataProbe("unavailable")
+    if not isinstance(root, dict):
+        return ProductMetadataProbe("malformed")
+    if root.get("CFBundleIdentifier") != expected_bundle_identifier:
+        return ProductMetadataProbe("identity-mismatch")
+    return ProductMetadataProbe("matched")
+
+
 def bounded_product_version(
     product: Path,
     *,

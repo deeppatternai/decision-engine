@@ -1,6 +1,6 @@
 # Decision Engine
 
-[English](README.md) · **简体中文** · **v0.2.78**
+[English](README.md) · **简体中文** · **v0.2.80**
 
 > **一个你真正敢信的第二意见 —— 因为它来自许多个彼此独立的头脑，而不是一个模型在自我认同。**
 
@@ -156,6 +156,7 @@ AQG 是本地、无需账户的工程纪律工具包。安装其中任一个，�
 |---|---|---|
 | Claude Code | `claude-code` | MCP、Skills、原生窗口、弹窗右侧追问、Stop Panel |
 | Claude Desktop | `claude-desktop` | MCP、原生窗口、弹窗右侧追问、Stop Panel |
+| 腾讯 CodeBuddy Agent CLI | `codebuddy` | 仅支持独立 Agent CLI；CodeBuddy Studio 是另一个未支持产品；MCP、Skills、原生窗口、弹窗右侧追问、Stop Panel |
 | Codex | `codex` | MCP、Skills、原生窗口、弹窗右侧追问、Stop Panel |
 | Cursor | `cursor` | MCP、Skills、原生窗口、弹窗右侧追问、Stop Panel |
 | 阿里 Qoder Desktop | `qoder` | Windows Desktop 1.106.3+；macOS Qoder.app 0.1.3+；MCP、Skills、原生窗口、弹窗右侧追问、Stop Panel |
@@ -165,8 +166,9 @@ AQG 是本地、无需账户的工程纪律工具包。安装其中任一个，�
 | TRAE CN Desktop | `trae-cn` | macOS Trae CN.app 3.3.95；MCP、Skills、原生窗口、弹窗右侧追问、Stop Panel |
 | TRAE Work CN | `trae-work-cn` | Windows and macOS Desktop 0.1.48+；MCP、Skills、原生窗口、弹窗右侧追问、Stop Panel |
 | 腾讯 WorkBuddy Desktop | `workbuddy` | Windows and macOS Desktop；MCP、Skills、原生窗口、弹窗右侧追问、Stop Panel |
+| 腾讯 WorkBuddy AI Desktop | `workbuddy-ai` | macOS WorkBuddy AI.app 5.5.2+；MCP、Skills、原生窗口、弹窗右侧追问、Stop Panel |
 
-已注册的 Qoder 与 TRAE Desktop 产品系列以及 WorkBuddy 现在都提供服务端追问对话（由 hub 托管、
+已注册的 Qoder、TRAE 与 WorkBuddy Desktop 产品系列以及 CodeBuddy Agent CLI 现在都提供服务端追问对话（由 hub 托管、
 不启动本地 agent）；旧的本地 CLI 追问路径仍只限于具备该契约的宿主。它们的 Graphic
 Explanation / Discussion Board 原生窗口和审计 Stop Panel 仍复用公共实现。
 它们在 macOS Intel 与 Apple Silicon 上使用同一套宿主契约，无需按芯片配置 Decision Engine。
@@ -231,7 +233,8 @@ cd decision-engine
 `~/.deeppattern/agent-quality-gates`，两者的 skill 都路由进你的 agent skill 目录
 （`~/.claude/skills/` 和 `~/.codex/skills/`）。探测到桌面宿主时，同一组受管 Skills 还会按
 注册宿主路由到 `~/.cursor/skills/`、`~/.trae/skills/`、`~/.trae-cn/skills/`、
-`~/.workbuddy/skills/`、`~/.qoder/skills/` 或 `~/.qoder-cn/skills/`。`install de`（默认）会把两个都装上。
+`~/.workbuddy/skills/`、`~/.workbuddy-ai/skills/`、`~/.codebuddy/skills/`、
+`~/.qoder/skills/` 或 `~/.qoder-cn/skills/`。`install de`（默认）会把两个都装上。
 若想从 AQG 一侧起步、并在同一步加上 DE，用 `WITH_DE=1 ./install.sh aqg`（见下）。永久配置只保存
 endpoint 和服务端签发的每设备凭据，绝不保存 owner 发放的 activation secret。
 

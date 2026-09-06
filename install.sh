@@ -379,7 +379,7 @@ install_de_dev_mode() {
     echo "==> Wiring the local decision-engine MCP into your agent(s) (--dev-root ${repo_root}):"
     ( cd "${repo_root}" && run_python -m installer.mcp_config --write --dev-root "${repo_root}" ) \
       || echo "install: NOTE — auto-wire found no agent or hit an error; run" \
-              "'${PYTHON_BIN} -m installer.mcp_config --write --dev-root ${repo_root} --client <claude-code|claude-desktop|codex|cursor|qoder|qoder-cn|trae|trae-work|trae-cn|trae-work-cn|workbuddy>'" \
+              "'${PYTHON_BIN} -m installer.mcp_config --write --dev-root ${repo_root} --client <claude-code|claude-desktop|codebuddy|codex|cursor|qoder|qoder-cn|trae|trae-work|trae-cn|trae-work-cn|workbuddy|workbuddy-ai>'" \
               "or see installer/README.md." >&2
 
     # Current Codex releases route through skills.  This is a one-way migration only: it removes
@@ -510,11 +510,74 @@ install_de_managed() {
   ( cd "${managed_root}" && run_python -m installer.doctor ) || true
 }
 
+run_aqg_client_phase() {
+  local phase="$1"
+  local flag="$2"
+  local script="${AQG_DEST}/scripts/install_aqg_clients.py"
+  local status
+  local q_python q_script q_home q_aqg_dest
+
+  if [ ! -f "${script}" ]; then
+    q_aqg_dest=$(printf '%q' "${AQG_DEST}")
+    die "AQG client adapter script not found at ${script}; update the AQG checkout with" \
+        "git -C ${q_aqg_dest} pull --ff-only, then retry this installer."
+  fi
+
+  if run_python "${script}" --installed-supported "${flag}" \
+      --home "${HOME}" --aqg-root "${AQG_DEST}"; then
+    status=0
+  else
+    status=$?
+  fi
+
+  case "${status}" in
+    0)
+      return 0
+      ;;
+    3)
+      echo "==> AQG client adapter ${phase}: no supported Agent host detected; successful no-op."
+      return 0
+      ;;
+    *)
+      q_python=$(printf '%q' "${PYTHON_BIN}")
+      q_script=$(printf '%q' "${script}")
+      q_home=$(printf '%q' "${HOME}")
+      q_aqg_dest=$(printf '%q' "${AQG_DEST}")
+      {
+        echo "install: AQG client adapter ${phase} phase failed via install_aqg_clients.py (exit ${status})."
+        echo "install: retry with: ${q_python} ${q_script} --installed-supported ${flag} --home ${q_home} --aqg-root ${q_aqg_dest}"
+      } >&2
+      return "${status}"
+      ;;
+  esac
+}
+
 install_de() {
   local aqg_ready="0"
+  local status
   if [ "${WITH_AQG}" = "1" ]; then
-    ensure_aqg_ready \
-      || die "AQG could not be installed and verified; Decision Engine was not installed."
+    ensure_aqg_checkout_and_deps \
+      || die "AQG could not be installed; Decision Engine was not installed." \
+             "Review the AQG installation errors above, then retry this installer."
+
+    if run_aqg_client_phase apply --apply; then
+      :
+    else
+      status=$?
+      return "${status}"
+    fi
+
+    if run_aqg_client_phase verify --verify; then
+      :
+    else
+      status=$?
+      return "${status}"
+    fi
+
+    echo "==> Verifying Agent Quality Gates:"
+    run_python "${AQG_DEST}/scripts/aqg_doctor.py" --no-cli \
+      || die "AQG Doctor reported unhealthy after client apply/verify; Decision Engine was not installed." \
+             "Review and repair the AQG Doctor errors above, then retry this installer."
     aqg_ready="1"
   fi
   install_de_body
@@ -568,6 +631,19 @@ ensure_aqg_dependencies() {
   else
     run_python -m pip install --user -r "${AQG_DEST}/requirements.txt"
   fi
+}
+
+ensure_aqg_checkout_and_deps() {
+  # Prepares the AQG checkout and its dependencies for the DE install flow
+  # WITHOUT running AQG Doctor as a pre-apply gate: an unhealthy/fresh host
+  # surface must not block the client wrapper apply/verify steps. The single
+  # fail-closed Doctor gate for this flow runs once, after apply/verify.
+  if aqg_checkout_is_usable; then
+    echo "==> AQG checkout present at ${AQG_DEST}; ensuring dependencies are installed."
+  else
+    install_aqg_body || return 1
+  fi
+  ensure_aqg_dependencies
 }
 
 ensure_aqg_ready() {

@@ -16,6 +16,7 @@ import sys
 import textwrap
 import unittest
 import unittest.mock
+import zlib
 from pathlib import Path
 
 REPO = Path(__file__).resolve().parents[2]
@@ -28,6 +29,26 @@ ICO = ICONS / "logo.ico"
 DECLARED_SIZES = (16, 20, 24, 32, 48, 64, 128, 256)
 BRACE_CUTOFF = 32   # 32px is SM_CXICON at 100% DPI — the taskbar button must carry the full mark
 BRAND = (11, 133, 101)
+
+# The macOS 11+ app-icon grid: a 1024x1024 canvas whose rounded-rect body is 824x824, i.e. 100px of
+# transparent margin per side. The Dock scales the whole canvas into its tile slot, so a body drawn
+# edge-to-edge fills the slot a conformant icon fills to 80.47% — it renders 1024/824 = 1.24x
+# oversized next to every other app. That is the defect these assertions exist to catch.
+TILE_BODY_RATIO = 824 / 1024
+# Slack on the measured body, as a fraction of the canvas, plus a flat allowance for the antialiased
+# edge. Both are needed and they cover different things:
+#
+#   * the proportional part absorbs the rounding of a fractional margin — a 16px entry cannot place
+#     Apple's 1.5625px margin on a pixel boundary;
+#   * the flat 2px is the squircle's antialiased edge, one partial pixel per side. `ink_bbox` counts
+#     any pixel above alpha 16, so at 16px the edge pixel (alpha 112) is inside the measurement and
+#     the body reads 14px against an ideal 12.875. At 256px and up the margin lands on whole pixels
+#     and the measurement is exact — 206 of 256, 824 of 1024.
+#
+# Neither admits the defect this pins against: at 1024 the pair allows 814..834 against a full-canvas
+# tile of 1024, and at 16px 10.9..14.9 against 16.
+TILE_RATIO_SLACK = 8 / 1024
+TILE_ANTIALIAS_SLACK_PX = 2
 
 
 def ico_entries(path: Path):
@@ -68,6 +89,111 @@ def ink_bbox(rows):
                 ys.append(y)
     assert xs, "image is entirely transparent"
     return min(xs), min(ys), max(xs), max(ys)
+
+
+# ── icns readers ─────────────────────────────────────────────────────────────────────────────────
+# Deliberately NOT the generator's own code. These are written from the format spec so a bug in the
+# writer cannot be cancelled out by the same bug in the checker, and they were validated against the
+# container iconutil itself produced before the tile geometry was fixed. Hand-decoding an asset is
+# the existing habit in this file (`ico_entries` / `dib_pixels` above), not a new one.
+
+def icns_entries(path: Path):
+    """``{OSType: payload}`` for every chunk, with the container's own length field checked."""
+    data = path.read_bytes()
+    magic, declared = struct.unpack(">4sI", data[:8])
+    assert magic == b"icns", "not an icns container"
+    assert declared == len(data), "the icns header length disagrees with the file"
+    out, offset = {}, 8
+    while offset < declared:
+        kind, length = struct.unpack(">4sI", data[offset:offset + 8])
+        assert 8 <= length <= declared - offset, "chunk %r has an impossible length" % kind
+        out[kind.decode("ascii")] = data[offset + 8:offset + length]
+        offset += length
+    return out
+
+
+def _unfilter_png(raw: bytes, width: int, height: int, channels: int) -> bytes:
+    """Reverse PNG's per-row filters. Only what a colour-type-6 8-bit image can carry (0-4)."""
+    stride = width * channels
+    out, prev, pos = bytearray(), bytearray(stride), 0
+    for _y in range(height):
+        kind = raw[pos]
+        pos += 1
+        line = bytearray(raw[pos:pos + stride])
+        pos += stride
+        for i in range(stride):
+            left = line[i - channels] if i >= channels else 0
+            up = prev[i]
+            upleft = prev[i - channels] if i >= channels else 0
+            if kind == 1:
+                line[i] = (line[i] + left) & 0xFF
+            elif kind == 2:
+                line[i] = (line[i] + up) & 0xFF
+            elif kind == 3:
+                line[i] = (line[i] + ((left + up) >> 1)) & 0xFF
+            elif kind == 4:
+                guess = left + up - upleft
+                da, db, dc = abs(guess - left), abs(guess - up), abs(guess - upleft)
+                near = left if (da <= db and da <= dc) else (up if db <= dc else upleft)
+                line[i] = (line[i] + near) & 0xFF
+            elif kind:
+                raise AssertionError("unknown PNG filter %d" % kind)
+        out.extend(line)
+        prev = line
+    return bytes(out)
+
+
+def png_rows(blob: bytes):
+    """Rows of (r, g, b, a) from an 8-bit RGBA PNG — the form every large icns entry takes."""
+    assert blob[:8] == b"\x89PNG\r\n\x1a\n", "not a PNG"
+    offset, idat, header = 8, bytearray(), None
+    while offset < len(blob):
+        length, kind = struct.unpack(">I4s", blob[offset:offset + 8])
+        payload = blob[offset + 8:offset + 8 + length]
+        if kind == b"IHDR":
+            header = struct.unpack(">IIBB", payload[:10])
+        elif kind == b"IDAT":
+            idat.extend(payload)
+        offset += 12 + length
+    width, height, depth, colour = header
+    assert (depth, colour) == (8, 6), "expected 8-bit RGBA, got depth=%d colour=%d" % (depth, colour)
+    flat = _unfilter_png(zlib.decompress(bytes(idat)), width, height, 4)
+    return [[tuple(flat[(y * width + x) * 4:(y * width + x) * 4 + 4])
+             for x in range(width)] for y in range(height)]
+
+
+def rle_decode(data: bytes, expect: int):
+    """Apple's PackBits variant, as used by the ARGB/is32 chunks: a control byte below 0x80 is a
+    literal run of ``control + 1`` bytes, 0x80 and up a repeat of ``control - 0x7D`` (so 3..130).
+    Returns the bytes and how many were consumed — the four channels are concatenated, so the
+    caller needs the offset to find the next one."""
+    out, pos = bytearray(), 0
+    while pos < len(data) and len(out) < expect:
+        control = data[pos]
+        pos += 1
+        if control & 0x80:
+            out.extend(bytes([data[pos]]) * (control - 0x7D))
+            pos += 1
+        else:
+            run = control + 1
+            out.extend(data[pos:pos + run])
+            pos += run
+    return bytes(out), pos
+
+
+def argb_rows(blob: bytes, size: int):
+    """Rows of (r, g, b, a) from an ARGB chunk — the form the 16px and 32px icns entries take."""
+    assert blob[:4] == b"ARGB", "not an ARGB chunk"
+    pixels, body, offset, planes = size * size, blob[4:], 0, []
+    for name in "ARGB":
+        plane, used = rle_decode(body[offset:], pixels)
+        assert len(plane) == pixels, "ARGB channel %s decoded %d of %d" % (name, len(plane), pixels)
+        planes.append(plane)
+        offset += used
+    assert offset == len(body), "ARGB chunk has %d trailing bytes" % (len(body) - offset)
+    alpha, red, green, blue = planes
+    return [[(red[y * size + x], green[y * size + x], blue[y * size + x], alpha[y * size + x])
+             for x in range(size)] for y in range(size)]
 
 
 class IcoFormat(unittest.TestCase):
@@ -391,10 +517,10 @@ class ApplyWindowIcon(unittest.TestCase):
         self.assertIsNotNone(png, "desktop/icons/logo-256.png is missing from the body")
 
     def test_the_icns_is_committed_and_is_an_icns(self):
-        """It is a runtime asset now, not just packaging input — the Dock reads it on macOS. It
-        also cannot be regenerated on a user's machine: iconutil is macOS-only and nothing runs a
-        build step there, so a missing or malformed file means a Dock tile that never appears.
-        Checked on every platform for that reason; only the reader is macOS-only."""
+        """It is a runtime asset now, not just packaging input — the Dock reads it on macOS. And
+        nothing regenerates it on a user's machine, so a missing or malformed file means a Dock tile
+        that never appears. Checked on every platform for that reason; only the reader is
+        macOS-only. (The generator no longer needs macOS either — see ``write_icns``.)"""
         self.assertTrue(tk_icon.ICNS_PATH.exists(),
                         "desktop/icons/AppIcon.icns is missing from the body")
         with tk_icon.ICNS_PATH.open("rb") as handle:
@@ -402,6 +528,90 @@ class ApplyWindowIcon(unittest.TestCase):
         self.assertEqual(magic, b"icns", "AppIcon.icns is not an icns container")
         self.assertEqual(size, tk_icon.ICNS_PATH.stat().st_size,
                          "the icns header length disagrees with the file — it is truncated")
+
+
+class IcnsGeometry(unittest.TestCase):
+    """The reported macOS defect, pinned as geometry.
+
+    A user's Dock showed the audit / graphic-explanation / comic-explanation / whiteboard tiles
+    standing visibly taller than their neighbours. The cause was not the artwork but the canvas:
+    every representation drew its rounded tile edge-to-edge, so the Dock scaled a 1024px body into
+    the slot that a conformant icon fills with an 824px one.
+
+    Measured off the committed bytes rather than off the generator, because the committed bytes are
+    what ships — the client body arrives by ``git pull`` and nothing regenerates anything on a
+    user's machine."""
+
+    # (OSType, pixels). The ARGB pair and a spread of the PNG entries; every size is the same
+    # compositor, so decoding all ten would only cost seconds to re-prove one property.
+    MEASURED = (("ic04", 16), ("ic05", 32), ("ic08", 256), ("ic14", 512), ("ic10", 1024))
+
+    def rows_for(self, kind, payload, size):
+        return argb_rows(payload, size) if kind in ("ic04", "ic05") else png_rows(payload)
+
+    def test_every_dock_representation_is_present(self):
+        """The Dock picks a representation by the slot it is drawing; a missing one is scaled up
+        from a smaller neighbour and looks soft rather than absent, which is easy to miss by eye."""
+        present = set(icns_entries(tk_icon.ICNS_PATH))
+        for kind, _size in self.MEASURED:
+            self.assertIn(kind, present, "%s is missing from AppIcon.icns" % kind)
+
+    def test_the_tile_leaves_apples_margin(self):
+        """The regression. Was: fill ratio 1.0000 at every size — no margin at all."""
+        entries = icns_entries(tk_icon.ICNS_PATH)
+        for kind, size in self.MEASURED:
+            rows = self.rows_for(kind, entries[kind], size)
+            self.assertEqual(len(rows), size, "%s is not %dpx tall" % (kind, size))
+            x0, y0, x1, y1 = ink_bbox(rows)
+            width, height = x1 - x0 + 1, y1 - y0 + 1
+            want = TILE_BODY_RATIO * size
+            slack = TILE_RATIO_SLACK * size + TILE_ANTIALIAS_SLACK_PX
+            for label, extent in (("width", width), ("height", height)):
+                self.assertLessEqual(
+                    extent, want + slack,
+                    "%s (%dpx) tile %s is %dpx of a %dpx canvas (fill ratio %.4f) — Apple's grid "
+                    "wants %.0fpx, so the Dock draws this %.2fx oversized. Re-run "
+                    "desktop/icons/make_icons.py and commit the result."
+                    % (kind, size, label, extent, size, extent / size, want, extent / want))
+                self.assertGreaterEqual(
+                    extent, want - slack,
+                    "%s (%dpx) tile %s is only %dpx of a %dpx canvas — undersized against "
+                    "Apple's %.0fpx grid" % (kind, size, label, extent, size, want))
+
+    def test_the_tile_is_centred_in_its_canvas(self):
+        """Apple's margin is symmetric. An off-centre body reads as a misaligned icon in the Dock
+        row even when its size is right, and it is the failure a one-sided inset would produce."""
+        entries = icns_entries(tk_icon.ICNS_PATH)
+        for kind, size in self.MEASURED:
+            x0, y0, x1, y1 = ink_bbox(self.rows_for(kind, entries[kind], size))
+            for label, near, far in (("horizontally", x0, size - 1 - x1),
+                                     ("vertically", y0, size - 1 - y1)):
+                self.assertLessEqual(abs(near - far), 1,
+                                     "%s (%dpx) is off-centre %s: %dpx one side, %dpx the other"
+                                     % (kind, size, label, near, far))
+
+    def test_the_corners_are_transparent_and_the_body_is_not(self):
+        """What separates a tile with a margin from a smaller mark on bare transparency: the corner
+        pixel must be clear (it is outside the squircle) while the centre must be opaque."""
+        entries = icns_entries(tk_icon.ICNS_PATH)
+        for kind, size in self.MEASURED:
+            rows = self.rows_for(kind, entries[kind], size)
+            self.assertEqual(rows[0][0][3], 0, "%s: the top-left corner is not transparent" % kind)
+            self.assertEqual(rows[size // 2][size // 2][3], 255,
+                             "%s: the centre of the tile is not opaque" % kind)
+
+    def test_the_small_representations_keep_a_legible_mark(self):
+        """Shrinking the tile shrinks the mark with it. At 16px the mark is only ~9px across, so
+        this guards the floor: brand-coloured ink must still be there in quantity. A mark that
+        silted up to nothing would otherwise satisfy every geometry assertion above."""
+        entries = icns_entries(tk_icon.ICNS_PATH)
+        for kind, size in (("ic04", 16), ("ic05", 32)):
+            rows = argb_rows(entries[kind], size)
+            ink = sum(1 for row in rows for r, g, b, a in row
+                      if a > 128 and max(r, g, b) < 200 and g > r and g > b)
+            self.assertGreaterEqual(ink, max(4, size * size // 40),
+                                    "%s (%dpx) has almost no mark left: %d ink pixels"
+                                    % (kind, size, ink))
 
 
 class Generator(unittest.TestCase):
@@ -509,6 +719,112 @@ class Generator(unittest.TestCase):
         half.opacity = 0.5
         color = dict((s.id, c) for s, c in self.make.layers(shapes, full_mark=True))[half.id]
         self.assertEqual(color, tuple(round(half.fill[i] * 0.5 + 255 * 0.5) for i in range(3)))
+
+    def test_the_tile_geometry_matches_apples_grid(self):
+        """The constants, checked against Apple's published numbers rather than against themselves:
+        a 1024 canvas, an 824 body, a 185.4px radius. Getting these wrong is not a crash, it is a
+        Dock tile that renders the wrong size — which is what shipped."""
+        self.assertEqual(self.make.APPLE_CANVAS_PX, 1024)
+        self.assertAlmostEqual(self.make.TILE_BODY_RATIO * 1024, 824, places=6)
+        self.assertAlmostEqual(self.make.TILE_MARGIN_RATIO * 1024, 100, places=6)
+        self.assertAlmostEqual(self.make.TILE_RADIUS_RATIO * 824, 185.4, places=6)
+
+    def test_the_tile_body_is_inset_and_centred(self):
+        """``rounded_tile`` against an empty buffer, so what is measured is the tile alone. Guards
+        the two-variable split inside it: the body's extent and the canvas centre are different
+        numbers now, and collapsing them back into one restores the edge-to-edge tile."""
+        size = 64
+        tile = self.make.rounded_tile(bytearray(size * size * 4), size, self.make.WHITE)
+        rows = [[tuple(tile[(y * size + x) * 4:(y * size + x) * 4 + 4]) for x in range(size)]
+                for y in range(size)]
+        x0, y0, x1, y1 = ink_bbox(rows)
+        want = self.make.TILE_BODY_RATIO * size
+        self.assertLessEqual(abs((x1 - x0 + 1) - want), 1, "tile body is not %.1fpx wide" % want)
+        self.assertLessEqual(abs((y1 - y0 + 1) - want), 1, "tile body is not %.1fpx tall" % want)
+        self.assertEqual((x0, y0), (size - 1 - x1, size - 1 - y1), "the margin is not symmetric")
+        self.assertEqual(rows[0][0][3], 0, "the corner is inside the tile")
+
+    def test_the_mark_is_centred_at_every_size(self):
+        """``_inset`` truncates its offset, so an odd ``size - inner`` puts the mark a pixel left of
+        and above centre inside a tile that is itself symmetric. Worst at 16px, where one pixel is
+        ~11% of a 9px mark — and 16/32/64 are exactly the sizes that rebasing on the tile body moved
+        into that case.
+
+        Measured by feeding in a fully opaque square and locating where the ink actually lands, so
+        this pins the observable placement rather than re-deriving the function's own arithmetic."""
+        for _ostype, size, _points in self.make.ICNS_SLOTS:
+            opaque = bytes([0, 0, 0, 255]) * (size * size)
+            placed = self.make._inset(opaque, size)
+            self.assertEqual(len(placed), size * size * 4, "%dpx: buffer changed size" % size)
+            rows = [[tuple(placed[(y * size + x) * 4:(y * size + x) * 4 + 4]) for x in range(size)]
+                    for y in range(size)]
+            x0, y0, x1, y1 = ink_bbox(rows)
+            self.assertEqual((x0, y0), (size - 1 - x1, size - 1 - y1),
+                             "%dpx: mark sits at L%d/R%d T%d/B%d — not centred"
+                             % (size, x0, size - 1 - x1, y0, size - 1 - y1))
+
+    def test_the_argb_codec_round_trips(self):
+        """``argb_chunk`` writes the two smallest representations, and its PackBits repeat bias is 3
+        rather than stock PackBits' 2 — the kind of off-by-one that yields a smeared icon rather than
+        an error. Includes the runs that sit on the encoding's boundaries (130 is the longest repeat
+        expressible, 128 the longest literal)."""
+        for label, data in (
+                ("flat", b"\x00" * 1000),
+                ("no repeats", bytes(range(256))),
+                ("longest repeat", b"\xff" * 130),
+                ("one past it", b"\xff" * 131),
+                ("alternating", b"ab" * 300),
+                ("mixed", b"\x00" * 3 + b"\x01" + b"\x02" * 2 + b"\x03" * 129)):
+            encoded = self.make._packbits(data)
+            decoded, used = rle_decode(encoded, len(data))
+            self.assertEqual(decoded, data, "%s: did not survive the round trip" % label)
+            self.assertEqual(used, len(encoded), "%s: %d of %d bytes consumed"
+                             % (label, used, len(encoded)))
+
+    def test_the_icns_writer_refuses_an_incomplete_set(self):
+        """Fail-closed. A missing representation is not a missing icon — the Dock scales a neighbour
+        up, which looks soft rather than absent, so a silently skipped slot could ship unnoticed."""
+        size_of = {ostype: px for ostype, px, _pts in self.make.ICNS_SLOTS}
+        full = {ostype: bytes(px * px * 4) for ostype, px in size_of.items()}
+        with self.assertRaises(ValueError):
+            self.make.write_icns(ICONS / "unwritten.icns", {k: v for k, v in full.items()
+                                                            if k != "ic10"})
+        wrong = dict(full, ic10=bytes(16 * 16 * 4))
+        with self.assertRaises(ValueError):
+            self.make.write_icns(ICONS / "unwritten.icns", wrong)
+        self.assertFalse((ICONS / "unwritten.icns").exists(), "it wrote a file before validating")
+
+    def test_slots_that_share_a_size_do_not_share_artwork(self):
+        """ic11 and ic05 are both 32px, but ic11 is a 16-POINT tile and ic05 a 32-point one, so one
+        drops the framing braces and the other keeps them. A writer keyed on pixel size instead of
+        slot would put one in the other's place — invisible at a glance, wrong on a Retina Dock."""
+        by_size = {}
+        for ostype, pixels, points in self.make.ICNS_SLOTS:
+            by_size.setdefault(pixels, []).append((ostype, points))
+        shared = {px: slots for px, slots in by_size.items() if len(slots) > 1}
+        self.assertTrue(shared, "no size is shared — this test no longer guards anything")
+        cutoff = self.make.BRACE_CUTOFF
+        self.assertTrue(
+            any(len({pts >= cutoff for _os, pts in slots}) > 1 for slots in shared.values()),
+            "no shared size straddles BRACE_CUTOFF, so nothing distinguishes the slots")
+
+    def test_committed_icns_still_regenerates_from_the_master(self):
+        """The icns counterpart of the .ico test above, and the assertion whose absence let an
+        edge-to-edge tile ship: every other icns check would pass against a stale or hand-built
+        file. Small slots only — the 512px and 1024px renders are minutes of pure Python."""
+        entries = icns_entries(tk_icon.ICNS_PATH)
+        _vw, _vh, shapes = self.make.load_master()
+        for ostype, size, points in self.make.ICNS_SLOTS:
+            if size > 64:
+                continue
+            mark = self.make.variant(shapes, size, points >= BRACE_CUTOFF, supersample=4)
+            tile = bytes(self.make.rounded_tile(
+                bytearray(self.make._inset(mark, size)), size, self.make.WHITE))
+            fresh = (self.make.argb_chunk(tile, size) if ostype in self.make.ICNS_ARGB
+                     else self.make.png_bytes(tile, size))
+            self.assertEqual(fresh, entries[ostype],
+                             "%s (%dpx) no longer matches logo.svg — re-run "
+                             "desktop/icons/make_icons.py and commit the result" % (ostype, size))
 
 
 if __name__ == "__main__":

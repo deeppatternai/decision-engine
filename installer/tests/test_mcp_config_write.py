@@ -1119,6 +1119,9 @@ class DetectAndCliTestCase(unittest.TestCase):
                        "TRAE_WORK_CN_CONFIG", "TRAE_WORK_CN_SKILLS_DIR",
                        "TRAE_WORK_CN_APP_ROOT", "WORKBUDDY_CONFIG",
                        "WORKBUDDY_SKILLS_DIR", "WORKBUDDY_APP_ROOT",
+                       "WORKBUDDY_AI_CONFIG", "WORKBUDDY_AI_SKILLS_DIR",
+                       "WORKBUDDY_AI_APP_ROOT", "CODEBUDDY_CONFIG",
+                       "CODEBUDDY_SKILLS_DIR", "CODEBUDDY_CLI",
                         "QODER_CONFIG", "QODER_SKILLS_DIR", "QODER_APP_ROOT",
                         "QODER_CN_CONFIG", "QODER_CN_SKILLS_DIR",
                         "QODER_CN_APP_ROOT", "TRAE_CONFIG", "TRAE_SKILLS_DIR",
@@ -1172,6 +1175,24 @@ class DetectAndCliTestCase(unittest.TestCase):
         )
         os.environ["WORKBUDDY_APP_ROOT"] = str(
             self.tmp / "no-workbuddy" / "app"
+        )
+        os.environ["WORKBUDDY_AI_CONFIG"] = str(
+            self.tmp / "wb-ai" / "mcp.json"
+        )
+        os.environ["WORKBUDDY_AI_SKILLS_DIR"] = str(
+            self.tmp / "no-workbuddy-ai" / "skills"
+        )
+        os.environ["WORKBUDDY_AI_APP_ROOT"] = str(
+            self.tmp / "no-workbuddy-ai" / "app"
+        )
+        os.environ["CODEBUDDY_CONFIG"] = str(
+            self.tmp / "cb" / "mcp.json"
+        )
+        os.environ["CODEBUDDY_SKILLS_DIR"] = str(
+            self.tmp / "no-codebuddy" / "skills"
+        )
+        os.environ["CODEBUDDY_CLI"] = str(
+            self.tmp / "no-codebuddy" / "bin" / "codebuddy"
         )
         os.environ["DE_UI_LOCALE"] = "en-US"
         self._root = mock.patch.object(mcp_config, "registration_root", return_value=self.tmp)
@@ -1231,6 +1252,9 @@ class DetectAndCliTestCase(unittest.TestCase):
                   "TRAE_WORK_CN_CONFIG", "TRAE_WORK_CN_SKILLS_DIR",
                   "TRAE_WORK_CN_APP_ROOT", "WORKBUDDY_CONFIG",
                   "WORKBUDDY_SKILLS_DIR", "WORKBUDDY_APP_ROOT",
+                  "WORKBUDDY_AI_CONFIG", "WORKBUDDY_AI_SKILLS_DIR",
+                  "WORKBUDDY_AI_APP_ROOT", "CODEBUDDY_CONFIG",
+                  "CODEBUDDY_SKILLS_DIR", "CODEBUDDY_CLI",
                   "QODER_CONFIG", "QODER_SKILLS_DIR", "QODER_APP_ROOT",
                   "QODER_CN_CONFIG", "QODER_CN_SKILLS_DIR", "QODER_CN_APP_ROOT",
                   "TRAE_CONFIG", "TRAE_SKILLS_DIR", "TRAE_APP_ROOT",

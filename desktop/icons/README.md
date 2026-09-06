@@ -11,7 +11,7 @@ python3 desktop/icons/make_icons.py        # add --no-icns to skip the macOS bun
 | `logo.svg` | no — **the master** | the generator, and nothing else |
 | `logo.ico` | yes | `client/tk_icon.py` → the Windows stop panel and the setup dialogs |
 | `logo-64.png`, `logo-256.png` | yes | `client/tk_icon.py` → Tk's `iconphoto` on non-Windows |
-| `AppIcon.icns` | yes (needs `iconutil`, so macOS) | `client/tk_icon.py` → the macOS Dock tile, at runtime; and the `Decision Engine Stopper.app` bundle, built out of band |
+| `AppIcon.icns` | yes | `client/tk_icon.py` → the macOS Dock tile, at runtime; and the `Decision Engine Stopper.app` bundle, built out of band |
 | `../macos/bin/stopper_icon.png`, `@2x` | yes | the Swift panel's menu-bar item, and `client/popup/native_shell.py` |
 
 The outputs are **committed**. The client body is delivered by `git pull` and nothing runs a build
@@ -53,6 +53,40 @@ same paint turns muddy and merges with whatever it overlaps. The generator subst
 composite-over-white colour, so white backgrounds are unchanged and dark ones keep their layering.
 The current master is a single flat `#0B8565`, so nothing triggers this — it stays because the next
 re-export is where it would silently matter.
+
+## The macOS tile has 100px of margin, and it is not spare space
+
+Apple's macOS 11+ app-icon grid is a 1024×1024 canvas whose rounded-rect body is **824×824**, with a
+185.4px corner radius — 100px of transparent margin per side. macOS does not mask an app icon the way
+iOS does (the squircle is yours to draw), and the Dock scales the *whole canvas* into its tile slot.
+
+So a body drawn edge-to-edge lands in the slot every conformant icon fills to 80.47%, and renders
+**1.24x larger than its neighbours**. That is not theory — it shipped, and the report was Dock tiles
+for the audit / graphic-explanation / comic-explanation / whiteboard windows standing visibly taller
+than the apps beside them. `TILE_BODY_RATIO` and its neighbours in the generator carry the numbers;
+`IcnsGeometry` in `installer/tests/test_window_icon.py` measures them back off the committed bytes.
+
+Only `AppIcon.icns` is inset. Windows scales a window icon to fit its own box, so the same margin in
+`logo.ico` would just make the icon smaller for nothing.
+
+## Why the .icns is not built by `iconutil`
+
+It used to be, which meant the file could only be regenerated on macOS — and, more to the point, only
+be *measured* there. The asset is committed and read at runtime, nothing builds on a user's machine,
+and every check this repo had on it amounted to "does it start with `icns`". An edge-to-edge tile
+satisfied that for as long as nobody looked at a Dock.
+
+`write_icns` writes the container directly: PNG payloads for the eight larger representations, and
+Apple's PackBits-compressed ARGB for the 16px and 32px pair, which is what `iconutil` emits at those
+sizes. Stdlib only, like the rest of this directory. It drops one thing `iconutil` writes — the
+`info` chunk, an NSKeyedArchiver blob naming the asset-catalog entry — which no image reader consults.
+
+Slots are keyed by OSType, not by pixel size, because two of them share a size without sharing
+artwork: `ic11` and `ic05` are both 32px, but `ic11` is a 16-**point** tile with the braces dropped
+and `ic05` a 32-point one that keeps them.
+
+The trade is deliberate: one writer, one output, on every platform. Keeping `iconutil` as a second
+path would mean the same master producing different bytes depending on who regenerated it.
 
 ## What the generator refuses
 

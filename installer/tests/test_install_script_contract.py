@@ -125,12 +125,19 @@ class InstallScriptContractTests(unittest.TestCase):
         start = self.script.index("\ninstall_de() {") + 1
         end = self.script.index("\n}\n", start)
         install_de = self.script[start:end]
-        self.assertIn("ensure_aqg_ready", install_de)
-        self.assertLess(
-            install_de.index("ensure_aqg_ready"),
-            install_de.index("install_de_body"),
+        expected_order = (
+            "ensure_aqg_checkout_and_deps",
+            "run_aqg_client_phase apply --apply",
+            "run_aqg_client_phase verify --verify",
+            "scripts/aqg_doctor.py",
+            "install_de_body",
         )
-        self.assertIn("AQG already installed and healthy", self.script)
+        for earlier, later in zip(expected_order, expected_order[1:]):
+            self.assertLess(
+                install_de.index(earlier),
+                install_de.index(later),
+                "expected %s before %s" % (earlier, later),
+            )
 
     def test_an_optional_stopper_agent_failure_does_not_abort_the_install(self):
         """The Stopper LaunchAgent is a convenience: it lets a sandboxed host wake the panel it

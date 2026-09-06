@@ -76,6 +76,7 @@ Decision Engine needs an owner-issued device activation key.
 |---|---|---|---|---|
 | Claude Code | `claude-code` | `~/.claude.json` | `~/.claude/skills/` | direct Python; JSON includes `cwd`; includes `type` |
 | Claude Desktop | `claude-desktop` | Windows: `%APPDATA%/Claude/claude_desktop_config.json`<br>macOS: `~/Library/Application Support/Claude/claude_desktop_config.json`<br>Linux: `~/.config/Claude/claude_desktop_config.json` | none | direct Python; JSON includes `cwd`; includes `type` |
+| Tencent CodeBuddy Agent CLI | `codebuddy` | `~/.codebuddy/mcp.json` | `~/.codebuddy/skills/` | direct Python; JSON omits `cwd`; omits `type`; CodeBuddy Studio is not installation evidence |
 | Codex | `codex` | `~/.codex/config.toml` | `~/.codex/skills/` | direct Python; TOML launcher |
 | Cursor | `cursor` | `~/.cursor/mcp.json` | `~/.cursor/skills/` | direct Python; JSON omits `cwd`; omits `type` |
 | Alibaba Qoder Desktop | `qoder` | `~/.qoder/mcp.json` (Windows); `~/.qoder/settings.json` (macOS) | `~/.qoder/skills/` | absolute `installer/mcp_bootstrap.py`; JSON omits `cwd`; omits `type` |
@@ -85,6 +86,7 @@ Decision Engine needs an owner-issued device activation key.
 | TRAE CN Desktop | `trae-cn` | `~/Library/Application Support/Trae CN/User/mcp.json` | `~/.trae-cn/skills/` | desktop Python (macOS direct); JSON includes `cwd`, omits `type` |
 | TRAE Work CN | `trae-work-cn` | Windows: `%APPDATA%/TRAE SOLO CN/User/mcp.json`<br>macOS: `~/Library/Application Support/TRAE SOLO CN/User/mcp.json` | `~/.trae-cn/skills/` | desktop Python (Windows space-safe, macOS direct); JSON includes `cwd`, omits `type` |
 | Tencent WorkBuddy Desktop | `workbuddy` | `~/.workbuddy/mcp.json` | `~/.workbuddy/skills/` | desktop Python (Windows space-safe, macOS direct); JSON omits `cwd`; omits `type` |
+| Tencent WorkBuddy AI Desktop | `workbuddy-ai` | `~/.workbuddy-ai/mcp.json` | `~/.workbuddy-ai/skills/` | desktop Python (macOS direct); JSON omits `cwd`; omits `type` |
 
 The Qoder and TRAE families are product-specific Desktop contracts. Qoder CN,
 TRAE, and TRAE CN are currently macOS-only; Qoder IDE and Qoder CN IDE are not

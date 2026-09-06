@@ -11,6 +11,7 @@ from installer.client_hosts.hosts import (
     trae_cn,
     trae_work,
     trae_work_cn,
+    workbuddy_ai,
 )
 from installer.client_hosts.registry import CLIENTS, CLIENT_SPECS
 from installer.config import ShellError
@@ -105,6 +106,14 @@ def _table_row(body: str, client: str) -> str:
 
 
 class InstallationDocsTestCase(unittest.TestCase):
+    def test_dev_install_manual_client_hint_names_every_registered_host(self):
+        body = (ROOT / "install.sh").read_text(encoding="utf-8")
+        hints = [line for line in body.splitlines() if "--client <" in line]
+        self.assertEqual(len(hints), 1)
+        for client in CLIENTS:
+            with self.subTest(client=client):
+                self.assertIn(client, hints[0])
+
     def test_every_installation_document_names_every_registered_host(self):
         for path in INSTALLATION_DOCS:
             body = path.read_text(encoding="utf-8")
@@ -145,6 +154,7 @@ class InstallationDocsTestCase(unittest.TestCase):
                 "trae-cn",
                 "trae-work-cn",
                 "workbuddy",
+                "workbuddy-ai",
             ):
                 with self.subTest(path=path.name, client=client):
                     self.assertIn(expected[client], _table_row(body, client))
@@ -201,6 +211,7 @@ class InstallationDocsTestCase(unittest.TestCase):
         floors = {
             "trae-work": trae_work._MINIMUM_VERSION,
             "trae-work-cn": trae_work_cn._MINIMUM_VERSION,
+            "workbuddy-ai": workbuddy_ai._MINIMUM_VERSION,
         }
         for path in ROOT_READMES + SETUP_DOCS:
             body = path.read_text(encoding="utf-8")
@@ -226,6 +237,7 @@ class InstallationDocsTestCase(unittest.TestCase):
             "trae-cn",
             "trae-work-cn",
             "workbuddy",
+            "workbuddy-ai",
         )
         for client in clients:
             spec = CLIENT_SPECS[client]
@@ -239,7 +251,7 @@ class InstallationDocsTestCase(unittest.TestCase):
                     if client == "qoder":
                         self.assertIn("Windows Desktop", row)
                         self.assertIn("macOS Qoder.app", row)
-                    elif client in {"qoder-cn", "trae", "trae-cn"}:
+                    elif client in {"qoder-cn", "trae", "trae-cn", "workbuddy-ai"}:
                         self.assertIn("macOS", row)
                     else:
                         self.assertIn("Windows and macOS Desktop", row)
@@ -264,6 +276,8 @@ class InstallationDocsTestCase(unittest.TestCase):
             "trae-cn",
             "trae-work-cn",
             "workbuddy",
+            "workbuddy-ai",
+            "codebuddy",
         ):
             self.assertFalse(CLIENT_SPECS[client].popup_followup)
 

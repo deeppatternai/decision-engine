@@ -31,6 +31,7 @@
 |---|---|---|---|---|
 | Claude Code | `claude-code` | `~/.claude.json` | `~/.claude/skills` | 受支持平台 |
 | Claude Desktop | `claude-desktop` | Windows：`%APPDATA%/Claude/claude_desktop_config.json`<br>macOS：`~/Library/Application Support/Claude/claude_desktop_config.json`<br>Linux：`~/.config/Claude/claude_desktop_config.json` | 无 | 受支持平台 |
+| 腾讯 CodeBuddy Agent CLI | `codebuddy` | `~/.codebuddy/mcp.json` | `~/.codebuddy/skills` | 仅支持独立 Agent CLI；CodeBuddy Studio 是另一个未支持产品 |
 | Codex | `codex` | `~/.codex/config.toml` | `~/.codex/skills` | 可加载全局 Skills 的版本及其受支持平台 |
 | Cursor | `cursor` | `~/.cursor/mcp.json` | `~/.cursor/skills` | 受支持平台 |
 | 阿里 Qoder Desktop | `qoder` | `~/.qoder/mcp.json`（Windows）；`~/.qoder/settings.json`（macOS） | `~/.qoder/skills` | Windows Desktop 1.106.3+；macOS Qoder.app 0.1.3+ |
@@ -40,6 +41,7 @@
 | TRAE CN Desktop | `trae-cn` | `~/Library/Application Support/Trae CN/User/mcp.json` | `~/.trae-cn/skills` | macOS Trae CN.app 3.3.95 |
 | TRAE Work CN | `trae-work-cn` | Windows：`%APPDATA%/TRAE SOLO CN/User/mcp.json`<br>macOS：`~/Library/Application Support/TRAE SOLO CN/User/mcp.json` | `~/.trae-cn/skills` | Windows and macOS Desktop 0.1.48+ |
 | 腾讯 WorkBuddy Desktop | `workbuddy` | `~/.workbuddy/mcp.json` | `~/.workbuddy/skills` | Windows and macOS Desktop |
+| 腾讯 WorkBuddy AI Desktop | `workbuddy-ai` | `~/.workbuddy-ai/mcp.json` | `~/.workbuddy-ai/skills` | 仅 macOS WorkBuddy AI.app 5.5.2+ |
 
 Graphic Explanation 弹窗右侧追问通过 API 提供，不需要 host CLI。支持的宿主仍可使用公共的
 Graphic Explanation / Discussion Board 原生窗口及审计 Stop Panel。
@@ -354,7 +356,7 @@ AQG Doctor 或核心安装错误都停止本文流程。无论 MCP 传输入口�
 ```
 
 按需把 `codex` 换成上表任一注册 ID：`claude-code`、`claude-desktop`、`cursor`、`qoder`、
-`qoder-cn`、`trae`、`trae-work`、`trae-cn`、`trae-work-cn` 或 `workbuddy`。需要多个客户端时，在同一命令中重复参数，例如
+`codebuddy`、`qoder-cn`、`trae`、`trae-work`、`trae-cn`、`trae-work-cn`、`workbuddy` 或 `workbuddy-ai`。需要多个客户端时，在同一命令中重复参数，例如
 `--client codex --client qoder`。`DE_PYTHON` 必须已经指向第 0 步验证过的准确解释器。本命令只在
 本次 bootstrap 中使用这些目标客户端。外层安装器可能已经注册不含凭据的 MCP 传输入口；本命令不
 接收 endpoint 或 activation key。如果激活被推迟，第 5 步要复用相同参数。不要把 endpoint 或

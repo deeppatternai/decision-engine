@@ -29,8 +29,9 @@ from typing import Any, Optional
 _ICON_DIR = Path(__file__).parent.parent / "desktop" / "icons"
 ICO_PATH = _ICON_DIR / "logo.ico"
 PNG_PATH = _ICON_DIR / "logo-256.png"
-# The macOS Dock tile. Multi-resolution and already a rounded white tile rather than bare
-# transparency, which is the shape the Dock expects — see the generator's notes.
+# The macOS Dock tile. Multi-resolution, and already a rounded white tile inset to Apple's 824/1024
+# grid rather than bare transparency — the shape AND the size the Dock expects, since it scales the
+# whole canvas into its slot and does not mask the corners itself. See the generator's notes.
 ICNS_PATH = _ICON_DIR / "AppIcon.icns"
 
 # Windows groups taskbar buttons by AppUserModelID, and takes the button's icon from the app that
@@ -87,7 +88,8 @@ def apply_dock_icon() -> bool:
     so the popup IS a Dock app and this is the only thing that fixes its tile.
 
     Reads ``AppIcon.icns`` because the Dock wants a tile, not bare transparency, and that file is
-    already generated as a rounded white one at every resolution the Dock asks for.
+    already generated as a rounded white one at every resolution the Dock asks for — inset to
+    Apple's grid, so it is drawn the same size as the icons beside it rather than 1.24x larger.
 
     Call this AFTER the toolkit has created its application object, and note that this is the
     opposite of ``claim_app_identity``'s before-the-first-window rule — the Dock reads the tile

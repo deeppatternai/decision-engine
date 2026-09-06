@@ -1,6 +1,6 @@
 # Decision Engine
 
-**English** · [简体中文](README.zh-CN.md) · **v0.2.78**
+**English** · [简体中文](README.zh-CN.md) · **v0.2.80**
 
 > **A second opinion you can actually trust — because it comes from many
 > independent minds, not one model agreeing with itself.**
@@ -189,6 +189,7 @@ with no account.
 |---|---|---|
 | Claude Code | `claude-code` | MCP, Skills, native windows, popup follow-up, Stop Panel |
 | Claude Desktop | `claude-desktop` | MCP, native windows, popup follow-up, Stop Panel |
+| Tencent CodeBuddy Agent CLI | `codebuddy` | Independent Agent CLI only; CodeBuddy Studio is a separate unsupported product; MCP, Skills, native windows, popup follow-up, Stop Panel |
 | Codex | `codex` | MCP, Skills, native windows, popup follow-up, Stop Panel |
 | Cursor | `cursor` | MCP, Skills, native windows, popup follow-up, Stop Panel |
 | Alibaba Qoder Desktop | `qoder` | Windows Desktop 1.106.3+; macOS Qoder.app 0.1.3+; MCP, Skills, native windows, popup follow-up, Stop Panel |
@@ -198,8 +199,9 @@ with no account.
 | TRAE CN Desktop | `trae-cn` | macOS Trae CN.app 3.3.95; MCP, Skills, native windows, popup follow-up, Stop Panel |
 | TRAE Work CN | `trae-work-cn` | Windows and macOS Desktop 0.1.48+; MCP, Skills, native windows, popup follow-up, Stop Panel |
 | Tencent WorkBuddy Desktop | `workbuddy` | Windows and macOS Desktop; MCP, Skills, native windows, popup follow-up, Stop Panel |
+| Tencent WorkBuddy AI Desktop | `workbuddy-ai` | macOS WorkBuddy AI.app 5.5.2+; MCP, Skills, native windows, popup follow-up, Stop Panel |
 
-The registered Qoder and TRAE Desktop families, plus WorkBuddy, get the server-backed popup
+The registered Qoder, TRAE, and WorkBuddy Desktop families, plus CodeBuddy Agent CLI, get the server-backed popup
 follow-up chat (hub-hosted, no local agent). The older local-CLI follow-up
 route stays limited to hosts with that contract; their Graphic Explanation /
 Discussion Board windows and audit Stop Panel use the shared native
@@ -278,8 +280,8 @@ AQG (from its own public repo) lands alongside it at
 `~/.deeppattern/agent-quality-gates`, both routed into your agent skills
 directories (`~/.claude/skills/` and `~/.codex/skills/`). Detected desktop hosts
 receive the same managed Skills at `~/.cursor/skills/`, `~/.trae/skills/`,
-`~/.trae-cn/skills/`, `~/.workbuddy/skills/`, `~/.qoder/skills/`, or
-`~/.qoder-cn/skills/`, according
+`~/.trae-cn/skills/`, `~/.workbuddy/skills/`, `~/.workbuddy-ai/skills/`,
+`~/.codebuddy/skills/`, `~/.qoder/skills/`, or `~/.qoder-cn/skills/`, according
 to the registered host. `install de` (the
 default) lays down both. To start from AQG instead and add DE in the same step,
 use `WITH_DE=1 ./install.sh aqg` (see below). Permanent setup stores the endpoint

@@ -34,7 +34,9 @@ class ClientHostExtensionConformanceTestCase(unittest.TestCase):
     def test_workbuddy_product_literals_do_not_escape_its_host_adapter(self):
         installer = Path(__file__).resolve().parents[1]
         allowed = {
+            installer / "client_hosts" / "hosts" / "codebuddy.py",
             installer / "client_hosts" / "hosts" / "workbuddy.py",
+            installer / "client_hosts" / "hosts" / "workbuddy_ai.py",
             installer / "client_hosts" / "registry.py",
         }
         shared_orchestration = tuple(
@@ -47,6 +49,27 @@ class ClientHostExtensionConformanceTestCase(unittest.TestCase):
         violations = []
         for path in shared_orchestration:
             if "workbuddy" in path.read_text(encoding="utf-8").lower():
+                violations.append(str(path.relative_to(installer)))
+
+        self.assertEqual(violations, [])
+
+    def test_codebuddy_product_literals_do_not_escape_its_host_adapter(self):
+        installer = Path(__file__).resolve().parents[1]
+        allowed = {
+            installer / "client_hosts" / "hosts" / "codebuddy.py",
+            installer / "client_hosts" / "hosts" / "workbuddy_ai.py",
+            installer / "client_hosts" / "registry.py",
+        }
+        shared_orchestration = tuple(
+            path
+            for path in installer.rglob("*.py")
+            if "tests" not in path.relative_to(installer).parts
+            and path not in allowed
+        )
+
+        violations = []
+        for path in shared_orchestration:
+            if "codebuddy" in path.read_text(encoding="utf-8").lower():
                 violations.append(str(path.relative_to(installer)))
 
         self.assertEqual(violations, [])

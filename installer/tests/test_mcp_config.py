@@ -496,6 +496,7 @@ class CursorConfigTestCase(unittest.TestCase):
             (
                 "claude-code",
                 "claude-desktop",
+                "codebuddy",
                 "codex",
                 "cursor",
                 "qoder",
@@ -505,6 +506,7 @@ class CursorConfigTestCase(unittest.TestCase):
                 "trae-cn",
                 "trae-work-cn",
                 "workbuddy",
+                "workbuddy-ai",
             ),
         )
         with self.assertRaises(TypeError):
@@ -2233,6 +2235,21 @@ assert mcp_config.CLIENT_SPECS == registry.CLIENT_SPECS
                     {"local-display", "popup-followup", "audit-stop-panel"}
                 ),
             },
+            "codebuddy": {
+                "config_renderer": "json-mcp-v1",
+                "skills_project_paths": (".codebuddy/skills",),
+                "skill_delivery_mode": "managed-copy",
+                "routing_kind": "skill",
+                "launcher_capabilities": frozenset(
+                    {"core-mcp", "local-display", "audit-stop-panel"}
+                ),
+                "doctor_capabilities": frozenset(
+                    {"mcp-entry", "skills", "workspace-shadow"}
+                ),
+                "optional_features": frozenset(
+                    {"local-display", "audit-stop-panel"}
+                ),
+            },
             "codex": {
                 "config_renderer": "codex-toml-v1",
                 "skills_project_paths": (),
@@ -2382,6 +2399,19 @@ assert mcp_config.CLIENT_SPECS == registry.CLIENT_SPECS
                     {"local-display", "audit-stop-panel"}
                 ),
             },
+            "workbuddy-ai": {
+                "config_renderer": "json-mcp-v1",
+                "skills_project_paths": (),
+                "skill_delivery_mode": "managed-copy",
+                "routing_kind": "skill",
+                "launcher_capabilities": frozenset(
+                    {"core-mcp", "local-display", "audit-stop-panel"}
+                ),
+                "doctor_capabilities": frozenset({"mcp-entry", "skills"}),
+                "optional_features": frozenset(
+                    {"local-display", "audit-stop-panel"}
+                ),
+            },
         }
 
         for client, values in expected.items():
@@ -2398,6 +2428,7 @@ assert mcp_config.CLIENT_SPECS == registry.CLIENT_SPECS
             (
                 "claude-code",
                 "claude-desktop",
+                "codebuddy",
                 "codex",
                 "cursor",
                 "qoder",
@@ -2407,6 +2438,7 @@ assert mcp_config.CLIENT_SPECS == registry.CLIENT_SPECS
                 "trae-cn",
                 "trae-work-cn",
                 "workbuddy",
+                "workbuddy-ai",
             ),
         )
         with self.assertRaisesRegex(ShellError, "unsupported Doctor capability"):
@@ -2607,6 +2639,7 @@ tool_timeout_sec = 660
             {
                 "claude-code",
                 "claude-desktop",
+                "codebuddy",
                 "codex",
                 "cursor",
                 "qoder",
@@ -2616,6 +2649,7 @@ tool_timeout_sec = 660
                 "trae-cn",
                 "trae-work-cn",
                 "workbuddy",
+                "workbuddy-ai",
             },
         )
         self.assertTrue(
@@ -2633,6 +2667,7 @@ tool_timeout_sec = 660
             {
                 "claude-code": False,
                 "claude-desktop": False,
+                "codebuddy": True,
                 "codex": False,
                 "cursor": True,
                 "qoder": True,
@@ -2642,6 +2677,7 @@ tool_timeout_sec = 660
                 "trae-cn": False,
                 "trae-work-cn": False,
                 "workbuddy": True,
+                "workbuddy-ai": True,
             },
         )
 

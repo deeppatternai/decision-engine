@@ -35,6 +35,7 @@ The installer accepts these exact client IDs and paths:
 |---|---|---|---|---|
 | Claude Code | `claude-code` | `~/.claude.json` | `~/.claude/skills` | supported platforms |
 | Claude Desktop | `claude-desktop` | Windows: `%APPDATA%/Claude/claude_desktop_config.json`<br>macOS: `~/Library/Application Support/Claude/claude_desktop_config.json`<br>Linux: `~/.config/Claude/claude_desktop_config.json` | none | supported platforms |
+| Tencent CodeBuddy Agent CLI | `codebuddy` | `~/.codebuddy/mcp.json` | `~/.codebuddy/skills` | independent Agent CLI only; CodeBuddy Studio is a separate unsupported product |
 | Codex | `codex` | `~/.codex/config.toml` | `~/.codex/skills` | supported platforms on builds that load global Skills |
 | Cursor | `cursor` | `~/.cursor/mcp.json` | `~/.cursor/skills` | supported platforms |
 | Alibaba Qoder Desktop | `qoder` | `~/.qoder/mcp.json` (Windows); `~/.qoder/settings.json` (macOS) | `~/.qoder/skills` | Windows Desktop 1.106.3+; macOS Qoder.app 0.1.3+ |
@@ -44,6 +45,7 @@ The installer accepts these exact client IDs and paths:
 | TRAE CN Desktop | `trae-cn` | `~/Library/Application Support/Trae CN/User/mcp.json` | `~/.trae-cn/skills` | macOS Trae CN.app 3.3.95 |
 | TRAE Work CN | `trae-work-cn` | Windows: `%APPDATA%/TRAE SOLO CN/User/mcp.json`<br>macOS: `~/Library/Application Support/TRAE SOLO CN/User/mcp.json` | `~/.trae-cn/skills` | Windows and macOS Desktop 0.1.48+ |
 | Tencent WorkBuddy Desktop | `workbuddy` | `~/.workbuddy/mcp.json` | `~/.workbuddy/skills` | Windows and macOS Desktop |
+| Tencent WorkBuddy AI Desktop | `workbuddy-ai` | `~/.workbuddy-ai/mcp.json` | `~/.workbuddy-ai/skills` | macOS WorkBuddy AI.app 5.5.2+ only |
 
 Graphic Explanation popup follow-up is provided through the API and does not require a
 host CLI. The shared native Graphic Explanation / Discussion Board windows and audit Stop Panel
@@ -412,7 +414,7 @@ files were cloned.
 ```
 
 Replace `codex` with any registered ID from the table above: `claude-code`, `claude-desktop`,
-`cursor`, `qoder`, `qoder-cn`, `trae`, `trae-work`, `trae-cn`, `trae-work-cn`, or `workbuddy`. For multiple clients, repeat the
+`codebuddy`, `cursor`, `qoder`, `qoder-cn`, `trae`, `trae-work`, `trae-cn`, `trae-work-cn`, `workbuddy`, or `workbuddy-ai`. For multiple clients, repeat the
 flag in the same command, for example `--client codex --client qoder`. `DE_PYTHON` must already
 name the exact interpreter verified in step 0. This uses the intended clients for this bootstrap
 run. The outer installer may already have registered a credential-free MCP transport; this bootstrap

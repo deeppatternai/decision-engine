@@ -100,6 +100,20 @@ class InstallerTestCase(unittest.TestCase):
                 base / "no-workbuddy" / "skills"
             ),
             "WORKBUDDY_APP_ROOT": str(base / "no-workbuddy" / "app"),
+            "CODEBUDDY_CONFIG": str(base / "no-codebuddy" / "mcp.json"),
+            "CODEBUDDY_SKILLS_DIR": str(
+                base / "no-codebuddy" / "skills"
+            ),
+            "CODEBUDDY_CLI": str(base / "no-codebuddy" / "codebuddy"),
+            "WORKBUDDY_AI_CONFIG": str(
+                base / "no-workbuddy-ai" / "mcp.json"
+            ),
+            "WORKBUDDY_AI_SKILLS_DIR": str(
+                base / "no-workbuddy-ai" / "skills"
+            ),
+            "WORKBUDDY_AI_APP_ROOT": str(
+                base / "no-workbuddy-ai" / "app"
+            ),
             "DE_CONFIG_PATH": str(self.deeppattern / "decision-engine" / "config.json"),
         }
         self._saved = {k: os.environ.get(k) for k in self._env}
@@ -127,6 +141,21 @@ class InstallerTestCase(unittest.TestCase):
         )
         defaults.update(kw)
         return install.run_install(target, **defaults)
+
+    def test_fixture_isolates_codebuddy_and_workbuddy_ai_skill_routes(self):
+        from installer.client_hosts.hosts import codebuddy, workbuddy_ai
+
+        with (
+            mock.patch.object(codebuddy, "_codebuddy_installed", return_value=True),
+            mock.patch.object(
+                workbuddy_ai, "_workbuddy_ai_installed", return_value=True
+            ),
+        ):
+            routes = install.mcp_config.active_skill_routes(setup_only=True)
+
+        base = Path(self.tmp.name)
+        self.assertTrue(routes["codebuddy"][0].is_relative_to(base))
+        self.assertTrue(routes["workbuddy-ai"][0].is_relative_to(base))
 
     def test_summary_routes_users_to_agent_permanent_setup(self):
         output = io.StringIO()

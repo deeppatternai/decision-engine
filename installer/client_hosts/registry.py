@@ -7,6 +7,7 @@ from typing import Dict, Iterable, Mapping, Optional
 
 from installer.client_hosts.contract import AgentHostSpec, validate_host_specs
 from installer.client_hosts.hosts.claude import HOST_SPECS as CLAUDE_HOST_SPECS
+from installer.client_hosts.hosts.codebuddy import HOST_SPECS as CODEBUDDY_HOST_SPECS
 from installer.client_hosts.hosts.codex import HOST_SPECS as CODEX_HOST_SPECS
 from installer.client_hosts.hosts.cursor import HOST_SPECS as CURSOR_HOST_SPECS
 from installer.client_hosts.hosts.qoder import HOST_SPECS as QODER_HOST_SPECS
@@ -18,6 +19,9 @@ from installer.client_hosts.hosts.trae_work_cn import (
     HOST_SPECS as TRAE_WORK_CN_HOST_SPECS,
 )
 from installer.client_hosts.hosts.workbuddy import HOST_SPECS as WORKBUDDY_HOST_SPECS
+from installer.client_hosts.hosts.workbuddy_ai import (
+    HOST_SPECS as WORKBUDDY_AI_HOST_SPECS,
+)
 from installer.config import ShellError
 
 
@@ -36,6 +40,7 @@ CLIENT_SPECS: Mapping[str, AgentHostSpec] = MappingProxyType(
     _build_registry(
         (
             CLAUDE_HOST_SPECS,
+            CODEBUDDY_HOST_SPECS,
             CODEX_HOST_SPECS,
             CURSOR_HOST_SPECS,
             QODER_HOST_SPECS,
@@ -45,6 +50,7 @@ CLIENT_SPECS: Mapping[str, AgentHostSpec] = MappingProxyType(
             TRAE_CN_HOST_SPECS,
             TRAE_WORK_CN_HOST_SPECS,
             WORKBUDDY_HOST_SPECS,
+            WORKBUDDY_AI_HOST_SPECS,
         )
     )
 )

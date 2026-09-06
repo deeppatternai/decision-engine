@@ -41,17 +41,24 @@ to what design authored:
    colour leaves white backgrounds identical and keeps the layering readable on dark ones. The
    current master is a single flat colour, so nothing triggers this — it stays because the next
    re-export is where it would silently matter.
+
+3. **The macOS tile is inset to Apple's grid.** The Dock scales a whole 1024px canvas into its tile
+   slot, and macOS does not mask an app icon the way iOS does — the rounded rect is ours to draw. So
+   the body has to be the 824 of 1024 Apple's grid specifies, or the icon renders 1.24x larger than
+   every neighbour in the Dock. It did: see ``TILE_BODY_RATIO``. Only the ``.icns`` is affected —
+   Windows scales a window icon to fit its own box, so the same margin there would just shrink it.
+
+The ``.icns`` is written by this file rather than by Apple's ``iconutil`` so that it can be rebuilt
+and MEASURED anywhere. It is a committed runtime asset — the Dock reads it and nothing builds on a
+user's machine — and an Apple-only writer is how a full-canvas tile shipped without being noticed.
 """
 
 from __future__ import annotations
 
 import math
 import re
-import shutil
 import struct
-import subprocess
 import sys
-import tempfile
 import zlib
 from pathlib import Path
 from typing import Dict, List, Optional, Sequence, Tuple
@@ -79,6 +86,30 @@ FRAMING_IDS = ("brace-left", "brace-right")
 # artwork drawn for it instead — the same licence the framing drop already takes, one step further.
 # Optional: a master without these still gets a small icon, just the mark minus its framing.
 SMALL_ONLY_IDS = ("brain-small",)
+# ── Apple's macOS 11+ app-icon grid ──────────────────────────────────────────────────────────────
+# The numbers, verbatim: a 1024x1024 document whose rounded-rect body is 824x824 with a 185.4px
+# corner radius, leaving 100px of transparent margin per side.
+#
+# That margin is NOT slack to be reclaimed. macOS does not mask an app icon the way iOS does — the
+# squircle is drawn by us — and the Dock scales the whole canvas into its tile slot. So a body drawn
+# edge-to-edge lands in the slot that every conformant icon fills to 824/1024, and renders
+# 1024/824 = 1.24x larger than its neighbours. That is exactly the defect this ratio fixes: the
+# Dock tile for the audit / graphic-explanation / comic-explanation / whiteboard windows stood
+# visibly taller than the apps beside it.
+#
+# Expressed as ratios rather than pixels because the same geometry has to hold for the 16px entry.
+APPLE_CANVAS_PX = 1024
+TILE_BODY_RATIO = 824 / APPLE_CANVAS_PX          # 0.8047 — body width as a fraction of the canvas
+TILE_MARGIN_RATIO = (1 - TILE_BODY_RATIO) / 2    # 0.0977 — per side
+# Radius as a fraction of the BODY, not of the canvas: 185.4/824. Apple's real curve is a
+# superellipse; a plain rounded rect at this radius is close enough at icon sizes, which is the
+# approximation this generator has always made. (It was 0.2237 of the canvas before — the same
+# number in spirit, but measured against the wrong extent once the body stopped being the canvas.)
+TILE_RADIUS_RATIO = 185.4 / 824
+# How much of the tile BODY the mark occupies, per side. Body-relative on purpose: it is the mark's
+# proportion inside the tile that the eye reads, and keeping it there means fixing the canvas
+# geometry above does not also redraw the interior.
+MARK_INSET_RATIO = 0.12
 # Width/height the macOS menu-bar image is generated at, before trimming back to the ink. Only has
 # to be at least the mark's own ratio; anything wider is trimmed away again, anything narrower would
 # letterbox left/right instead, which trimming rows cannot fix.
@@ -362,18 +393,28 @@ def render(shapes: Sequence[Tuple[Shape, Color]], size: int, box: Tuple[float, f
     return out
 
 
-def rounded_tile(rgba: bytearray, size: int, fill: Color, radius_ratio: float = 0.2237) -> bytearray:
+def rounded_tile(rgba: bytearray, size: int, fill: Color,
+                 radius_ratio: float = TILE_RADIUS_RATIO,
+                 margin_ratio: float = TILE_MARGIN_RATIO) -> bytearray:
     """Composite an RGBA buffer onto a rounded-rect tile (the macOS app-icon convention; the icon
-    this replaces was a tile too, so the Dock keeps the shape it had). 0.2237 is Apple's squircle
-    corner ratio, approximated with a plain rounded rect — close enough at icon sizes."""
-    radius = size * radius_ratio
-    half = size / 2.0
-    inner = half - radius
+    this replaces was a tile too, so the Dock keeps the shape it had).
+
+    ``margin_ratio`` is the transparent border Apple's grid requires — see TILE_MARGIN_RATIO. The
+    tile BODY is what the radius is measured against, so the corner curve stays proportional to the
+    shape it rounds rather than to the canvas that shape floats in."""
+    body = size * (1 - 2 * margin_ratio)
+    radius = body * radius_ratio
+    # Two distinct numbers now that the body is smaller than the canvas: distance is measured from
+    # the CANVAS centre (the body stays centred, so the margin is symmetric), while the extent it is
+    # measured against is the BODY's half-width. Folding them back into one variable is what would
+    # silently restore the edge-to-edge tile.
+    centre = size / 2.0
+    inner = body / 2.0 - radius
     out = bytearray(size * size * 4)
     for y in range(size):
-        qy = abs(y + 0.5 - half) - inner
+        qy = abs(y + 0.5 - centre) - inner
         for x in range(size):
-            qx = abs(x + 0.5 - half) - inner
+            qx = abs(x + 0.5 - centre) - inner
             # signed distance to the rounded rect; ±0.5px of it is the antialiased edge
             dist = math.hypot(max(qx, 0.0), max(qy, 0.0)) + min(max(qx, qy), 0.0) - radius
             tile_a = max(0.0, min(1.0, 0.5 - dist))
@@ -428,7 +469,7 @@ def _png_chunk(kind: bytes, data: bytes) -> bytes:
             + struct.pack(">I", zlib.crc32(kind + data) & 0xFFFFFFFF))
 
 
-def write_png(path: Path, rgba: bytes, size: int, height: Optional[int] = None) -> None:
+def png_bytes(rgba: bytes, size: int, height: Optional[int] = None) -> bytes:
     """``height`` defaults to ``size`` — every icon here is square except the menu-bar image, which
     is height-constrained and free in width because that is the shape of a macOS menu bar."""
     tall = size if height is None else height
@@ -441,7 +482,11 @@ def write_png(path: Path, rgba: bytes, size: int, height: Optional[int] = None) 
     png += _png_chunk(b"IHDR", struct.pack(">IIBBBBB", size, tall, 8, 6, 0, 0, 0))
     png += _png_chunk(b"IDAT", zlib.compress(bytes(raw), 9))
     png += _png_chunk(b"IEND", b"")
-    path.write_bytes(png)
+    return png
+
+
+def write_png(path: Path, rgba: bytes, size: int, height: Optional[int] = None) -> None:
+    path.write_bytes(png_bytes(rgba, size, height))
 
 
 def trim_transparent_rows(rgba: bytes, size: int) -> Tuple[bytes, int]:
@@ -508,6 +553,93 @@ def write_ico(path: Path, images: Sequence[Tuple[int, bytes]]) -> None:
     for _, blob in blobs:
         out += blob
     path.write_bytes(bytes(out))
+
+
+# ── icns ─────────────────────────────────────────────────────────────────────────────────────────
+# Written here rather than shelled out to ``iconutil``, which is macOS-only. AppIcon.icns is a
+# COMMITTED runtime asset — the Dock reads it and nothing builds on a user's machine — so an
+# Apple-only writer meant the file could not be regenerated, or measured, from the machine most of
+# this repo is edited on. It shipped a full-canvas tile for exactly that long. ~60 lines of stdlib
+# buys every platform the ability to rebuild and verify it.
+#
+# Each OSType is a slot the Dock and Finder ask for by name. The pair below the modern PNG types are
+# ARGB chunks, which is what iconutil emits at those sizes; the payloads are otherwise plain PNG.
+# Chunk ORDER is not a contract — every reader looks up by type — but ascending size keeps a hexdump
+# legible. (``info``, the NSKeyedArchiver blob iconutil adds, is asset-catalog metadata no image
+# reader consults, and is not written.)
+#
+# (ostype, pixels, points) — points is what BRACE_CUTOFF is read against; see main().
+ICNS_SLOTS = (("ic04", 16, 16), ("ic11", 32, 16), ("ic05", 32, 32), ("ic12", 64, 32),
+              ("ic07", 128, 128), ("ic13", 256, 128), ("ic08", 256, 256), ("ic14", 512, 256),
+              ("ic09", 512, 512), ("ic10", 1024, 512))
+# The two that must be ARGB rather than PNG, matching iconutil.
+ICNS_ARGB = ("ic04", "ic05")
+
+
+def _packbits(data: bytes) -> bytes:
+    """Apple's PackBits variant, as the ARGB and is32 chunks use it: a control byte below 0x80 means
+    a literal run of ``control + 1`` bytes, 0x80 and up a repeat of ``control - 0x7D`` (3..130).
+
+    Note the repeat encoding is NOT stock PackBits — the bias is 3, not 2 — which is the detail a
+    reader silently mis-decodes into a smeared icon. Verified in both directions: the matching
+    decoder in installer/tests/test_window_icon.py consumes iconutil's own output byte-exactly, and
+    round-trips this encoder's."""
+    out, i, n = bytearray(), 0, len(data)
+    while i < n:
+        run = 1
+        while run < 130 and i + run < n and data[i + run] == data[i]:
+            run += 1
+        if run >= 3:
+            out.append(0x7D + run)
+            out.append(data[i])
+            i += run
+            continue
+        # No worthwhile repeat here: emit literals up to the next run of 3, capped at 128.
+        start = i
+        i += 1
+        while i < n and i - start < 128:
+            if i + 2 < n and data[i] == data[i + 1] == data[i + 2]:
+                break
+            i += 1
+        out.append(i - start - 1)
+        out.extend(data[start:i])
+    return bytes(out)
+
+
+def argb_chunk(rgba: bytes, size: int) -> bytes:
+    """An ARGB chunk: the magic, then the four channels de-interleaved and each PackBits-compressed.
+    Straight alpha, exactly as the buffer holds it — matching what iconutil wrote at these sizes."""
+    planes = [bytes(rgba[offset::4]) for offset in (3, 0, 1, 2)]     # A, R, G, B
+    for name, plane in zip("ARGB", planes):
+        if len(plane) != size * size:
+            raise ValueError("channel %s has %d of %d pixels" % (name, len(plane), size * size))
+    return b"ARGB" + b"".join(_packbits(plane) for plane in planes)
+
+
+def write_icns(path: Path, images: Dict[str, bytes]) -> None:
+    """``images`` is {ostype: rgba} and must cover every slot in ICNS_SLOTS.
+
+    Keyed by SLOT and not by pixel size, because two slots can share a size and not the artwork:
+    ic11 and ic05 are both 32px, but ic11 is a 16-POINT tile (braces dropped) and ic05 a 32-point one
+    (braces kept). Keying by size would put one of them in the other's slot.
+
+    Fail-closed on a missing or mis-sized buffer rather than skipping the slot: a Dock that cannot
+    find the representation for the tile it is drawing scales a neighbour up instead, which looks
+    soft rather than absent and is easy to miss by eye."""
+    chunks = bytearray()
+    for ostype, pixels, _points in ICNS_SLOTS:
+        rgba = images.get(ostype)
+        if rgba is None:
+            raise ValueError("no image for icns slot %s (%dpx)" % (ostype, pixels))
+        if len(rgba) != pixels * pixels * 4:
+            raise ValueError("icns slot %s wants %dpx RGBA (%d bytes), got %d"
+                             % (ostype, pixels, pixels * pixels * 4, len(rgba)))
+        payload = (argb_chunk(rgba, pixels) if ostype in ICNS_ARGB
+                   else png_bytes(rgba, pixels))
+        chunks += struct.pack(">4sI", ostype.encode("ascii"), len(payload) + 8) + payload
+    # The container's own length counts its 8-byte header too, and a reader that trusts it will run
+    # off the end of a file that disagrees.
+    path.write_bytes(struct.pack(">4sI", b"icns", len(chunks) + 8) + bytes(chunks))
 
 
 # ── assembly ─────────────────────────────────────────────────────────────────────────────────────
@@ -617,44 +749,52 @@ def main(argv: List[str]) -> int:
     print("wrote %s (%dx%d)" % (macos / "stopper_icon.png", square, height))
 
     # 3. macOS app icon. A white rounded tile, not bare transparency: the Dock expects a tile (the
-    #    icon this replaces was one), and white is the ground the mark was drawn for.
+    #    icon this replaces was one), and white is the ground the mark was drawn for. The tile is
+    #    inset to Apple's 824/1024 grid — drawn edge-to-edge it renders 1.24x oversized in the Dock,
+    #    which is the defect TILE_BODY_RATIO documents.
+    #    Written by write_icns rather than iconutil so this runs on every platform; the 1024px render
+    #    is the slow part, hence --no-icns for a quick pass over the Windows assets alone.
     if "--no-icns" in argv:
         return 0
-    iconutil = shutil.which("iconutil")
-    if not iconutil:
-        print("skipping AppIcon.icns — iconutil not found (macOS only)")
-        return 0
-    # (filename, pixels, points). BRACE_CUTOFF is a legibility threshold, so on macOS it has to be
-    # read against POINTS, not pixels: icon_16x16@2x is 32 pixels drawn in a 16-point slot, and at
-    # 16 points the braces are the same two smudges they are on a non-Retina screen — just sharper
-    # ones. Keying it on pixels would put braces on Retina and none on everything else, at the same
-    # apparent size. Windows has no equivalent: there a 32px entry is 32px of screen.
-    entries_icns = [("icon_16x16.png", 16, 16), ("icon_16x16@2x.png", 32, 16),
-                    ("icon_32x32.png", 32, 32), ("icon_32x32@2x.png", 64, 32),
-                    ("icon_128x128.png", 128, 128), ("icon_128x128@2x.png", 256, 128),
-                    ("icon_256x256.png", 256, 256), ("icon_256x256@2x.png", 512, 256),
-                    ("icon_512x512.png", 512, 512), ("icon_512x512@2x.png", 1024, 512)]
+    # BRACE_CUTOFF is a legibility threshold, so on macOS it has to be read against POINTS, not
+    # pixels: ic11 is 32 pixels drawn in a 16-point slot, and at 16 points the braces are the same
+    # two smudges they are on a non-Retina screen — just sharper ones. Keying it on pixels would put
+    # braces on Retina and none on everything else, at the same apparent size. Windows has no
+    # equivalent: there a 32px entry is 32px of screen.
+    #
+    # Cached on (pixels, full_mark) rather than per slot: ic09/ic14 are both 512px full-mark tiles
+    # and ic08/ic13 both 256px, so this halves the number of renders — and the 512px one is seconds.
     cache: Dict[Tuple[int, bool], bytes] = {}
-    with tempfile.TemporaryDirectory(prefix="de_icon_") as tmp:
-        iconset = Path(tmp) / "AppIcon.iconset"
-        iconset.mkdir()
-        for filename, size, points in entries_icns:
-            key = (size, points >= BRACE_CUTOFF)
-            if key not in cache:
-                ss = 4 if size <= 64 else (2 if size <= 256 else 1)
-                mark = variant(shapes, size, key[1], supersample=ss)
-                cache[key] = bytes(rounded_tile(bytearray(_inset(mark, size, 0.12)), size, WHITE))
-                print("  icns %4dpx  %s" % (size, "full mark" if key[1] else "braces dropped"))
-            write_png(iconset / filename, cache[key], size)
-        subprocess.run([iconutil, "-c", "icns", str(iconset), "-o", str(HERE / "AppIcon.icns")],
-                       check=True)
-    print("wrote %s" % (HERE / "AppIcon.icns"))
+    tiles: Dict[str, bytes] = {}
+    for ostype, size, points in ICNS_SLOTS:
+        key = (size, points >= BRACE_CUTOFF)
+        if key not in cache:
+            ss = 4 if size <= 64 else (2 if size <= 256 else 1)
+            mark = variant(shapes, size, key[1], supersample=ss)
+            cache[key] = bytes(rounded_tile(bytearray(_inset(mark, size)), size, WHITE))
+            print("  icns %4dpx  %s" % (size, "full mark" if key[1] else "braces dropped"))
+        tiles[ostype] = cache[key]
+    write_icns(HERE / "AppIcon.icns", tiles)
+    print("wrote %s (%d bytes)" % (HERE / "AppIcon.icns",
+                                   (HERE / "AppIcon.icns").stat().st_size))
     return 0
 
 
-def _inset(rgba: bytes, size: int, ratio: float) -> bytearray:
-    """Shrink the mark inside its square so a tile has breathing room around it."""
-    inner = max(1, int(size * (1 - 2 * ratio)))
+def _inset(rgba: bytes, size: int, ratio: float = MARK_INSET_RATIO,
+           span_ratio: float = TILE_BODY_RATIO) -> bytearray:
+    """Shrink the mark, centred, so the tile it lands on has breathing room around it.
+
+    ``ratio`` is measured against ``span_ratio`` of the canvas — i.e. against the tile BODY, not the
+    canvas — so the mark keeps its proportion inside the tile. Rebasing this is what stops Apple's
+    100px margin from being taken out of the tile's own padding and leaving the mark oversized
+    inside a correctly-sized tile."""
+    inner = max(1, int(size * span_ratio * (1 - 2 * ratio)))
+    # Match the canvas's parity, so (size - inner) is even and the offset below splits it exactly.
+    # Otherwise the truncating // leaves the mark a pixel left of and above centre inside a tile that
+    # is itself symmetric — worst at 16px, where one pixel is ~11% of a 9px mark. Costs at most 1px
+    # of mark, and only where it would otherwise be off-centre.
+    if inner != size and (size - inner) % 2:
+        inner -= 1
     small = downsample(bytearray(rgba), size, inner) if inner != size else bytearray(rgba)
     out = bytearray(size * size * 4)
     off = (size - inner) // 2
