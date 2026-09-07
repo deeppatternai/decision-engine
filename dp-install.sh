@@ -1,6 +1,6 @@
 #!/usr/bin/env bash
 #
-# DE/AQG first-time installer for macOS.
+# Deep Pattern (DP) first-time installer for macOS.
 #
 # This is the thin public entrypoint intended for:
 #
@@ -14,6 +14,8 @@ set -euo pipefail
 
 DE_REPO="https://github.com/deeppatternai/decision-engine.git"
 AQG_REPO="https://github.com/deeppatternai/agent-quality-gates.git"
+AQG_REF="main"
+PROGRAM_NAME="dp-install"
 MANAGED_ROOT="$HOME/.deeppattern/decision-engine"
 AQG_ROOT="$HOME/.deeppattern/agent-quality-gates"
 CLAUDE_3P_CONFIG="$HOME/Library/Application Support/Claude-3p/claude_desktop_config.json"
@@ -22,14 +24,15 @@ WORKBUDDY_AI_APP="/Applications/WorkBuddy AI.app"
 WORKBUDDY_AI_ROOT="$HOME/.workbuddy-ai"
 EXIT_USAGE=2
 EXIT_BLOCKED=3
+EXIT_PARTIAL=4
 
 fail() {
-  printf 'de-aqg-install: ERROR: %s\n' "$*" >&2
+  printf '%s: ERROR: %s\n' "$PROGRAM_NAME" "$*" >&2
   exit "$EXIT_USAGE"
 }
 
 blocked() {
-  printf 'de-aqg-install: BLOCKED: %s\n' "$*" >&2
+  printf '%s: BLOCKED: %s\n' "$PROGRAM_NAME" "$*" >&2
   exit "$EXIT_BLOCKED"
 }
 
@@ -66,6 +69,28 @@ append_client_line() {
   else
     printf '%s' "$client"
   fi
+}
+
+line_list_contains() {
+  local values="$1" expected="$2"
+  printf '%s\n' "$values" | grep -Fxq "$expected"
+}
+
+comma_list_contains() {
+  local values="$1" expected="$2"
+  printf '%s' "$values" | tr ',' '\n' | grep -Fxq "$expected"
+}
+
+regular_app_has_bundle_id() {
+  local app_path="$1" expected_bundle_id="$2" actual_bundle_id
+  [ -d "$app_path" ] && [ ! -L "$app_path" ] || return 1
+  [ -f "$app_path/Contents/Info.plist" ] \
+    && [ ! -L "$app_path/Contents/Info.plist" ] || return 1
+  actual_bundle_id="$(
+    /usr/bin/plutil -extract CFBundleIdentifier raw -o - \
+      "$app_path/Contents/Info.plist" 2>/dev/null || true
+  )"
+  [ "$actual_bundle_id" = "$expected_bundle_id" ]
 }
 
 workbuddy_variant="none"
@@ -145,7 +170,7 @@ if [ -e "$MANAGED_ROOT" ] || [ -L "$MANAGED_ROOT" ]; then
   managed_root_was_present=1
 fi
 
-tmp_root="$(clean_exec mktemp -d /tmp/de-aqg-install.XXXXXX)"
+tmp_root="$(clean_exec mktemp -d /tmp/dp-install.XXXXXX)"
 cleanup() {
   clean_exec rm -rf "$tmp_root"
 }
@@ -156,7 +181,7 @@ trap 'exit 143' TERM
 
 tty_print "Checking the official Decision Engine source and signed stable channel..."
 if ! remote_refs="$(clean_exec env GIT_TERMINAL_PROMPT=0 "$GIT_BIN" ls-remote "$DE_REPO" refs/heads/main refs/heads/stable 2>/dev/null)"; then
-  fail "could not read the official Decision Engine repository; check GitHub access and network"
+  fail "could not read the Decision Engine product repository; check GitHub access and network"
 fi
 if ! printf '%s\n' "$remote_refs" | grep -Eq '[[:space:]]refs/heads/main$'; then
   fail "the official repository did not expose refs/heads/main"
@@ -177,6 +202,14 @@ actual_remote="$(clean_exec "$GIT_BIN" -C "$source_root" remote get-url origin 2
 [ -z "$(clean_exec "$GIT_BIN" -C "$source_root" status --porcelain)" ] \
   || fail "the downloaded installer source is not clean"
 source_sha="$(clean_exec "$GIT_BIN" -C "$source_root" rev-parse HEAD)"
+
+# The bootstrap source and signed stable release must stay in the product
+# repository. Development repositories are deliberately excluded here.
+if ! grep -Fq \
+    '("github", "https://github.com/deeppatternai/decision-engine.git")' \
+    "$source_root/installer/managed_install.py"; then
+  fail "the Decision Engine product repository does not declare the approved signed-stable remote contract; no product state was changed"
+fi
 
 run_source_python() {
   (
@@ -319,7 +352,7 @@ except (
     ValueError,
     update_coordination.InstallTransactionBusy,
 ) as exc:
-    print(f"de-aqg-install: managed stable update refused: {exc}", file=sys.stderr)
+    print(f"dp-install: managed stable update refused: {exc}", file=sys.stderr)
     raise SystemExit(1)
 
 accepted_statuses = {"up_to_date", "candidate_ready", "updated"}
@@ -334,7 +367,7 @@ if result.status not in accepted_statuses:
     if blocker_pids:
         details.append(f"active_shim_pids={blocker_pids}")
     print(
-        "de-aqg-install: managed stable update did not apply: " + ", ".join(details),
+        "dp-install: managed stable update did not apply: " + ", ".join(details),
         file=sys.stderr,
     )
 raise SystemExit(0 if result.status in accepted_statuses else 1)
@@ -395,21 +428,32 @@ if ! source_detected_clients="$(
   fail "could not inspect the current Decision Engine host adapter catalog"
 fi
 
+# These bundles are distinct products, not aliases for the supported Desktop
+# adapters with similar names. Report them explicitly when the current product
+# source does not recognize them so a partial install cannot look complete.
+unsupported_installed_hosts=""
+if regular_app_has_bundle_id "/Applications/CodeBuddy.app" "com.tencent.codebuddy" \
+    && ! line_list_contains "$source_detected_clients" "codebuddy"; then
+  unsupported_installed_hosts="$(append_client_line \
+    "$unsupported_installed_hosts" \
+    "codebuddy (CodeBuddy.app): DE adapter unavailable")"
+fi
+if regular_app_has_bundle_id "/Applications/Qoder IDE.app" "com.qoder.ide" \
+    && ! line_list_contains "$source_detected_clients" "qoder-ide"; then
+  unsupported_installed_hosts="$(append_client_line \
+    "$unsupported_installed_hosts" \
+    "qoder-ide (Qoder IDE.app): separate product; DE adapter unavailable")"
+fi
+if regular_app_has_bundle_id "/Applications/Qoder CN IDE.app" "com.aliyun.lingma.ide" \
+    && ! line_list_contains "$source_detected_clients" "qoder-cn-ide"; then
+  unsupported_installed_hosts="$(append_client_line \
+    "$unsupported_installed_hosts" \
+    "qoder-cn-ide (Qoder CN IDE.app): separate product; DE adapter unavailable")"
+fi
+
 verify_aqg_checkout() {
-  local actual_remote resolved parent version
-  if [ -L "$AQG_ROOT" ]; then
-    # AQG's updater atomically switches this link between versions/<commit>.
-    # Resolve both sides so parent aliases (e.g. macOS /var) compare correctly.
-    resolved="$(cd "$AQG_ROOT" 2>/dev/null && pwd -P)" \
-      || fail "$AQG_ROOT is a symlink that cannot be resolved; preserve it and stop"
-    parent="$(cd "$(dirname "$AQG_ROOT")" 2>/dev/null && pwd -P)" \
-      || fail "$AQG_ROOT has no resolvable parent directory; preserve it and stop"
-    [ "${resolved%/*}" = "$parent/versions" ] \
-      || fail "$AQG_ROOT is a symlink outside the managed versions directory; preserve it and stop"
-    version="${resolved##*/}"
-    [[ "$version" =~ ^[0-9a-f]{40}$ ]] \
-      || fail "$AQG_ROOT is not a full-commit checkout in the managed versions directory; preserve it and stop"
-  elif [ ! -d "$AQG_ROOT" ]; then
+  local actual_remote status_output
+  if [ -L "$AQG_ROOT" ] || [ ! -d "$AQG_ROOT" ]; then
     fail "$AQG_ROOT is not a regular AQG checkout directory; preserve it and stop"
   fi
   [ -e "$AQG_ROOT/.git" ] \
@@ -425,6 +469,28 @@ verify_aqg_checkout() {
     "$AQG_REPO"|git@github.com:deeppatternai/agent-quality-gates.git|ssh://git@github.com/deeppatternai/agent-quality-gates.git) ;;
     *) fail "$AQG_ROOT has an unexpected Git origin; preserve it and stop" ;;
   esac
+  status_output="$(clean_exec "$GIT_BIN" -C "$AQG_ROOT" status --porcelain=v1 --untracked-files=all 2>/dev/null)" \
+    || fail "could not verify the AQG checkout state; preserve it and stop"
+  [ -z "$status_output" ] \
+    || fail "$AQG_ROOT has local changes; preserve it and stop"
+}
+
+sync_aqg_checkout() {
+  local target_sha
+  verify_aqg_checkout
+  tty_print "Synchronizing Agent Quality Gates from $AQG_REPO at $AQG_REF..."
+  if ! clean_exec env GIT_TERMINAL_PROMPT=0 "$GIT_BIN" -C "$AQG_ROOT" fetch \
+      --depth 1 "$AQG_REPO" "refs/heads/$AQG_REF"; then
+    fail "could not read the AQG product target $AQG_REF; the existing checkout was preserved"
+  fi
+  target_sha="$(clean_exec "$GIT_BIN" -C "$AQG_ROOT" rev-parse --verify FETCH_HEAD 2>/dev/null || true)"
+  [[ "$target_sha" =~ ^[0-9a-f]{40}$ ]] \
+    || fail "the AQG product target did not resolve to a valid commit; the existing checkout was preserved"
+  clean_exec "$GIT_BIN" -C "$AQG_ROOT" checkout --detach "$target_sha" \
+    || fail "could not switch the AQG checkout to the approved target; preserve it and stop"
+  clean_exec "$GIT_BIN" -C "$AQG_ROOT" remote set-url origin "$AQG_REPO" \
+    || fail "AQG was updated, but its origin could not be normalized to the product repository"
+  verify_aqg_checkout
 }
 
 run_aqg_clients() {
@@ -434,9 +500,28 @@ run_aqg_clients() {
     tty_print "AQG $phase: no supported installed AQG host requires configuration."
     return 0
   fi
-  if clean_exec env PATH="$PYTHON_DIR:$PATH" \
-      "$PYTHON_BIN" "$AQG_ROOT/scripts/install_aqg_clients.py" \
-      --clients "$aqg_selected_clients" --aqg-root "$AQG_ROOT" "$@"; then
+  # Preserve the exact host selection made below while using AQG's
+  # installed-supported mode so mixed-scope clients keep their user commands
+  # when no PROJECT_ROOT was selected.
+  if (
+    cd "$AQG_ROOT"
+    clean_exec env PATH="$PYTHON_DIR:$PATH" "$PYTHON_BIN" -c \
+      'import sys
+from scripts import install_aqg_clients
+
+clients = tuple(client for client in sys.argv[1].split(",") if client)
+detection = install_aqg_clients.DetectionResult(
+    selected=clients,
+    evidence={client: "selected by dp-install" for client in clients},
+    conflicts=(),
+)
+install_aqg_clients.detect_clients = lambda home=None: detection
+raise SystemExit(
+    install_aqg_clients.main(
+        ["--installed-supported", "--aqg-root", sys.argv[2], *sys.argv[3:]]
+    )
+)' "$aqg_selected_clients" "$AQG_ROOT" "$@"
+  ); then
     return 0
   else
     status=$?
@@ -446,45 +531,6 @@ run_aqg_clients() {
     return 0
   fi
   return "$status"
-}
-
-run_aqg_workbuddy_ai() {
-  local phase="$1" action
-  [ "$workbuddy_variant" = "ai" ] || return 0
-  case "$phase" in
-    dry-run)
-      tty_print "AQG dry-run: WorkBuddy AI will use $WORKBUDDY_AI_ROOT/skills."
-      return 0
-      ;;
-    apply) action="--apply" ;;
-    verify) action="--verify" ;;
-    *) fail "internal WorkBuddy AI AQG phase is invalid: $phase" ;;
-  esac
-  clean_exec env PATH="$PYTHON_DIR:$PATH" "$PYTHON_BIN" -c \
-    'from dataclasses import replace
-from pathlib import Path
-import sys
-
-aqg_root = Path(sys.argv[1]).resolve()
-home = Path(sys.argv[2]).resolve()
-sys.path.insert(0, str(aqg_root))
-from scripts import install_aqg_work_clients as installer
-
-installer.PROFILES = dict(installer.PROFILES)
-installer.PROFILES["workbuddy"] = replace(
-    installer.PROFILES["workbuddy"],
-    user_dir=".workbuddy-ai",
-    project_dir=".workbuddy-ai",
-)
-raise SystemExit(installer.main([
-    sys.argv[3],
-    "--client", "workbuddy",
-    "--scope", "user",
-    "--home", str(home),
-    "--aqg-root", str(aqg_root),
-    "--mode", "link",
-]))' \
-    "$AQG_ROOT" "$HOME" "$action"
 }
 
 workbuddy_ai_de_is_approved() {
@@ -514,8 +560,7 @@ try:
         ",".join(sorted(env)),
     ))
     fingerprint = hashlib.sha256(fingerprint_input.encode("utf-8")).hexdigest()
-    approval_key = fingerprint + ":" * 2 + "decision-engine"
-    approved = isinstance(approvals, dict) and approval_key in approvals
+    approved = isinstance(approvals, dict) and f"{fingerprint}::decision-engine" in approvals
 except (KeyError, OSError, TypeError, ValueError, json.JSONDecodeError):
     approved = False
 raise SystemExit(0 if approved else 1)
@@ -552,7 +597,7 @@ converge_managed_claude_hooks() {
       inspect_managed_claude_hooks
       ;;
     *)
-      printf 'de-aqg-install: ERROR: AQG-managed Claude hook state is invalid; refusing to rewrite it\n' >&2
+      printf '%s: ERROR: AQG-managed Claude hook state is invalid; refusing to rewrite it\n' "$PROGRAM_NAME" >&2
       return 1
       ;;
   esac
@@ -570,14 +615,13 @@ install_aqg_dependencies() {
 }
 
 if [ -e "$AQG_ROOT" ] || [ -L "$AQG_ROOT" ]; then
-  verify_aqg_checkout
-  tty_print "Reusing the existing AQG checkout without changing its revision."
+  sync_aqg_checkout
 else
-  tty_print "Installing Agent Quality Gates from the official repository..."
+  tty_print "Installing Agent Quality Gates from the product repository at $AQG_REF..."
   clean_exec mkdir -p "$(dirname "$AQG_ROOT")"
   if ! clean_exec env GIT_TERMINAL_PROMPT=0 "$GIT_BIN" clone \
-      --depth 1 --branch main --single-branch "$AQG_REPO" "$AQG_ROOT"; then
-    fail "could not obtain the official AQG source; Decision Engine was not installed"
+      --depth 1 --branch "$AQG_REF" --single-branch "$AQG_REPO" "$AQG_ROOT"; then
+    fail "could not obtain the AQG product source at $AQG_REF; Decision Engine was not installed"
   fi
   verify_aqg_checkout
 fi
@@ -588,31 +632,16 @@ if ! aqg_detected_clients="$(
     'from scripts import install_aqg_clients
 
 for client in install_aqg_clients.installed_supported_clients():
-    commands = install_aqg_clients.build_commands(
-        (client,),
-        action=install_aqg_clients.ACTION_APPLY,
-        hooks_enabled=True,
-    )
-    scope = (
-        "project"
-        if install_aqg_clients._commands_require_project_root(commands)
-        else "user"
-    )
-    print(f"{client}|{scope}")'
+    print(client)'
 )"; then
   fail "could not inspect the current AQG host adapter catalog"
 fi
 aqg_selected_clients=""
-aqg_skipped_project_clients=""
-while IFS='|' read -r aqg_client aqg_scope; do
+while IFS= read -r aqg_client; do
   [ -n "$aqg_client" ] || continue
-  if [ "$aqg_scope" = "project" ]; then
-    aqg_skipped_project_clients="$(append_client_line "$aqg_skipped_project_clients" "$aqg_client")"
-    continue
-  fi
   # WorkBuddy AI is a separate macOS product identity whose real data root is
   # .workbuddy-ai. Do not let a leftover .workbuddy directory select the old
-  # profile; the constrained compatibility adapter below owns this variant.
+  # profile; AQG's registered workbuddy-ai profile owns this variant.
   if [ "$workbuddy_variant" = "ai" ] && [ "$aqg_client" = "workbuddy" ]; then
     continue
   fi
@@ -622,10 +651,6 @@ while IFS='|' read -r aqg_client aqg_scope; do
     aqg_selected_clients="$aqg_client"
   fi
 done <<<"$aqg_detected_clients"
-if [ -n "$aqg_skipped_project_clients" ]; then
-  tty_print "Skipping project-scoped AQG adapters during this user-global installation (no project directory is selected):"
-  printf '%s\n' "$aqg_skipped_project_clients" >/dev/tty
-fi
 
 install_aqg_dependencies \
   || fail "AQG dependency installation failed; Decision Engine was not installed"
@@ -633,20 +658,14 @@ install_aqg_dependencies \
 tty_print "Planning AQG configuration for every supported host detected by AQG..."
 run_aqg_clients "dry-run" \
   || fail "AQG multi-host dry-run failed; Decision Engine was not installed"
-run_aqg_workbuddy_ai "dry-run" \
-  || fail "AQG WorkBuddy AI dry-run failed; Decision Engine was not installed"
 tty_print "Applying AQG skills, rules, and only the lifecycle hooks supported by each detected host..."
 run_aqg_clients "apply" --apply \
   || fail "AQG multi-host configuration failed; Decision Engine was not installed"
-run_aqg_workbuddy_ai "apply" \
-  || fail "AQG WorkBuddy AI configuration failed; Decision Engine was not installed"
 converge_managed_claude_hooks \
   || fail "AQG-managed Claude hooks could not be converged safely; Decision Engine was not installed"
 tty_print "Verifying AQG multi-host configuration..."
 run_aqg_clients "verify" --verify \
   || fail "AQG multi-host verification failed; Decision Engine was not installed"
-run_aqg_workbuddy_ai "verify" \
-  || fail "AQG WorkBuddy AI verification failed; Decision Engine was not installed"
 if ! clean_exec env PATH="$PYTHON_DIR:$PATH" \
     "$PYTHON_BIN" "$AQG_ROOT/scripts/aqg_doctor.py"; then
   fail "AQG Doctor failed after multi-host configuration; Decision Engine was not installed"
@@ -701,6 +720,72 @@ run_managed_python() {
     # Do not allow an inherited PYTHONPATH to shadow the landed managed copy.
     de_exec "$PYTHON_BIN" "$@"
   )
+}
+
+ensure_managed_runtime_git_excludes() {
+  run_managed_python -c \
+    'from pathlib import Path
+import os
+import stat
+import sys
+
+root = Path(sys.argv[1])
+git_dir = root / ".git"
+info_dir = git_dir / "info"
+exclude_path = info_dir / "exclude"
+marker = b"/stopper-ui.json"
+
+for directory in (git_dir, info_dir):
+    if directory == info_dir and not directory.exists():
+        directory.mkdir(mode=0o700)
+    entry = directory.lstat()
+    if not stat.S_ISDIR(entry.st_mode) or directory.is_symlink():
+        raise SystemExit("refusing an unsafe managed Git metadata directory")
+    if hasattr(os, "getuid") and entry.st_uid != os.getuid():
+        raise SystemExit("managed Git metadata is not owned by this user")
+
+flags = os.O_RDWR | os.O_CREAT
+if hasattr(os, "O_CLOEXEC"):
+    flags |= os.O_CLOEXEC
+if hasattr(os, "O_NOFOLLOW"):
+    flags |= os.O_NOFOLLOW
+fd = os.open(exclude_path, flags, 0o600)
+try:
+    entry = os.fstat(fd)
+    if not stat.S_ISREG(entry.st_mode):
+        raise SystemExit("managed Git exclude path is not a regular file")
+    if hasattr(os, "getuid") and entry.st_uid != os.getuid():
+        raise SystemExit("managed Git exclude file is not owned by this user")
+    if entry.st_size > 128 * 1024:
+        raise SystemExit("managed Git exclude file is oversized")
+    with os.fdopen(fd, "r+b", closefd=False) as handle:
+        data = handle.read()
+        if marker not in data.splitlines():
+            handle.seek(0, os.SEEK_END)
+            if data and not data.endswith(b"\n"):
+                handle.write(b"\n")
+            handle.write(marker + b"\n")
+            handle.flush()
+            os.fsync(handle.fileno())
+finally:
+    os.close(fd)' \
+    "$MANAGED_ROOT"
+}
+
+ensure_macos_stopper_host() {
+  local state
+  tty_print "Installing and verifying the macOS Stopper host bridge..."
+  run_managed_python -m installer.stopper_launch_agent install \
+    --de-root "$MANAGED_ROOT" >/dev/tty || return 1
+  state="$(run_managed_python -c \
+    'from pathlib import Path
+import sys
+from installer import stopper_launch_agent
+
+result = stopper_launch_agent.status(de_root=Path(sys.argv[1]))
+print(result.get("status", "unknown"))' \
+    "$MANAGED_ROOT")" || return 1
+  [ "$state" = "ready" ]
 }
 
 run_claude_3p_python() {
@@ -785,8 +870,8 @@ verify_claude_3p_profile() {
     )" || return 1
   fi
   [ "$status" = "ready" ] || {
-    printf 'de-aqg-install: ERROR: Claude third-party profile MCP wiring is %s, not ready\n' \
-      "${status:-unknown}" >&2
+    printf '%s: ERROR: Claude third-party profile MCP wiring is %s, not ready\n' \
+      "$PROGRAM_NAME" "${status:-unknown}" >&2
     return 1
   }
 }
@@ -848,6 +933,10 @@ if [ -n "$unwritable_clients" ]; then
   tty_print "Hosts detected by signed stable $managed_version but rejected by its own wiring preflight and therefore not configured:"
   printf '%s\n' "$unwritable_clients" >/dev/tty
 fi
+if [ -n "$unsupported_installed_hosts" ]; then
+  tty_print "Installed products not recognized by the current Decision Engine adapter catalog:"
+  printf '%s\n' "$unsupported_installed_hosts" >/dev/tty
+fi
 
 verify_managed_mcp_wiring() {
   local allow_unactivated="${1:-0}" client status
@@ -858,18 +947,18 @@ verify_managed_mcp_wiring() {
       if ! status="$(run_managed_python -c \
         'from installer import mcp_config; import sys; print(mcp_config.entry_status(sys.argv[1], allow_unactivated=True))' \
         "$client")"; then
-        printf 'de-aqg-install: ERROR: could not verify MCP wiring for %s\n' "$client" >&2
+        printf '%s: ERROR: could not verify MCP wiring for %s\n' "$PROGRAM_NAME" "$client" >&2
         return 1
       fi
     elif ! status="$(run_managed_python -c \
         'from installer import mcp_config; import sys; print(mcp_config.entry_status(sys.argv[1]))' \
         "$client")"; then
-      printf 'de-aqg-install: ERROR: could not verify MCP wiring for %s\n' "$client" >&2
+      printf '%s: ERROR: could not verify MCP wiring for %s\n' "$PROGRAM_NAME" "$client" >&2
       return 1
     fi
     if [ "$status" != "ready" ]; then
-      printf 'de-aqg-install: ERROR: MCP wiring for %s is %s, not ready\n' \
-        "$client" "${status:-unknown}" >&2
+      printf '%s: ERROR: MCP wiring for %s is %s, not ready\n' \
+        "$PROGRAM_NAME" "$client" "${status:-unknown}" >&2
       return 1
     fi
   done <<<"$detected_clients"
@@ -894,19 +983,19 @@ wire_all_detected_hosts() {
     if [ "$allow_unactivated" = "1" ] \
         && [ "$managed_mcp_allow_unactivated" = "1" ]; then
       run_managed_python -m installer.mcp_config --write --allow-unactivated --client "$client" || {
-        printf 'de-aqg-install: ERROR: MCP wiring failed for %s\n' "$client" >&2
+        printf '%s: ERROR: MCP wiring failed for %s\n' "$PROGRAM_NAME" "$client" >&2
         failed=1
       }
     else
       run_managed_python -m installer.mcp_config --write --client "$client" || {
-        printf 'de-aqg-install: ERROR: MCP wiring failed for %s\n' "$client" >&2
+        printf '%s: ERROR: MCP wiring failed for %s\n' "$PROGRAM_NAME" "$client" >&2
         failed=1
       }
     fi
   done <<<"$detected_clients"
   if [ "$claude_3p_profile_detected" = "1" ]; then
     wire_claude_3p_profile "$allow_unactivated" || {
-      printf 'de-aqg-install: ERROR: MCP wiring failed for Claude third-party provider profile\n' >&2
+      printf '%s: ERROR: MCP wiring failed for Claude third-party provider profile\n' "$PROGRAM_NAME" >&2
       failed=1
     }
   fi
@@ -915,7 +1004,7 @@ wire_all_detected_hosts() {
     run_managed_python -m installer.codex_routing || return 1
   fi
   repair_managed_skill_routes || {
-    printf 'de-aqg-install: ERROR: managed skill routing failed for one or more hosts\n' >&2
+    printf '%s: ERROR: managed skill routing failed for one or more hosts\n' "$PROGRAM_NAME" >&2
     return 1
   }
   verify_managed_mcp_wiring "$allow_unactivated"
@@ -924,6 +1013,62 @@ wire_all_detected_hosts() {
 wire_unactivated_mcp() {
   tty_print "activation was cancelled. Publishing managed MCP entries for all listed hosts so the unactivated DE Lite path remains available..."
   wire_all_detected_hosts 1
+}
+
+capability_report_incomplete=0
+print_host_capability_report() {
+  local client display_name capability aqg_state
+  tty_print "Decision Engine host capability report:"
+  tty_print "The MCP status below proves the configuration on disk. Restarting the host is still required before runtime use."
+  while IFS= read -r client; do
+    [ -n "$client" ] || continue
+    display_name="$client"
+    if [ "$client" = "workbuddy" ] && [ "$workbuddy_variant" = "ai" ]; then
+      display_name="workbuddy-ai"
+    fi
+    capability="$(run_managed_python -c \
+      'from installer.client_hosts.registry import CLIENT_SPECS
+import sys
+spec = CLIENT_SPECS[sys.argv[1]]
+skills = "managed" if spec.skill_delivery_mode != "none" else "not-supported"
+print(f"skills={skills}; routing={spec.routing_kind}")' \
+      "$client")" || {
+        capability="skills=unknown; routing=unknown"
+        capability_report_incomplete=1
+      }
+    aqg_state="not-selected"
+    if comma_list_contains "$aqg_selected_clients" "$client"; then
+      aqg_state="configured-and-verified"
+    elif [ "$client" = "workbuddy" ] \
+        && [ "$workbuddy_variant" = "ai" ] \
+        && comma_list_contains "$aqg_selected_clients" "workbuddy-ai"; then
+      aqg_state="configured-and-verified"
+    fi
+    tty_print "$display_name: DE MCP=disk-ready; $capability; AQG=$aqg_state; runtime=restart-required"
+  done <<<"$detected_clients"
+  if [ "$claude_3p_profile_detected" = "1" ]; then
+    tty_print "claude-desktop-3p: DE MCP=disk-ready; skills=not-supported; routing=mcp-only; AQG=unsupported-for-this-profile; runtime=restart-required"
+  fi
+  tty_print "Agent Quality Gates host capability report:"
+  while IFS= read -r client; do
+    [ -n "$client" ] || continue
+    tty_print "$client: AQG=configured-and-verified"
+  done <<<"$(printf '%s' "$aqg_selected_clients" | tr ',' '\n')"
+  if [ -z "$aqg_selected_clients" ]; then
+    tty_print "(no supported AQG host detected)"
+  fi
+  if [ -n "$catalog_missing_clients" ]; then
+    tty_print "Pending signed stable adapters (not configured):"
+    printf '%s\n' "$catalog_missing_clients" >/dev/tty
+  fi
+  if [ -n "$unwritable_clients" ]; then
+    tty_print "Rejected host configurations (not configured):"
+    printf '%s\n' "$unwritable_clients" >/dev/tty
+  fi
+  if [ -n "$unsupported_installed_hosts" ]; then
+    tty_print "Unsupported installed products (not configured by DE):"
+    printf '%s\n' "$unsupported_installed_hosts" >/dev/tty
+  fi
 }
 
 run_selected_permanent_setup() {
@@ -944,6 +1089,13 @@ run_selected_permanent_setup() {
   fi
   run_managed_python -m installer.permanent_setup "$@"
 }
+
+ensure_managed_runtime_git_excludes \
+  || fail "the managed runtime Git exclusion could not be installed safely; no activation attempt was made"
+ensure_macos_stopper_host \
+  || fail "the managed core is complete, but the owned macOS Stopper host bridge could not be installed and verified; the existing activation state was preserved"
+validate_complete_managed_root \
+  || fail "the managed stable install changed while preparing the Stopper host bridge"
 
 if [ "$activated_repair_mode" -eq 1 ]; then
   if ! wire_all_detected_hosts; then
@@ -978,23 +1130,52 @@ else
       tty_print "Restart the configured host applications to use the DE Lite path."
       ;;
     *)
-      printf 'de-aqg-install: activation failed; core installation is complete, but the device remains unactivated.\n' >&2
-      printf 'de-aqg-install: rerun the managed activation flow after correcting the owner values or network.\n' >&2
+      actual_activation_state="$(managed_activation_state 2>/dev/null || true)"
+      if [ "$actual_activation_state" = "activated" ]; then
+        printf '%s: device is activated, but post-activation validation failed (setup exit %s).\n' \
+          "$PROGRAM_NAME" "$activation_status" >&2
+        printf '%s: fix the Doctor item and rerun this installer; the saved device credentials will be reused without another activation.\n' \
+          "$PROGRAM_NAME" >&2
+      else
+        printf '%s: activation failed; core installation is complete, but the device remains unactivated.\n' "$PROGRAM_NAME" >&2
+        printf '%s: rerun the managed activation flow after correcting the owner values or network.\n' "$PROGRAM_NAME" >&2
+      fi
       exit 1
       ;;
   esac
 fi
 
+tty_print "Running final Decision Engine Doctor..."
+run_managed_python -m installer.doctor \
+  || fail "Decision Engine Doctor still reports a blocking failure after installation or repair"
+
+print_host_capability_report
+
+manual_host_action_pending=0
 if [ "$workbuddy_variant" = "ai" ]; then
   if workbuddy_ai_de_is_approved; then
     tty_print "WorkBuddy AI has approved the Decision Engine MCP connector."
   else
+    manual_host_action_pending=1
     tty_print "WorkBuddy AI detected the Decision Engine MCP connector, but its third-party MCP security gate still requires one in-app approval."
     tty_print "In WorkBuddy AI > MCP Service Management, switch decision-engine on and approve it; then restart WorkBuddy AI. Reconnect alone cannot approve an untrusted server."
   fi
 fi
 
-printf 'de-aqg-install: source=%s\n' "$source_sha"
-printf 'de-aqg-install: decision-engine-version=%s\n' "$managed_version"
-printf 'de-aqg-install: decision-engine=%s\n' "$managed_sha"
-printf 'de-aqg-install: aqg=%s\n' "$aqg_sha"
+printf '%s: source=%s\n' "$PROGRAM_NAME" "$source_sha"
+printf '%s: decision-engine-version=%s\n' "$PROGRAM_NAME" "$managed_version"
+printf '%s: decision-engine=%s\n' "$PROGRAM_NAME" "$managed_sha"
+printf '%s: aqg=%s\n' "$PROGRAM_NAME" "$aqg_sha"
+
+if [ -n "$catalog_missing_clients" ] \
+    || [ -n "$unwritable_clients" ] \
+    || [ -n "$unsupported_installed_hosts" ] \
+    || [ "$capability_report_incomplete" -ne 0 ] \
+    || [ "$manual_host_action_pending" -ne 0 ]; then
+  printf '%s: PARTIAL: supported components were installed, but one or more detected hosts are unsupported, unconfigured, unverifiable, or awaiting in-app approval.\n' \
+    "$PROGRAM_NAME" >&2
+  exit "$EXIT_PARTIAL"
+fi
+
+printf '%s: PASS: all detected supported hosts are configured on disk; restart the host applications before runtime verification.\n' \
+  "$PROGRAM_NAME"
