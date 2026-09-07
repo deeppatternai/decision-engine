@@ -34,16 +34,30 @@ class MultiDesktopRegistryTestCase(unittest.TestCase):
 
     def test_runtime_aliases_distinguish_trae_products_and_bound_shared_qoder(self):
         self.assertIsNone(mcp_config.normalize_observed_client_info("mcphost"))
+        self.assertIsNone(
+            mcp_config.normalize_observed_client_info(
+                "qoder-desktop-mcp-host"
+            )
+        )
         self.assertIsNone(mcp_config.normalize_observed_client_info("Trae"))
         self.assertEqual(mcp_config.normalize_client_host("Qoder"), "qoder")
         self.assertEqual(
             mcp_config.normalize_client_host("Qoder CN"), "qoder-cn"
         )
-        self.assertIsNone(mcp_config.normalize_client_host("Qoder CN IDE"))
+        self.assertEqual(
+            mcp_config.normalize_client_host("Qoder IDE"), "qoder-ide"
+        )
+        self.assertEqual(
+            mcp_config.normalize_client_host("Qoder CN IDE"), "qoder-cn-ide"
+        )
 
         cases = (
             ("qoder", "mcphost"),
             ("qoder-cn", "mcphost"),
+            ("qoder", "qoder-desktop-mcp-host"),
+            ("qoder-cn", "qoder-desktop-mcp-host"),
+            ("qoder-ide", "Qoder"),
+            ("qoder-cn-ide", "Qoder CN"),
             ("trae", "Trae"),
             ("trae-work", "Trae"),
             ("trae-cn", "Trae"),
@@ -384,6 +398,90 @@ class TraeDesktopHostTestCase(unittest.TestCase):
                         ShellError, f"{client.replace('-', '_')}_identity_mismatch"
                     ):
                         module._config_write_guard()
+
+    def test_trae_cn_write_installs_audit_hook_without_touching_international(self):
+        from installer.client_hosts.hosts import trae_cn
+
+        with tempfile.TemporaryDirectory() as tmp:
+            root = Path(tmp)
+            home = root / "home"
+            managed = root / "managed"
+            cn_hooks = home / ".trae-cn" / "hooks.json"
+            international_hooks = home / ".trae" / "hooks.json"
+            cn_hooks.parent.mkdir(parents=True)
+            international_hooks.parent.mkdir(parents=True)
+            aqg_group = {
+                "matcher": "",
+                "hooks": [
+                    {
+                        "type": "command",
+                        "command": "/usr/bin/python3 /opt/aqg/hook.py userPromptSubmit",
+                    }
+                ],
+            }
+            cn_hooks.write_text(
+                json.dumps({"hooks": {"UserPromptSubmit": [aqg_group]}}),
+                encoding="utf-8",
+            )
+            international_hooks.write_text(
+                '{"keep":"international"}\n', encoding="utf-8"
+            )
+            before = international_hooks.read_bytes()
+            with mock.patch.object(Path, "home", return_value=home), mock.patch.dict(
+                os.environ,
+                {
+                    "TRAE_CN_CONFIG": str(root / "trae-cn" / "mcp.json"),
+                    "TRAE_CN_HOOKS": "",
+                },
+                clear=False,
+            ), mock.patch.object(
+                trae_cn, "_config_write_guard", return_value=None
+            ):
+                result = mcp_config.write_entry("trae-cn", dev_root=managed)
+
+            data = json.loads(cn_hooks.read_text(encoding="utf-8"))
+            groups = data["hooks"]["UserPromptSubmit"]
+            self.assertIn(aqg_group, groups)
+            managed_groups = [
+                group
+                for group in groups
+                if "decision-engine-trae-cn-audit-routing-v1"
+                in json.dumps(group)
+            ]
+            self.assertEqual(len(managed_groups), 1)
+            self.assertIn(
+                str(managed / "installer" / "trae_cn_audit_prompt_hook.py"),
+                managed_groups[0]["hooks"][0]["command"],
+            )
+            self.assertEqual(result["companion"]["action"], "updated")
+            self.assertEqual(international_hooks.read_bytes(), before)
+
+    def test_trae_cn_invalid_hooks_fail_before_mcp_is_written(self):
+        from installer.client_hosts.hosts import trae_cn
+
+        with tempfile.TemporaryDirectory() as tmp:
+            root = Path(tmp)
+            home = root / "home"
+            hooks = home / ".trae-cn" / "hooks.json"
+            mcp_path = root / "trae-cn" / "mcp.json"
+            hooks.parent.mkdir(parents=True)
+            hooks.write_text("{invalid", encoding="utf-8")
+            with mock.patch.object(Path, "home", return_value=home), mock.patch.dict(
+                os.environ,
+                {
+                    "TRAE_CN_CONFIG": str(mcp_path),
+                    "TRAE_CN_HOOKS": "",
+                },
+                clear=False,
+            ), mock.patch.object(
+                trae_cn, "_config_write_guard", return_value=None
+            ), self.assertRaisesRegex(
+                ShellError, "invalid TRAE Code CN settings"
+            ):
+                mcp_config.write_entry("trae-cn", dev_root=root / "managed")
+
+            self.assertFalse(mcp_path.exists())
+            self.assertEqual(hooks.read_text(encoding="utf-8"), "{invalid")
 
     def test_trae_desktop_renderers_use_product_specific_markers(self):
         root = Path("/opt/decision-engine")

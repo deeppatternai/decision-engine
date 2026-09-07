@@ -77,6 +77,24 @@ class InstallerTestCase(unittest.TestCase):
             "QODER_CN_CONFIG": str(base / "no-qoder-cn" / "settings.json"),
             "QODER_CN_SKILLS_DIR": str(base / "no-qoder-cn" / "skills"),
             "QODER_CN_APP_ROOT": str(base / "no-qoder-cn" / "app"),
+            "QODER_IDE_CONFIG": str(base / "no-qoder-ide" / "mcp.json"),
+            "QODER_IDE_SETTINGS": str(
+                base / "no-qoder-ide" / "settings.json"
+            ),
+            "QODER_IDE_SKILLS_DIR": str(base / "no-qoder-ide" / "skills"),
+            "QODER_IDE_APP_ROOT": str(base / "no-qoder-ide" / "app"),
+            "QODER_CN_IDE_CONFIG": str(
+                base / "no-qoder-cn-ide" / "mcp.json"
+            ),
+            "QODER_CN_IDE_SETTINGS": str(
+                base / "no-qoder-cn-ide" / "settings.json"
+            ),
+            "QODER_CN_IDE_SKILLS_DIR": str(
+                base / "no-qoder-cn-ide" / "skills"
+            ),
+            "QODER_CN_IDE_APP_ROOT": str(
+                base / "no-qoder-cn-ide" / "app"
+            ),
             "TRAE_CONFIG": str(base / "no-trae" / "mcp.json"),
             "TRAE_SKILLS_DIR": str(base / "no-trae" / "skills"),
             "TRAE_APP_ROOT": str(base / "no-trae" / "app"),

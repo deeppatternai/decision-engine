@@ -1,4 +1,4 @@
-"""Inject deterministic Qoder routing context for explicit audit prompts."""
+"""Inject deterministic WorkBuddy AI routing context for explicit audits."""
 
 from __future__ import annotations
 
@@ -18,29 +18,23 @@ except ModuleNotFoundError as exc:
         is_explicit_audit_prompt as _is_explicit_audit_prompt,
         read_payload as _read_payload,
     )
+
+
 _ROUTING_CONTEXT = (
     "Decision Engine routing requirement: this user prompt explicitly requests an audit. "
     "Invoke Skill `audit` now as the first action and pass the user's exact request unchanged. "
     "Do not inspect the workspace, create or modify files, search the web, invoke "
     "`audit-brainstorming`, or answer with an inline review before Skill `audit` is loaded. "
-    "After the skill is loaded, Qoder must invoke Decision Engine through the generic "
-    "`mcp_call` tool. The submit call must have exactly this wrapper shape: "
-    "{\"toolName\":\"mcp__decision_engine__audit_skill_submit\","
-    "\"arguments\":{\"skill_name\":\"audit\",\"args\":{...}}}. "
-    "`arguments` must be an object, not a JSON string. Do not call any "
-    "`mcp__decision_engine__*` name directly. Never call `activation_required`; an "
+    "Use the tool from connector `decision-engine` whose logical name "
+    "`audit_skill_submit` is exposed by this host. Never call `activation_required`; an "
     "unactivated audit is handled by `audit_skill_submit`. Submit exactly once. After any "
     "rejected or failed submission, stop without retrying another Decision Engine tool. "
-    "The only permitted MCP target names in this workflow are "
-    "`mcp__decision_engine__audit_skill_submit` and "
-    "`mcp__decision_engine__audit_skill_complete`. Do not invoke or invent an AQG MCP tool; "
-    "load the installed AQG skill when the audit instructions require it. Call complete only "
-    "after submit returns a non-empty `local_id`, with exactly this wrapper shape: "
-    "{\"toolName\":\"mcp__decision_engine__audit_skill_complete\","
-    "\"arguments\":{\"local_id\":\"<returned local_* id>\","
-    "\"status\":\"completed\"}}. Attempt completion exactly once. If completion is "
-    "rejected or fails, stop and report it instead of retrying. Never use `run_id` in "
-    "the completion arguments."
+    "Do not invoke or invent an AQG MCP tool; load the installed AQG skill when the audit "
+    "instructions require it. Call the Decision Engine tool with logical name "
+    "`audit_skill_complete` only after submit returns a non-empty `local_id`, passing exactly "
+    "that `local_id` and `status=completed`. Attempt completion exactly once. If completion "
+    "is rejected or fails, stop and report it instead of retrying. Never use `run_id` in "
+    "completion arguments."
 )
 
 

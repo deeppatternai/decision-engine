@@ -63,6 +63,7 @@ class WorkBuddyAIHostTestCase(unittest.TestCase):
         self.assertFalse(spec.popup_followup)
         self.assertTrue(spec.audit_stop_panel)
         self.assertTrue(spec.unverified_lite_stopper)
+        self.assertIsNotNone(spec.post_mcp_write)
         self.assertNotEqual(spec.config_env, legacy.config_env)
         self.assertNotEqual(spec.skill_route_name, legacy.skill_route_name)
         self.assertEqual(
@@ -88,6 +89,10 @@ class WorkBuddyAIHostTestCase(unittest.TestCase):
             self.assertEqual(
                 workbuddy_ai._workbuddy_ai_skills_path(),
                 Path("/isolated/workbuddy-ai-skills"),
+            )
+            self.assertEqual(
+                workbuddy_ai._workbuddy_ai_settings_path(),
+                Path("/Users/test/.workbuddy-ai/settings.json"),
             )
 
     def test_workbuddy_ai_guard_checks_exact_bundle_identity_and_version(self):
@@ -203,6 +208,145 @@ class WorkBuddyAIHostTestCase(unittest.TestCase):
             self.assertEqual(result["action"], "added")
             self.assertIn("decision-engine", data["mcpServers"])
             self.assertEqual(legacy.read_bytes(), before)
+
+    def test_workbuddy_ai_upgrade_preserves_host_disabled_state(self):
+        from installer.client_hosts.hosts import workbuddy_ai
+
+        with tempfile.TemporaryDirectory() as tmp:
+            root = Path(tmp)
+            mcp_path = root / "home" / ".workbuddy-ai" / "mcp.json"
+            settings = root / "home" / ".workbuddy-ai" / "settings.json"
+            old_de = root / "old-de"
+            new_de = root / "new-de"
+            environment = {
+                "WORKBUDDY_AI_CONFIG": str(mcp_path),
+                "WORKBUDDY_AI_SETTINGS": str(settings),
+            }
+            with mock.patch.dict(os.environ, environment, clear=False), mock.patch.object(
+                workbuddy_ai, "_workbuddy_ai_config_write_guard", return_value=None
+            ):
+                mcp_config.write_entry("workbuddy-ai", dev_root=old_de)
+                data = json.loads(mcp_path.read_text(encoding="utf-8"))
+                data["mcpServers"]["decision-engine"]["disabled"] = False
+                mcp_path.write_text(json.dumps(data), encoding="utf-8")
+
+                result = mcp_config.write_entry("workbuddy-ai", dev_root=new_de)
+
+            entry = json.loads(mcp_path.read_text(encoding="utf-8"))["mcpServers"][
+                "decision-engine"
+            ]
+            self.assertEqual(result["action"], "updated")
+            self.assertFalse(entry["disabled"])
+            self.assertEqual(entry["env"]["PYTHONPATH"], str(new_de))
+
+    def test_workbuddy_ai_upgrade_rejects_invalid_host_disabled_state(self):
+        from installer.client_hosts.hosts import workbuddy_ai
+
+        with tempfile.TemporaryDirectory() as tmp:
+            root = Path(tmp)
+            mcp_path = root / "home" / ".workbuddy-ai" / "mcp.json"
+            settings = root / "home" / ".workbuddy-ai" / "settings.json"
+            environment = {
+                "WORKBUDDY_AI_CONFIG": str(mcp_path),
+                "WORKBUDDY_AI_SETTINGS": str(settings),
+            }
+            with mock.patch.dict(os.environ, environment, clear=False), mock.patch.object(
+                workbuddy_ai, "_workbuddy_ai_config_write_guard", return_value=None
+            ):
+                mcp_config.write_entry("workbuddy-ai", dev_root=root / "old-de")
+                data = json.loads(mcp_path.read_text(encoding="utf-8"))
+                data["mcpServers"]["decision-engine"]["disabled"] = "false"
+                mcp_path.write_text(json.dumps(data), encoding="utf-8")
+                before = mcp_path.read_bytes()
+
+                with self.assertRaisesRegex(ShellError, "same_name_unowned"):
+                    mcp_config.write_entry("workbuddy-ai", dev_root=root / "new-de")
+
+            self.assertEqual(mcp_path.read_bytes(), before)
+
+    def test_workbuddy_ai_write_installs_owned_audit_hook_and_preserves_existing_hooks(self):
+        from installer.client_hosts.hosts import workbuddy_ai
+
+        with tempfile.TemporaryDirectory() as tmp:
+            home = Path(tmp) / "home"
+            root = Path(tmp) / "managed"
+            settings = home / ".workbuddy-ai" / "settings.json"
+            aqg_group = {
+                "matcher": "",
+                "hooks": [
+                    {
+                        "type": "command",
+                        "command": "/usr/bin/python3 /opt/aqg/hook.py userPromptSubmit",
+                    }
+                ],
+            }
+            user_group = {
+                "matcher": "custom",
+                "hooks": [{"type": "command", "command": "/opt/user/hook"}],
+            }
+            settings.parent.mkdir(parents=True)
+            settings.write_text(
+                json.dumps(
+                    {"hooks": {"UserPromptSubmit": [aqg_group, user_group]}},
+                    ensure_ascii=False,
+                ),
+                encoding="utf-8",
+            )
+            environment = {
+                "WORKBUDDY_AI_CONFIG": "",
+                "WORKBUDDY_AI_SETTINGS": "",
+            }
+            with mock.patch.object(Path, "home", return_value=home), mock.patch.dict(
+                os.environ, environment, clear=False
+            ), mock.patch.object(
+                workbuddy_ai, "_workbuddy_ai_config_write_guard", return_value=None
+            ):
+                first = mcp_config.write_entry("workbuddy-ai", dev_root=root)
+                first_bytes = settings.read_bytes()
+                second = mcp_config.write_entry("workbuddy-ai", dev_root=root)
+
+            data = json.loads(first_bytes.decode("utf-8"))
+            groups = data["hooks"]["UserPromptSubmit"]
+            self.assertIn(aqg_group, groups)
+            self.assertIn(user_group, groups)
+            managed = [
+                group
+                for group in groups
+                if "decision-engine-workbuddy-ai-audit-routing-v1"
+                in json.dumps(group)
+            ]
+            self.assertEqual(len(managed), 1)
+            command = managed[0]["hooks"][0]["command"]
+            self.assertIn(str(root / "installer" / "workbuddy_audit_prompt_hook.py"), command)
+            self.assertEqual(first["companion"]["action"], "updated")
+            self.assertEqual(second["companion"]["action"], "unchanged")
+            self.assertEqual(settings.read_bytes(), first_bytes)
+
+    def test_workbuddy_ai_invalid_hook_settings_fail_before_mcp_is_written(self):
+        from installer.client_hosts.hosts import workbuddy_ai
+
+        with tempfile.TemporaryDirectory() as tmp:
+            home = Path(tmp) / "home"
+            root = Path(tmp) / "managed"
+            mcp_path = home / ".workbuddy-ai" / "mcp.json"
+            settings = home / ".workbuddy-ai" / "settings.json"
+            settings.parent.mkdir(parents=True)
+            settings.write_text("{invalid", encoding="utf-8")
+            environment = {
+                "WORKBUDDY_AI_CONFIG": "",
+                "WORKBUDDY_AI_SETTINGS": "",
+            }
+            with mock.patch.object(Path, "home", return_value=home), mock.patch.dict(
+                os.environ, environment, clear=False
+            ), mock.patch.object(
+                workbuddy_ai, "_workbuddy_ai_config_write_guard", return_value=None
+            ), self.assertRaisesRegex(
+                ShellError, "invalid WorkBuddy AI settings"
+            ):
+                mcp_config.write_entry("workbuddy-ai", dev_root=root)
+
+            self.assertFalse(mcp_path.exists())
+            self.assertEqual(settings.read_text(encoding="utf-8"), "{invalid")
 
     def test_workbuddy_ai_doctor_skill_route_requires_its_mcp_entry(self):
         from installer.client_hosts.hosts import workbuddy_ai

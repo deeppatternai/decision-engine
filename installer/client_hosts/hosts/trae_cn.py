@@ -44,6 +44,13 @@ def _skills_path() -> Path:
     return Path.home() / ".trae-cn" / "skills"
 
 
+def _hooks_path() -> Path:
+    configured = os.getenv("TRAE_CN_HOOKS")
+    if configured and configured.strip():
+        return Path(configured).expanduser()
+    return Path.home() / ".trae-cn" / "hooks.json"
+
+
 def _product_metadata() -> ProductMetadataProbe:
     root = _app_root()
     product = bounded_product_metadata(
@@ -130,6 +137,31 @@ def _config_write_guard():
     return None
 
 
+def _post_mcp_write(
+    entry: dict[str, object], dry_run: bool
+) -> dict[str, object]:
+    from installer.client_hosts.hosts import trae_cn_prompt_hook
+
+    environment = entry.get("env")
+    command = entry.get("command")
+    de_root = environment.get("PYTHONPATH") if isinstance(environment, dict) else None
+    if (
+        not isinstance(command, str)
+        or not command.strip()
+        or not isinstance(de_root, str)
+        or not Path(de_root).is_absolute()
+    ):
+        raise ShellError(
+            "rendered TRAE Code CN entry cannot identify its DE hook runtime"
+        )
+    return trae_cn_prompt_hook.install_hook(
+        _hooks_path(),
+        de_root=Path(de_root),
+        python_executable=command,
+        dry_run=dry_run,
+    )
+
+
 TRAE_CN = AgentHostSpec(
     id="trae-cn",
     transport="stdio",
@@ -172,6 +204,7 @@ TRAE_CN = AgentHostSpec(
     ),
     optional_features=frozenset({"local-display", "audit-stop-panel"}),
     onboarding_evidence=("skill",),
+    post_mcp_write=_post_mcp_write,
 )
 
 HOST_SPECS = (TRAE_CN,)

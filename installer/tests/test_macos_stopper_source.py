@@ -8,8 +8,12 @@ still compile and exercise the app itself.
 from __future__ import annotations
 
 import re
+import sys
 import unittest
 from pathlib import Path
+
+ROOT = Path(__file__).resolve().parents[2]
+sys.path.insert(0, str(ROOT))
 
 
 _SOURCE = (
@@ -313,6 +317,15 @@ class MacOSStopperSourceContractTests(unittest.TestCase):
         self.assertLess(guard_at, verify_at)
         self.assertIn('updated["status"] as? String) == "cancelling"', poll_body)
 
+
+
+class SwiftDebugAuditorDisplayTests(unittest.TestCase):
+    def test_debug_authorized_gates_model_rows_and_row_height(self):
+        self.assertIn("private func debugAuditorRows", _SOURCE)
+        self.assertIn("run[\"debug_authorized\"] as? Bool) == true", _SOURCE)
+        self.assertIn("let debugRows = debugAuditorRows(run).count", _SOURCE)
+        self.assertIn("for rowText in debugAuditorRows(run)", _SOURCE)
+        self.assertIn("return auditors.map { auditorDisplayText($0) }", _SOURCE)
 
 if __name__ == "__main__":
     unittest.main()

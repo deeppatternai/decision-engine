@@ -37,6 +37,8 @@ class ClientHostExtensionConformanceTestCase(unittest.TestCase):
             installer / "client_hosts" / "hosts" / "codebuddy.py",
             installer / "client_hosts" / "hosts" / "workbuddy.py",
             installer / "client_hosts" / "hosts" / "workbuddy_ai.py",
+            installer / "client_hosts" / "hosts" / "workbuddy_ai_prompt_hook.py",
+            installer / "workbuddy_audit_prompt_hook.py",
             installer / "client_hosts" / "registry.py",
         }
         shared_orchestration = tuple(
@@ -79,6 +81,9 @@ class ClientHostExtensionConformanceTestCase(unittest.TestCase):
         allowed = {
             installer / "client_hosts" / "hosts" / "qoder.py",
             installer / "client_hosts" / "hosts" / "qoder_cn.py",
+            installer / "client_hosts" / "hosts" / "qoder_ide.py",
+            installer / "client_hosts" / "hosts" / "qoder_cn_ide.py",
+            installer / "client_hosts" / "hosts" / "qoder_ide_common.py",
             installer / "client_hosts" / "hosts" / "qoder_prompt_hook.py",
             installer / "qoder_audit_prompt_hook.py",
             installer / "client_hosts" / "registry.py",

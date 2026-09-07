@@ -23,6 +23,97 @@ class PublicInstallEntryPointTests(unittest.TestCase):
 
 
 class CleanUninstallQoderHookTests(unittest.TestCase):
+    def test_de_scope_removes_qoder_ide_connectors_and_shared_hooks(self):
+        repo_root = Path(__file__).resolve().parents[2]
+        script = repo_root / "dp-uninstall.sh"
+        with tempfile.TemporaryDirectory() as tmp:
+            root = Path(tmp)
+            home = root / "home"
+            for family, client in (
+                (".qoder", "qoder-ide"),
+                (".qoder-cn", "qoder-cn-ide"),
+            ):
+                profile = home / family
+                profile.mkdir(parents=True)
+                (profile / "mcp.json").write_text(
+                    json.dumps(
+                        {
+                            "mcpServers": {
+                                "keep": {"command": "keep"},
+                                "decision-engine": {
+                                    "command": "/usr/bin/python3",
+                                    "args": [
+                                        "/opt/decision-engine/installer/mcp_bootstrap.py",
+                                        "/opt/decision-engine",
+                                        "--managed-root",
+                                        "/opt/decision-engine",
+                                    ],
+                                    "env": {"DE_MCP_CLIENT_HOST": client},
+                                },
+                            }
+                        }
+                    ),
+                    encoding="utf-8",
+                )
+                (profile / "settings.json").write_text(
+                    json.dumps(
+                        {
+                            "hooks": {
+                                "UserPromptSubmit": [
+                                    {
+                                        "matcher": "",
+                                        "hooks": [
+                                            {
+                                                "type": "command",
+                                                "command": "/usr/bin/python3",
+                                                "args": [
+                                                    "/opt/decision-engine/installer/qoder_audit_prompt_hook.py"
+                                                ],
+                                                "name": "decision-engine-audit-routing-v1",
+                                            }
+                                        ],
+                                    }
+                                ]
+                            },
+                            "enabledPlugins": {"keep": True},
+                        }
+                    ),
+                    encoding="utf-8",
+                )
+            launchctl = root / "launchctl"
+            launchctl.write_text("#!/bin/sh\nexit 113\n", encoding="utf-8")
+            launchctl.chmod(0o755)
+            environment = os.environ.copy()
+            environment.update(
+                {
+                    "HOME": str(home),
+                    "DEEPPATTERN_HOME": str(home / ".deeppattern"),
+                    "DE_AQG_BACKUP_ROOT": str(root / "backups"),
+                    "DE_AQG_UNINSTALL_PROCESS_COMMAND": "/usr/bin/true",
+                    "DE_AQG_UNINSTALL_LAUNCHCTL_COMMAND": str(launchctl),
+                }
+            )
+
+            completed = subprocess.run(
+                [str(script), "--scope", "de", "--apply"],
+                env=environment,
+                text=True,
+                stdout=subprocess.PIPE,
+                stderr=subprocess.STDOUT,
+                check=False,
+            )
+
+            self.assertEqual(completed.returncode, 0, completed.stdout)
+            for family in (".qoder", ".qoder-cn"):
+                profile = home / family
+                mcp = json.loads((profile / "mcp.json").read_text(encoding="utf-8"))
+                settings = json.loads(
+                    (profile / "settings.json").read_text(encoding="utf-8")
+                )
+                self.assertEqual(mcp["mcpServers"], {"keep": {"command": "keep"}})
+                self.assertEqual(settings["hooks"]["UserPromptSubmit"], [])
+                self.assertEqual(settings["enabledPlugins"], {"keep": True})
+
     def test_de_scope_removes_only_owned_qoder_prompt_hook(self):
         repo_root = Path(__file__).resolve().parents[2]
         script = repo_root / "de-aqg-clean-uninstall"
@@ -161,6 +252,209 @@ class CleanUninstallQoderHookTests(unittest.TestCase):
             self.assertEqual(completed.returncode, 3, completed.stdout)
             self.assertIn("ownership is unknown", completed.stdout)
             self.assertEqual(settings.read_bytes(), before)
+
+
+class PublicUninstallWorkBuddyAIHookTests(unittest.TestCase):
+    def test_de_scope_blocks_foreign_same_id_workbuddy_ai_prompt_hook(self):
+        repo_root = Path(__file__).resolve().parents[2]
+        script = repo_root / "dp-uninstall.sh"
+        with tempfile.TemporaryDirectory() as tmp:
+            root = Path(tmp)
+            home = root / "home"
+            settings = home / ".workbuddy-ai" / "settings.json"
+            settings.parent.mkdir(parents=True)
+            settings.write_text(
+                json.dumps(
+                    {
+                        "hooks": {
+                            "UserPromptSubmit": [
+                                {
+                                    "matcher": "",
+                                    "hooks": [
+                                        {
+                                            "type": "command",
+                                            "command": (
+                                                "/opt/foreign/hook --managed-id "
+                                                "decision-engine-workbuddy-ai-audit-routing-v1"
+                                            ),
+                                            "timeout": 30,
+                                        }
+                                    ],
+                                }
+                            ]
+                        }
+                    }
+                ),
+                encoding="utf-8",
+            )
+            before = settings.read_bytes()
+            launchctl = root / "launchctl"
+            launchctl.write_text("#!/bin/sh\nexit 113\n", encoding="utf-8")
+            launchctl.chmod(0o755)
+            environment = os.environ.copy()
+            environment.update(
+                {
+                    "HOME": str(home),
+                    "DEEPPATTERN_HOME": str(home / ".deeppattern"),
+                    "DE_AQG_BACKUP_ROOT": str(root / "backups"),
+                    "DE_AQG_UNINSTALL_PROCESS_COMMAND": "/usr/bin/true",
+                    "DE_AQG_UNINSTALL_LAUNCHCTL_COMMAND": str(launchctl),
+                }
+            )
+
+            completed = subprocess.run(
+                [str(script), "--scope", "de", "--apply"],
+                env=environment,
+                text=True,
+                stdout=subprocess.PIPE,
+                stderr=subprocess.STDOUT,
+                check=False,
+            )
+
+            self.assertNotEqual(completed.returncode, 0, completed.stdout)
+            self.assertIn("ownership is unknown", completed.stdout)
+            self.assertIn("STOP:", completed.stdout)
+            self.assertEqual(settings.read_bytes(), before)
+
+    def test_de_scope_removes_only_owned_workbuddy_ai_prompt_hook(self):
+        repo_root = Path(__file__).resolve().parents[2]
+        script = repo_root / "dp-uninstall.sh"
+        with tempfile.TemporaryDirectory() as tmp:
+            root = Path(tmp)
+            home = root / "home"
+            settings = home / ".workbuddy-ai" / "settings.json"
+            settings.parent.mkdir(parents=True)
+            aqg_group = {
+                "matcher": "",
+                "hooks": [
+                    {
+                        "type": "command",
+                        "command": "/usr/bin/python3 /opt/aqg/hook.py userPromptSubmit",
+                    }
+                ],
+            }
+            user_group = {
+                "matcher": "custom",
+                "hooks": [{"type": "command", "command": "/opt/user/hook"}],
+            }
+            de_group = {
+                "matcher": "",
+                "hooks": [
+                    {
+                        "type": "command",
+                        "command": (
+                            "/usr/bin/python3 "
+                            "/opt/decision-engine/installer/workbuddy_audit_prompt_hook.py "
+                            "--managed-id decision-engine-workbuddy-ai-audit-routing-v1"
+                        ),
+                        "timeout": 30,
+                    }
+                ],
+            }
+            settings.write_text(
+                json.dumps(
+                    {
+                        "hooks": {
+                            "UserPromptSubmit": [aqg_group, de_group, user_group]
+                        }
+                    }
+                ),
+                encoding="utf-8",
+            )
+            launchctl = root / "launchctl"
+            launchctl.write_text("#!/bin/sh\nexit 113\n", encoding="utf-8")
+            launchctl.chmod(0o755)
+            environment = os.environ.copy()
+            environment.update(
+                {
+                    "HOME": str(home),
+                    "DEEPPATTERN_HOME": str(home / ".deeppattern"),
+                    "DE_AQG_BACKUP_ROOT": str(root / "backups"),
+                    "DE_AQG_UNINSTALL_PROCESS_COMMAND": "/usr/bin/true",
+                    "DE_AQG_UNINSTALL_LAUNCHCTL_COMMAND": str(launchctl),
+                }
+            )
+
+            completed = subprocess.run(
+                [str(script), "--scope", "de", "--apply"],
+                env=environment,
+                text=True,
+                stdout=subprocess.PIPE,
+                stderr=subprocess.STDOUT,
+                check=False,
+            )
+
+            self.assertEqual(completed.returncode, 0, completed.stdout)
+            data = json.loads(settings.read_text(encoding="utf-8"))
+            self.assertEqual(
+                data["hooks"]["UserPromptSubmit"], [aqg_group, user_group]
+            )
+            self.assertIn("PASS: uninstall verified", completed.stdout)
+
+    def test_de_scope_removes_only_owned_trae_cn_prompt_hook(self):
+        repo_root = Path(__file__).resolve().parents[2]
+        script = repo_root / "dp-uninstall.sh"
+        with tempfile.TemporaryDirectory() as tmp:
+            root = Path(tmp)
+            home = root / "home"
+            hooks = home / ".trae-cn" / "hooks.json"
+            hooks.parent.mkdir(parents=True)
+            aqg_group = {
+                "matcher": "",
+                "hooks": [
+                    {
+                        "type": "command",
+                        "command": "/usr/bin/python3 /opt/aqg/hook.py userPromptSubmit",
+                    }
+                ],
+            }
+            de_group = {
+                "matcher": "",
+                "hooks": [
+                    {
+                        "type": "command",
+                        "command": (
+                            "/usr/bin/python3 "
+                            "/opt/decision-engine/installer/trae_cn_audit_prompt_hook.py "
+                            "--managed-id decision-engine-trae-cn-audit-routing-v1"
+                        ),
+                        "timeout": 30,
+                    }
+                ],
+            }
+            hooks.write_text(
+                json.dumps(
+                    {"hooks": {"UserPromptSubmit": [aqg_group, de_group]}}
+                ),
+                encoding="utf-8",
+            )
+            launchctl = root / "launchctl"
+            launchctl.write_text("#!/bin/sh\nexit 113\n", encoding="utf-8")
+            launchctl.chmod(0o755)
+            environment = os.environ.copy()
+            environment.update(
+                {
+                    "HOME": str(home),
+                    "DEEPPATTERN_HOME": str(home / ".deeppattern"),
+                    "DE_AQG_BACKUP_ROOT": str(root / "backups"),
+                    "DE_AQG_UNINSTALL_PROCESS_COMMAND": "/usr/bin/true",
+                    "DE_AQG_UNINSTALL_LAUNCHCTL_COMMAND": str(launchctl),
+                }
+            )
+
+            completed = subprocess.run(
+                [str(script), "--scope", "de", "--apply"],
+                env=environment,
+                text=True,
+                stdout=subprocess.PIPE,
+                stderr=subprocess.STDOUT,
+                check=False,
+            )
+
+            self.assertEqual(completed.returncode, 0, completed.stdout)
+            data = json.loads(hooks.read_text(encoding="utf-8"))
+            self.assertEqual(data["hooks"]["UserPromptSubmit"], [aqg_group])
+            self.assertIn("PASS: uninstall verified", completed.stdout)
 
 
 if __name__ == "__main__":

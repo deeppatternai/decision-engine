@@ -41,6 +41,7 @@ config.json
 denylist.txt
 .env
 .aqg/
+.claude/
 .workbuddy/
 
 # Internal development documentation (design/reviews/decisions/evidence/

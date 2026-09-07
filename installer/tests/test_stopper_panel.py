@@ -13,11 +13,15 @@ from __future__ import annotations
 
 import json
 import os
+import sys
 import tempfile
 import time
 from pathlib import Path
 import threading
 import unittest
+
+ROOT = Path(__file__).resolve().parents[2]
+sys.path.insert(0, str(ROOT))
 from unittest import mock
 
 from client import i18n, runner
@@ -867,6 +871,16 @@ class RenderHelperTests(unittest.TestCase):
             {"run_id": "local-x", "status": "running", "local": True})["local"], True)
         self.assertIs(runner.active_run_payload(
             {"run_id": "r1", "status": "running"})["local"], False)
+        self.assertIs(runner.active_run_payload(
+            {"run_id": "r1", "status": "running", "debug_authorized": True}
+        )["debug_authorized"], True)
+        self.assertIs(runner.active_run_payload(
+            {"run_id": "r1", "status": "running", "debug_authorized": False}
+        )["debug_authorized"], False)
+        self.assertNotIn(
+            "debug_authorized",
+            runner.active_run_payload({"run_id": "r1", "status": "running"}),
+        )
 
     # audit ee5e025a: local status→word/color mapping across every state
     def _local(self, status, locale="zh-CN"):
@@ -1486,6 +1500,7 @@ class LaunchWiringTests(unittest.TestCase):
                 "run_id": "hosted-one",
                 "status": "queued",
                 "title": "Hosted audit",
+                "debug_authorized": True,
             })
             runner.save_local_advisory_run(
                 "local-service-one",
@@ -1498,6 +1513,7 @@ class LaunchWiringTests(unittest.TestCase):
 
         self.assertEqual(set(registry["runs"]), {"hosted-one", "local-service-one"})
         self.assertIs(registry["runs"]["hosted-one"]["local"], False)
+        self.assertIs(registry["runs"]["hosted-one"]["debug_authorized"], True)
         self.assertIs(registry["runs"]["local-service-one"]["local"], True)
 
     def test_panel_log_setup_failure_never_escapes_audit_start(self):
@@ -2075,6 +2091,28 @@ class RegistryReapTests(unittest.TestCase):
         self.assertIn("r1", app.runs, "the live poll must have reset the grace counter")
         self.assertIn("r1", json.loads(self.registry.read_text())["runs"])
 
+
+
+class DebugAuditorDisplayTests(unittest.TestCase):
+    NOW = 1_000.0
+
+    def test_debug_authorized_reveals_models(self):
+        base = {"run_id": "a", "profile": "standard", "ui_locale": "en-US", "status": "running", "started_at": 905.0}
+        run = dict(base, debug_authorized=True, auditors=[{"status": "running", "model_id": "gpt-5.6-sol"}, {"status": "completed", "model_alias": "gemini-3.1-pro-high", "duration_ms": 12000}])
+        text = panel.depth_line_text(run, self.NOW, {})
+        self.assertIn("gpt-5.6-sol", text)
+        self.assertIn("gemini-3.1-pro-high", text)
+        self.assertIn("completed", text)
+
+    def test_debug_authorized_fails_closed_for_unauthorized_or_malformed_auditors(self):
+        base = {"run_id": "a", "profile": "standard", "ui_locale": "en-US", "status": "running", "started_at": 905.0}
+        cases = ({"debug_authorized": False, "auditors": [{"status": "running", "model_id": "gpt-5.6-sol"}]}, {"debug_authorized": None, "auditors": [{"status": "running", "model_id": "gpt-5.6-sol"}]}, {"auditors": [{"status": "running", "model_id": "gpt-5.6-sol"}]}, {"debug_authorized": True, "auditors": []}, {"debug_authorized": True, "auditors": [None]})
+        for over in cases:
+            with self.subTest(over=over):
+                text = panel.depth_line_text(dict(base, **over), self.NOW, {})
+                self.assertEqual(text.splitlines()[0], "Standard · Auditing · 1m 35s ⏱")
+                self.assertNotIn("gpt-5.6-sol", text)
+                self.assertNotIn("gemini-3.1-pro-high", text)
 
 if __name__ == "__main__":
     unittest.main()

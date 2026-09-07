@@ -2091,10 +2091,22 @@ def _managed_launcher_args(args: Any, cwd: Any) -> bool:
     return _managed_launcher_root(args, cwd) is not None
 
 
-def _is_marked_de_entry(existing: Any, desired: Dict[str, Any]) -> bool:
+def _is_marked_de_entry(
+    existing: Any,
+    desired: Dict[str, Any],
+    host_owned_fields: FrozenSet[str] = frozenset(),
+) -> bool:
     """Recognize a prior generated JSON entry without trusting its dynamic paths."""
 
-    if not isinstance(existing, dict) or set(existing) != set(desired):
+    extra_fields = (
+        set(existing).difference(desired) if isinstance(existing, dict) else set()
+    )
+    if (
+        not isinstance(existing, dict)
+        or not set(desired).issubset(existing)
+        or not extra_fields.issubset(host_owned_fields)
+        or ("disabled" in extra_fields and type(existing["disabled"]) is not bool)
+    ):
         return False
     existing_env = existing.get("env")
     desired_env = desired.get("env")
@@ -2125,6 +2137,7 @@ def _write_json_client(
     dry_run: bool,
     *,
     ownership_policy: str = "replace-existing-v1",
+    host_owned_fields: FrozenSet[str] = frozenset(),
     collection_key: str = "mcpServers",
     config_transform: Optional[Callable[[Dict[str, Any]], bool]] = None,
 ) -> Dict[str, Any]:
@@ -2166,16 +2179,21 @@ def _write_json_client(
     if (
         ownership_policy == "replace-marked-de-v1"
         and server_name in servers
-        and not _is_marked_de_entry(existing_entry, entry)
+        and not _is_marked_de_entry(existing_entry, entry, host_owned_fields)
     ):
         raise ShellError(
             "same_name_unowned: Decision Engine entry differs from the requested "
             "registration; nothing was written"
         )
-    servers[server_name] = entry
+    target_entry = dict(entry)
+    if isinstance(existing_entry, dict):
+        for field in host_owned_fields:
+            if field in existing_entry:
+                target_entry[field] = existing_entry[field]
+    servers[server_name] = target_entry
     data[collection_key] = servers
     transformed = config_transform(data) if config_transform is not None else False
-    if existing_entry == entry and not transformed:
+    if existing_entry == target_entry and not transformed:
         return {"client": client, "path": str(path), "action": "unchanged", "backup": None}
     if ownership_policy not in {"replace-existing-v1", "replace-marked-de-v1"}:
         raise ShellError("entry ownership policy is unsupported")
@@ -2187,7 +2205,7 @@ def _write_json_client(
                        expect_mtime_ns=mtime_ns, expect_sha256=original_digest,
                        expect_exists=existed)
     verify = json.loads(path.read_text(encoding="utf-8"))
-    if verify.get(collection_key, {}).get(server_name) != entry:
+    if verify.get(collection_key, {}).get(server_name) != target_entry:
         if backup is not None:
             shutil.copy2(backup, path)   # restore the pre-write file rather than leave a bad merge
         raise ShellError("post-write verification failed for %s (restored backup %s)"
@@ -2376,6 +2394,13 @@ def _write_json_renderer(
     config_transform = None
     if spec.json_config_transform is not None:
         config_transform = lambda data: spec.json_config_transform(data, entry)
+    companion = None
+    if spec.post_mcp_write is not None:
+        companion = spec.post_mcp_write(entry, True)
+        if not isinstance(companion, dict) or not isinstance(
+            companion.get("action"), str
+        ):
+            raise ShellError("post-MCP-write companion returned an invalid result")
     result = _write_json_client(
         client,
         path,
@@ -2383,6 +2408,7 @@ def _write_json_renderer(
         entry,
         dry_run,
         ownership_policy=spec.entry_ownership_policy,
+        host_owned_fields=spec.host_owned_entry_fields,
         collection_key=collection_key,
         config_transform=config_transform,
     )
@@ -2391,6 +2417,15 @@ def _write_json_renderer(
         or spec.config_write_guard_probe is not None
     ):
         result["warning"] = warning
+    if spec.post_mcp_write is not None:
+        if not dry_run:
+            companion = spec.post_mcp_write(entry, False)
+            if not isinstance(companion, dict) or not isinstance(
+                companion.get("action"), str
+            ):
+                raise ShellError("post-MCP-write companion returned an invalid result")
+        assert companion is not None
+        result["companion"] = companion
     return result
 
 

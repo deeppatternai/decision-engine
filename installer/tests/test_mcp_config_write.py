@@ -1124,7 +1124,11 @@ class DetectAndCliTestCase(unittest.TestCase):
                        "CODEBUDDY_SKILLS_DIR", "CODEBUDDY_CLI",
                         "QODER_CONFIG", "QODER_SKILLS_DIR", "QODER_APP_ROOT",
                         "QODER_CN_CONFIG", "QODER_CN_SKILLS_DIR",
-                        "QODER_CN_APP_ROOT", "TRAE_CONFIG", "TRAE_SKILLS_DIR",
+                        "QODER_CN_APP_ROOT", "QODER_IDE_CONFIG",
+                        "QODER_IDE_SETTINGS", "QODER_IDE_SKILLS_DIR",
+                        "QODER_IDE_APP_ROOT", "QODER_CN_IDE_CONFIG",
+                        "QODER_CN_IDE_SETTINGS", "QODER_CN_IDE_SKILLS_DIR",
+                        "QODER_CN_IDE_APP_ROOT", "TRAE_CONFIG", "TRAE_SKILLS_DIR",
                         "TRAE_APP_ROOT", "TRAE_CN_CONFIG", "TRAE_CN_SKILLS_DIR",
                         "TRAE_CN_APP_ROOT",
                         "DE_UI_LOCALE")}
@@ -1144,6 +1148,28 @@ class DetectAndCliTestCase(unittest.TestCase):
         )
         os.environ["QODER_CN_APP_ROOT"] = str(
             self.tmp / "no-qoder-cn" / "app"
+        )
+        os.environ["QODER_IDE_CONFIG"] = str(self.tmp / "qd-ide" / "mcp.json")
+        os.environ["QODER_IDE_SETTINGS"] = str(
+            self.tmp / "qd-ide" / "settings.json"
+        )
+        os.environ["QODER_IDE_SKILLS_DIR"] = str(
+            self.tmp / "no-qoder-ide" / "skills"
+        )
+        os.environ["QODER_IDE_APP_ROOT"] = str(
+            self.tmp / "no-qoder-ide" / "app"
+        )
+        os.environ["QODER_CN_IDE_CONFIG"] = str(
+            self.tmp / "qd-cn-ide" / "mcp.json"
+        )
+        os.environ["QODER_CN_IDE_SETTINGS"] = str(
+            self.tmp / "qd-cn-ide" / "settings.json"
+        )
+        os.environ["QODER_CN_IDE_SKILLS_DIR"] = str(
+            self.tmp / "no-qoder-cn-ide" / "skills"
+        )
+        os.environ["QODER_CN_IDE_APP_ROOT"] = str(
+            self.tmp / "no-qoder-cn-ide" / "app"
         )
         os.environ["TRAE_CONFIG"] = str(self.tmp / "trae" / "mcp.json")
         os.environ["TRAE_SKILLS_DIR"] = str(
@@ -1257,6 +1283,10 @@ class DetectAndCliTestCase(unittest.TestCase):
                   "CODEBUDDY_SKILLS_DIR", "CODEBUDDY_CLI",
                   "QODER_CONFIG", "QODER_SKILLS_DIR", "QODER_APP_ROOT",
                   "QODER_CN_CONFIG", "QODER_CN_SKILLS_DIR", "QODER_CN_APP_ROOT",
+                  "QODER_IDE_CONFIG", "QODER_IDE_SETTINGS",
+                  "QODER_IDE_SKILLS_DIR", "QODER_IDE_APP_ROOT",
+                  "QODER_CN_IDE_CONFIG", "QODER_CN_IDE_SETTINGS",
+                  "QODER_CN_IDE_SKILLS_DIR", "QODER_CN_IDE_APP_ROOT",
                   "TRAE_CONFIG", "TRAE_SKILLS_DIR", "TRAE_APP_ROOT",
                   "TRAE_CN_CONFIG", "TRAE_CN_SKILLS_DIR", "TRAE_CN_APP_ROOT"):
             os.environ.pop(k, None)

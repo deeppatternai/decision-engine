@@ -432,6 +432,12 @@ fi
 # adapters with similar names. Report them explicitly when the current product
 # source does not recognize them so a partial install cannot look complete.
 unsupported_installed_hosts=""
+if regular_app_has_bundle_id "/Applications/CodeBuddy Studio.app" "com.codebuddy.ride" \
+    && ! line_list_contains "$source_detected_clients" "codebuddy-studio"; then
+  unsupported_installed_hosts="$(append_client_line \
+    "$unsupported_installed_hosts" \
+    "codebuddy-studio (CodeBuddy Studio.app): DE adapter unavailable")"
+fi
 if regular_app_has_bundle_id "/Applications/CodeBuddy.app" "com.tencent.codebuddy" \
     && ! line_list_contains "$source_detected_clients" "codebuddy"; then
   unsupported_installed_hosts="$(append_client_line \
@@ -810,9 +816,35 @@ detect_managed_clients() {
     'from installer import mcp_config; print("\n".join(mcp_config.detect_clients()))'
 }
 
+normalize_managed_clients_for_variant() {
+  local clients="$1" normalized="" client
+  if [ "$workbuddy_variant" != "ai" ] \
+      || ! line_list_contains "$clients" "workbuddy-ai"; then
+    printf '%s\n' "$clients"
+    return 0
+  fi
+  while IFS= read -r client; do
+    [ -n "$client" ] || continue
+    [ "$client" = "workbuddy" ] && continue
+    normalized="$(append_client_line "$normalized" "$client")"
+  done <<<"$clients"
+  printf '%s\n' "$normalized"
+}
+
 if ! managed_detected_clients="$(detect_managed_clients)"; then
   fail "could not detect hosts through the signed Decision Engine stable release"
 fi
+managed_skill_route_exclusions=""
+if [ "$workbuddy_variant" = "ai" ] \
+    && line_list_contains "$managed_detected_clients" "workbuddy-ai"; then
+  managed_skill_route_exclusions="workbuddy"
+fi
+managed_detected_clients="$(
+  normalize_managed_clients_for_variant "$managed_detected_clients"
+)"
+source_clients_for_catalog="$(
+  normalize_managed_clients_for_variant "$source_detected_clients"
+)"
 
 managed_mcp_supports_allow_unactivated() {
   run_managed_python -c \
@@ -924,7 +956,7 @@ while IFS= read -r source_client; do
   if ! printf '%s\n' "$managed_detected_clients" | grep -Fxq "$source_client"; then
     catalog_missing_clients="$(append_client_line "$catalog_missing_clients" "$source_client")"
   fi
-done <<<"$source_detected_clients"
+done <<<"$source_clients_for_catalog"
 if [ -n "$catalog_missing_clients" ]; then
   tty_print "Installed host adapters not present in signed stable $managed_version and therefore not configured:"
   printf '%s\n' "$catalog_missing_clients" >/dev/tty
@@ -973,7 +1005,16 @@ repair_managed_skill_routes() {
   # publishing the entries so every skill-capable detected host is usable in
   # both activated and unactivated installations.
   run_managed_python -c \
-    'from installer import config, install; result = install.repair_detected_skill_routes(config.managed_component_root("decision-engine")); raise SystemExit(1 if result.failed else 0)'
+    'import sys
+from installer import config, install
+
+excluded = frozenset(client for client in sys.argv[1].split(",") if client)
+result = install.repair_detected_skill_routes(
+    config.managed_component_root("decision-engine"),
+    excluded_clients=excluded,
+)
+raise SystemExit(1 if result.failed else 0)' \
+    "$managed_skill_route_exclusions"
 }
 
 wire_all_detected_hosts() {

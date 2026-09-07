@@ -2076,6 +2076,37 @@ def _merge_local_audit_tools(response: Dict[str, Any]) -> Dict[str, Any]:
     return response
 
 
+def _display_suppression_reason(
+    *,
+    lite_mode: bool,
+    offline_mode: bool,
+    identity_enabled: bool,
+    display_enabled: bool,
+) -> Optional[str]:
+    """Which conjunct is withholding the local display tools, or None if none is.
+
+    The four gates at the tools/list merge are ANDed and, until this existed, failed
+    IDENTICALLY from outside: open_ge simply was not in the list, with nothing said to
+    the user or the calling model. Diagnosing one cost a multi-session bisect against a
+    second machine. Order mirrors the merge condition so the reported cause is the one a
+    reader will find first at the call site. Pure and keyword-only so the call site can
+    stay a single expression and each branch is directly testable.
+    """
+
+    if lite_mode:
+        return "lite session (hub not activated); local display is not served"
+    if offline_mode:
+        return "offline session (hub unreachable); the artifact cannot be rendered"
+    if not identity_enabled:
+        return (
+            "host identity was enforced and did not match; the preceding "
+            "'host identity status=' line carries the reported= name to adapt to"
+        )
+    if not display_enabled:
+        return "transport capability gate has display disabled for this host"
+    return None
+
+
 def _display_capability_disabled() -> Dict[str, Any]:
     result = _tool_content(
         {"status": "failed", "reason": "capability-disabled"}
@@ -2783,13 +2814,25 @@ def serve(
                 resolved_client_host, raw_params
             )
             if identity.status != "matched":
+                reported = raw_params.get("clientInfo") if isinstance(
+                    raw_params, dict
+                ) else None
+                reported_name = (
+                    reported.get("name") if isinstance(reported, dict) else None
+                )
                 _log(
-                    "host identity status=%s diagnostic=%s declared=%s observed=%s"
+                    # The REPORTED name is the actionable part: an upstream host that
+                    # renames its connector id can only be re-adapted by someone who can
+                    # read back what it actually sent. It is a product identifier, never
+                    # user content.
+                    "host identity status=%s diagnostic=%s declared=%s observed=%s "
+                    "reported=%r"
                     % (
                         identity.status,
                         identity.diagnostic or "none",
                         identity.declared_host or "none",
                         identity.observed_host or "none",
+                        reported_name,
                     )
                 )
             identity_matches_initialize = (
@@ -3125,15 +3168,21 @@ def serve(
                     elif transport_gate.stage == CapabilityStage.READY_FOR_INITIALIZE:
                         transport_gate.fail_initialize()
                 if method == "tools/list":
-                    if mcp_config.host_adapter(resolved_client_host) is not None:
+                    adapter = mcp_config.host_adapter(resolved_client_host)
+                    if adapter is not None:
                         response = _merge_local_audit_tools(response)
-                    if (
-                        not lite_mode
-                        and not offline_mode
-                        and identity_optional_features_enabled
-                        and transport_gate.display_enabled
-                    ):
+                    withheld = _display_suppression_reason(
+                        lite_mode=lite_mode,
+                        offline_mode=offline_mode,
+                        identity_enabled=identity_optional_features_enabled,
+                        display_enabled=transport_gate.display_enabled,
+                    )
+                    if withheld is None:
                         response = _merge_display_tools(response)
+                    elif adapter is not None and adapter.local_display_tools:
+                        # Only hosts that SHOULD have had them: staying quiet here is
+                        # what made a missing open_ge undiagnosable from the outside.
+                        _log("display tools withheld: %s" % withheld)
                 elif method == "tools/call" and (
                     tool_name in _AUDIT_SUBMIT_TOOLS or local_fallback
                 ):

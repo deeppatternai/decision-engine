@@ -43,7 +43,10 @@ class QoderHostTestCase(unittest.TestCase):
         self.assertEqual(spec.host_family, "qoder")
         self.assertEqual(spec.config_renderer, "json-mcp-v1")
         self.assertEqual(spec.launch_policy, "absolute-bootstrap-v1")
-        self.assertEqual(spec.observed_client_aliases, frozenset({"mcphost"}))
+        self.assertEqual(
+            spec.observed_client_aliases,
+            frozenset({"mcphost", "qoder-desktop-mcp-host"}),
+        )
         self.assertTrue(spec.require_observed_identity)
         self.assertEqual(spec.skills_project_paths, (".qoder/skills",))
         self.assertEqual(spec.skill_delivery_mode, "managed-copy")

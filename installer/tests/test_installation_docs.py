@@ -7,6 +7,8 @@ from unittest import mock
 from installer.client_hosts.hosts import (
     qoder,
     qoder_cn,
+    qoder_cn_ide,
+    qoder_ide,
     trae,
     trae_cn,
     trae_work,
@@ -209,6 +211,8 @@ class InstallationDocsTestCase(unittest.TestCase):
 
     def test_documented_version_floors_come_from_host_modules(self):
         floors = {
+            "qoder-ide": qoder_ide.qoder_ide_common.MINIMUM_VERSION,
+            "qoder-cn-ide": qoder_cn_ide.qoder_ide_common.MINIMUM_VERSION,
             "trae-work": trae_work._MINIMUM_VERSION,
             "trae-work-cn": trae_work_cn._MINIMUM_VERSION,
             "workbuddy-ai": workbuddy_ai._MINIMUM_VERSION,

@@ -4,6 +4,9 @@ Two contracts are pinned here:
   * resolve_locale follows exactly one order — explicit → $DE_UI_LOCALE → system → en-US — and an
     unrecognized candidate is SKIPPED (never swallows the next one). detect_system_locale is
     monkeypatched to None so the default path does not follow the CI machine's locale.
+  * C / POSIX / C.UTF-8 are treated as "no language signal", not English.
+  * macOS UI language probing honors AppleLanguages first, then AppleLocale, so a Chinese desktop
+    still resolves zh-CN even when Codex launches Python with C.UTF-8 env vars.
   * the per-language files (client/locales/en_US.py, zh_CN.py) expose identical key sets for every
     table — the parity guard against a string being added to one language but not the other.
 """
@@ -12,6 +15,7 @@ from __future__ import annotations
 
 import unittest
 from unittest import mock
+import locale
 
 from client import i18n
 from client.locales import en_US, zh_CN
@@ -37,6 +41,11 @@ class ResolveLocaleTests(unittest.TestCase):
     def test_unrecognized_explicit_is_skipped_not_defaulted(self):
         # "fr-FR" is not en/zh; with system pinned off and no env, it must fall through to en-US.
         self.assertEqual(i18n.resolve_locale("fr-FR"), "en-US")
+
+    def test_c_like_locale_tags_are_skipped(self):
+        for value in ("C", "POSIX", "C.UTF-8"):
+            with self.subTest(value=value):
+                self.assertIsNone(i18n._normalize_tag(value))
 
     def test_env_used_when_no_explicit(self):
         with mock.patch.dict("os.environ", {"DE_UI_LOCALE": "zh-CN"}):
@@ -89,6 +98,45 @@ class DetectSystemLocaleTests(unittest.TestCase):
         for var in ("LC_ALL", "LC_CTYPE", "LANG", "LANGUAGE"):
             os.environ.pop(var, None)
 
+    def _defaults_run(self, **values):
+        def run(command, capture_output=True, text=True, check=False):
+            key = command[-1]
+            return mock.Mock(
+                returncode=0 if key in values else 1,
+                stdout=values.get(key, ""),
+            )
+
+        return run
+
+    def test_macos_apple_languages_beats_c_utf8_env(self):
+        # Codex may launch Python with C.UTF-8, but on macOS the real UI language is still the
+        # machine's AppleLanguages preference, not the process locale.
+        self._clear_env()
+        with mock.patch.object(i18n.sys, "platform", "darwin"), \
+             mock.patch.dict("os.environ", {"LC_ALL": "C.UTF-8", "LANG": "C.UTF-8"}), \
+             mock.patch.object(i18n.subprocess, "run", side_effect=self._defaults_run(
+                 AppleLanguages='(\n    "zh-Hans-CN",\n    "en-US"\n)\n',
+             )):
+            self.assertEqual(i18n.detect_system_locale(), "zh-CN")
+
+    def test_macos_apple_locale_fallback_is_normalized(self):
+        self._clear_env()
+        with mock.patch.object(i18n.sys, "platform", "darwin"), \
+             mock.patch.object(i18n.subprocess, "run", side_effect=self._defaults_run(
+                 AppleLocale="zh_CN\n",
+             )):
+            self.assertEqual(i18n.detect_system_locale(), "zh-CN")
+
+    def test_real_lc_all_language_wins_even_on_macos(self):
+        self._clear_env()
+        for lc_all, expected in (("en_US.UTF-8", "en-US"), ("zh_CN.UTF-8", "zh-CN")):
+            with self.subTest(lc_all=lc_all), \
+                 mock.patch.object(i18n.sys, "platform", "darwin"), \
+                 mock.patch.dict("os.environ", {"LC_ALL": lc_all}), \
+                 mock.patch.object(i18n.subprocess, "run") as run:
+                self.assertEqual(i18n.detect_system_locale(), expected)
+                run.assert_not_called()
+
     def test_windows_ui_language_beats_posix_lang(self):
         # REGRESSION: zh-CN Windows + Git Bash LANG=en_US.UTF-8 must resolve zh-CN, not en-US.
         self._clear_env()
@@ -119,6 +167,28 @@ class DetectSystemLocaleTests(unittest.TestCase):
         with mock.patch.object(i18n.os, "name", "posix"), \
              mock.patch.dict("os.environ", {"LANG": "en_US.UTF-8"}):
             self.assertEqual(i18n.detect_system_locale(), "en-US")
+
+    def test_linux_c_utf8_env_does_not_become_english(self):
+        # Linux / WSL: C.UTF-8 is still "no language signal", so if every locale env is C-like the
+        # resolver must stop before the stdlib fallback can manufacture English.
+        self._clear_env()
+        with mock.patch.object(i18n.os, "name", "posix"), \
+             mock.patch.dict("os.environ", {
+                 "LC_ALL": "C.UTF-8",
+                 "LC_CTYPE": "C.UTF-8",
+                 "LANG": "C.UTF-8",
+                 "LANGUAGE": "C.UTF-8",
+             }), \
+             mock.patch.object(locale, "getlocale", return_value=("en_US", "UTF-8")) as getlocale:
+            self.assertIsNone(i18n.detect_system_locale())
+            getlocale.assert_not_called()
+
+    def test_linux_language_list_skips_a_c_like_lead_in(self):
+        # LANGUAGE is a priority list; a C-like first entry must not block a later supported tag.
+        self._clear_env()
+        with mock.patch.object(i18n.os, "name", "posix"), \
+             mock.patch.dict("os.environ", {"LANGUAGE": "C.UTF-8:zh_CN.UTF-8"}):
+            self.assertEqual(i18n.detect_system_locale(), "zh-CN")
 
     def test_lc_all_overrides_windows_ui(self):
         # LC_ALL is the deliberate "override everything" hammer (Git Bash never injects it) and must

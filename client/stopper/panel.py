@@ -249,6 +249,13 @@ def _local_advisory_line(run: Dict[str, Any], now: float, frozen: Dict[str, floa
 
 
 def depth_line_text(run: Dict[str, Any], now: float, frozen: Dict[str, float]) -> str:
+    collapsed = _collapsed_depth_line_text(run, now, frozen)
+    debug_lines = _debug_auditor_lines(run, now)
+    if debug_lines:
+        return collapsed + chr(10) + chr(10).join(debug_lines)
+    return collapsed
+
+def _collapsed_depth_line_text(run: Dict[str, Any], now: float, frozen: Dict[str, float]) -> str:
     if run.get("local"):
         return _local_advisory_line(run, now, frozen)
     depth = depth_label(run)
@@ -265,6 +272,16 @@ def depth_line_text(run: Dict[str, Any], now: float, frozen: Dict[str, float]) -
         return strings["hub_queued"] % depth
     return strings["hub"].get(status, strings["hub"]["reviewing"]) % (depth, elapsed)
 
+
+def _debug_auditor_lines(run: Dict[str, Any], now: float) -> List[str]:
+    if run.get("debug_authorized") is not True:
+        return []
+    auditors = run.get("auditors")
+    if not isinstance(auditors, list) or not auditors:
+        return []
+    if any(not isinstance(auditor, dict) for auditor in auditors):
+        return []
+    return [_auditor_display_text(auditor, now) for auditor in auditors]
 
 def depth_line_color(run: Dict[str, Any], now: Optional[float] = None) -> str:
     if run.get("local"):
@@ -1129,5 +1146,41 @@ def main(argv: Optional[List[str]] = None) -> int:
     return 0
 
 
+def _auditor_model_label(auditor: Dict[str, Any]) -> str:
+    return (
+        str(auditor.get("model_id") or "").strip()
+        or str(auditor.get("model_alias") or "").strip()
+        or str(auditor.get("model") or "").strip()
+        or str(auditor.get("provider") or "").strip()
+        or "auditor"
+    )
+
+
+def _auditor_elapsed(auditor: Dict[str, Any], now: float) -> str:
+    duration_ms = _num(auditor.get("duration_ms"))
+    if duration_ms > 0:
+        return elapsed_string(duration_ms / 1000.0)
+    started_at = _num(auditor.get("started_at"))
+    if started_at > 0:
+        return elapsed_string(max(0.0, now - started_at))
+    return "0s"
+
+
+def _auditor_display_text(auditor: Dict[str, Any], now: float) -> str:
+    model = _auditor_model_label(auditor)
+    status = str(auditor.get("status") or "pending").lower()
+    if status == "completed":
+        elapsed = _auditor_elapsed(auditor, now)
+        return model + " · completed · " + elapsed + " ✓"
+    if status == "failed":
+        return model + " · failed"
+    if status == "running":
+        elapsed = _auditor_elapsed(auditor, now)
+        return model + " · running · " + elapsed
+    return model + " · " + status
+
+
 if __name__ == "__main__":
     raise SystemExit(main())
+
+

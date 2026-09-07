@@ -39,7 +39,9 @@ The installer accepts these exact client IDs and paths:
 | Codex | `codex` | `~/.codex/config.toml` | `~/.codex/skills` | supported platforms on builds that load global Skills |
 | Cursor | `cursor` | `~/.cursor/mcp.json` | `~/.cursor/skills` | supported platforms |
 | Alibaba Qoder Desktop | `qoder` | `~/.qoder/mcp.json` (Windows); `~/.qoder/settings.json` (macOS) | `~/.qoder/skills` | Windows Desktop 1.106.3+; macOS Qoder.app 0.1.3+ |
-| Alibaba Qoder CN Desktop | `qoder-cn` | `~/.qoder-cn/settings.json` | `~/.qoder-cn/skills` | macOS Qoder CN.app 0.1.4 only; Qoder CN IDE is a separate unsupported product |
+| Alibaba Qoder CN Desktop | `qoder-cn` | `~/.qoder-cn/settings.json` | `~/.qoder-cn/skills` | macOS Qoder CN.app 0.1.4 only |
+| Alibaba Qoder IDE | `qoder-ide` | `~/.qoder/mcp.json` | `~/.qoder/skills` | macOS Qoder IDE.app 1.106.3+; shares family Skills and hook with Qoder Desktop |
+| Alibaba Qoder CN IDE | `qoder-cn-ide` | `~/.qoder-cn/mcp.json` | `~/.qoder-cn/skills` | macOS Qoder CN IDE.app 1.106.3+; shares family Skills and hook with Qoder CN Desktop |
 | TRAE Desktop | `trae` | `~/Library/Application Support/Trae/User/mcp.json` | `~/.trae/skills` | macOS Trae.app 3.5.81 |
 | TRAE Work | `trae-work` | Windows: `%APPDATA%/TRAE SOLO/User/mcp.json`<br>macOS: `~/Library/Application Support/TRAE SOLO/User/mcp.json` | `~/.trae/skills` | Windows and macOS Desktop 0.1.48+ |
 | TRAE CN Desktop | `trae-cn` | `~/Library/Application Support/Trae CN/User/mcp.json` | `~/.trae-cn/skills` | macOS Trae CN.app 3.3.95 |

@@ -523,6 +523,8 @@ def active_run_payload(run: Dict[str, Any]) -> Dict[str, Any]:
         "completed_at": run.get("completed_at"),
         "updated_at": now,
     }
+    if "debug_authorized" in run:
+        payload["debug_authorized"] = run.get("debug_authorized")
     if payload["local"]:
         payload["local_surface"] = run.get("local_surface", "")
         payload["fallback_mode"] = run.get("fallback_mode", "session-llm")

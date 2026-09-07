@@ -67,6 +67,8 @@ class QoderAuditPromptHookTests(unittest.TestCase):
         )
         self.assertIn("Do not invoke or invent an AQG MCP tool", context)
         self.assertIn("only permitted MCP target names", context)
+        self.assertIn("Attempt completion exactly once", context)
+        self.assertIn("If completion is rejected or fails, stop", context)
 
     def test_non_audit_prompts_and_invalid_events_add_no_context(self):
         for payload in (

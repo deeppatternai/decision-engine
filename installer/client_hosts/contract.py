@@ -5,7 +5,7 @@ from __future__ import annotations
 import re
 from dataclasses import dataclass
 from pathlib import Path, PurePosixPath, PureWindowsPath
-from typing import Callable, FrozenSet, Mapping, Optional, Tuple
+from typing import Any, Callable, FrozenSet, Mapping, Optional, Tuple
 
 from installer.client_hosts.renderers import renderer_format, renderer_writer
 from installer.client_hosts.launchers import registered_launch_policies
@@ -48,6 +48,7 @@ _SUPPORTED_ONBOARDING_EVIDENCE = frozenset({"presence", "skill"})
 _SUPPORTED_ENTRY_OWNERSHIP_POLICIES = frozenset(
     {"replace-existing-v1", "replace-marked-de-v1"}
 )
+_SUPPORTED_HOST_OWNED_ENTRY_FIELDS = frozenset({"disabled"})
 
 
 @dataclass(frozen=True)
@@ -95,6 +96,7 @@ class AgentHostSpec:
     # probes are retired; validation below rejects any new use.
     onboarding_routing_probe: Optional[Callable[[], bool]] = None
     entry_ownership_policy: str = "replace-existing-v1"
+    host_owned_entry_fields: FrozenSet[str] = frozenset()
     config_write_guard_probe: Optional[Callable[[], Optional[str]]] = None
     installation_probe: Optional[Callable[[], bool]] = None
     post_mcp_write_notice: Optional[Callable[[], str]] = None
@@ -108,6 +110,9 @@ class AgentHostSpec:
     webview_render_guard_probe: Optional[Callable[[], Optional[str]]] = None
     json_config_transform: Optional[Callable[[dict, dict], bool]] = None
     unverified_lite_stopper: bool = False
+    post_mcp_write: Optional[
+        Callable[[dict[str, Any], bool], dict[str, object]]
+    ] = None
 
 
 # Compatibility for callers/tests that imported the pre-WP1 type name.
@@ -197,6 +202,8 @@ def validate_host_specs(specs: Mapping[str, AgentHostSpec]) -> None:
             and not callable(spec.json_config_transform)
         ):
             _invalid_host_spec(client, "JSON config transform is invalid")
+        if spec.post_mcp_write is not None and not callable(spec.post_mcp_write):
+            _invalid_host_spec(client, "post-MCP-write companion is invalid")
         if (
             spec.config_write_guard is not None
             and spec.config_write_guard_probe is not None
@@ -223,6 +230,16 @@ def validate_host_specs(specs: Mapping[str, AgentHostSpec]) -> None:
             _invalid_host_spec(client, "delivers skills but declares no onboarding evidence")
         if spec.entry_ownership_policy not in _SUPPORTED_ENTRY_OWNERSHIP_POLICIES:
             _invalid_host_spec(client, "entry ownership policy is unsupported")
+        if (
+            not spec.host_owned_entry_fields.issubset(
+                _SUPPORTED_HOST_OWNED_ENTRY_FIELDS
+            )
+            or spec.host_owned_entry_fields.intersection(
+                {"command", "args", "env", "cwd", "type"}
+            )
+            or (spec.host_owned_entry_fields and spec.config_format != "json")
+        ):
+            _invalid_host_spec(client, "host-owned entry fields are invalid")
         if renderer_writer(spec.config_renderer) != "json-merge-v1" and (
             spec.config_write_guard is not None
             or spec.config_write_guard_probe is not None

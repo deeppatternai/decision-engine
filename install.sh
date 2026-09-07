@@ -379,7 +379,7 @@ install_de_dev_mode() {
     echo "==> Wiring the local decision-engine MCP into your agent(s) (--dev-root ${repo_root}):"
     ( cd "${repo_root}" && run_python -m installer.mcp_config --write --dev-root "${repo_root}" ) \
       || echo "install: NOTE — auto-wire found no agent or hit an error; run" \
-              "'${PYTHON_BIN} -m installer.mcp_config --write --dev-root ${repo_root} --client <claude-code|claude-desktop|codebuddy|codex|cursor|qoder|qoder-cn|trae|trae-work|trae-cn|trae-work-cn|workbuddy|workbuddy-ai>'" \
+              "'${PYTHON_BIN} -m installer.mcp_config --write --dev-root ${repo_root} --client <claude-code|claude-desktop|codebuddy|codex|cursor|qoder|qoder-cn|qoder-ide|qoder-cn-ide|trae|trae-work|trae-cn|trae-work-cn|workbuddy|workbuddy-ai>'" \
               "or see installer/README.md." >&2
 
     # Current Codex releases route through skills.  This is a one-way migration only: it removes

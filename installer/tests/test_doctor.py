@@ -83,6 +83,26 @@ class CheckTests(unittest.TestCase):
                     / "no-workbuddy"
                     / "app"
                 ),
+                "WORKBUDDY_AI_CONFIG": str(
+                    Path(self._host_isolation.name)
+                    / "no-workbuddy-ai"
+                    / "mcp.json"
+                ),
+                "WORKBUDDY_AI_SETTINGS": str(
+                    Path(self._host_isolation.name)
+                    / "no-workbuddy-ai"
+                    / "settings.json"
+                ),
+                "WORKBUDDY_AI_SKILLS_DIR": str(
+                    Path(self._host_isolation.name)
+                    / "no-workbuddy-ai"
+                    / "skills"
+                ),
+                "WORKBUDDY_AI_APP_ROOT": str(
+                    Path(self._host_isolation.name)
+                    / "no-workbuddy-ai"
+                    / "app"
+                ),
                 "QODER_CONFIG": str(
                     Path(self._host_isolation.name) / "no-qoder" / "mcp.json"
                 ),
@@ -100,6 +120,30 @@ class CheckTests(unittest.TestCase):
                 ),
                 "QODER_CN_APP_ROOT": str(
                     Path(self._host_isolation.name) / "no-qoder-cn" / "app"
+                ),
+                "QODER_IDE_CONFIG": str(
+                    Path(self._host_isolation.name) / "no-qoder-ide" / "mcp.json"
+                ),
+                "QODER_IDE_SETTINGS": str(
+                    Path(self._host_isolation.name) / "no-qoder-ide" / "settings.json"
+                ),
+                "QODER_IDE_SKILLS_DIR": str(
+                    Path(self._host_isolation.name) / "no-qoder-ide" / "skills"
+                ),
+                "QODER_IDE_APP_ROOT": str(
+                    Path(self._host_isolation.name) / "no-qoder-ide" / "app"
+                ),
+                "QODER_CN_IDE_CONFIG": str(
+                    Path(self._host_isolation.name) / "no-qoder-cn-ide" / "mcp.json"
+                ),
+                "QODER_CN_IDE_SETTINGS": str(
+                    Path(self._host_isolation.name) / "no-qoder-cn-ide" / "settings.json"
+                ),
+                "QODER_CN_IDE_SKILLS_DIR": str(
+                    Path(self._host_isolation.name) / "no-qoder-cn-ide" / "skills"
+                ),
+                "QODER_CN_IDE_APP_ROOT": str(
+                    Path(self._host_isolation.name) / "no-qoder-cn-ide" / "app"
                 ),
                 "TRAE_CONFIG": str(
                     Path(self._host_isolation.name) / "no-trae" / "mcp.json"

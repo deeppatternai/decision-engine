@@ -33,6 +33,13 @@ def _workbuddy_ai_skills_path() -> Path:
     return Path.home() / ".workbuddy-ai" / "skills"
 
 
+def _workbuddy_ai_settings_path() -> Path:
+    configured = os.getenv("WORKBUDDY_AI_SETTINGS")
+    if configured and configured.strip():
+        return Path(configured).expanduser()
+    return Path.home() / ".workbuddy-ai" / "settings.json"
+
+
 def _workbuddy_ai_product_metadata():
     return bounded_plist_metadata(
         _workbuddy_ai_app_root() / "Contents" / "Info.plist",
@@ -97,6 +104,31 @@ def _workbuddy_ai_config_write_guard():
     return None
 
 
+def _workbuddy_ai_post_mcp_write(
+    entry: dict[str, object], dry_run: bool
+) -> dict[str, object]:
+    from installer.client_hosts.hosts import workbuddy_ai_prompt_hook
+
+    environment = entry.get("env")
+    command = entry.get("command")
+    de_root = environment.get("PYTHONPATH") if isinstance(environment, dict) else None
+    if (
+        not isinstance(command, str)
+        or not command.strip()
+        or not isinstance(de_root, str)
+        or not Path(de_root).is_absolute()
+    ):
+        raise ShellError(
+            "rendered WorkBuddy AI entry cannot identify its DE hook runtime"
+        )
+    return workbuddy_ai_prompt_hook.install_hook(
+        _workbuddy_ai_settings_path(),
+        de_root=Path(de_root),
+        python_executable=command,
+        dry_run=dry_run,
+    )
+
+
 WORKBUDDY_AI = AgentHostSpec(
     id="workbuddy-ai",
     transport="stdio",
@@ -136,7 +168,9 @@ WORKBUDDY_AI = AgentHostSpec(
     doctor_capabilities=frozenset({"mcp-entry", "skills"}),
     optional_features=frozenset({"local-display", "audit-stop-panel"}),
     onboarding_evidence=("skill",),
+    host_owned_entry_fields=frozenset({"disabled"}),
     unverified_lite_stopper=True,
+    post_mcp_write=_workbuddy_ai_post_mcp_write,
 )
 
 HOST_SPECS = (WORKBUDDY_AI,)

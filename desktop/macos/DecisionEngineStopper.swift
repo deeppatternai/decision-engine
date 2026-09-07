@@ -595,6 +595,7 @@ final class DecisionEngineStopper: NSObject, NSApplicationDelegate {
                 updated["title"] = payload["title"] as? String ?? updated["title"] ?? ""
                 updated["profile"] = payload["profile"] as? String ?? updated["profile"] ?? ""
                 updated["auditors"] = payload["auditors"] as? [[String: Any]] ?? updated["auditors"] ?? []
+                updated["debug_authorized"] = payload["debug_authorized"] as? Bool ?? false
                 // Carry the server's run timestamps forward — the live elapsed clock reads `started_at`,
                 // so dropping it here (as this poll used to) froze the panel timer at 0s. A JSON null
                 // arrives as NSNull, which must NOT overwrite a value we already have; only copy a real
@@ -928,7 +929,8 @@ final class DecisionEngineStopper: NSObject, NSApplicationDelegate {
         // One collapsed depth line (title + depth/status/elapsed) — fixed height, independent of the
         // number of voices (which is no longer rendered). +20 when the audit ID label is shown
         // (title + ID + depth line = 3 stacked labels instead of 2 — see makeRunDetailStack).
-        return auditIdText(run).isEmpty ? 72 : 92
+        let debugRows = debugAuditorRows(run).count
+        return (auditIdText(run).isEmpty ? 72 : 92) + CGFloat(debugRows) * 18
     }
 
     private func emptyRow() -> NSView {
@@ -1020,6 +1022,11 @@ final class DecisionEngineStopper: NSObject, NSApplicationDelegate {
         let label = auditorLabel(text: "· " + depthLineText(run), color: depthLineColor(run))
         stack.addArrangedSubview(label)
         label.widthAnchor.constraint(lessThanOrEqualTo: stack.widthAnchor).isActive = true
+        for rowText in debugAuditorRows(run) {
+            let rowLabel = auditorLabel(text: rowText, color: paletteText)
+            stack.addArrangedSubview(rowLabel)
+            rowLabel.widthAnchor.constraint(lessThanOrEqualTo: stack.widthAnchor).isActive = true
+        }
         return stack
     }
 
@@ -1311,6 +1318,13 @@ final class DecisionEngineStopper: NSObject, NSApplicationDelegate {
             return formatElapsed(max(0, Date().timeIntervalSince1970 - startedAt))
         }
         return "0s"
+    }
+
+    private func debugAuditorRows(_ run: [String: Any]) -> [String] {
+        guard (run["debug_authorized"] as? Bool) == true else { return [] }
+        let auditors = (run["auditors"] as? [[String: Any]]) ?? []
+        if auditors.isEmpty { return [] }
+        return auditors.map { auditorDisplayText($0) }
     }
 
     private func auditorColor(_ auditor: [String: Any]) -> NSColor {

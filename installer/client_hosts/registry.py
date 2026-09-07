@@ -12,6 +12,10 @@ from installer.client_hosts.hosts.codex import HOST_SPECS as CODEX_HOST_SPECS
 from installer.client_hosts.hosts.cursor import HOST_SPECS as CURSOR_HOST_SPECS
 from installer.client_hosts.hosts.qoder import HOST_SPECS as QODER_HOST_SPECS
 from installer.client_hosts.hosts.qoder_cn import HOST_SPECS as QODER_CN_HOST_SPECS
+from installer.client_hosts.hosts.qoder_cn_ide import (
+    HOST_SPECS as QODER_CN_IDE_HOST_SPECS,
+)
+from installer.client_hosts.hosts.qoder_ide import HOST_SPECS as QODER_IDE_HOST_SPECS
 from installer.client_hosts.hosts.trae import HOST_SPECS as TRAE_HOST_SPECS
 from installer.client_hosts.hosts.trae_cn import HOST_SPECS as TRAE_CN_HOST_SPECS
 from installer.client_hosts.hosts.trae_work import HOST_SPECS as TRAE_WORK_HOST_SPECS
@@ -45,6 +49,8 @@ CLIENT_SPECS: Mapping[str, AgentHostSpec] = MappingProxyType(
             CURSOR_HOST_SPECS,
             QODER_HOST_SPECS,
             QODER_CN_HOST_SPECS,
+            QODER_IDE_HOST_SPECS,
+            QODER_CN_IDE_HOST_SPECS,
             TRAE_HOST_SPECS,
             TRAE_WORK_HOST_SPECS,
             TRAE_CN_HOST_SPECS,

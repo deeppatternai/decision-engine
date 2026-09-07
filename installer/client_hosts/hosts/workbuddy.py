@@ -280,8 +280,35 @@ WORKBUDDY = AgentHostSpec(
     entry_ownership_policy="replace-marked-de-v1",
     config_write_guard_probe=lambda: _workbuddy_config_write_guard(),
     observed_client_aliases=frozenset({"connector:custom-mcp:decision-engine"}),
-    require_observed_identity=True,
-    detection="file-or-parent",
+    # Observed for diagnostics, never enforced. WorkBuddy composes clientInfo.name
+    # from its OWN internal connector id, which embeds the key we registered the
+    # server under ("connector:custom-mcp:<key>") -- a private string we do not
+    # control and that already differs across its builds. Enforcing it silently
+    # stripped open_ge, open_ge_popup, open_db_board and db_board_result from real
+    # users whenever upstream renamed it, with no signal to the user or the calling
+    # model.
+    #
+    # Premise, explicit because the whole argument rests on it: this spec is reached
+    # only over local stdio, spawned by the WorkBuddy process on the user's own
+    # machine (transport="stdio" above; there is no remote or relayed connector path
+    # to this host). Under that premise the check bought no security -- the alias is
+    # a plaintext constant in a public repo, so any peer able to spawn this process
+    # can replay it, and such a peer already holds user-level code execution. Should
+    # a non-local transport ever reach this host, revisit this and gate by transport
+    # instead.
+    #
+    # Blast radius: identity enforcement gated three capability lanes at once
+    # (shim.py closes display, followup and stopper together on a mismatch), so this
+    # also ungates the audit stop panel. That panel only cancels the caller's own
+    # queued audits and the four display tools take run_id/title/context, so no
+    # approval or credential surface widens; popup_followup is already False here.
+    #
+    # Matches claude-code, claude-desktop, codex and the four trae hosts -- 7 of the
+    # 15 registered hosts already exposed these same display tools without identity
+    # enforcement before this change. Whether a native window can actually open
+    # stays with client/popup/backend.py's sandbox and GUI-session probes.
+    require_observed_identity=False,
+    detection="installation-probe",
     installation_probe=lambda: _workbuddy_installed(),
     post_mcp_write_notice=_workbuddy_post_mcp_write_notice,
     webview_render_guard_probe=_workbuddy_webview_render_guard,

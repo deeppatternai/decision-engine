@@ -179,7 +179,9 @@ QODER = AgentHostSpec(
     config_renderer="json-mcp-v1",
     entry_ownership_policy="replace-marked-de-v1",
     config_write_guard_probe=lambda: _qoder_config_write_guard(),
-    observed_client_aliases=frozenset({"mcphost"}),
+    observed_client_aliases=frozenset(
+        {"mcphost", "qoder-desktop-mcp-host"}
+    ),
     require_observed_identity=True,
     detection="file-or-parent",
     installation_probe=lambda: _qoder_installed(),

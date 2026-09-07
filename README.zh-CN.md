@@ -161,6 +161,8 @@ AQG 是本地、无需账户的工程纪律工具包。安装其中任一个，�
 | Cursor | `cursor` | MCP、Skills、原生窗口、弹窗右侧追问、Stop Panel |
 | 阿里 Qoder Desktop | `qoder` | Windows Desktop 1.106.3+；macOS Qoder.app 0.1.3+；MCP、Skills、原生窗口、弹窗右侧追问、Stop Panel |
 | 阿里 Qoder CN Desktop | `qoder-cn` | macOS Qoder CN.app 0.1.4；MCP、Skills、原生窗口、弹窗右侧追问、Stop Panel |
+| 阿里 Qoder IDE | `qoder-ide` | macOS Qoder IDE.app 1.106.3+；独立 MCP 身份、共享 Qoder Skills 与审计 hook、原生窗口、弹窗右侧追问、Stop Panel |
+| 阿里 Qoder CN IDE | `qoder-cn-ide` | macOS Qoder CN IDE.app 1.106.3+；独立 MCP 身份、共享 Qoder CN Skills 与审计 hook、原生窗口、弹窗右侧追问、Stop Panel |
 | TRAE Desktop | `trae` | macOS Trae.app 3.5.81；MCP、Skills、原生窗口、弹窗右侧追问、Stop Panel |
 | TRAE Work | `trae-work` | Windows and macOS Desktop 0.1.48+；MCP、Skills、原生窗口、弹窗右侧追问、Stop Panel |
 | TRAE CN Desktop | `trae-cn` | macOS Trae CN.app 3.3.95；MCP、Skills、原生窗口、弹窗右侧追问、Stop Panel |

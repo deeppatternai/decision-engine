@@ -501,6 +501,8 @@ class CursorConfigTestCase(unittest.TestCase):
                 "cursor",
                 "qoder",
                 "qoder-cn",
+                "qoder-ide",
+                "qoder-cn-ide",
                 "trae",
                 "trae-work",
                 "trae-cn",
@@ -578,7 +580,8 @@ class CursorConfigTestCase(unittest.TestCase):
             spec.observed_client_aliases,
             frozenset({"connector:custom-mcp:decision-engine"}),
         )
-        self.assertTrue(spec.require_observed_identity)
+        # Observed for diagnostics, never enforced -- see the spec's rationale.
+        self.assertFalse(spec.require_observed_identity)
         self.assertEqual(spec.onboarding_evidence, ("skill",))
         self.assertEqual(spec.skills_project_paths, ())
         self.assertEqual(spec.skill_delivery_mode, "managed-copy")
@@ -1036,6 +1039,24 @@ class CursorConfigTestCase(unittest.TestCase):
                 ),
             ):
                 self.assertTrue(workbuddy._workbuddy_skills_in_use())
+
+    def test_workbuddy_detection_ignores_stale_profile_without_desktop_app(self):
+        from installer.client_hosts.hosts import workbuddy
+
+        with tempfile.TemporaryDirectory() as tmp:
+            root = Path(tmp)
+            config = root / ".workbuddy" / "mcp.json"
+            config.parent.mkdir(parents=True)
+            config.write_text("{}\n", encoding="utf-8")
+            with mock.patch.object(workbuddy.sys, "platform", "darwin"), mock.patch.dict(
+                os.environ,
+                {
+                    "WORKBUDDY_APP_ROOT": str(root / "missing.app"),
+                    "WORKBUDDY_CONFIG": str(config),
+                },
+                clear=False,
+            ):
+                self.assertFalse(mcp_config.client_present("workbuddy"))
 
     def test_workbuddy_doctor_route_requires_its_mcp_entry(self):
         with tempfile.TemporaryDirectory() as tmp:
@@ -2326,6 +2347,36 @@ assert mcp_config.CLIENT_SPECS == registry.CLIENT_SPECS
                     {"local-display", "audit-stop-panel"}
                 ),
             },
+            "qoder-ide": {
+                "config_renderer": "json-mcp-v1",
+                "skills_project_paths": (".qoder/skills",),
+                "skill_delivery_mode": "managed-copy",
+                "routing_kind": "skill",
+                "launcher_capabilities": frozenset(
+                    {"core-mcp", "local-display", "audit-stop-panel"}
+                ),
+                "doctor_capabilities": frozenset(
+                    {"mcp-entry", "skills", "workspace-shadow"}
+                ),
+                "optional_features": frozenset(
+                    {"local-display", "audit-stop-panel"}
+                ),
+            },
+            "qoder-cn-ide": {
+                "config_renderer": "json-mcp-v1",
+                "skills_project_paths": (".qoder-cn/skills",),
+                "skill_delivery_mode": "managed-copy",
+                "routing_kind": "skill",
+                "launcher_capabilities": frozenset(
+                    {"core-mcp", "local-display", "audit-stop-panel"}
+                ),
+                "doctor_capabilities": frozenset(
+                    {"mcp-entry", "skills", "workspace-shadow"}
+                ),
+                "optional_features": frozenset(
+                    {"local-display", "audit-stop-panel"}
+                ),
+            },
             "trae": {
                 "config_renderer": "json-mcp-v1",
                 "skills_project_paths": (".trae/skills",),
@@ -2433,6 +2484,8 @@ assert mcp_config.CLIENT_SPECS == registry.CLIENT_SPECS
                 "cursor",
                 "qoder",
                 "qoder-cn",
+                "qoder-ide",
+                "qoder-cn-ide",
                 "trae",
                 "trae-work",
                 "trae-cn",
@@ -2644,6 +2697,8 @@ tool_timeout_sec = 660
                 "cursor",
                 "qoder",
                 "qoder-cn",
+                "qoder-ide",
+                "qoder-cn-ide",
                 "trae",
                 "trae-work",
                 "trae-cn",
@@ -2672,11 +2727,13 @@ tool_timeout_sec = 660
                 "cursor": True,
                 "qoder": True,
                 "qoder-cn": True,
+                "qoder-ide": True,
+                "qoder-cn-ide": True,
                 "trae": False,
                 "trae-work": False,
                 "trae-cn": False,
                 "trae-work-cn": False,
-                "workbuddy": True,
+                "workbuddy": False,
                 "workbuddy-ai": True,
             },
         )

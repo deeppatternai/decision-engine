@@ -30,7 +30,7 @@ from urllib.request import HTTPSHandler
 
 from client import runner
 from client.http_safety import NoRedirect
-from installer import config, shim
+from installer import config, mcp_config, shim
 from installer.client_host_runtime import CapabilityStage, PreflightResult, TransportCapabilityGate
 
 
@@ -734,6 +734,211 @@ class ShimServeTestCase(unittest.TestCase):
         self.assertFalse(gate.followup_enabled)
         self.assertTrue(gate.stopper_enabled)
 
+    def test_workbuddy_unrecognised_client_name_still_enables_display(self):
+        """WorkBuddy composes clientInfo.name from its own internal connector id, so a
+        rename upstream must not silently strip the popup tools (covers: R1)."""
+        for observed in (
+            "custom-mcp:decision-engine",     # same id, no `connector:` prefix
+            "workbuddy",
+            "connector:custom-mcp:de",        # server registered under another key
+        ):
+            with self.subTest(observed=observed):
+                fwd = FakeForwarder(
+                    responses={
+                        "initialize": {
+                            "jsonrpc": "2.0",
+                            "id": 1,
+                            "result": {"serverInfo": {"name": "de"}},
+                        },
+                        "tools/list": {
+                            "jsonrpc": "2.0",
+                            "id": 2,
+                            "result": {"tools": []},
+                        },
+                    }
+                )
+                initialize = {
+                    "jsonrpc": "2.0",
+                    "id": 1,
+                    "method": "initialize",
+                    "params": {
+                        "clientInfo": {"name": observed, "version": "1.0.0"}
+                    },
+                }
+                tools_list = {
+                    "jsonrpc": "2.0",
+                    "id": 2,
+                    "method": "tools/list",
+                    "params": {},
+                }
+
+                out = _run(
+                    fwd,
+                    [json.dumps(initialize), json.dumps(tools_list)],
+                    client_host="workbuddy",
+                )
+
+                names = {tool["name"] for tool in out[1]["result"]["tools"]}
+                self.assertTrue(
+                    {"open_ge", "open_ge_popup", "open_db_board", "db_board_result"}
+                    <= names,
+                    "display tools stripped for clientInfo.name=%r" % observed,
+                )
+
+    def test_enforcing_host_still_strips_display_on_unrecognised_client_name(self):
+        """Counterpart to the workbuddy case: dropping enforcement for ONE host must
+        not disable the mechanism for the hosts that still declare it. Without this,
+        deleting the whole `if identity_enforced` branch would keep the suite green."""
+        self.assertTrue(
+            mcp_config.CLIENT_SPECS["cursor"].require_observed_identity,
+            "cursor must still enforce for this counterpart test to mean anything",
+        )
+        fwd = FakeForwarder(
+            responses={
+                "initialize": {
+                    "jsonrpc": "2.0",
+                    "id": 1,
+                    "result": {"serverInfo": {"name": "de"}},
+                },
+                "tools/list": {
+                    "jsonrpc": "2.0",
+                    "id": 2,
+                    "result": {"tools": []},
+                },
+            }
+        )
+        initialize = {
+            "jsonrpc": "2.0",
+            "id": 1,
+            "method": "initialize",
+            "params": {
+                "clientInfo": {"name": "not-cursor-at-all", "version": "1.0.0"}
+            },
+        }
+        tools_list = {
+            "jsonrpc": "2.0",
+            "id": 2,
+            "method": "tools/list",
+            "params": {},
+        }
+
+        out = _run(
+            fwd,
+            [json.dumps(initialize), json.dumps(tools_list)],
+            client_host="cursor",
+        )
+
+        names = {tool["name"] for tool in out[1]["result"]["tools"]}
+        self.assertFalse(
+            {"open_ge", "open_ge_popup", "open_db_board", "db_board_result"} & names,
+            "an enforcing host must not receive display tools on an identity mismatch",
+        )
+
+    def test_display_suppression_reason_names_the_failing_condition(self):
+        """Each of the four conjuncts that can hide the display tools must be
+        distinguishable by name, so a missing open_ge is diagnosable (covers: R3)."""
+        self.assertIsNone(
+            shim._display_suppression_reason(
+                lite_mode=False,
+                offline_mode=False,
+                identity_enabled=True,
+                display_enabled=True,
+            )
+        )
+        cases = (
+            ({"lite_mode": True}, "lite"),
+            ({"offline_mode": True}, "offline"),
+            ({"identity_enabled": False}, "identity"),
+            ({"display_enabled": False}, "transport"),
+        )
+        for override, expected_token in cases:
+            with self.subTest(**override):
+                kwargs = {
+                    "lite_mode": False,
+                    "offline_mode": False,
+                    "identity_enabled": True,
+                    "display_enabled": True,
+                }
+                kwargs.update(override)
+                reason = shim._display_suppression_reason(**kwargs)
+                self.assertIsNotNone(reason)
+                self.assertIn(expected_token, reason)
+
+    def test_suppressed_display_tools_are_reported_on_stderr(self):
+        """A display-capable host that receives no display tools must say why
+        exactly once, instead of failing silently (covers: R3)."""
+        fwd = FakeForwarder(
+            responses={
+                "initialize": {
+                    "jsonrpc": "2.0",
+                    "id": 1,
+                    "result": {"serverInfo": {"name": "de"}},
+                },
+                "tools/list": {
+                    "jsonrpc": "2.0",
+                    "id": 2,
+                    "result": {"tools": []},
+                },
+            }
+        )
+        initialize = {
+            "jsonrpc": "2.0",
+            "id": 1,
+            "method": "initialize",
+            "params": {
+                "clientInfo": {"name": "definitely-not-cursor", "version": "1.0.0"}
+            },
+        }
+        tools_list = {
+            "jsonrpc": "2.0",
+            "id": 2,
+            "method": "tools/list",
+            "params": {},
+        }
+
+        with mock.patch("sys.stderr", new_callable=io.StringIO) as err:
+            out = _run(
+                fwd,
+                [json.dumps(initialize), json.dumps(tools_list)],
+                client_host="cursor",
+            )
+        logged = err.getvalue()
+
+        names = {tool["name"] for tool in out[1]["result"]["tools"]}
+        self.assertNotIn("open_ge", names)
+        self.assertIn("display tools withheld", logged)
+        self.assertIn("identity", logged)
+        self.assertEqual(logged.count("display tools withheld"), 1)
+
+    def test_identity_mismatch_logs_the_name_the_host_actually_reported(self):
+        """Adapting an alias to a renamed upstream host is impossible unless the
+        rejected name itself is recoverable from the logs (covers: R4)."""
+        fwd = FakeForwarder(
+            responses={
+                "initialize": {
+                    "jsonrpc": "2.0",
+                    "id": 1,
+                    "result": {"serverInfo": {"name": "de"}},
+                },
+            }
+        )
+        initialize = {
+            "jsonrpc": "2.0",
+            "id": 1,
+            "method": "initialize",
+            "params": {
+                "clientInfo": {
+                    "name": "custom-mcp:decision-engine",
+                    "version": "1.0.0",
+                }
+            },
+        }
+
+        with mock.patch("sys.stderr", new_callable=io.StringIO) as err:
+            _run(fwd, [json.dumps(initialize)], client_host="cursor")
+
+        self.assertIn("custom-mcp:decision-engine", err.getvalue())
+
     def test_qoder_identity_enables_display_without_popup_followup(self):
         fwd = FakeForwarder(
             responses={
@@ -779,6 +984,101 @@ class ShimServeTestCase(unittest.TestCase):
         self.assertTrue(gate.display_enabled)
         self.assertFalse(gate.followup_enabled)
         self.assertTrue(gate.stopper_enabled)
+
+    def test_qoder_ide_identities_advertise_all_local_display_tools(self):
+        for client_host, observed_name in (
+            ("qoder-ide", "Qoder"),
+            ("qoder-cn-ide", "Qoder CN"),
+        ):
+            with self.subTest(client_host=client_host):
+                fwd = FakeForwarder(
+                    responses={
+                        "initialize": {
+                            "jsonrpc": "2.0",
+                            "id": 1,
+                            "result": {"serverInfo": {"name": "de"}},
+                        },
+                        "tools/list": {
+                            "jsonrpc": "2.0",
+                            "id": 2,
+                            "result": {"tools": []},
+                        },
+                    }
+                )
+                initialize = {
+                    "jsonrpc": "2.0",
+                    "id": 1,
+                    "method": "initialize",
+                    "params": {
+                        "clientInfo": {
+                            "name": observed_name,
+                            "version": "1.28.0",
+                        }
+                    },
+                }
+                tools_list = {
+                    "jsonrpc": "2.0",
+                    "id": 2,
+                    "method": "tools/list",
+                    "params": {},
+                }
+
+                out = _run(
+                    fwd,
+                    [json.dumps(initialize), json.dumps(tools_list)],
+                    client_host=client_host,
+                )
+
+                names = {tool["name"] for tool in out[1]["result"]["tools"]}
+                self.assertTrue(
+                    {"open_ge", "open_ge_popup", "open_db_board", "db_board_result"}
+                    <= names
+                )
+
+    def test_qoder_cn_018_identity_advertises_all_local_display_tools(self):
+        fwd = FakeForwarder(
+            responses={
+                "initialize": {
+                    "jsonrpc": "2.0",
+                    "id": 1,
+                    "result": {"serverInfo": {"name": "de"}},
+                },
+                "tools/list": {
+                    "jsonrpc": "2.0",
+                    "id": 2,
+                    "result": {"tools": []},
+                },
+            }
+        )
+        initialize = {
+            "jsonrpc": "2.0",
+            "id": 1,
+            "method": "initialize",
+            "params": {
+                "clientInfo": {
+                    "name": "qoder-desktop-mcp-host",
+                    "version": "1.0.0",
+                }
+            },
+        }
+        tools_list = {
+            "jsonrpc": "2.0",
+            "id": 2,
+            "method": "tools/list",
+            "params": {},
+        }
+
+        out = _run(
+            fwd,
+            [json.dumps(initialize), json.dumps(tools_list)],
+            client_host="qoder-cn",
+        )
+
+        names = {tool["name"] for tool in out[1]["result"]["tools"]}
+        self.assertTrue(
+            {"open_ge", "open_ge_popup", "open_db_board", "db_board_result"}
+            <= names
+        )
 
     def test_qoder_cn_unidentified_initialize_keeps_lite_stopper_and_completion(self):
         class _SyncThread:
@@ -1196,7 +1496,8 @@ class ShimServeTestCase(unittest.TestCase):
         )
         log.assert_any_call(
             "host identity status=conflicting diagnostic=host_identity_conflict "
-            "declared=cursor observed=codex"
+            # reported= is the RAW name, not the normalized alias it resolved to.
+            "declared=cursor observed=codex reported='OpenAI Codex'"
         )
 
     def test_registration_host_malformed_initialize_params_logs_malformed(self):
@@ -1215,8 +1516,9 @@ class ShimServeTestCase(unittest.TestCase):
             )
 
         log.assert_any_call(
+            # params is a list here, so there is no clientInfo to report.
             "host identity status=malformed diagnostic=none "
-            "declared=codex observed=none"
+            "declared=codex observed=none reported=None"
         )
 
     def test_cursor_nonmatched_identity_denies_optional_ui_but_forwards_core(self):

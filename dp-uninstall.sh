@@ -54,6 +54,14 @@ QODER_HOOK_NAMES = {
     "decision-engine-audit-routing-experiment",
 }
 QODER_HOOK_SCRIPT_SUFFIX = "/installer/qoder_audit_prompt_hook.py"
+COMMAND_PROMPT_HOOK_SPECS = {
+    "decision-engine-workbuddy-ai-audit-routing-v1": (
+        "/installer/workbuddy_audit_prompt_hook.py"
+    ),
+    "decision-engine-trae-cn-audit-routing-v1": (
+        "/installer/trae_cn_audit_prompt_hook.py"
+    ),
+}
 AQG_SUPPORT_DESCRIPTION = (
     "AQG diagnostic connector placeholder; lifecycle gates remain hook/rule driven."
 )
@@ -74,6 +82,11 @@ AQG_ROOT_PATH_MARKERS = (
     "/agent-packs/claude-code/",
 )
 AQG_WORK_MARKER_MANAGERS = {"AQG", "aqg-work-client-support"}
+AQG_PRODUCT_REMOTES = {
+    "https://github.com/deeppatternai/agent-quality-gates.git",
+    "git@github.com:deeppatternai/agent-quality-gates.git",
+    "ssh://git@github.com/deeppatternai/agent-quality-gates.git",
+}
 QODER_DE_PLUGIN_ID = "decision-engine@de-bundler"
 QODER_DE_PLUGIN_HOMEPAGES = {
     "https://github.com/deeppatternai/decision-engine",
@@ -179,6 +192,7 @@ class Inventory:
         self.launchagent_loaded = False
         self.processes: list[dict[str, str]] = []
         self.aqg_uninstaller: Path | None = None
+        self.aqg_managed_target: Path | None = None
         self.qoder_residue_paths: list[tuple[Path, str]] = []
 
     def add_action(self, kind: str, path: Path, detail: str = "") -> None:
@@ -310,6 +324,18 @@ class Inventory:
         if not lexists(root):
             self.notes.append(f"preserve absent {root}")
             return
+        if component == "aqg" and root == self.aqg and root.is_symlink():
+            target = self.proven_managed_aqg_target(root)
+            if target is None:
+                self.blockers.append(
+                    f"{component} root ownership is unknown through symlink: {root}"
+                )
+                return
+            self.aqg_managed_target = target
+            self.aqg_refs = (self.aqg, target)
+            self.add_action("quarantine-root-link", root, "aqg managed root link")
+            self.add_action("quarantine-root", target, "aqg managed version target")
+            return
         parent_link = path_has_symlink_component(root, self.home)
         if parent_link:
             self.blockers.append(f"{component} root ownership is unknown through symlink: {parent_link}")
@@ -329,6 +355,87 @@ class Inventory:
             self.blockers.append(f"{component} root has unexpected layout; ownership is unknown: {root}")
             return
         self.add_action("quarantine-root", root, component)
+
+    def proven_managed_aqg_target(self, root: Path) -> Path | None:
+        if root != self.aqg or not root.is_symlink():
+            return None
+        try:
+            link_stat = root.lstat()
+            link_text = os.readlink(root)
+        except OSError:
+            return None
+        if hasattr(os, "getuid") and link_stat.st_uid != os.getuid():
+            return None
+        target = Path(link_text)
+        if not target.is_absolute():
+            target = root.parent / target
+        target = lex(target)
+        versions = self.dp / "versions"
+        if target.parent != versions or re.fullmatch(r"[0-9a-f]{40}", target.name) is None:
+            return None
+        if (
+            path_has_symlink_component(versions, self.home)
+            or target.is_symlink()
+            or not target.is_dir()
+        ):
+            return None
+        try:
+            versions_stat = versions.stat()
+            target_stat = target.stat()
+        except OSError:
+            return None
+        if hasattr(os, "getuid") and (
+            versions_stat.st_uid != os.getuid() or target_stat.st_uid != os.getuid()
+        ):
+            return None
+        required = (
+            target / "scripts" / "install_aqg_clients.py",
+            target / "AI_SETUP.md",
+            target / "VERSION",
+            target / "requirements.txt",
+        )
+        if not all(path.is_file() and not path.is_symlink() for path in required):
+            return None
+        git = shutil.which("git")
+        if not git:
+            return None
+        try:
+            head = subprocess.run(
+                [git, "-C", str(target), "rev-parse", "HEAD"],
+                text=True,
+                stdout=subprocess.PIPE,
+                stderr=subprocess.DEVNULL,
+                check=False,
+                timeout=10,
+            )
+            remote = subprocess.run(
+                [git, "-C", str(target), "remote", "get-url", "origin"],
+                text=True,
+                stdout=subprocess.PIPE,
+                stderr=subprocess.DEVNULL,
+                check=False,
+                timeout=10,
+            )
+            status_result = subprocess.run(
+                [git, "-C", str(target), "status", "--porcelain=v1", "--untracked-files=all"],
+                text=True,
+                stdout=subprocess.PIPE,
+                stderr=subprocess.DEVNULL,
+                check=False,
+                timeout=10,
+            )
+        except (OSError, subprocess.TimeoutExpired):
+            return None
+        if (
+            head.returncode != 0
+            or head.stdout.strip() != target.name
+            or remote.returncode != 0
+            or remote.stdout.strip() not in AQG_PRODUCT_REMOTES
+            or status_result.returncode != 0
+            or bool(status_result.stdout.strip())
+        ):
+            return None
+        return target
 
     def inspect_aux(self) -> None:
         if self.scope in ("de", "both"):
@@ -580,9 +687,11 @@ class Inventory:
             ".cursor/mcp.json",
             ".trae/mcp.json",
             ".trae-cn/mcp.json",
+            ".trae-cn/hooks.json",
             ".trae-work/mcp.json",
             ".trae-work-cn/mcp.json",
             ".workbuddy/mcp.json",
+            ".workbuddy-ai/settings.json",
             ".codebuddy/mcp.json",
             ".kimi/mcp.json",
             ".kimi-code/mcp.json",
@@ -684,7 +793,7 @@ class Inventory:
                         and isinstance(value, list)
                     ):
                         for index, group in enumerate(value):
-                            ownership = self.qoder_prompt_hook_ownership(group)
+                            ownership = self.de_prompt_hook_ownership(group)
                             hook_pointer = next_pointer + (str(index),)
                             if ownership == "owned":
                                 targets.append(hook_pointer)
@@ -732,7 +841,7 @@ class Inventory:
             self.add_action("edit-json", path, f"remove {len(targets)} owned decision-engine {suffix}")
 
     @staticmethod
-    def qoder_prompt_hook_ownership(group: Any) -> str:
+    def de_prompt_hook_ownership(group: Any) -> str:
         if not isinstance(group, dict) or group.get("matcher") != "":
             return "none"
         hooks = group.get("hooks")
@@ -743,20 +852,52 @@ class Inventory:
             for hook in hooks
             if isinstance(hook, dict) and hook.get("name") in QODER_HOOK_NAMES
         ]
-        if not named:
-            return "none"
-        if len(hooks) != 1 or len(named) != 1:
+        if named:
+            if len(hooks) != 1 or len(named) != 1:
+                return "unknown"
+            hook = named[0]
+            args = hook.get("args")
+            if (
+                hook.get("type") == "command"
+                and isinstance(hook.get("command"), str)
+                and bool(hook["command"].strip())
+                and isinstance(args, list)
+                and len(args) == 1
+                and isinstance(args[0], str)
+                and args[0].replace("\\", "/").endswith(QODER_HOOK_SCRIPT_SUFFIX)
+            ):
+                return "owned"
             return "unknown"
-        hook = named[0]
-        args = hook.get("args")
+
+        if len(hooks) != 1 or not isinstance(hooks[0], dict):
+            return "none"
+        hook = hooks[0]
+        command = hook.get("command")
+        if not isinstance(command, str):
+            return "none"
+        managed_ids = [
+            managed_id
+            for managed_id in COMMAND_PROMPT_HOOK_SPECS
+            if managed_id in command
+        ]
+        if not managed_ids:
+            return "none"
+        if len(managed_ids) != 1:
+            return "unknown"
+        managed_id = managed_ids[0]
+        try:
+            tokens = shlex.split(command)
+        except ValueError:
+            return "unknown"
         if (
             hook.get("type") == "command"
-            and isinstance(hook.get("command"), str)
-            and bool(hook["command"].strip())
-            and isinstance(args, list)
-            and len(args) == 1
-            and isinstance(args[0], str)
-            and args[0].replace("\\", "/").endswith(QODER_HOOK_SCRIPT_SUFFIX)
+            and hook.get("timeout") == 30
+            and len(tokens) == 4
+            and bool(tokens[0])
+            and tokens[1].replace("\\", "/").endswith(
+                COMMAND_PROMPT_HOOK_SPECS[managed_id]
+            )
+            and tokens[2:] == ["--managed-id", managed_id]
         ):
             return "owned"
         return "unknown"
@@ -1053,6 +1194,36 @@ class Inventory:
             paths.update({app / "skills", app / "User" / "skills"})
         return tuple(sorted(paths))
 
+    def orphaned_de_bootstrap_skill_target(self, link: Path) -> Path | None:
+        if not link.is_symlink() or re.fullmatch(r"[a-z0-9][a-z0-9-]{0,63}", link.name) is None:
+            return None
+        try:
+            if hasattr(os, "getuid") and link.lstat().st_uid != os.getuid():
+                return None
+            raw_target = Path(os.readlink(link))
+        except OSError:
+            return None
+        target = raw_target if raw_target.is_absolute() else link.parent / raw_target
+        if target.exists():
+            return None
+        temporary_root = Path(
+            os.path.realpath(os.environ.get("TMPDIR") or tempfile.gettempdir())
+        )
+        normalized_target = Path(os.path.realpath(target))
+        try:
+            relative = normalized_target.relative_to(temporary_root)
+        except ValueError:
+            return None
+        parts = relative.parts
+        if (
+            len(parts) != 5
+            or not parts[0].startswith("tmp")
+            or parts[1:4] != ("deeppattern", "decision-engine", "skills")
+            or parts[4] != link.name
+        ):
+            return None
+        return lex(target)
+
     def inspect_skills(self) -> None:
         components = ("de",) if self.scope == "de" else ("aqg",) if self.scope == "aqg" else ("de", "aqg")
         for directory in self.skill_dirs():
@@ -1076,6 +1247,15 @@ class Inventory:
                 if any(self.path_ref(target, component=component) for component in components):
                     self.skill_links.append(child)
                     self.add_action("unlink-skill", child, f"owned route -> {target}")
+                elif "de" in components:
+                    orphaned_target = self.orphaned_de_bootstrap_skill_target(child)
+                    if orphaned_target is not None:
+                        self.skill_links.append(child)
+                        self.add_action(
+                            "unlink-skill",
+                            child,
+                            f"orphaned managed bootstrap route -> {orphaned_target}",
+                        )
 
     def launchctl_path(self) -> str | None:
         return os.environ.get("DE_AQG_UNINSTALL_LAUNCHCTL_COMMAND") or shutil.which("launchctl")
@@ -1468,6 +1648,11 @@ class Inventory:
         candidates, residue_found = self.discover_aqg_roots()
         if lexists(self.aqg):
             candidates.add(self.aqg)
+        if self.aqg_managed_target is not None:
+            candidates = {
+                self.aqg_managed_target if root == self.aqg else root
+                for root in candidates
+            }
         valid = {root for root in candidates if self.valid_aqg_uninstaller_root(root)}
         invalid = candidates - valid
         if invalid:
@@ -1944,7 +2129,7 @@ def apply_inventory(inv: Inventory) -> Path:
         roots: list[Path] = []
         if inv.scope in ("de", "both"):
             roots.append(inv.de)
-        if inv.scope in ("aqg", "both"):
+        if inv.scope in ("aqg", "both") and inv.aqg_managed_target is None:
             roots.append(inv.aqg)
         for source in roots:
             if not lexists(source):
@@ -1953,6 +2138,39 @@ def apply_inventory(inv: Inventory) -> Path:
             destination.parent.mkdir(parents=True, exist_ok=True)
             shutil.move(str(source), str(destination))
             manifest.record_tree_moved(source, destination)
+
+        if inv.scope in ("aqg", "both") and inv.aqg_managed_target is not None:
+            source = inv.aqg
+            target = inv.aqg_managed_target
+            try:
+                same_target = os.path.samefile(source, target)
+            except OSError:
+                same_target = False
+            if not source.is_symlink() or not same_target:
+                raise RuntimeError("managed AQG root link changed before quarantine")
+            link_destination = backup / "quarantine" / "managed" / source.name
+            link_destination.parent.mkdir(parents=True, exist_ok=True)
+            link_text = os.readlink(source)
+            shutil.move(str(source), str(link_destination))
+            manifest.add(
+                {
+                    "operation": "quarantine-root-link",
+                    "source": str(source),
+                    "destination": str(link_destination),
+                    "type": "symlink",
+                    "target": link_text,
+                }
+            )
+            if not target.is_dir() or target.is_symlink():
+                raise RuntimeError("managed AQG version target changed before quarantine")
+            target_destination = (
+                backup / "quarantine" / "managed-versions" / target.name
+            )
+            target_destination.parent.mkdir(parents=True, exist_ok=True)
+            shutil.move(str(target), str(target_destination))
+            manifest.record_tree_moved(
+                target, target_destination
+            )
 
         manifest.add({"operation": "apply-complete", "source": None, "destination": str(backup)})
         verify_after_apply(inv)

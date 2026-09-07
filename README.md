@@ -194,6 +194,8 @@ with no account.
 | Cursor | `cursor` | MCP, Skills, native windows, popup follow-up, Stop Panel |
 | Alibaba Qoder Desktop | `qoder` | Windows Desktop 1.106.3+; macOS Qoder.app 0.1.3+; MCP, Skills, native windows, popup follow-up, Stop Panel |
 | Alibaba Qoder CN Desktop | `qoder-cn` | macOS Qoder CN.app 0.1.4; MCP, Skills, native windows, popup follow-up, Stop Panel |
+| Alibaba Qoder IDE | `qoder-ide` | macOS Qoder IDE.app 1.106.3+; independent MCP identity, shared Qoder Skills and audit hook, native windows, popup follow-up, Stop Panel |
+| Alibaba Qoder CN IDE | `qoder-cn-ide` | macOS Qoder CN IDE.app 1.106.3+; independent MCP identity, shared Qoder CN Skills and audit hook, native windows, popup follow-up, Stop Panel |
 | TRAE Desktop | `trae` | macOS Trae.app 3.5.81; MCP, Skills, native windows, popup follow-up, Stop Panel |
 | TRAE Work | `trae-work` | Windows and macOS Desktop 0.1.48+; MCP, Skills, native windows, popup follow-up, Stop Panel |
 | TRAE CN Desktop | `trae-cn` | macOS Trae CN.app 3.3.95; MCP, Skills, native windows, popup follow-up, Stop Panel |
