@@ -229,11 +229,19 @@ function Test-AqgManagedRoot {
     }
     $target = [System.IO.Path]::GetFullPath($target)
     $versions = [System.IO.Path]::GetFullPath((Join-Path (Split-Path -Parent $Path) "versions"))
-    return ((Split-Path -Parent $target) -eq $versions) -and `
-        ((Split-Path -Leaf $target) -cmatch '^[0-9a-f]{40}$') -and `
-        (Test-Path -LiteralPath $target -PathType Container) -and `
-        (-not (Test-ReparsePoint -Path $versions)) -and `
-        (-not (Test-ReparsePoint -Path $target))
+    $version = Split-Path -Leaf $target
+    if (((Split-Path -Parent $target) -ne $versions) -or `
+        ($version -cnotmatch '^[0-9a-f]{40}$') -or `
+        (-not (Test-Path -LiteralPath $target -PathType Container)) -or `
+        (Test-ReparsePoint -Path $versions) -or `
+        (Test-ReparsePoint -Path $target)) {
+        return $false
+    }
+    $head = Invoke-WithCleanEnvironment -FilePath $GitPath -ArgumentList @(
+        "-C", $target, "rev-parse", "--verify", "HEAD"
+    ) -Capture
+    return $head.ExitCode -eq 0 -and `
+        (($head.Output -join "").Trim() -ceq $version)
 }
 
 function Invoke-ManagedPython {

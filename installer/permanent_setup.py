@@ -177,6 +177,8 @@ def _localized_setup_success_dialog(result: PermanentSetupResult) -> Tuple[str, 
         message = strings["already_activated_success"]
     else:
         message = strings["setup_succeeded"]
+    if result.post_mcp_write_notices:
+        message += "\n\n" + "\n".join(result.post_mcp_write_notices)
     return strings["setup_success_title"], message
 
 

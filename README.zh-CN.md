@@ -173,12 +173,13 @@ AQG 是本地、无需账户的工程纪律工具包。安装其中任一个，�
 | TRAE | TRAE Desktop、TRAE CN Desktop、TRAE Work、TRAE Work CN | Desktop 与 Work、普通版与 CN 版分别列出；平台和版本要求见详情。 |
 
 <details>
-<summary>展开查看全部 15 个产品的安装器 ID、平台和版本要求</summary>
+<summary>展开查看全部 16 个产品的安装器 ID、平台和版本要求</summary>
 
 | 系列 | 宿主 | 安装器 ID | 当前本地宿主范围 |
 |---|---|---|---|
 | Claude | Claude Code | `claude-code` | MCP、Skills、原生窗口、弹窗右侧追问、Stop Panel |
 | Claude | Claude Desktop | `claude-desktop` | MCP、原生窗口、弹窗右侧追问、Stop Panel |
+| Claude | Claude 第三方提供商配置 | `claude-desktop-3p` | 仅 macOS 的独立 MCP 配置、原生窗口、弹窗右侧追问、Stop Panel |
 | Codex | Codex | `codex` | MCP、Skills、原生窗口、弹窗右侧追问、Stop Panel |
 | Cursor | Cursor | `cursor` | MCP、Skills、原生窗口、弹窗右侧追问、Stop Panel |
 | 腾讯 | 腾讯 CodeBuddy Agent CLI | `codebuddy` | 仅支持独立 Agent CLI；CodeBuddy Studio 是另一个未支持产品；MCP、Skills、原生窗口、弹窗右侧追问、Stop Panel |

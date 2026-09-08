@@ -396,7 +396,7 @@ if ! source_detected_clients="$(
 fi
 
 verify_aqg_checkout() {
-  local actual_remote resolved parent version
+  local actual_head actual_remote resolved parent version
   if [ -L "$AQG_ROOT" ]; then
     # AQG's updater atomically switches this link between versions/<commit>.
     # Resolve both sides so parent aliases (e.g. macOS /var) compare correctly.
@@ -414,6 +414,11 @@ verify_aqg_checkout() {
   fi
   [ -e "$AQG_ROOT/.git" ] \
     || fail "$AQG_ROOT is not a Git checkout; preserve it and stop"
+  if [ -L "$AQG_ROOT" ]; then
+    actual_head="$(clean_exec "$GIT_BIN" -C "$AQG_ROOT" rev-parse --verify HEAD 2>/dev/null || true)"
+    [ "$actual_head" = "$version" ] \
+      || fail "$AQG_ROOT checkout HEAD does not match its version directory; preserve it and stop"
+  fi
   [ -f "$AQG_ROOT/AI_SETUP.md" ] \
     || fail "$AQG_ROOT is missing AI_SETUP.md; preserve it and stop"
   [ -f "$AQG_ROOT/scripts/install_aqg_clients.py" ] \

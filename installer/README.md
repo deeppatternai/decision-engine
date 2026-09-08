@@ -81,6 +81,7 @@ an owner-issued device activation key.
 |---|---|---|---|---|
 | Claude Code | `claude-code` | `~/.claude.json` | `~/.claude/skills/` | direct Python; JSON includes `cwd`; includes `type` |
 | Claude Desktop | `claude-desktop` | Windows: `%APPDATA%/Claude/claude_desktop_config.json`<br>macOS: `~/Library/Application Support/Claude/claude_desktop_config.json`<br>Linux: `~/.config/Claude/claude_desktop_config.json` | none | direct Python; JSON includes `cwd`; includes `type` |
+| Claude third-party provider profile | `claude-desktop-3p` | `~/Library/Application Support/Claude-3p/claude_desktop_config.json` | none | direct Python; JSON includes `cwd`; includes `type` |
 | Tencent CodeBuddy Agent CLI | `codebuddy` | `~/.codebuddy/mcp.json` | `~/.codebuddy/skills/` | direct Python; JSON omits `cwd`; omits `type`; CodeBuddy Studio is not installation evidence |
 | Codex | `codex` | `~/.codex/config.toml` | `~/.codex/skills/` | direct Python; TOML launcher |
 | Cursor | `cursor` | `~/.cursor/mcp.json` | `~/.cursor/skills/` | direct Python; JSON omits `cwd`; omits `type` |

@@ -203,7 +203,7 @@ support, and platform and version requirements.
 
 | Family | Supported products | Differences to note |
 |---|---|---|
-| Claude | Claude Code, Claude Desktop | Claude Code also supports Skills. |
+| Claude | Claude Code, Claude Desktop, Claude third-party provider profile | Claude Code also supports Skills; the third-party profile is an independent macOS MCP location. |
 | Codex | Codex | Supports Skills. |
 | Cursor | Cursor | Supports Skills. |
 | Tencent | CodeBuddy Agent CLI, WorkBuddy Desktop, WorkBuddy AI Desktop | CodeBuddy support is limited to the standalone Agent CLI, not CodeBuddy Studio; see details for platform requirements. |
@@ -211,12 +211,13 @@ support, and platform and version requirements.
 | TRAE | TRAE Desktop, TRAE CN Desktop, TRAE Work, TRAE Work CN | Desktop/Work and standard/CN variants are listed separately; see details for platform and version requirements. |
 
 <details>
-<summary>Expand all 15 products: installer IDs, platforms, and version requirements</summary>
+<summary>Expand all 16 products: installer IDs, platforms, and version requirements</summary>
 
 | Family | Host | Installer ID | Current local-host scope |
 |---|---|---|---|
 | Claude | Claude Code | `claude-code` | MCP, Skills, native windows, popup follow-up, Stop Panel |
 | Claude | Claude Desktop | `claude-desktop` | MCP, native windows, popup follow-up, Stop Panel |
+| Claude | Claude third-party provider profile | `claude-desktop-3p` | macOS-only independent MCP profile, native windows, popup follow-up, Stop Panel |
 | Codex | Codex | `codex` | MCP, Skills, native windows, popup follow-up, Stop Panel |
 | Cursor | Cursor | `cursor` | MCP, Skills, native windows, popup follow-up, Stop Panel |
 | Tencent | Tencent CodeBuddy Agent CLI | `codebuddy` | Independent Agent CLI only; CodeBuddy Studio is a separate unsupported product; MCP, Skills, native windows, popup follow-up, Stop Panel |

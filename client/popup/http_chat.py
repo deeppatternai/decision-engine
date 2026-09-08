@@ -719,16 +719,16 @@ class HttpChatSession:
             server_code = error_value.get("error_code") if isinstance(error_value, dict) else None
         except (UnicodeDecodeError, json.JSONDecodeError, RecursionError, ValueError):
             server_code = None
-        if status == 429:
-            return _error("rate_limited", retryable=True, http_status=status)
-        if status == 503:
-            return _error("network_error", retryable=True, http_status=status)
         if isinstance(server_code, str) and server_code in _STABLE_CODES:
             return _error(
                 server_code,
                 retryable=server_code in {"network_error", "rate_limited", "timeout"},
                 http_status=status,
             )
+        if status == 429:
+            return _error("rate_limited", retryable=True, http_status=status)
+        if status == 503:
+            return _error("network_error", retryable=True, http_status=status)
         if status in {401, 403}:
             return _error("auth_required", http_status=status)
         if status == 404:

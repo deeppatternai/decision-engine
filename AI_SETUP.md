@@ -35,6 +35,7 @@ The installer accepts these exact client IDs and paths:
 |---|---|---|---|---|
 | Claude Code | `claude-code` | `~/.claude.json` | `~/.claude/skills` | supported platforms |
 | Claude Desktop | `claude-desktop` | Windows: `%APPDATA%/Claude/claude_desktop_config.json`<br>macOS: `~/Library/Application Support/Claude/claude_desktop_config.json`<br>Linux: `~/.config/Claude/claude_desktop_config.json` | none | supported platforms |
+| Claude third-party provider profile | `claude-desktop-3p` | `~/Library/Application Support/Claude-3p/claude_desktop_config.json` | none | macOS only; independent from Claude Desktop |
 | Tencent CodeBuddy Agent CLI | `codebuddy` | `~/.codebuddy/mcp.json` | `~/.codebuddy/skills` | independent Agent CLI only; CodeBuddy Studio is a separate unsupported product |
 | Codex | `codex` | `~/.codex/config.toml` | `~/.codex/skills` | supported platforms on builds that load global Skills |
 | Cursor | `cursor` | `~/.cursor/mcp.json` | `~/.cursor/skills` | supported platforms |

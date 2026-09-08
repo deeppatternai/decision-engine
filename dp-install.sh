@@ -459,7 +459,7 @@ if regular_app_has_bundle_id "/Applications/Qoder CN IDE.app" "com.aliyun.lingma
 fi
 
 verify_aqg_checkout() {
-  local actual_remote status_output resolved parent version
+  local actual_head actual_remote status_output resolved parent version
   if [ -L "$AQG_ROOT" ]; then
     # Same managed-layout contract as de-aqg-install. Resolve aliases on both
     # sides (macOS /var, relative links) without accepting escaped targets.
@@ -477,6 +477,11 @@ verify_aqg_checkout() {
   fi
   [ -e "$AQG_ROOT/.git" ] \
     || fail "$AQG_ROOT is not a Git checkout; preserve it and stop"
+  if [ -L "$AQG_ROOT" ]; then
+    actual_head="$(clean_exec "$GIT_BIN" -C "$AQG_ROOT" rev-parse --verify HEAD 2>/dev/null || true)"
+    [ "$actual_head" = "$version" ] \
+      || fail "$AQG_ROOT checkout HEAD does not match its version directory; preserve it and stop"
+  fi
   [ -f "$AQG_ROOT/AI_SETUP.md" ] \
     || fail "$AQG_ROOT is missing AI_SETUP.md; preserve it and stop"
   [ -f "$AQG_ROOT/scripts/install_aqg_clients.py" ] \
@@ -502,6 +507,10 @@ sync_aqg_checkout() {
     return 0
   fi
   tty_print "Synchronizing Agent Quality Gates from $AQG_REPO at $AQG_REF..."
+  clean_exec "$GIT_BIN" -C "$AQG_ROOT" config --local core.autocrlf false \
+    || fail "could not pin LF-safe Git configuration for the AQG checkout; preserve it and stop"
+  clean_exec "$GIT_BIN" -C "$AQG_ROOT" config --local core.eol lf \
+    || fail "could not pin LF-safe Git configuration for the AQG checkout; preserve it and stop"
   if ! clean_exec env GIT_TERMINAL_PROMPT=0 "$GIT_BIN" -C "$AQG_ROOT" fetch \
       --depth 1 "$AQG_REPO" "refs/heads/$AQG_REF"; then
     fail "could not read the AQG product target $AQG_REF; the existing checkout was preserved"
@@ -818,13 +827,10 @@ print(result.get("status", "unknown"))' \
 # it must refuse before any host write, and it protects a product-owned file
 # rather than a Decision Engine one.
 claude_3p_profile_detected=0
-if [ -d "$CLAUDE_3P_ROOT" ] || [ -e "$CLAUDE_3P_CONFIG" ] \
-    || [ -L "$CLAUDE_3P_CONFIG" ]; then
-  if [ -e "$CLAUDE_3P_CONFIG" ] || [ -L "$CLAUDE_3P_CONFIG" ]; then
-    if [ -L "$CLAUDE_3P_CONFIG" ] || [ ! -f "$CLAUDE_3P_CONFIG" ]; then
-      blocked \
-        "$CLAUDE_3P_CONFIG is not a regular configuration file; preserve it and repair the Claude third-party profile before continuing"
-    fi
+if [ -e "$CLAUDE_3P_CONFIG" ] || [ -L "$CLAUDE_3P_CONFIG" ]; then
+  if [ -L "$CLAUDE_3P_CONFIG" ] || [ ! -f "$CLAUDE_3P_CONFIG" ]; then
+    blocked \
+      "$CLAUDE_3P_CONFIG is not a regular configuration file; preserve it and repair the Claude third-party profile before continuing"
   fi
   claude_3p_profile_detected=1
 fi

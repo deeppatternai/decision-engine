@@ -31,6 +31,7 @@
 |---|---|---|---|---|
 | Claude Code | `claude-code` | `~/.claude.json` | `~/.claude/skills` | 受支持平台 |
 | Claude Desktop | `claude-desktop` | Windows：`%APPDATA%/Claude/claude_desktop_config.json`<br>macOS：`~/Library/Application Support/Claude/claude_desktop_config.json`<br>Linux：`~/.config/Claude/claude_desktop_config.json` | 无 | 受支持平台 |
+| Claude 第三方提供商配置 | `claude-desktop-3p` | `~/Library/Application Support/Claude-3p/claude_desktop_config.json` | 无 | 仅 macOS；独立于 Claude Desktop |
 | 腾讯 CodeBuddy Agent CLI | `codebuddy` | `~/.codebuddy/mcp.json` | `~/.codebuddy/skills` | 仅支持独立 Agent CLI；CodeBuddy Studio 是另一个未支持产品 |
 | Codex | `codex` | `~/.codex/config.toml` | `~/.codex/skills` | 可加载全局 Skills 的版本及其受支持平台 |
 | Cursor | `cursor` | `~/.cursor/mcp.json` | `~/.cursor/skills` | 受支持平台 |

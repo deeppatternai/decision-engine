@@ -166,7 +166,8 @@ class InstallAqgClientOrchestrationTest(unittest.TestCase):
 
         cmd = _bash_script_command(INSTALL_SH, fake_bin, target)
         completed = subprocess.run(
-            cmd, env=env, capture_output=True, text=True, timeout=30
+            cmd, env=env, capture_output=True, text=True,
+            encoding="utf-8", errors="replace", timeout=30,
         )
         events = [line for line in event_file.read_text().splitlines() if line]
         invocations = [
@@ -405,7 +406,8 @@ class InstallAqgClientOrchestrationTest(unittest.TestCase):
 
         cmd = _bash_script_command(INSTALL_SH, fake_bin, target)
         completed = subprocess.run(
-            cmd, env=env, capture_output=True, text=True, timeout=30
+            cmd, env=env, capture_output=True, text=True,
+            encoding="utf-8", errors="replace", timeout=30,
         )
         events = [line for line in event_file.read_text().splitlines() if line]
         invocations = [

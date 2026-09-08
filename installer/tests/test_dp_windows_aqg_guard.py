@@ -7,7 +7,14 @@ from pathlib import Path
 
 import pytest
 
-from installer.tests.test_de_aqg_install import AQG_REPO, SHA, _checkout, _git, _link
+from installer.tests.test_de_aqg_install import (
+    AQG_REPO,
+    SHA,
+    _checkout,
+    _git,
+    _link,
+    _managed_checkout,
+)
 
 ROOT = Path(__file__).resolve().parents[2]
 pytestmark = pytest.mark.skipif(os.name != "nt", reason="native Windows bootstrapper")
@@ -43,8 +50,7 @@ def test_native_guard_accepts_installed_layouts(verify, tmp_path, kind):
     if kind == "checkout":
         _checkout(root)
     else:
-        source = _checkout(tmp_path / "source")
-        sha = _git(source, "rev-parse", "HEAD")
+        source, sha = _managed_checkout(tmp_path / "managed-source")
         target = root.parent / "versions" / sha
         target.parent.mkdir(parents=True)
         if kind == "migrated":
@@ -62,7 +68,7 @@ def test_native_guard_accepts_installed_layouts(verify, tmp_path, kind):
 @pytest.mark.parametrize("kind", ["outside", "nested-link", "dirty", "foreign-origin"])
 def test_native_guard_preserves_unowned_or_modified_installs(verify, tmp_path, kind):
     root = tmp_path / ".deeppattern" / "agent-quality-gates"
-    target = _checkout(root.parent / "versions" / SHA)
+    target, _commit = _managed_checkout(root.parent)
     if kind == "outside":
         target = _checkout(tmp_path / "outside")
     elif kind == "nested-link":
@@ -79,3 +85,16 @@ def test_native_guard_preserves_unowned_or_modified_installs(verify, tmp_path, k
     assert result.returncode == 3, result.stderr
     assert root.readlink() == before
     assert (root / "AI_SETUP.md").is_file()
+
+
+def test_native_guard_rejects_version_directory_that_does_not_match_head(
+    verify, tmp_path,
+):
+    root = tmp_path / ".deeppattern" / "agent-quality-gates"
+    target = _checkout(root.parent / "versions" / SHA)
+    assert _git(target, "rev-parse", "HEAD") != SHA
+    _link(root, target)
+
+    result = verify(root)
+
+    assert result.returncode == 3, result.stderr

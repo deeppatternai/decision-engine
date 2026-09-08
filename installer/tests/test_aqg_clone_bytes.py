@@ -66,3 +66,79 @@ $sourceRoot = $env:AQG_DEST
                             env=env, capture_output=True, text=True, timeout=30)
     assert result.returncode == 0, result.stdout + result.stderr
     assert (dest / "scripts/install.sh").read_bytes() == payload
+
+
+@pytest.mark.parametrize("entry", ["install.sh", "dp-install.sh"])
+def test_aqg_update_pins_local_line_endings_before_git_operation(tmp_path, entry):
+    origin, dest = tmp_path / "origin", tmp_path / "installed"
+    origin.mkdir()
+    config = tmp_path / "gitconfig"
+    config.write_text("[core]\n\tautocrlf = true\n\teol = crlf\n", encoding="utf-8")
+    env = {**os.environ, "GIT_CONFIG_GLOBAL": str(config), "GIT_CONFIG_NOSYSTEM": "1"}
+
+    def git(root, *args):
+        return subprocess.run(
+            ["git", "-C", str(root), *args], env=env, check=True,
+            capture_output=True, text=True,
+        ).stdout.strip()
+
+    git(origin, "init", "-q", "-b", "main")
+    git(origin, "config", "user.name", "Fixture")
+    git(origin, "config", "user.email", "fixture@example.invalid")
+    git(origin, "config", "commit.gpgsign", "false")
+    git(origin, "config", "core.autocrlf", "false")
+    (origin / "scripts").mkdir()
+    for name in (
+        "AI_SETUP.md",
+        "scripts/install.sh",
+        "scripts/install_aqg_clients.py",
+        "scripts/aqg_doctor.py",
+    ):
+        path = origin / name
+        path.parent.mkdir(parents=True, exist_ok=True)
+        path.write_text("fixture\n", encoding="utf-8")
+    git(origin, "add", ".")
+    git(origin, "commit", "-qm", "fixture")
+    subprocess.run(
+        ["git", "clone", "-q", str(origin), str(dest)], env=env, check=True,
+        capture_output=True,
+    )
+    git(dest, "remote", "set-url", "origin", origin.as_posix())
+    subprocess.run(
+        ["git", "-C", str(dest), "config", "--unset-all", "core.autocrlf"],
+        env=env, check=False, capture_output=True,
+    )
+    subprocess.run(
+        ["git", "-C", str(dest), "config", "--unset-all", "core.eol"],
+        env=env, check=False, capture_output=True,
+    )
+
+    source = (REPO / entry).read_text(encoding="utf-8")
+    if entry == "install.sh":
+        start = source.index("install_aqg_body() {")
+        code = source[start:source.index("\n}\n", start) + 3]
+        code += "\nrun_aqg_installer() { :; }\ninstall_aqg_body\n"
+    else:
+        names = ("fail", "clean_exec", "verify_aqg_checkout", "sync_aqg_checkout")
+        functions = []
+        for name in names:
+            match = re.search(rf"^{name}\(\) \{{\n.*?^\}}$", source, re.M | re.S)
+            assert match is not None, name
+            functions.append(match.group())
+        code = "\n".join([
+            "set -euo pipefail", "EXIT_USAGE=2", "PROGRAM_NAME=fixture-installer",
+            "tty_print() { :; }", *functions, "sync_aqg_checkout",
+        ])
+    env.update(
+        AQG_REPO=origin.as_posix(), AQG_DEST=dest.as_posix(),
+        AQG_ROOT=dest.as_posix(), AQG_REF="main", GIT_BIN="git",
+    )
+    result = subprocess.run(
+        ["bash", "--noprofile", "--norc", "-c", code], env=env,
+        capture_output=True, text=True, encoding="utf-8", errors="replace",
+        timeout=30,
+    )
+
+    assert result.returncode == 0, result.stdout + result.stderr
+    assert git(dest, "config", "--local", "--get", "core.autocrlf") == "false"
+    assert git(dest, "config", "--local", "--get", "core.eol") == "lf"

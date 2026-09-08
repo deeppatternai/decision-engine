@@ -1759,6 +1759,17 @@ class PermanentSetupTestCase(unittest.TestCase):
                 self.assertEqual(exit_code, 0)
                 self.assertIn(notice, stdout.getvalue())
 
+    def test_gui_success_dialog_renders_host_notice(self):
+        notice = "host-specific manual follow-up"
+        result = permanent_setup.PermanentSetupResult(
+            permanent=True,
+            post_mcp_write_notices=(notice,),
+        )
+
+        _title, message = permanent_setup._localized_setup_success_dialog(result)
+
+        self.assertIn(notice, message)
+
     def test_run_propagates_host_notice_after_first_or_repeated_activation(self):
         notice = "host-specific manual follow-up"
         route_result = permanent_setup.install.SkillRouteRepairResult(

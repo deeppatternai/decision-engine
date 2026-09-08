@@ -60,6 +60,15 @@ def _checkout(root):
     return root
 
 
+def _managed_checkout(parent):
+    staging = _checkout(parent / "staging")
+    commit = _git(staging, "rev-parse", "HEAD")
+    target = parent / "versions" / commit
+    target.parent.mkdir(parents=True, exist_ok=True)
+    staging.rename(target)
+    return target, commit
+
+
 def _link(root, target):
     root.parent.mkdir(parents=True, exist_ok=True)
     try:
@@ -134,7 +143,7 @@ sync_aqg_checkout
 
 
 def test_repeat_install_does_not_checkout_inside_a_managed_version(verify_checkout, tmp_path):
-    target = _checkout(tmp_path / "versions" / SHA)
+    target, _commit = _managed_checkout(tmp_path)
     root = _link(tmp_path / "agent-quality-gates", target)
     before = _git(root, "rev-parse", "HEAD")
     result = verify_checkout(root, synchronize=True)
@@ -147,10 +156,10 @@ def test_repeat_install_does_not_checkout_inside_a_managed_version(verify_checko
 @pytest.mark.parametrize("parent_alias", [True, False])
 def test_managed_link_is_accepted(verify_checkout, tmp_path, relative, parent_alias):
     parent = tmp_path / "home with spaces" / ".deeppattern"
-    target = _checkout(parent / "versions" / SHA)
+    target, commit = _managed_checkout(parent)
     root = _link(
         parent / "agent-quality-gates",
-        Path("versions") / SHA if relative else target,
+        Path("versions") / commit if relative else target,
     )
     if parent_alias:
         alias = _link(tmp_path / "home alias", parent.parent)
@@ -259,7 +268,7 @@ def test_non_directory_roots_are_rejected(verify_checkout, tmp_path, kind):
     "https://example.test/foreign.git",
 ])
 def test_managed_link_still_checks_origin(verify_checkout, tmp_path, remote):
-    target = _checkout(tmp_path / "versions" / SHA)
+    target, _commit = _managed_checkout(tmp_path)
     _git(target, "remote", "set-url", "origin", remote)
     root = _link(tmp_path / "agent-quality-gates", target)
 
@@ -274,7 +283,7 @@ def test_managed_link_still_checks_origin(verify_checkout, tmp_path, remote):
 
 @pytest.mark.parametrize("missing", [".git", *REQUIRED_FILES])
 def test_managed_link_still_requires_checkout_files(verify_checkout, tmp_path, missing):
-    target = _checkout(tmp_path / "versions" / SHA)
+    target, _commit = _managed_checkout(tmp_path)
     path = target / missing
     if path.is_dir():
         for item in path.rglob("*"):
@@ -290,3 +299,17 @@ def test_managed_link_still_requires_checkout_files(verify_checkout, tmp_path, m
     assert result.returncode == 2, result.stderr
     expected = "not a Git checkout" if missing == ".git" else "missing"
     assert expected in result.stderr
+
+
+def test_managed_link_rejects_directory_name_that_does_not_match_head(
+    verify_checkout, tmp_path,
+):
+    target = _checkout(tmp_path / "versions" / SHA)
+    actual = _git(target, "rev-parse", "HEAD")
+    assert actual != SHA
+    root = _link(tmp_path / "agent-quality-gates", target)
+
+    result = verify_checkout(root)
+
+    assert result.returncode == 2, result.stderr
+    assert "does not match its version directory" in result.stderr

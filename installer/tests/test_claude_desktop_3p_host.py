@@ -481,8 +481,14 @@ class ClaudeThirdPartyInstallerContractTestCase(unittest.TestCase):
             self.body,
         )
         self.assertIn("is not a regular configuration file", self.body)
+        self.assertNotIn(
+            'if [ -d "$CLAUDE_3P_ROOT" ] || [ -e "$CLAUDE_3P_CONFIG" ]',
+            self.body,
+            "an empty product directory is not a configured host profile",
+        )
 
 
+@unittest.skipUnless(os.name == "posix", "dp-uninstall.sh is POSIX-only")
 class ClaudeThirdPartyUninstallContractTestCase(unittest.TestCase):
     """Owned uninstall on the independent 3p path."""
 

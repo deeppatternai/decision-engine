@@ -1001,11 +1001,9 @@ class HttpChatTurnTests(unittest.TestCase):
         ]
         self.assertEqual(len(submit_calls), 1)
 
-    def test_submit_503_remains_temporary_service_failure(self):
+    def test_submit_503_preserves_explicit_stable_server_code(self):
         transport = _ScriptedTransport(
             (200, json.dumps(_conversation_response()).encode("utf-8")),
-            (503, b'{"error_code":"rate_limited"}'),
-            (503, b'{"error_code":"rate_limited"}'),
             (503, b'{"error_code":"rate_limited"}'),
         )
         session = self._session(transport, sleep=lambda _seconds: None)
@@ -1013,9 +1011,28 @@ class HttpChatTurnTests(unittest.TestCase):
         with self.assertRaises(ChatClientError) as caught:
             session.submit_turn("question", [], _TURN_KEY)
 
-        self.assertEqual(caught.exception.code, "network_error")
+        self.assertEqual(caught.exception.code, "rate_limited")
         self.assertTrue(caught.exception.retryable)
         self.assertEqual(caught.exception.http_status, 503)
+        submit_calls = [
+            call for call in transport.calls
+            if call["method"] == "POST" and call["url"].endswith("/turns")
+        ]
+        self.assertEqual(len(submit_calls), 1)
+
+    def test_submit_429_preserves_terminal_stable_server_code(self):
+        transport = _ScriptedTransport(
+            (200, json.dumps(_conversation_response()).encode("utf-8")),
+            (429, b'{"error_code":"insufficient_credits"}'),
+        )
+        session = self._session(transport, sleep=lambda _seconds: None)
+
+        with self.assertRaises(ChatClientError) as caught:
+            session.submit_turn("question", [], _TURN_KEY)
+
+        self.assertEqual(caught.exception.code, "insufficient_credits")
+        self.assertFalse(caught.exception.retryable)
+        self.assertEqual(caught.exception.http_status, 429)
 
     def test_submit_accepts_strict_terminal_idempotency_replays(self):
         expected = {
