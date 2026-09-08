@@ -955,7 +955,7 @@ class StopPanelApp:
                 self._polling.discard(run_id)
             return
         with self._lock:
-            if self._state_epochs.get(run_id, 0) != expected_epoch:
+            if run_id in self._retired or self._state_epochs.get(run_id, 0) != expected_epoch:
                 self._polling.discard(run_id)
                 return
             self._not_found_polls.pop(run_id, None)   # a live view resets the reap streak
@@ -971,7 +971,7 @@ class StopPanelApp:
                     self._cancel_inflight.discard(run_id)
                 if merged.get("status") != existing.get("status"):
                     try:
-                        runner.save_active_run(merged)
+                        runner.save_active_run(merged, existing_only=True)
                     except Exception:  # aqg: top-level boundary — registry persistence is best-effort UI state
                         pass
             self._polling.discard(run_id)
@@ -1069,7 +1069,7 @@ class StopPanelApp:
                     self._server_verified.discard(run_id)
                     self._state_epochs[run_id] = self._state_epochs.get(run_id, 0) + 1
                     try:
-                        runner.save_active_run(updated)
+                        runner.save_active_run(updated, existing_only=True)
                     except Exception:  # aqg: top-level boundary — best-effort UI persistence
                         pass
             return
@@ -1105,13 +1105,13 @@ class StopPanelApp:
                 updated = {**current, "status": "unknown"}
                 self.runs[run_id] = updated
                 try:
-                    runner.save_active_run(updated)
+                    runner.save_active_run(updated, existing_only=True)
                 except Exception:  # aqg: top-level boundary — best-effort UI persistence
                     pass
                 return
             self.runs[run_id] = updated
             try:
-                runner.save_active_run(updated)
+                runner.save_active_run(updated, existing_only=True)
             except Exception:  # aqg: top-level boundary — registry persistence is best-effort UI state
                 pass
 

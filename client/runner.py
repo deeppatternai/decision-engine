@@ -713,6 +713,7 @@ def _save_active_run_locked(
     registry_loader=None,
     registry_writer=None,
     payload_writer=None,
+    existing_only: bool = False,
 ) -> None:
     """Persist one run while the caller holds ``active_runs_lock()``."""
     payload = active_run_payload(run)
@@ -722,20 +723,65 @@ def _save_active_run_locked(
     registry_loader = registry_loader or load_active_runs_registry
     registry_writer = registry_writer or _write_active_runs_registry
     payload_writer = payload_writer or _write_active_run_payload
-    registry = (
-        prune_active_runs(registry_loader())
-        if registry is None
-        else registry
-    )
+    registry = registry_loader() if registry is None else registry
+    previous = registry.get("runs", {}).get(run_id)
+    registry = prune_active_runs(registry)
+    if (isinstance(previous, dict) and previous.get("status") in TERMINAL_STATUSES
+            and run_id not in registry["runs"]):
+        registry["updated_at"] = time.time()
+        registry_writer(registry)
+        return
+    if existing_only and run_id not in registry["runs"]:
+        return
+    if isinstance(previous, dict) and previous.get("status") in TERMINAL_STATUSES:
+        # Concurrent panel polls and repeated result reads cannot restart the terminal linger
+        # or move a finished run back to running. Preserve only LOCAL persisted deadlines.
+        if payload.get("status") not in TERMINAL_STATUSES:
+            return
+        payload["status"] = previous["status"]
+        if payload.get("completed_at") is None:
+            payload["completed_at"] = previous.get("completed_at")
+        for field in ("finished_at", "hidden_after"):
+            if isinstance(previous.get(field), (int, float)):
+                payload[field] = previous[field]
+        if payload.get("hidden_after", float("inf")) <= time.time():
+            return
     registry["runs"][run_id] = payload
     registry["updated_at"] = time.time()
     registry_writer(registry)
     payload_writer(payload)
 
 
-def save_active_run(run: Dict[str, Any]) -> None:
+def save_active_run(run: Dict[str, Any], *, existing_only: bool = False) -> None:
     with active_runs_lock():
-        _save_active_run_locked(run)
+        _save_active_run_locked(run, existing_only=existing_only)
+
+
+def sync_hosted_run_completion(run_id: str, view: Dict[str, Any]) -> None:
+    """Complete an existing hosted row without reopening history or launching a panel."""
+    if view.get("status") not in TERMINAL_STATUSES or view.get("local") is True:
+        return
+    with active_runs_lock():
+        registry = prune_active_runs(load_active_runs_registry())
+        current = registry.get("runs", {}).get(run_id)
+        if not isinstance(current, dict) or current.get("local") is True:
+            return
+        merged = dict(current)
+        # Result envelopes may contain the entire review. Persist display metadata only,
+        # retaining the submit-time title and locale when follow-ups omit them.
+        merged["status"] = view["status"]
+        for field in ("started_at", "completed_at"):
+            value = view.get(field)
+            if type(value) in (int, float) and math.isfinite(value):
+                merged[field] = value
+        if isinstance(view.get("auditors"), list):
+            merged["auditors"] = [
+                {"status": item["status"]} for item in view["auditors"][:64]
+                if isinstance(item, dict) and isinstance(item.get("status"), str)
+                and item["status"] in TERMINAL_STATUSES | {"pending", "queued", "running"}
+            ]
+        merged["run_id"] = run_id
+        _save_active_run_locked(merged, registry)
 
 
 # Safety ceiling for a LOCAL advisory entry: no hub poll can ever reap it (design §11/§17), so it
@@ -898,13 +944,9 @@ def complete_local_advisory_run(
 def forget_active_run(run_id: str) -> None:
     """Drop a run from the registry outright — the panel calls this once it has finished showing it.
 
-    The registry is the panel's data source, and nothing else reaps it on the MCP path: the shim
-    seeds a run at submit (status queued/running, so no `hidden_after`) and never writes again, so
-    `prune_active_runs` — which only drops entries whose `hidden_after` has passed — can never
-    remove it, and `clear_active_run` is only reached from the CLI. The entry therefore outlived
-    every audit, and each panel start re-seeded the whole history as "running": rows that never
-    went away and stacked up. This is the client-side counterpart of the A-repo server deleting an
-    audit's state file once the run is over — the row's SOURCE goes away, so the row cannot return.
+    The registry is the panel's data source. Terminal MCP follow-ups now set a local expiry even
+    without a panel, and this explicit removal also covers runs completed through panel polling.
+    Removing the source prevents the next panel from loading the finished row again.
 
     Unlike clear_active_run this does not preserve a terminal entry for its linger: the linger is
     over, that is precisely why the caller is here.

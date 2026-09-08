@@ -7,6 +7,9 @@ covered by the Owner self-test checklist in the PR (the panel imports GUI-free b
 these tests run anywhere).
 
 Run:  python3 -m unittest installer.tests.test_stopper_panel
+
+Visible scrolling/focus tests are opt-in: set DE_RUN_VISIBLE_GUI_TESTS=1 and run
+installer.tests.test_stopper_panel.RealTkTaskScrollTests on an isolated test desktop.
 """
 
 from __future__ import annotations
@@ -620,6 +623,10 @@ class RenderReconciliationTests(unittest.TestCase):
         self.assertEqual(app.runs["real-id"]["_sort_at"], 12.0)
 
 
+@unittest.skipUnless(
+    os.environ.get("DE_RUN_VISIBLE_GUI_TESTS") == "1",
+    "visible GUI tests require DE_RUN_VISIBLE_GUI_TESTS=1 on an isolated test desktop",
+)
 class RealTkTaskScrollTests(unittest.TestCase):
     def setUp(self):
         try:
@@ -1282,6 +1289,7 @@ class CancelContractTests(unittest.TestCase):
         app._server_verified = {"r1"}
         app._state_epochs = {}
         app._polling = set()
+        app._retired = set()
         app._not_found_polls = {}
         app._lock = threading.Lock()
         app._render = mock.Mock()
@@ -1335,7 +1343,7 @@ class CancelContractTests(unittest.TestCase):
         self.assertEqual(run["status"], "cancelled")
         self.assertEqual(run["hidden_after"], 100.0 + panel.FINISHED_LINGER_S)
         self.assertNotIn("r1", app._cancel_inflight)
-        save.assert_called_once_with(run)
+        save.assert_called_once_with(run, existing_only=True)
 
     def test_stopped_false_restores_a_non_cancellable_running_state(self):
         app = self._app("cancelling")
@@ -1348,7 +1356,7 @@ class CancelContractTests(unittest.TestCase):
 
         self.assertEqual(app.runs["r1"]["status"], "running")
         self.assertNotIn("r1", app._cancel_inflight)
-        save.assert_called_once_with(app.runs["r1"])
+        save.assert_called_once_with(app.runs["r1"], existing_only=True)
 
     def test_transport_failure_requires_fresh_reconciliation_before_retry(self):
         app = self._app("cancelling")
@@ -1360,7 +1368,7 @@ class CancelContractTests(unittest.TestCase):
         self.assertEqual(app.runs["r1"]["status"], "unknown")
         self.assertNotIn("r1", app._cancel_inflight)
         self.assertNotIn("r1", app._server_verified)
-        save.assert_called_once_with(app.runs["r1"])
+        save.assert_called_once_with(app.runs["r1"], existing_only=True)
 
     def test_stopped_false_without_status_fails_closed_until_poll(self):
         app = self._app("cancelling")
@@ -1371,7 +1379,7 @@ class CancelContractTests(unittest.TestCase):
 
         self.assertEqual(app.runs["r1"]["status"], "unknown")
         self.assertNotIn("r1", app._server_verified)
-        save.assert_called_once_with(app.runs["r1"])
+        save.assert_called_once_with(app.runs["r1"], existing_only=True)
 
     def test_malformed_cancel_response_fails_closed_until_poll(self):
         app = self._app("cancelling")
@@ -1382,7 +1390,7 @@ class CancelContractTests(unittest.TestCase):
 
         self.assertEqual(app.runs["r1"]["status"], "unknown")
         self.assertNotIn("r1", app._server_verified)
-        save.assert_called_once_with(app.runs["r1"])
+        save.assert_called_once_with(app.runs["r1"], existing_only=True)
 
     def test_stopped_false_with_terminal_status_stamps_linger_metadata(self):
         app = self._app("cancelling")
@@ -1395,7 +1403,7 @@ class CancelContractTests(unittest.TestCase):
 
         self.assertEqual(app.runs["r1"]["status"], "completed")
         self.assertEqual(app.runs["r1"]["hidden_after"], 100.0 + panel.FINISHED_LINGER_S)
-        save.assert_called_once_with(app.runs["r1"])
+        save.assert_called_once_with(app.runs["r1"], existing_only=True)
 
     def test_late_cancel_response_never_overwrites_a_terminal_poll(self):
         app = self._app("completed")
@@ -1417,7 +1425,7 @@ class CancelContractTests(unittest.TestCase):
             app._poll("r1")
 
         self.assertEqual(app.runs["r1"]["status"], "running")
-        save.assert_called_once_with(app.runs["r1"])
+        save.assert_called_once_with(app.runs["r1"], existing_only=True)
 
     def test_terminal_poll_ends_an_inflight_cancel_and_wins_the_race(self):
         app = self._app("cancelling")
@@ -1430,7 +1438,7 @@ class CancelContractTests(unittest.TestCase):
 
         self.assertEqual(app.runs["r1"]["status"], "completed")
         self.assertNotIn("r1", app._cancel_inflight)
-        save.assert_called_once_with(app.runs["r1"])
+        save.assert_called_once_with(app.runs["r1"], existing_only=True)
 
     def test_poll_issued_before_cancel_transition_cannot_regress_newer_state(self):
         for status in ("running", "cancelled"):

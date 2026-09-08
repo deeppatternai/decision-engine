@@ -44,12 +44,13 @@ CredentialPrompt = Callable[[], Optional[Credentials]]
 CredentialSubmitHandler = Callable[[str, str], object]
 RECOVERY_REQUIRED_EXIT_CODE = activate.RECOVERY_REQUIRED_EXIT_CODE
 
+_DEFAULT_ENDPOINT = "https://endpoint.deeppattern.ai"
 _MAX_ENDPOINT_INPUT = 2048
 _MAX_SECRET_INPUT = 4096
 # The masked-credential form, ONE per backend. Visible copy and the page-side JS strings are baked in
 # by `_render_credential_form_html` from the resolved locale's PERMANENT_SETUP table; the `__DE_*__`
-# sentinels are its only substitution points. The example endpoint URL and the element ids/JS control
-# flow are language-independent and stay literal here (a parity/behavior test pins that flow). Strings
+# sentinels are its only substitution points. The element ids/JS control flow are language-independent
+# and stay literal here (a parity/behavior test pins that flow). Strings
 # are injected via .replace() (not %-format or .format()) so the CSS `{}` / `%` need no escaping — the
 # same idiom client/popup/launcher.py uses for its popups.
 _CREDENTIAL_FORM_TEMPLATE = r"""<!doctype html>
@@ -62,7 +63,7 @@ input:focus{border-color:#2f6feb;box-shadow:0 0 0 3px rgba(47,111,235,.13)}.hint
 button{min-width:96px;height:38px;padding:0 18px;border-radius:8px;border:1px solid #cbd5e1;font-size:13px;font-weight:650;cursor:pointer}.cancel{color:#344054;background:#fff}.primary{color:#fff;background:#2f6feb;border-color:#2f6feb}.primary:hover{background:#2459bd}
 </style></head><body><header class="header"><div class="title">__DE_TITLE__</div><div class="subtitle">__DE_SUBTITLE__</div></header>
 <main class="wrap"><form class="card" id="setup-form"><label for="endpoint">__DE_ENDPOINT_LABEL__</label>
-<input id="endpoint" required autocomplete="url" maxlength="2048" placeholder="https://engine.example.com" autofocus><div class="hint">__DE_ENDPOINT_HINT__</div>
+<input id="endpoint" required autocomplete="url" maxlength="2048" value="__DE_DEFAULT_ENDPOINT__" autofocus><div class="hint">__DE_ENDPOINT_HINT__</div>
 <label for="secret">__DE_SECRET_LABEL__</label><input id="secret" type="password" required autocomplete="off" maxlength="4096" spellcheck="false" placeholder="__DE_SECRET_PLACEHOLDER__">
 <div class="hint">__DE_SECRET_HINT__</div><div class="error" id="form-error" role="alert" aria-live="polite"></div><div class="actions"><button type="button" class="cancel" id="cancel">__DE_CANCEL__</button><button type="submit" class="primary" id="activate">__DE_ACTIVATE__</button></div></form></main>
 <script>const S=__DE_SETUP_STRINGS__;const endpoint=document.getElementById('endpoint'),secret=document.getElementById('secret'),form=document.getElementById('setup-form'),cancel=document.getElementById('cancel'),activate=document.getElementById('activate'),error=document.getElementById('form-error');let submitting=false;
@@ -124,6 +125,7 @@ def _render_credential_form_html(strings: dict) -> str:
         "__DE_SUBTITLE__": html.escape(strings["subtitle"], quote=True),
         "__DE_ENDPOINT_LABEL__": html.escape(strings["endpoint_label"], quote=True),
         "__DE_ENDPOINT_HINT__": html.escape(strings["endpoint_hint"], quote=True),
+        "__DE_DEFAULT_ENDPOINT__": html.escape(_DEFAULT_ENDPOINT, quote=True),
         "__DE_SECRET_LABEL__": html.escape(strings["secret_label"], quote=True),
         "__DE_SECRET_HINT__": html.escape(strings["secret_hint"], quote=True),
         "__DE_SECRET_PLACEHOLDER__": html.escape(strings["secret_placeholder"], quote=True),
@@ -924,6 +926,7 @@ def _prompt_credentials_tk(
         )
 
         endpoint_var = tk_module.StringVar(root)
+        endpoint_var.set(_DEFAULT_ENDPOINT)
         secret_var = tk_module.StringVar(root)
         endpoint_validation = (
             root.register(lambda proposed: len(proposed) <= _MAX_ENDPOINT_INPUT),

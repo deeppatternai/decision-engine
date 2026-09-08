@@ -2208,6 +2208,7 @@ _AUDIT_FOLLOWUP_TOOLS = frozenset({
     "audit_skill_result",
     "audit_skill_events",
     "check_audit_status",
+    "get_audit_result",
     "wait_audit",
 })
 
@@ -2282,7 +2283,7 @@ def _hosted_work_blocking_local_audit(
     return None
 
 
-_TERMINAL_AUDIT_SUBMIT_STATUSES = frozenset({"completed", "failed", "cancelled"})
+_TERMINAL_AUDIT_SUBMIT_STATUSES = frozenset({"completed", "partial", "failed", "cancelled"})
 
 
 def _audit_run_payload(response: Dict[str, Any]) -> Optional[Dict[str, Any]]:
@@ -2499,6 +2500,62 @@ def _remove_hosted_run_for_local_fallback(run_id: Optional[str]) -> None:
         runner.forget_active_run(run_id)
     except Exception as exc:  # aqg: top-level boundary -- local panel cleanup cannot break MCP
         _log("hosted row cleanup before local fallback failed: %r" % exc)
+
+
+_STOPPER_COMPLETION_SLOTS = threading.BoundedSemaphore(8)
+
+
+def _schedule_stopper_completion(message: Dict[str, Any], response: Dict[str, Any]) -> None:
+    """Bound optional display workers; neither parsing nor disk locks may hold up MCP replies."""
+    params = message.get("params") if isinstance(message.get("params"), dict) else {}
+    name = _logical_mcp_tool_name(params.get("name"))
+    if not isinstance(name, str) or name not in _AUDIT_FOLLOWUP_TOOLS:
+        return
+    if not _STOPPER_COMPLETION_SLOTS.acquire(blocking=False):
+        _log("audit completion sync skipped: worker capacity exhausted")
+        return
+
+    def sync() -> None:
+        try:
+            _sync_stopper_completion(message, response)
+        except Exception as exc:  # aqg: top-level boundary — optional UI parsing must not lose results
+            _log("audit completion sync skipped: %s" % type(exc).__name__)
+        finally:
+            _STOPPER_COMPLETION_SLOTS.release()
+
+    try:
+        threading.Thread(target=sync, daemon=True, name="de-stopper-completion").start()
+    except Exception as exc:  # aqg: top-level boundary — thread creation is best-effort UI work
+        _STOPPER_COMPLETION_SLOTS.release()
+        _log("audit completion sync skipped: %s" % type(exc).__name__)
+
+
+def _sync_stopper_completion(message: Dict[str, Any], response: Dict[str, Any]) -> None:
+    """A completed MCP read must expire its local row even when no GUI is running."""
+    params = message.get("params") if isinstance(message.get("params"), dict) else {}
+    if _logical_mcp_tool_name(params.get("name")) not in _AUDIT_FOLLOWUP_TOOLS:
+        return
+    if not isinstance(response, dict):
+        return
+    result = response.get("result")
+    if response.get("error") is not None or not isinstance(result, dict) or result.get("isError"):
+        return
+    view = _audit_run_payload(response)
+    run_id = _audit_request_run_id(message)
+    # Use the explicit run-level payload, never a nested voice's status or an ID from prose.
+    if not run_id or not isinstance(view, dict) or view.get("local") is True:
+        return
+    if any(view.get(field, run_id) != run_id for field in ("run_id", "audit_id")):
+        return
+    status = view.get("status")
+    if not isinstance(status, str) or status.strip().lower() not in _TERMINAL_AUDIT_SUBMIT_STATUSES:
+        return
+    try:
+        from client import runner
+
+        runner.sync_hosted_run_completion(run_id, {**view, "status": status.strip().lower()})
+    except Exception as exc:  # aqg: top-level boundary — UI state must not break result delivery
+        _log("audit completion sync skipped: %s" % type(exc).__name__)
 
 
 def _spawn_stopper_for_audit(
@@ -3195,6 +3252,8 @@ def serve(
         # that id. Notifications (no id) get no reply regardless.
         if is_request:
             if response:
+                if method == "tools/call":
+                    _schedule_stopper_completion(message, response)
                 if method == "initialize":
                     if isinstance(response.get("result"), dict):
                         transport_gate.finalize_initialize(

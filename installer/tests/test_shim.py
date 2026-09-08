@@ -130,12 +130,14 @@ class FakeForwarder:
         return self._responses.get(method, {"jsonrpc": "2.0", "id": message.get("id"), "result": {}})
 
 
-def _run(forwarder, lines, **serve_kwargs):
+def _run(forwarder, lines, *, background_stopper=False, **serve_kwargs):
     stdin = io.StringIO("".join(l + "\n" for l in lines))
     stdout = io.StringIO()
     # Neutralize the launch self-update in transport tests — it would otherwise spawn a real
     # `git pull` from this checkout. Its own behavior is covered by SelfUpdateTestCase.
-    with mock.patch.object(shim, "_maybe_self_update"), mock.patch.dict(
+    completion = shim._schedule_stopper_completion if background_stopper else shim._sync_stopper_completion
+    with mock.patch.object(shim, "_schedule_stopper_completion", side_effect=completion), \
+            mock.patch.object(shim, "_maybe_self_update"), mock.patch.dict(
         os.environ, {"DE_SKIP_STOPPER_LAUNCH": "1"}
     ):
         shim.serve(forwarder, stdin=stdin, stdout=stdout, **serve_kwargs)
@@ -3182,6 +3184,251 @@ def _submit_result(run_id="run_abc", status="queued"):
                        "text": json.dumps({"run_id": run_id, "status": status})}]}}
 
 
+class HostedCompletionRegistryTestCase(unittest.TestCase):
+    def setUp(self):
+        tmp = tempfile.TemporaryDirectory()
+        self.addCleanup(tmp.cleanup)
+        self.root = Path(tmp.name)
+        self.registry_path = self.root / "active-runs.json"
+        env = {
+            "DE_CONFIG_PATH": str(self.root / "config.json"),
+            "DE_ACTIVE_RUNS": str(self.registry_path),
+            "DE_ACTIVE_RUN": str(self.root / "active-run.json"),
+            "DE_ACTIVE_RUNS_WRITE_PATHS": json.dumps([str(self.registry_path)]),
+            "DE_ACTIVE_RUN_WRITE_PATHS": json.dumps([str(self.root / "active-run.json")]),
+            "DE_ACTIVE_RUNS_LOCK_PATHS": json.dumps([str(self.root / "runs.lock")]),
+        }
+        patcher = mock.patch.dict(os.environ, env)
+        patcher.start()
+        self.addCleanup(patcher.stop)
+        sweep = mock.patch("client.popup.session.sweep")
+        sweep.start()
+        self.addCleanup(sweep.stop)
+        clock = mock.patch.object(runner.time, "time", return_value=100.0)
+        self.clock = clock.start()
+        self.addCleanup(clock.stop)
+        runner.save_active_run({"run_id": "aud_old", "status": "running", "title": "Old audit",
+                                "started_at": 90.0, "ui_locale": "zh-CN"})
+        runner.save_active_run({"run_id": "aud_other", "status": "running"})
+
+    def _runs(self):
+        return json.loads(self.registry_path.read_text(encoding="utf-8"))["runs"]
+
+    def _followup(self, tool="audit_skill_result", payload=None, *, run_id="aud_old", error=False):
+        payload = payload if payload is not None else {
+            "run_id": run_id, "status": "completed", "completed_at": 99.0,
+        }
+        response = {"jsonrpc": "2.0", "id": 1, "result": {
+            "content": [{"type": "text", "text": json.dumps(payload)}], "isError": error,
+        }}
+        request = {"jsonrpc": "2.0", "id": 1, "method": "tools/call", "params": {
+            "name": tool, "arguments": {"skill_name": "audit", "run_id": run_id},
+        }}
+        with mock.patch.object(runner, "launch_stopper_if_available") as launch:
+            output = _run(FakeForwarder(responses={"tools/call": response}),
+                          [json.dumps(request)], client_host="claude")
+        self.assertEqual(output, [response])
+        launch.assert_not_called()
+
+    def test_terminal_followups_sync_existing_row_without_a_panel(self):
+        for tool in ("audit_skill_status", "audit_skill_result", "wait_audit",
+                     "check_audit_status", "get_audit_result"):
+            for status in ("completed", "partial", "failed", "cancelled"):
+                with self.subTest(tool=tool, status=status):
+                    run_id = "aud_" + tool + status
+                    runner.save_active_run({"run_id": run_id, "status": "running",
+                                            "title": "Original title", "started_at": 90.0})
+                    self._followup(tool, {"schema_version": "1.0", "skill": "audit",
+                        "run_id": run_id, "payload": {"status": status, "completed_at": 99.0}},
+                        run_id=run_id)
+                    saved = self._runs()[run_id]
+                    self.assertEqual(saved["status"], status)
+                    self.assertEqual(saved["title"], "Original title")
+                    self.assertEqual(saved["completed_at"], 99.0)
+                    self.assertEqual(saved["hidden_after"], 130.0)
+        self.assertEqual(self._runs()["aud_other"]["status"], "running")
+
+    def test_repeated_results_and_panel_updates_do_not_extend_linger(self):
+        self._followup()
+        self.clock.return_value = 120.0
+        self._followup()
+        runner.save_active_run({**self._runs()["aud_old"], "completed_at": 99.0})
+        self.assertEqual(self._runs()["aud_old"]["hidden_after"], 130.0)
+        runner.save_active_run({"run_id": "aud_old", "status": "running"})
+        self.assertEqual(self._runs()["aud_old"]["status"], "completed")
+        self.clock.return_value = 140.0
+        self._followup()
+        runner.save_active_run({"run_id": "aud_new", "status": "running"})
+        self.assertNotIn("aud_old", self._runs())
+        self._followup()
+        self.assertNotIn("aud_old", self._runs())
+        self.assertEqual(set(self._runs()), {"aud_other", "aud_new"})
+
+    def test_terminal_read_does_not_create_history_or_complete_local_rows(self):
+        self._followup(run_id="aud_missing")
+        self.assertNotIn("aud_missing", self._runs())
+        runner.save_active_run({"run_id": "local_example", "status": "running", "local": True})
+        self._followup(run_id="local_example")
+        self.assertEqual(self._runs()["local_example"]["status"], "running")
+
+    def test_only_matching_successful_run_level_followups_can_complete_a_row(self):
+        for payload in (
+            {"run_id": "aud_other", "status": "completed"},
+            {"audit_id": "aud_other", "status": "completed"},
+            {"run_id": "aud_old", "status": "running", "auditors": [{"status": "completed"}]},
+            {"run_id": "aud_old", "auditors": [{"status": "completed"}]},
+            {"run_id": "aud_old", "status": "completed", "local": True},
+        ):
+            with self.subTest(payload=payload):
+                self._followup(payload=payload)
+                self.assertEqual(self._runs()["aud_old"]["status"], "running")
+        self._followup(error=True)
+        self._followup(tool="unrelated_tool")
+        self.assertEqual(self._runs()["aud_old"]["status"], "running")
+        self.assertEqual(self._runs()["aud_other"]["status"], "running")
+
+    def test_flat_terminal_response_can_use_the_request_run_id(self):
+        self._followup(payload={"status": "completed", "completed_at": 99.0})
+        self.assertEqual(self._runs()["aud_old"]["status"], "completed")
+
+    def test_registry_failure_does_not_lose_the_audit_result(self):
+        with mock.patch.object(runner, "_write_active_runs_registry", side_effect=OSError("unavailable")):
+            self._followup()
+        self.assertEqual(self._runs()["aud_old"]["status"], "running")
+
+    def test_result_body_is_not_written_into_the_registry(self):
+        self._followup(payload={"run_id": "aud_old", "status": "completed",
+            "markdown": "private-report-sentinel", "json": {"findings": [1]},
+            "started_at": "private-report-sentinel", "completed_at": float("nan"),
+            "auditors": [{"status": "completed", "text": "private-report-sentinel"}] * 80})
+        saved = self._runs()["aud_old"]
+        self.assertNotIn("markdown", saved)
+        self.assertNotIn("json", saved)
+        self.assertEqual(saved["started_at"], 90.0)
+        self.assertIsNone(saved["completed_at"])
+        self.assertEqual(saved["auditors"], [{"status": "completed"}] * 64)
+        self.assertNotIn("private-report-sentinel", self.registry_path.read_text(encoding="utf-8"))
+
+    def test_terminal_metadata_survives_sparse_panel_update_and_expiry_is_persisted(self):
+        self._followup()
+        runner.save_active_run({"run_id": "aud_old", "status": "completed"})
+        self.assertEqual(self._runs()["aud_old"]["completed_at"], 99.0)
+        self.clock.return_value = 140.0
+        runner.save_active_run({"run_id": "aud_old", "status": "running", "local": False})
+        self.assertNotIn("aud_old", self._runs())
+
+    def test_real_lock_contention_does_not_block_result_delivery(self):
+        delivered, synced, entered = threading.Event(), threading.Event(), threading.Event()
+        real_sync = shim._sync_stopper_completion
+        outputs, failures = [], []
+
+        def sync(*args):
+            entered.set()
+            try:
+                real_sync(*args)
+            finally:
+                synced.set()
+
+        response = _submit_result("aud_old", "completed")
+        request = {"jsonrpc": "2.0", "id": 1, "method": "tools/call", "params": {
+            "name": "audit_skill_result", "arguments": {"run_id": "aud_old"}}}
+
+        def deliver():
+            try:
+                outputs.extend(_run(FakeForwarder(responses={"tools/call": response}),
+                                    [json.dumps(request)], background_stopper=True))
+            except Exception as exc:  # aqg: top-level boundary — collect the transport worker failure for assertion
+                failures.append(exc)
+            finally:
+                delivered.set()
+
+        with mock.patch.object(shim, "_sync_stopper_completion", side_effect=sync):
+            worker = threading.Thread(target=deliver)
+            with runner.active_runs_lock():
+                worker.start()
+                returned_while_locked = delivered.wait(2)
+                entered_while_locked = entered.wait(2)
+                synced_while_locked = synced.is_set()
+            worker.join(5)
+            finished = synced.wait(5)
+        self.assertTrue(returned_while_locked)
+        self.assertTrue(entered_while_locked)
+        self.assertFalse(synced_while_locked)
+        self.assertTrue(finished)
+        self.assertEqual(failures, [])
+        self.assertEqual(outputs, [response])
+        self.assertEqual(self._runs()["aud_old"]["status"], "completed")
+
+    def test_completion_workers_are_bounded_and_creation_failure_releases_capacity(self):
+        request = {"params": {"name": "audit_skill_result", "arguments": {"run_id": "aud_old"}}}
+        slots = threading.BoundedSemaphore(1)
+        with mock.patch.object(shim, "_STOPPER_COMPLETION_SLOTS", slots):
+            slots.acquire()
+            with mock.patch.object(shim.threading, "Thread") as thread:
+                shim._schedule_stopper_completion(request, _submit_result("aud_old", "completed"))
+                thread.assert_not_called()
+            slots.release()
+            with mock.patch.object(shim.threading, "Thread", side_effect=RuntimeError("unavailable")):
+                shim._schedule_stopper_completion(request, _submit_result("aud_old", "completed"))
+            self.assertTrue(slots.acquire(blocking=False))
+            slots.release()
+
+    def test_background_parser_failure_releases_capacity(self):
+        request = {"params": {"name": "audit_skill_result", "arguments": {"run_id": "aud_old"}}}
+        completed = threading.Event()
+        slots = threading.BoundedSemaphore(1)
+
+        def record(*args):
+            completed.set()
+
+        with mock.patch.object(shim, "_STOPPER_COMPLETION_SLOTS", slots), \
+                mock.patch.object(shim, "_audit_run_payload", side_effect=RecursionError()), \
+                mock.patch.object(shim, "_log", side_effect=record):
+            shim._schedule_stopper_completion(request, _submit_result("aud_old", "completed"))
+            self.assertTrue(completed.wait(2))
+            self.assertTrue(slots.acquire(timeout=2))
+            slots.release()
+
+    def _panel(self):
+        from client.stopper import panel
+
+        app = object.__new__(panel.StopPanelApp)
+        app.runs = {}
+        app._retired = set()
+        app._polling = set()
+        app._cancel_inflight = set()
+        app._server_verified = set()
+        app._state_epochs = {}
+        app._not_found_polls = {}
+        app._lock = threading.Lock()
+        app._merge_disk()
+        return app
+
+    def test_late_panel_response_cannot_recreate_expired_registry_row(self):
+        app = self._panel()
+        self._followup()
+        self.clock.return_value = 140.0
+        runner.save_active_run({"run_id": "aud_new", "status": "running"})
+        self.assertNotIn("aud_old", self._runs())
+        with mock.patch.object(runner, "request_json", return_value={
+            "run_id": "aud_old", "status": "completed", "completed_at": 99.0,
+        }):
+            app._poll("aud_old")
+        self.assertNotIn("aud_old", self._runs())
+        self.assertEqual(set(self._runs()), {"aud_other", "aud_new"})
+
+    def test_late_panel_response_cannot_recreate_a_retired_visible_row(self):
+        app = self._panel()
+        app.runs.pop("aud_old")
+        app._retired.add("aud_old")
+        with mock.patch.object(runner, "request_json", return_value={
+            "run_id": "aud_old", "status": "completed", "completed_at": 99.0,
+        }):
+            app._poll("aud_old")
+        self.assertNotIn("aud_old", app.runs)
+        self.assertEqual(self._runs()["aud_old"]["status"], "running")
+
+
 class AuditStopPanelTestCase(unittest.TestCase):
     """The agent starts a hub audit through the shim's MCP path -- via `audit_skill_submit` (the skill
     workflow) OR the raw `submit_audit` hub tool -- not the `audit` CLI. The shim must mirror the CLI:
@@ -3273,7 +3520,7 @@ class AuditStopPanelTestCase(unittest.TestCase):
         launch.assert_not_called()
 
     def test_spawn_ignores_terminal_submit_payloads(self):
-        for status in ("completed", "failed", "cancelled"):
+        for status in ("completed", "partial", "failed", "cancelled"):
             with self.subTest(status=status), \
                  mock.patch("client.runner.save_active_run") as save, \
                  mock.patch("client.runner.launch_stopper_if_available") as launch:

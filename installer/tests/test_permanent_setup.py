@@ -33,7 +33,10 @@ def _credential_tk_double(answers, *, action="Activate"):
     def string_var(_parent=None):
         variable = mock.MagicMock()
         values = next(answer_values)
-        if isinstance(values, (list, tuple)):
+        if values is None:
+            variable.get.return_value = ""
+            variable.set.side_effect = lambda value: variable.get.configure_mock(return_value=value)
+        elif isinstance(values, (list, tuple)):
             variable.get.side_effect = values
         else:
             variable.get.return_value = values
@@ -418,6 +421,18 @@ class PermanentSetupTestCase(unittest.TestCase):
         self.assertEqual(result, ("https://owner.example", "owner_invite_value"))
         widgets.Style.assert_called_once_with(root)
         self.assertEqual(len(widgets.Entry.call_args_list), 2)
+        endpoint_options = widgets.Entry.call_args_list[0].kwargs
+        endpoint_options["textvariable"].set.assert_called_once_with(
+            "https://endpoint.deeppattern.ai"
+        )
+        self.assertEqual(endpoint_options.get("state", "normal"), "normal")
+
+    def test_tk_form_submits_default_endpoint_when_unedited(self):
+        tk_module, widgets, _root = _credential_tk_double([None, "owner_invite_value"])
+
+        result = permanent_setup._prompt_credentials_tk(tk_module, widgets)
+
+        self.assertEqual(result, ("https://endpoint.deeppattern.ai", "owner_invite_value"))
 
     def test_tk_form_keeps_invalid_required_input_open_with_feedback(self):
         tk_module, widgets, root = _credential_tk_double(
@@ -524,6 +539,10 @@ class PermanentSetupTestCase(unittest.TestCase):
         self.assertIn('id="secret" type="password"', captured["html"])
         self.assertIn('id="form-error"', captured["html"])
         self.assertIn('id="endpoint" required', captured["html"])
+        endpoint_input = captured["html"].split('<input id="endpoint"', 1)[1].split(">", 1)[0]
+        self.assertIn('value="https://endpoint.deeppattern.ai"', endpoint_input)
+        self.assertNotIn("readonly", endpoint_input)
+        self.assertNotIn("disabled", endpoint_input)
         self.assertIn('id="secret" type="password" required', captured["html"])
         self.assertIn("Owner-issued endpoint", captured["html"])
         self.assertIn("Activation key", captured["html"])
@@ -592,6 +611,7 @@ class PermanentSetupTestCase(unittest.TestCase):
         self.assertNotIn("Activation key", captured["html"])
         self.assertNotIn("Owner-issued endpoint", captured["html"])
         self.assertNotIn("__DE_", captured["html"])               # every sentinel substituted
+        self.assertIn('value="https://endpoint.deeppattern.ai"', captured["html"])
 
     def test_render_is_single_pass_so_a_poisoned_slot_cannot_re_enter_substitution(self):
         """Defense-in-depth the docstring promises: a slot value that itself contains a substitution

@@ -5,9 +5,9 @@
 one file (or passes a new version) and nothing drifts — including the README version badge, which
 would otherwise be hand-edited and go stale.
 
-    python3 scripts/set_version.py            # sync all markers TO the current VERSION file
-    python3 scripts/set_version.py 0.3.0      # set VERSION + all markers to 0.3.0
-    python3 scripts/set_version.py --check     # verify everything already agrees (exit 1 on drift)
+    python3 installer/set_version.py             # sync all markers TO the current VERSION file
+    python3 installer/set_version.py 0.3.0       # set VERSION + all markers to 0.3.0
+    python3 installer/set_version.py --check     # verify everything already agrees (exit 1 on drift)
 
 Markers kept in sync (all `X.Y.Z`):
   VERSION · client/version.py (CLIENT_VERSION) · pyproject.toml (version) ·
