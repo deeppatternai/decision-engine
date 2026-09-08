@@ -49,6 +49,12 @@ _SUPPORTED_ENTRY_OWNERSHIP_POLICIES = frozenset(
     {"replace-existing-v1", "replace-marked-de-v1"}
 )
 _SUPPORTED_HOST_OWNED_ENTRY_FIELDS = frozenset({"disabled"})
+# Fields a host may DELETE from a previously written managed entry without that
+# entry stopping being ours. Deliberately limited to non-semantic JSON hints:
+# neither one can change which process the host launches, so tolerating their
+# absence cannot be used to adopt a foreign connector. `command`, `args`, `env`
+# and any unrecognized field stay outside this set forever.
+_SUPPORTED_HOST_NORMALIZED_ENTRY_FIELDS = frozenset({"type", "cwd"})
 
 
 @dataclass(frozen=True)
@@ -113,6 +119,11 @@ class AgentHostSpec:
     post_mcp_write: Optional[
         Callable[[dict[str, Any], bool], dict[str, object]]
     ] = None
+    # Host normalization tolerance. Both are ownership-recognition inputs only:
+    # they widen what still counts as OUR previous entry, never what gets
+    # written, and both require the fail-closed marked-DE ownership policy.
+    host_normalized_entry_fields: FrozenSet[str] = frozenset()
+    legacy_registration_host_families: FrozenSet[str] = frozenset()
 
 
 # Compatibility for callers/tests that imported the pre-WP1 type name.
@@ -240,6 +251,33 @@ def validate_host_specs(specs: Mapping[str, AgentHostSpec]) -> None:
             or (spec.host_owned_entry_fields and spec.config_format != "json")
         ):
             _invalid_host_spec(client, "host-owned entry fields are invalid")
+        if not spec.host_normalized_entry_fields.issubset(
+            _SUPPORTED_HOST_NORMALIZED_ENTRY_FIELDS
+        ) or spec.host_normalized_entry_fields.intersection(
+            spec.host_owned_entry_fields
+        ):
+            _invalid_host_spec(client, "host-normalized entry fields are invalid")
+        if any(
+            not isinstance(family, str)
+            or family != family.strip().lower()
+            or not family
+            or family == spec.host_family
+            for family in spec.legacy_registration_host_families
+        ):
+            _invalid_host_spec(
+                client, "legacy registration host families are invalid"
+            )
+        if (
+            spec.host_normalized_entry_fields
+            or spec.legacy_registration_host_families
+        ) and (
+            renderer_writer(spec.config_renderer) != "json-merge-v1"
+            or spec.entry_ownership_policy != "replace-marked-de-v1"
+        ):
+            _invalid_host_spec(
+                client,
+                "host normalization tolerance requires owned JSON entries",
+            )
         if renderer_writer(spec.config_renderer) != "json-merge-v1" and (
             spec.config_write_guard is not None
             or spec.config_write_guard_probe is not None

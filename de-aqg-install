@@ -576,6 +576,7 @@ else
   tty_print "Installing Agent Quality Gates from the official repository..."
   clean_exec mkdir -p "$(dirname "$AQG_ROOT")"
   if ! clean_exec env GIT_TERMINAL_PROMPT=0 "$GIT_BIN" clone \
+      --config core.autocrlf=false --config core.eol=lf \
       --depth 1 --branch main --single-branch "$AQG_REPO" "$AQG_ROOT"; then
     fail "could not obtain the official AQG source; Decision Engine was not installed"
   fi

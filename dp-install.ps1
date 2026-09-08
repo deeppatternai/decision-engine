@@ -33,7 +33,7 @@ function Stop-Install {
         [Parameter(Mandatory = $true)][string]$Message,
         [int]$Code = $ExitUsage
     )
-    [Console]::Error.WriteLine("{0}: ERROR: {1}" -f $ProgramName, $Message)
+    [Console]::Error.WriteLine(("{0}: ERROR: {1}" -f $ProgramName, $Message))
     exit $Code
 }
 
@@ -214,6 +214,28 @@ function Test-ReparsePoint {
     return ($item.Attributes -band [System.IO.FileAttributes]::ReparsePoint) -ne 0
 }
 
+function Test-AqgManagedRoot {
+    param([Parameter(Mandatory = $true)][string]$Path)
+    $item = Get-Item -LiteralPath $Path -Force
+    if ($item.LinkType -ne "SymbolicLink" -or -not $item.PSIsContainer) {
+        return $false
+    }
+    $targets = @($item.Target)
+    if ($targets.Count -ne 1) { return $false }
+    $target = [string]$targets[0]
+    if ($target.StartsWith('\\?\')) { $target = $target.Substring(4) }
+    if (-not [System.IO.Path]::IsPathRooted($target)) {
+        $target = Join-Path (Split-Path -Parent $Path) $target
+    }
+    $target = [System.IO.Path]::GetFullPath($target)
+    $versions = [System.IO.Path]::GetFullPath((Join-Path (Split-Path -Parent $Path) "versions"))
+    return ((Split-Path -Parent $target) -eq $versions) -and `
+        ((Split-Path -Leaf $target) -cmatch '^[0-9a-f]{40}$') -and `
+        (Test-Path -LiteralPath $target -PathType Container) -and `
+        (-not (Test-ReparsePoint -Path $versions)) -and `
+        (-not (Test-ReparsePoint -Path $target))
+}
+
 function Invoke-ManagedPython {
     param(
         [Parameter(Mandatory = $true)][string[]]$Arguments,
@@ -250,7 +272,8 @@ if (Test-ReparsePoint -Path (Join-Path $HOME ".deeppattern")) {
     Stop-Install "$HOME\.deeppattern is a reparse point; preserve it and use an owner-guided install." $ExitBlocked
 }
 if (Test-Path -LiteralPath $AqgRoot) {
-    if (-not (Test-Path -LiteralPath $AqgRoot -PathType Container) -or (Test-ReparsePoint -Path $AqgRoot)) {
+    if (-not (Test-Path -LiteralPath $AqgRoot -PathType Container) -or
+        ((Test-ReparsePoint -Path $AqgRoot) -and -not (Test-AqgManagedRoot -Path $AqgRoot))) {
         Stop-Install "$AqgRoot is not a regular AQG checkout; preserve it and use the managed replacement flow." $ExitBlocked
     }
     $aqgOrigin = Invoke-WithCleanEnvironment -FilePath $GitPath -ArgumentList @(
@@ -284,7 +307,8 @@ try {
 
     $sourceRoot = Join-Path $tempRoot "decision-engine"
     $clone = Invoke-WithCleanEnvironment -FilePath $GitPath -ArgumentList @(
-        "clone", "--depth", "1", "--branch", "main", "--single-branch",
+        "clone", "--config", "core.autocrlf=false", "--config", "core.eol=lf",
+        "--depth", "1", "--branch", "main", "--single-branch",
         "--", $DecisionEngineRepository, $sourceRoot
     )
     if ($clone -ne 0) {

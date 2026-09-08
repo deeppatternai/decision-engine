@@ -2095,15 +2095,26 @@ def _is_marked_de_entry(
     existing: Any,
     desired: Dict[str, Any],
     host_owned_fields: FrozenSet[str] = frozenset(),
+    normalized_fields: FrozenSet[str] = frozenset(),
+    legacy_host_families: FrozenSet[str] = frozenset(),
 ) -> bool:
-    """Recognize a prior generated JSON entry without trusting its dynamic paths."""
+    """Recognize a prior generated JSON entry without trusting its dynamic paths.
 
-    extra_fields = (
-        set(existing).difference(desired) if isinstance(existing, dict) else set()
-    )
+    ``normalized_fields`` names non-semantic fields (``type``/``cwd``) that the
+    host is known to DELETE from entries it has loaded. Only their absence is
+    tolerated: a field the host rewrote to a different value is still treated
+    as foreign, so this can widen recognition of our own past write but never
+    adopt someone else's connector. ``legacy_host_families`` names registration
+    markers a previous DE release wrote at this same location, so an upgrade
+    repairs its own history instead of failing closed against it.
+    """
+
+    if not isinstance(existing, dict):
+        return False
+    missing_fields = set(desired).difference(existing)
+    extra_fields = set(existing).difference(desired)
     if (
-        not isinstance(existing, dict)
-        or not set(desired).issubset(existing)
+        not missing_fields.issubset(normalized_fields)
         or not extra_fields.issubset(host_owned_fields)
         or ("disabled" in extra_fields and type(existing["disabled"]) is not bool)
     ):
@@ -2114,17 +2125,36 @@ def _is_marked_de_entry(
         not isinstance(existing_env, dict)
         or not isinstance(desired_env, dict)
         or set(existing_env) != set(desired_env)
-        or existing_env.get(CLIENT_HOST_ENV) != desired_env.get(CLIENT_HOST_ENV)
         or not isinstance(existing.get("command"), str)
         or not existing["command"]
+    ):
+        return False
+    existing_marker = existing_env.get(CLIENT_HOST_ENV)
+    if existing_marker != desired_env.get(CLIENT_HOST_ENV) and (
+        not isinstance(existing_marker, str)
+        or existing_marker not in legacy_host_families
     ):
         return False
     launcher_root = _managed_launcher_root(
         existing.get("args"), existing.get("cwd")
     )
+    if launcher_root is None and "cwd" in missing_fields:
+        # The host dropped the pinned working directory. PYTHONPATH is the same
+        # DE-authored root, and the argv must still be exactly the managed
+        # launcher, so re-checking against it recognizes our own entry without
+        # loosening what the argv itself is allowed to be.
+        recorded_root = existing_env.get("PYTHONPATH")
+        if isinstance(recorded_root, str) and recorded_root:
+            launcher_root = _managed_launcher_root(
+                existing.get("args"), recorded_root
+            )
     if launcher_root is None or existing_env.get("PYTHONPATH") != launcher_root:
         return False
-    if "type" in desired and existing.get("type") != desired.get("type"):
+    if (
+        "type" in desired
+        and "type" not in missing_fields
+        and existing.get("type") != desired.get("type")
+    ):
         return False
     return True
 
@@ -2138,6 +2168,8 @@ def _write_json_client(
     *,
     ownership_policy: str = "replace-existing-v1",
     host_owned_fields: FrozenSet[str] = frozenset(),
+    normalized_fields: FrozenSet[str] = frozenset(),
+    legacy_host_families: FrozenSet[str] = frozenset(),
     collection_key: str = "mcpServers",
     config_transform: Optional[Callable[[Dict[str, Any]], bool]] = None,
 ) -> Dict[str, Any]:
@@ -2179,7 +2211,13 @@ def _write_json_client(
     if (
         ownership_policy == "replace-marked-de-v1"
         and server_name in servers
-        and not _is_marked_de_entry(existing_entry, entry, host_owned_fields)
+        and not _is_marked_de_entry(
+            existing_entry,
+            entry,
+            host_owned_fields,
+            normalized_fields,
+            legacy_host_families,
+        )
     ):
         raise ShellError(
             "same_name_unowned: Decision Engine entry differs from the requested "
@@ -2409,6 +2447,8 @@ def _write_json_renderer(
         dry_run,
         ownership_policy=spec.entry_ownership_policy,
         host_owned_fields=spec.host_owned_entry_fields,
+        normalized_fields=spec.host_normalized_entry_fields,
+        legacy_host_families=spec.legacy_registration_host_families,
         collection_key=collection_key,
         config_transform=config_transform,
     )

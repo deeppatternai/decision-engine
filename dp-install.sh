@@ -18,7 +18,8 @@ AQG_REF="main"
 PROGRAM_NAME="dp-install"
 MANAGED_ROOT="$HOME/.deeppattern/decision-engine"
 AQG_ROOT="$HOME/.deeppattern/agent-quality-gates"
-CLAUDE_3P_CONFIG="$HOME/Library/Application Support/Claude-3p/claude_desktop_config.json"
+CLAUDE_3P_ROOT="$HOME/Library/Application Support/Claude-3p"
+CLAUDE_3P_CONFIG="$CLAUDE_3P_ROOT/claude_desktop_config.json"
 WORKBUDDY_STANDARD_APP="/Applications/WorkBuddy.app"
 WORKBUDDY_AI_APP="/Applications/WorkBuddy AI.app"
 WORKBUDDY_AI_ROOT="$HOME/.workbuddy-ai"
@@ -57,7 +58,7 @@ tty_print() {
 
 clean_exec() {
   env -u DE_ENDPOINT -u DE_ACTIVATION_SECRET -u PYTHONPATH \
-    -u CLAUDE_DESKTOP_CONFIG -u WORKBUDDY_APP_ROOT \
+    -u CLAUDE_DESKTOP_CONFIG -u CLAUDE_DESKTOP_3P_CONFIG -u WORKBUDDY_APP_ROOT \
     -u WORKBUDDY_CONFIG -u WORKBUDDY_SKILLS_DIR \
     -u BASH_ENV -u ENV "$@"
 }
@@ -458,8 +459,20 @@ if regular_app_has_bundle_id "/Applications/Qoder CN IDE.app" "com.aliyun.lingma
 fi
 
 verify_aqg_checkout() {
-  local actual_remote status_output
-  if [ -L "$AQG_ROOT" ] || [ ! -d "$AQG_ROOT" ]; then
+  local actual_remote status_output resolved parent version
+  if [ -L "$AQG_ROOT" ]; then
+    # Same managed-layout contract as de-aqg-install. Resolve aliases on both
+    # sides (macOS /var, relative links) without accepting escaped targets.
+    resolved="$(cd "$AQG_ROOT" 2>/dev/null && pwd -P)" \
+      || fail "$AQG_ROOT is a symlink that cannot be resolved; preserve it and stop"
+    parent="$(cd "$(dirname "$AQG_ROOT")" 2>/dev/null && pwd -P)" \
+      || fail "$AQG_ROOT has no resolvable parent directory; preserve it and stop"
+    [ "${resolved%/*}" = "$parent/versions" ] \
+      || fail "$AQG_ROOT is a symlink outside the managed versions directory; preserve it and stop"
+    version="${resolved##*/}"
+    [[ "$version" =~ ^[0-9a-f]{40}$ ]] \
+      || fail "$AQG_ROOT is not a full-commit checkout in the managed versions directory; preserve it and stop"
+  elif [ ! -d "$AQG_ROOT" ]; then
     fail "$AQG_ROOT is not a regular AQG checkout directory; preserve it and stop"
   fi
   [ -e "$AQG_ROOT/.git" ] \
@@ -484,6 +497,10 @@ verify_aqg_checkout() {
 sync_aqg_checkout() {
   local target_sha
   verify_aqg_checkout
+  if [ -L "$AQG_ROOT" ]; then
+    tty_print "Reusing the managed AQG version; subsequent updates belong to AQG's signed channel."
+    return 0
+  fi
   tty_print "Synchronizing Agent Quality Gates from $AQG_REPO at $AQG_REF..."
   if ! clean_exec env GIT_TERMINAL_PROMPT=0 "$GIT_BIN" -C "$AQG_ROOT" fetch \
       --depth 1 "$AQG_REPO" "refs/heads/$AQG_REF"; then
@@ -626,6 +643,7 @@ else
   tty_print "Installing Agent Quality Gates from the product repository at $AQG_REF..."
   clean_exec mkdir -p "$(dirname "$AQG_ROOT")"
   if ! clean_exec env GIT_TERMINAL_PROMPT=0 "$GIT_BIN" clone \
+      --config core.autocrlf=false --config core.eol=lf \
       --depth 1 --branch "$AQG_REF" --single-branch "$AQG_REPO" "$AQG_ROOT"; then
     fail "could not obtain the AQG product source at $AQG_REF; Decision Engine was not installed"
   fi
@@ -794,19 +812,19 @@ print(result.get("status", "unknown"))' \
   [ "$state" = "ready" ]
 }
 
-run_claude_3p_python() {
-  (
-    cd "$MANAGED_ROOT"
-    de_exec env CLAUDE_DESKTOP_CONFIG="$CLAUDE_3P_CONFIG" \
-      "$PYTHON_BIN" "$@"
-  )
-}
-
+# The third-party provider profile is its own registered Decision Engine host
+# (claude-desktop-3p), so the signed release detects, writes, and verifies it
+# through the ordinary client path. Only the fail-closed file guard stays here:
+# it must refuse before any host write, and it protects a product-owned file
+# rather than a Decision Engine one.
 claude_3p_profile_detected=0
-if [ -e "$CLAUDE_3P_CONFIG" ] || [ -L "$CLAUDE_3P_CONFIG" ]; then
-  if [ -L "$CLAUDE_3P_CONFIG" ] || [ ! -f "$CLAUDE_3P_CONFIG" ]; then
-    blocked \
-      "$CLAUDE_3P_CONFIG is not a regular configuration file; preserve it and repair the Claude third-party profile before continuing"
+if [ -d "$CLAUDE_3P_ROOT" ] || [ -e "$CLAUDE_3P_CONFIG" ] \
+    || [ -L "$CLAUDE_3P_CONFIG" ]; then
+  if [ -e "$CLAUDE_3P_CONFIG" ] || [ -L "$CLAUDE_3P_CONFIG" ]; then
+    if [ -L "$CLAUDE_3P_CONFIG" ] || [ ! -f "$CLAUDE_3P_CONFIG" ]; then
+      blocked \
+        "$CLAUDE_3P_CONFIG is not a regular configuration file; preserve it and repair the Claude third-party profile before continuing"
+    fi
   fi
   claude_3p_profile_detected=1
 fi
@@ -861,51 +879,10 @@ if managed_mcp_supports_allow_unactivated; then
   managed_mcp_allow_unactivated=1
 fi
 
-managed_supports_claude_desktop() {
+managed_supports_claude_desktop_3p() {
   run_managed_python -c \
-    'from installer import mcp_config; raise SystemExit(0 if "claude-desktop" in mcp_config.CLIENTS else 1)' \
+    'from installer import mcp_config; raise SystemExit(0 if "claude-desktop-3p" in mcp_config.CLIENTS else 1)' \
     </dev/null >/dev/null 2>&1
-}
-
-preflight_claude_3p_profile() {
-  if [ "$managed_mcp_allow_unactivated" = "1" ]; then
-    run_claude_3p_python -m installer.mcp_config --write --dry-run \
-      --allow-unactivated --client claude-desktop >/dev/null
-  else
-    run_claude_3p_python -m installer.mcp_config --write --dry-run \
-      --client claude-desktop >/dev/null
-  fi
-}
-
-wire_claude_3p_profile() {
-  local allow_unactivated="${1:-0}"
-  if [ "$allow_unactivated" = "1" ] \
-      && [ "$managed_mcp_allow_unactivated" = "1" ]; then
-    run_claude_3p_python -m installer.mcp_config --write \
-      --allow-unactivated --client claude-desktop
-  else
-    run_claude_3p_python -m installer.mcp_config --write \
-      --client claude-desktop
-  fi
-}
-
-verify_claude_3p_profile() {
-  local allow_unactivated="${1:-0}" status
-  if [ "$allow_unactivated" = "1" ] \
-      && [ "$managed_mcp_allow_unactivated" = "1" ]; then
-    status="$(run_claude_3p_python -c \
-      'from installer import mcp_config; print(mcp_config.entry_status("claude-desktop", allow_unactivated=True))' \
-    )" || return 1
-  else
-    status="$(run_claude_3p_python -c \
-      'from installer import mcp_config; print(mcp_config.entry_status("claude-desktop"))' \
-    )" || return 1
-  fi
-  [ "$status" = "ready" ] || {
-    printf '%s: ERROR: Claude third-party profile MCP wiring is %s, not ready\n' \
-      "$PROGRAM_NAME" "${status:-unknown}" >&2
-    return 1
-  }
 }
 
 # Old stable releases may detect a stale config path even when their own
@@ -931,13 +908,11 @@ while IFS= read -r client; do
 done <<<"$managed_detected_clients"
 
 if [ "$claude_3p_profile_detected" = "1" ]; then
-  managed_supports_claude_desktop \
-    || fail "signed stable $managed_version does not support the Claude Desktop MCP contract required by the detected third-party profile"
-  preflight_claude_3p_profile \
-    || fail "Claude third-party profile failed the signed stable release's non-mutating MCP wiring preflight"
+  managed_supports_claude_desktop_3p \
+    || fail "signed stable $managed_version does not provide the claude-desktop-3p host adapter required by the detected third-party profile"
 fi
 
-if [ -z "$detected_clients" ] && [ "$claude_3p_profile_detected" != "1" ]; then
+if [ -z "$detected_clients" ]; then
   blocked \
     "no Agent host accepted by Decision Engine $managed_version passed its non-mutating wiring preflight"
 fi
@@ -945,8 +920,8 @@ fi
 tty_print "Detected all supported Decision Engine hosts present on this Mac for signed stable $managed_version:"
 tty_print "Every listed host will be configured; each passed the stable release's wiring preflight."
 printf '%s\n' "$detected_clients" >/dev/tty
-if [ "$claude_3p_profile_detected" = "1" ]; then
-  tty_print "claude-desktop-3p (third-party provider profile)"
+if line_list_contains "$detected_clients" "claude-desktop-3p"; then
+  tty_print "claude-desktop-3p is the third-party provider profile; it is configured independently of claude-desktop."
 fi
 tty_print "Running this command authorizes setup for every listed host."
 
@@ -994,9 +969,6 @@ verify_managed_mcp_wiring() {
       return 1
     fi
   done <<<"$detected_clients"
-  if [ "$claude_3p_profile_detected" = "1" ]; then
-    verify_claude_3p_profile "$allow_unactivated" || return 1
-  fi
 }
 
 repair_managed_skill_routes() {
@@ -1034,12 +1006,6 @@ wire_all_detected_hosts() {
       }
     fi
   done <<<"$detected_clients"
-  if [ "$claude_3p_profile_detected" = "1" ]; then
-    wire_claude_3p_profile "$allow_unactivated" || {
-      printf '%s: ERROR: MCP wiring failed for Claude third-party provider profile\n' "$PROGRAM_NAME" >&2
-      failed=1
-    }
-  fi
   [ "$failed" -eq 0 ] || return 1
   if printf '%s\n' "$detected_clients" | grep -Fxq codex; then
     run_managed_python -m installer.codex_routing || return 1
@@ -1085,11 +1051,20 @@ print(f"skills={skills}; routing={spec.routing_kind}")' \
         && comma_list_contains "$aqg_selected_clients" "workbuddy-ai"; then
       aqg_state="configured-and-verified"
     fi
+    if [ "$client" = "claude-desktop-3p" ]; then
+      # MCP-only third-party provider profile. Its connector state and its
+      # on-disk configuration are reported separately from runtime, which
+      # Decision Engine cannot observe until this host restarts and actually
+      # calls a tool. The literal capabilities below are re-derived from the
+      # registry above and flagged here if they ever drift.
+      if [ "$capability" != "skills=not-supported; routing=mcp-only" ]; then
+        capability_report_incomplete=1
+      fi
+      tty_print "claude-desktop-3p: DE MCP=connector-written; config=disk-ready; skills=not-supported; routing=mcp-only; AQG=unsupported-for-this-profile; runtime=unverified; runtime-verification=restart-required"
+      continue
+    fi
     tty_print "$display_name: DE MCP=disk-ready; $capability; AQG=$aqg_state; runtime=restart-required"
   done <<<"$detected_clients"
-  if [ "$claude_3p_profile_detected" = "1" ]; then
-    tty_print "claude-desktop-3p: DE MCP=disk-ready; skills=not-supported; routing=mcp-only; AQG=unsupported-for-this-profile; runtime=restart-required"
-  fi
   tty_print "Agent Quality Gates host capability report:"
   while IFS= read -r client; do
     [ -n "$client" ] || continue
@@ -1113,21 +1088,12 @@ print(f"skills={skills}; routing={spec.routing_kind}")' \
 }
 
 run_selected_permanent_setup() {
-  local client claude_desktop_selected=0
+  local client
   set --
   while IFS= read -r client; do
     [ -n "$client" ] || continue
     set -- "$@" --client "$client"
-    if [ "$client" = "claude-desktop" ]; then
-      claude_desktop_selected=1
-    fi
   done <<<"$detected_clients"
-  if [ "$claude_3p_profile_detected" = "1" ] \
-      && [ "$claude_desktop_selected" = "0" ]; then
-    # Permanent setup needs one registered host ID. The wrapper publishes and
-    # verifies the separate third-party profile immediately afterward.
-    set -- "$@" --client claude-desktop
-  fi
   run_managed_python -m installer.permanent_setup "$@"
 }
 

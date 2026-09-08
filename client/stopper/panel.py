@@ -710,8 +710,72 @@ class StopPanelApp:
         # front — it just stops winning every raise after that, so the title bar's minimise means
         # what it says. The Swift panel keeps .floating: that is a menu-bar-anchored accessory on a
         # platform where a floating utility window is the convention, not a taskbar app.
-        self.body = tk.Frame(self.root, bg=BG)
-        self.body.pack(fill="both", expand=True, padx=12, pady=12)
+        viewport = tk.Frame(self.root, bg=BG)
+        viewport.pack(fill="both", expand=True, padx=12, pady=12)
+        viewport.grid_rowconfigure(0, weight=1)
+        viewport.grid_columnconfigure(0, weight=1)
+        self.scroll_canvas = tk.Canvas(
+            viewport, bg=BG, width=520, height=72, bd=0, highlightthickness=0,
+            yscrollincrement=1, takefocus=True,
+        )
+        self.scroll_canvas.grid(row=0, column=0, sticky="nsew")
+        self.scrollbar = tk.Scrollbar(viewport, orient="vertical", command=self.scroll_canvas.yview)
+        self.scroll_canvas.configure(yscrollcommand=self.scrollbar.set)
+        self.body = tk.Frame(self.scroll_canvas, bg=BG)
+        self._body_window = self.scroll_canvas.create_window(0, 0, anchor="nw", window=self.body)
+        self.body.bind("<Configure>", self._sync_scroll_region)
+        self.scroll_canvas.bind("<Configure>", self._resize_viewport)
+        self._wheel_remainder = 0.0
+        # Toplevel bindings also receive events over descendant labels, entries and buttons.
+        # Keep them local to this window; bind_all would capture unrelated Tk windows.
+        self.root.bind("<MouseWheel>", self._scroll_wheel, add="+")
+        if self.root.tk.call("tk", "windowingsystem") == "x11":
+            self.root.bind("<Button-4>", self._scroll_wheel, add="+")
+            self.root.bind("<Button-5>", self._scroll_wheel, add="+")
+        self.root.bind("<FocusIn>", self._reveal_focused_row, add="+")
+        for key, direction in (("<Prior>", -1), ("<Next>", 1)):
+            self.scroll_canvas.bind(key, lambda _event, d=direction: self.scroll_canvas.yview_scroll(d, "pages"))
+
+    def _resize_viewport(self, event: Any) -> None:
+        self.scroll_canvas.itemconfigure(self._body_window, width=event.width)
+        self._sync_scroll_region()
+
+    def _sync_scroll_region(self, _event: Any = None) -> None:
+        canvas = self.scroll_canvas
+        height = self.body.winfo_reqheight()
+        # Let Tk auto-fit a short list, leaving room for the taskbar/Dock and native chrome.
+        canvas.configure(height=min(height, max(72, int(self.root.winfo_screenheight() * 0.75) - 24)))
+        canvas.configure(scrollregion=(0, 0, canvas.winfo_width(), max(height, canvas.winfo_height())))
+        if height > canvas.winfo_height():
+            self.scrollbar.grid(row=0, column=1, sticky="ns")
+        else:
+            self.scrollbar.grid_remove()
+            canvas.yview_moveto(0)
+
+    def _scroll_wheel(self, event: Any) -> str:
+        if self.body.winfo_reqheight() <= self.scroll_canvas.winfo_height():
+            return "break"
+        if getattr(event, "num", None) in (4, 5):
+            pixels = -40 if event.num == 4 else 40
+        elif self.root.tk.call("tk", "windowingsystem") == "aqua":
+            pixels = -event.delta  # Tk's Mac trackpad deltas are already small; never divide by 120.
+        else:
+            pixels = -event.delta * 40 / 120
+        self._wheel_remainder += pixels * _display_scale(self.root, self._tk)
+        whole_pixels = int(self._wheel_remainder)
+        self._wheel_remainder -= whole_pixels
+        self.scroll_canvas.yview_scroll(whole_pixels, "units")
+        return "break"
+
+    def _reveal_focused_row(self, event: Any) -> None:
+        widget = event.widget
+        if not str(widget).startswith(str(self.body) + "."):
+            return
+        canvas = self.scroll_canvas
+        top = widget.winfo_rooty() - canvas.winfo_rooty()
+        bottom = top + widget.winfo_height()
+        offset = min(top, 0) if top < 0 else max(0, bottom - canvas.winfo_height())
+        canvas.yview_scroll(offset, "units")
 
     # -- data --------------------------------------------------------------------------------
     def _merge_disk(self) -> None:
@@ -1098,6 +1162,7 @@ class StopPanelApp:
                 self._empty_label = tk.Label(
                     self.body, text=empty_text, bg=BG, fg=FG_MUTED, font=(_UI, 13))
                 self._empty_label.pack(anchor="w")
+            self.body.after_idle(self._sync_scroll_region)
             return
 
         if self._empty_label is not None:
@@ -1123,6 +1188,8 @@ class StopPanelApp:
                     row.pack_configure(fill="x", pady=6, after=previous)
                 previous = row
             self._row_order = list(desired_order)
+        # Off-screen canvas windows may defer their Configure event after rows are removed.
+        self.body.after_idle(self._sync_scroll_region)
 
     def run(self) -> None:
         self._tick()

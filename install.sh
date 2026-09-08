@@ -609,7 +609,7 @@ decision_engine_is_activated() {
 }
 
 aqg_checkout_is_usable() {
-  [ -d "${AQG_DEST}/.git" ] \
+  [ -e "${AQG_DEST}/.git" ] \
     && [ -f "${AQG_DEST}/scripts/install.sh" ] \
     && [ -f "${AQG_DEST}/scripts/aqg_doctor.py" ] \
     && [ -f "${AQG_DEST}/requirements.txt" ]
@@ -675,13 +675,17 @@ install_aqg_body() {
   # Returns non-zero on failure (does NOT die), so the caller can report the
   # AQG-before-DE failure at the correct boundary.
   echo "==> Installing Agent Quality Gates (local, no account) from ${AQG_REPO}"
+  if [ -L "${AQG_DEST}" ] || [ -f "${AQG_DEST}/.git" ]; then
+    echo "install: incomplete managed AQG checkout at ${AQG_DEST}; preserve it and repair AQG before retrying" >&2
+    return 1
+  fi
   if [ -d "${AQG_DEST}/.git" ]; then
     echo "    Existing checkout at ${AQG_DEST} — updating."
     git -C "${AQG_DEST}" pull --ff-only \
       || { echo "install: could not update AQG checkout at ${AQG_DEST}" >&2; return 1; }
   else
     mkdir -p "$(dirname "${AQG_DEST}")"
-    git clone "${AQG_REPO}" "${AQG_DEST}" \
+    git clone --config core.autocrlf=false --config core.eol=lf "${AQG_REPO}" "${AQG_DEST}" \
       || { echo "install: could not clone AQG from ${AQG_REPO} (public? git installed?)" >&2; return 1; }
   fi
   [ -f "${AQG_DEST}/scripts/install.sh" ] \

@@ -19,6 +19,7 @@ import shutil
 import struct
 import subprocess
 import sys
+import tempfile
 import unittest
 from pathlib import Path
 
@@ -48,6 +49,69 @@ def _last_commit_epoch(path: Path) -> int:
 
 
 class SwiftSourceCompiles(unittest.TestCase):
+    @unittest.skipUnless(sys.platform == "darwin" and shutil.which("swiftc"),
+                         "AppKit scrolling regression requires macOS + swiftc")
+    def test_many_tasks_scroll_refresh_and_shrink_in_appkit(self):
+        # Compile the real panel with a same-file extension; do not start its polling/registry loop.
+        source = SOURCE.read_text(encoding="utf-8").split("let app = NSApplication.shared", 1)[0]
+        harness = r'''
+extension DecisionEngineStopper {
+    func verifyTaskScrolling() {
+        ensurePanel()
+        for i in 0..<30 {
+            let id = "scroll-\(i)"
+            runsByID[id] = ["run_id": id, "title": "Task \(i)",
+                            "status": "queued", "created_at": Double(100 + i)]
+        }
+        updatePanel()
+        let window = panelWindow!
+        window.contentView!.layoutSubtreeIfNeeded()
+        guard let scroll = window.contentView!.subviews.compactMap({ $0 as? NSScrollView }).first,
+              let document = scroll.documentView else { fatalError("Tasks have no scroll container") }
+        precondition(window.frame.height <= window.screen!.visibleFrame.height)
+        precondition(document.frame.height > scroll.contentSize.height)
+        precondition(document.isFlipped && scroll.contentView.bounds.minY == 0)
+        scroll.contentView.scroll(to: NSPoint(x: 0, y: 500))
+        scroll.reflectScrolledClipView(scroll.contentView)
+        let offset = scroll.contentView.bounds.minY
+        updatePanel()
+        precondition(abs(scroll.contentView.bounds.minY - offset) < 1, "Refresh jumped")
+        let bottom = document.frame.height - scroll.contentSize.height
+        scroll.contentView.scroll(to: NSPoint(x: 0, y: bottom))
+        scroll.reflectScrolledClipView(scroll.contentView)
+        let last = rowsStack!.arrangedSubviews.last!
+        let lastRect = last.convert(last.bounds, to: document)
+        precondition(scroll.documentVisibleRect.insetBy(dx: -1, dy: -1).contains(lastRect))
+        window.setContentSize(NSSize(width: 320, height: 240))
+        window.contentView!.layoutSubtreeIfNeeded()
+        precondition(abs(document.frame.width - scroll.contentSize.width) < 1)
+        runsByID = ["scroll-0": runsByID["scroll-0"]!]
+        updatePanel()
+        precondition(scroll.contentView.bounds.minY == 0, "Shrink left a blank viewport")
+        precondition(scroll.documentVisibleRect.intersects(document.bounds))
+        runsByID.removeAll()
+        updatePanel()
+        precondition(scroll.contentView.bounds.minY == 0)
+        precondition(rowsStack!.arrangedSubviews.count == 1)
+        window.close()
+        print("AppKit scrolling OK")
+    }
+}
+let app = NSApplication.shared
+app.setActivationPolicy(.accessory)
+DecisionEngineStopper().verifyTaskScrolling()
+'''
+        with tempfile.TemporaryDirectory() as directory:
+            test_source = Path(directory) / "main.swift"
+            binary = Path(directory) / "scroll-test"
+            test_source.write_text(source + harness, encoding="utf-8")
+            built = subprocess.run(["swiftc", str(test_source), "-o", str(binary)],
+                                   capture_output=True, text=True, timeout=120)
+            self.assertEqual(built.returncode, 0, built.stderr)
+            result = subprocess.run([str(binary)], capture_output=True, text=True, timeout=30)
+            self.assertEqual(result.returncode, 0, result.stderr)
+            self.assertIn("AppKit scrolling OK", result.stdout)
+
     @unittest.skipUnless(sys.platform == "darwin", "swiftc + AppKit are macOS-only")
     @unittest.skipUnless(shutil.which("swiftc"), "swiftc is not installed")
     def test_the_source_type_checks(self):

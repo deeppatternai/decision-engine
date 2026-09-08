@@ -1008,6 +1008,7 @@ class EntryStatusTestCase(unittest.TestCase):
             "CLAUDE_CODE_CONFIG": self.tmp / ".claude.json",
             "CODEX_CONFIG": self.tmp / "config.toml",
             "CLAUDE_DESKTOP_CONFIG": self.tmp / "desktop.json",
+            "CLAUDE_DESKTOP_3P_CONFIG": self.tmp / "desktop-3p.json",
         }
         self._env = mock.patch.dict(
             os.environ,
@@ -1114,6 +1115,7 @@ class DetectAndCliTestCase(unittest.TestCase):
         self.tmp = Path(self._tmp.name)
         self._saved = {k: os.environ.get(k) for k in
                        ("CLAUDE_CODE_CONFIG", "CODEX_CONFIG", "CLAUDE_DESKTOP_CONFIG",
+                        "CLAUDE_DESKTOP_3P_CONFIG",
                         "CURSOR_CONFIG", "TRAE_WORK_CONFIG", "TRAE_WORK_SKILLS_DIR",
                         "TRAE_WORK_APP_ROOT",
                        "TRAE_WORK_CN_CONFIG", "TRAE_WORK_CN_SKILLS_DIR",
@@ -1136,6 +1138,9 @@ class DetectAndCliTestCase(unittest.TestCase):
         os.environ["CLAUDE_CODE_CONFIG"] = str(self.tmp / "cc" / ".claude.json")
         os.environ["CODEX_CONFIG"] = str(self.tmp / "cx" / "config.toml")
         os.environ["CLAUDE_DESKTOP_CONFIG"] = str(self.tmp / "cd" / "claude_desktop_config.json")
+        os.environ["CLAUDE_DESKTOP_3P_CONFIG"] = str(
+            self.tmp / "cd-3p" / "claude_desktop_config.json"
+        )
         os.environ["CURSOR_CONFIG"] = str(self.tmp / "cu" / "mcp.json")
         os.environ["QODER_CONFIG"] = str(self.tmp / "qd" / "mcp.json")
         os.environ["QODER_SKILLS_DIR"] = str(
@@ -1273,6 +1278,7 @@ class DetectAndCliTestCase(unittest.TestCase):
         # audit f2: $HOME always exists, so the parent-dir heuristic must NOT flag claude-code
         # merely because home exists — require the config file or a ~/.claude dir.
         for k in ("CLAUDE_CODE_CONFIG", "CODEX_CONFIG", "CLAUDE_DESKTOP_CONFIG",
+                  "CLAUDE_DESKTOP_3P_CONFIG",
                   "CURSOR_CONFIG", "TRAE_WORK_CONFIG", "TRAE_WORK_SKILLS_DIR",
                   "TRAE_WORK_APP_ROOT",
                   "TRAE_WORK_CN_CONFIG", "TRAE_WORK_CN_SKILLS_DIR",

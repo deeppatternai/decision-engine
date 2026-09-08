@@ -496,6 +496,7 @@ class CursorConfigTestCase(unittest.TestCase):
             (
                 "claude-code",
                 "claude-desktop",
+                "claude-desktop-3p",
                 "codebuddy",
                 "codex",
                 "cursor",
@@ -2256,6 +2257,24 @@ assert mcp_config.CLIENT_SPECS == registry.CLIENT_SPECS
                     {"local-display", "popup-followup", "audit-stop-panel"}
                 ),
             },
+            "claude-desktop-3p": {
+                "config_renderer": "json-mcp-v1",
+                "skills_project_paths": (),
+                "skill_delivery_mode": "none",
+                "routing_kind": "mcp-only",
+                "launcher_capabilities": frozenset(
+                    {
+                        "core-mcp",
+                        "local-display",
+                        "popup-followup",
+                        "audit-stop-panel",
+                    }
+                ),
+                "doctor_capabilities": frozenset({"mcp-entry"}),
+                "optional_features": frozenset(
+                    {"local-display", "popup-followup", "audit-stop-panel"}
+                ),
+            },
             "codebuddy": {
                 "config_renderer": "json-mcp-v1",
                 "skills_project_paths": (".codebuddy/skills",),
@@ -2479,6 +2498,7 @@ assert mcp_config.CLIENT_SPECS == registry.CLIENT_SPECS
             (
                 "claude-code",
                 "claude-desktop",
+                "claude-desktop-3p",
                 "codebuddy",
                 "codex",
                 "cursor",
@@ -2692,6 +2712,7 @@ tool_timeout_sec = 660
             {
                 "claude-code",
                 "claude-desktop",
+                "claude-desktop-3p",
                 "codebuddy",
                 "codex",
                 "cursor",
@@ -2722,6 +2743,7 @@ tool_timeout_sec = 660
             {
                 "claude-code": False,
                 "claude-desktop": False,
+                "claude-desktop-3p": False,
                 "codebuddy": True,
                 "codex": False,
                 "cursor": True,

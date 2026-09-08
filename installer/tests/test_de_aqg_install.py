@@ -54,6 +54,9 @@ def _checkout(root):
         path = root / name
         path.parent.mkdir(parents=True, exist_ok=True)
         path.write_text("fixture\n", encoding="utf-8")
+    _git(root, "add", ".")
+    _git(root, "-c", "user.name=Fixture", "-c", "user.email=fixture@example.test",
+         "-c", "commit.gpgsign=false", "commit", "--quiet", "-m", "fixture")
     return root
 
 
@@ -68,22 +71,27 @@ def _link(root, target):
     return root
 
 
-@pytest.fixture
-def verify_checkout():
+@pytest.fixture(params=["de-aqg-install", "dp-install.sh"])
+def verify_checkout(request):
     bash = shutil.which("bash")
     if bash is None:
         pytest.skip("bash executable not found on PATH")
-    source = (ROOT / "de-aqg-install").read_text(encoding="utf-8")
+    source = (ROOT / request.param).read_text(encoding="utf-8")
     # Load the real functions only: no network, activation, or host writes.
     functions = []
     for name in ("fail", "clean_exec", "verify_aqg_checkout"):
         match = re.search(rf"^{name}\(\) \{{\n.*?^\}}$", source, re.M | re.S)
         assert match is not None, f"missing installer function: {name}"
         functions.append(match.group())
+    if request.param == "dp-install.sh":
+        functions.append(re.search(r"^sync_aqg_checkout\(\) \{\n.*?^\}$", source, re.M | re.S).group())
     script = "\n".join(
         [
             "set -euo pipefail",
             "EXIT_USAGE=2",
+            "PROGRAM_NAME=fixture-installer",
+            "AQG_REF=fixture-no-network",
+            "tty_print() { printf '%s\\n' \"$*\"; }",
             'AQG_ROOT="$1"',
             'AQG_REPO="$2"',
             'GIT_BIN="$(command -v git)"',
@@ -95,11 +103,27 @@ def verify_checkout():
     environment.pop("BASH_ENV", None)
     environment.pop("ENV", None)
 
-    def verify(root):
+    def verify(root, *, synchronize=False):
+        invocation = script
+        if synchronize and request.param == "dp-install.sh":
+            # Refuse mutating Git operations at the dependency boundary: no
+            # test may fetch the public repository if the reuse path regresses.
+            invocation = invocation.rsplit("verify_aqg_checkout", 1)[0] + '''
+real_git="$GIT_BIN"
+git_guard() {
+  case " $* " in *" fetch "*|*" checkout "*|*" pull "*) exit 79;; esac
+  "$real_git" "$@"
+}
+export real_git
+export -f git_guard
+clean_exec() { "$@"; }
+GIT_BIN=git_guard
+sync_aqg_checkout
+'''
         return subprocess.run(
             [bash, "--noprofile", "--norc", "-s", "--",
              _bash_path(root, bash, environment), AQG_REPO],
-            input=script,
+            input=invocation,
             capture_output=True,
             text=True,
             env=environment,
@@ -107,6 +131,16 @@ def verify_checkout():
         )
 
     return verify
+
+
+def test_repeat_install_does_not_checkout_inside_a_managed_version(verify_checkout, tmp_path):
+    target = _checkout(tmp_path / "versions" / SHA)
+    root = _link(tmp_path / "agent-quality-gates", target)
+    before = _git(root, "rev-parse", "HEAD")
+    result = verify_checkout(root, synchronize=True)
+    assert result.returncode == 0, result.stderr
+    assert _git(root, "rev-parse", "HEAD") == before
+    assert _git(root, "status", "--porcelain") == ""
 
 
 @pytest.mark.parametrize("relative", [True, False])
@@ -132,11 +166,6 @@ def test_managed_link_is_accepted(verify_checkout, tmp_path, relative, parent_al
 
 def test_regular_checkout_can_be_reused_after_migration(verify_checkout, tmp_path):
     root = _checkout(tmp_path / ".deeppattern" / "agent-quality-gates")
-    _git(root, "add", ".")
-    _git(
-        root, "-c", "user.name=Fixture", "-c", "user.email=fixture@example.test",
-        "-c", "commit.gpgsign=false", "commit", "--quiet", "-m", "fixture",
-    )
     commit = _git(root, "rev-parse", "HEAD")
     initial = verify_checkout(root)
     assert initial.returncode == 0, initial.stderr
@@ -154,11 +183,6 @@ def test_regular_checkout_can_be_reused_after_migration(verify_checkout, tmp_pat
 
 def test_managed_git_worktree_is_accepted(verify_checkout, tmp_path):
     source = _checkout(tmp_path / "source")
-    _git(source, "add", ".")
-    _git(
-        source, "-c", "user.name=Fixture", "-c", "user.email=fixture@example.test",
-        "-c", "commit.gpgsign=false", "commit", "--quiet", "-m", "fixture",
-    )
     commit = _git(source, "rev-parse", "HEAD")
     parent = tmp_path / ".deeppattern"
     target = parent / "versions" / commit
@@ -253,6 +277,9 @@ def test_managed_link_still_requires_checkout_files(verify_checkout, tmp_path, m
     target = _checkout(tmp_path / "versions" / SHA)
     path = target / missing
     if path.is_dir():
+        for item in path.rglob("*"):
+            if item.is_file():
+                item.chmod(0o600)
         shutil.rmtree(path)
     else:
         path.unlink()

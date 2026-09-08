@@ -51,6 +51,10 @@ func color(_ red: CGFloat, _ green: CGFloat, _ blue: CGFloat) -> NSColor {
     return NSColor(calibratedRed: red / 255, green: green / 255, blue: blue / 255, alpha: 1)
 }
 
+private final class TaskListDocumentView: NSView {
+    override var isFlipped: Bool { true }
+}
+
 final class DecisionEngineStopper: NSObject, NSApplicationDelegate {
     private let statusItem = NSStatusBar.system.statusItem(withLength: NSStatusItem.variableLength)
     private let activeRunPath = ProcessInfo.processInfo.environment["DE_ACTIVE_RUN"]
@@ -103,6 +107,7 @@ final class DecisionEngineStopper: NSObject, NSApplicationDelegate {
     private var finishedElapsedByRun: [String: TimeInterval] = [:]   // freeze elapsed once a run is terminal
     private var panelWindow: NSPanel?
     private var rowsStack: NSStackView?
+    private var rowsScrollView: NSScrollView?
     private var lockFD: Int32 = -1
     // Run ids this panel has finished showing (hidden_after passed). Mirrors client/stopper/panel.py's
     // `_retired`: a reaped run must be dropped from the on-disk registry AND never re-adopted from a
@@ -748,30 +753,50 @@ final class DecisionEngineStopper: NSObject, NSApplicationDelegate {
         window.collectionBehavior = [.canJoinAllSpaces, .fullScreenAuxiliary]
         window.minSize = NSSize(width: 280, height: 72)
 
-        let content = NSView()
+        let content = NSView(frame: NSRect(x: 0, y: 0, width: initialWidth, height: 92))
         content.wantsLayer = true
         content.layer?.backgroundColor = paletteBg.cgColor
         // No inner cornerRadius: a titled window draws (and rounds) its own frame; rounding the content
         // too would inset a second rounded rect under the chrome.
+
+        let scroll = NSScrollView(frame: NSRect(x: 12, y: 10, width: initialWidth - 24, height: 54))
+        scroll.translatesAutoresizingMaskIntoConstraints = false
+        scroll.drawsBackground = false
+        scroll.borderType = .noBorder
+        scroll.hasVerticalScroller = true
+        scroll.hasHorizontalScroller = false
+        scroll.autohidesScrollers = true
+        scroll.scrollerStyle = .overlay
+        scroll.scrollerKnobStyle = .light
+        content.addSubview(scroll)
+        let document = TaskListDocumentView(
+            frame: NSRect(x: 0, y: 0, width: scroll.contentSize.width, height: emptyRowHeight())
+        )
+        document.autoresizingMask = [.width]
+        scroll.documentView = document
 
         let stack = NSStackView()
         stack.orientation = .vertical
         stack.alignment = .leading
         stack.spacing = 8
         stack.translatesAutoresizingMaskIntoConstraints = false
-        content.addSubview(stack)
+        document.addSubview(stack)
         NSLayoutConstraint.activate([
-            stack.leadingAnchor.constraint(equalTo: content.leadingAnchor, constant: 12),
-            stack.trailingAnchor.constraint(equalTo: content.trailingAnchor, constant: -12),
+            scroll.leadingAnchor.constraint(equalTo: content.leadingAnchor, constant: 12),
+            scroll.trailingAnchor.constraint(equalTo: content.trailingAnchor, constant: -12),
             // Top inset clears the traffic lights, which float over the full-size content view.
-            stack.topAnchor.constraint(equalTo: content.topAnchor, constant: 28),
-            stack.bottomAnchor.constraint(equalTo: content.bottomAnchor, constant: -10),
+            scroll.topAnchor.constraint(equalTo: content.topAnchor, constant: 28),
+            scroll.bottomAnchor.constraint(equalTo: content.bottomAnchor, constant: -10),
+            stack.leadingAnchor.constraint(equalTo: document.leadingAnchor),
+            stack.trailingAnchor.constraint(equalTo: document.trailingAnchor),
+            stack.topAnchor.constraint(equalTo: document.topAnchor),
         ])
 
         window.contentView = content
         window.delegate = self
         panelWindow = window
         rowsStack = stack
+        rowsScrollView = scroll
     }
 
     @objc private func statusItemClicked() {
@@ -810,6 +835,7 @@ final class DecisionEngineStopper: NSObject, NSApplicationDelegate {
 
     private func updatePanel() {
         guard let rowsStack else { return }
+        let scrollOffset = rowsScrollView?.contentView.bounds.origin ?? .zero
         for view in Array(rowsStack.arrangedSubviews) {
             rowsStack.removeArrangedSubview(view)
             view.removeFromSuperview()
@@ -828,6 +854,14 @@ final class DecisionEngineStopper: NSObject, NSApplicationDelegate {
             }
         }
         updatePanelSize(runs: runs)
+        // Rows are rebuilt every poll. Restore the reading position after layout, clamping it
+        // when completed tasks disappear so a shortened list cannot leave an empty viewport.
+        if let scroll = rowsScrollView, let document = scroll.documentView {
+            panelWindow?.contentView?.layoutSubtreeIfNeeded()
+            let maxY = max(0, document.frame.height - scroll.contentSize.height)
+            scroll.contentView.scroll(to: NSPoint(x: 0, y: min(max(0, scrollOffset.y), maxY)))
+            scroll.reflectScrolledClipView(scroll.contentView)
+        }
     }
 
     private func pinRowToStack(_ row: NSView) {
@@ -843,8 +877,14 @@ final class DecisionEngineStopper: NSObject, NSApplicationDelegate {
         let width = max(panelWindow.contentView?.bounds.width ?? 520, 280)
         let rowHeights = runs.isEmpty ? [emptyRowHeight()] : runs.map { rowHeight(run: $0) }
         // 38 = 28 top inset (clears the traffic lights over the full-size content view) + 10 bottom.
-        let contentHeight = CGFloat(38) + rowHeights.reduce(0, +) + CGFloat(max(0, rowHeights.count - 1) * 8)
-        setPanelContentSize(NSSize(width: width, height: contentHeight))
+        let listHeight = rowHeights.reduce(0, +) + CGFloat(max(0, rowHeights.count - 1) * 8)
+        let screenHeight = (panelWindow.screen?.visibleFrame ?? bestVisibleFrame(for: panelWindow.frame))?.height ?? 800
+        let maxHeight = min(CGFloat(640), screenHeight - 24)
+        setPanelContentSize(NSSize(width: width, height: min(38 + listHeight, maxHeight)))
+        panelWindow.contentView?.layoutSubtreeIfNeeded()
+        if let scroll = rowsScrollView {
+            scroll.documentView?.setFrameSize(NSSize(width: scroll.contentSize.width, height: listHeight))
+        }
     }
 
     private func setPanelContentSize(_ size: NSSize) {

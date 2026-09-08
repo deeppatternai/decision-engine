@@ -86,6 +86,10 @@ class _FakeWidget:
     def bind(self, event, callback):
         self.bindings[event] = callback
 
+    def after_idle(self, callback):
+        # Row tests have no event loop; RealTkTaskScrollTests exercise scheduled geometry updates.
+        pass
+
     def focus_set(self):
         self.focused = True
 
@@ -566,6 +570,98 @@ class RenderReconciliationTests(unittest.TestCase):
             app._merge_disk()
         self.assertEqual(app.runs["real-id"]["run_id"], "real-id")
         self.assertEqual(app.runs["real-id"]["_sort_at"], 12.0)
+
+
+class RealTkTaskScrollTests(unittest.TestCase):
+    def setUp(self):
+        try:
+            import tkinter as tk
+        except ImportError as exc:
+            self.skipTest(str(exc))
+        try:
+            root = tk.Tk()
+        except tk.TclError as exc:
+            self.skipTest("Tk display unavailable: %s" % exc)
+        self.addCleanup(root.destroy)
+        with mock.patch.object(tk, "Tk", return_value=root), \
+             mock.patch.object(panel.tk_icon, "claim_app_identity"), \
+             mock.patch.object(panel.tk_icon, "apply_window_icon"), \
+             mock.patch.object(panel.tk_icon, "apply_dock_icon"):
+            self.app = panel.StopPanelApp()
+        self.app.root.geometry("560x300+0+0")
+        self.app.runs = {
+            "scroll-%02d" % i: {"run_id": "scroll-%02d" % i, "title": "Task %02d" % i,
+                               "status": "queued", "created_at": 100 + i}
+            for i in range(30)
+        }
+        self.app._render()
+        self.app.root.update()
+
+    def test_wheel_over_task_and_scrollbar_reach_last_row(self):
+        app = self.app
+        self.assertLess(app.scroll_canvas.yview()[1], 1.0)
+        entry = app._rows[app._row_order[0]]["audit_id"]
+        entry.event_generate("<MouseWheel>", delta=-120)
+        app.root.update()
+        self.assertGreater(app.scroll_canvas.yview()[0], 0)
+        # Drive the actual scrollbar command as its thumb does.
+        app.root.tk.call(app.scrollbar.cget("command"), "moveto", 1.0)
+        app.root.update()
+        last = app._rows[app._row_order[-1]]["row"]
+        self.assertGreaterEqual(last.winfo_rooty(), app.scroll_canvas.winfo_rooty())
+        self.assertLessEqual(last.winfo_rooty() + last.winfo_height(),
+                             app.scroll_canvas.winfo_rooty() + app.scroll_canvas.winfo_height())
+
+    def test_refresh_keeps_offset_and_shrink_reveals_remaining_task(self):
+        app = self.app
+        app.scroll_canvas.yview_moveto(0.5)
+        before = app.scroll_canvas.canvasy(0)
+        app._render()
+        app.root.update()
+        self.assertEqual(app.scroll_canvas.canvasy(0), before)
+        last_key = app._row_order[-1]
+        app.runs = {last_key: app.runs[last_key]}
+        app._render()
+        app.root.update()
+        self.assertEqual(app.scroll_canvas.yview(), (0.0, 1.0))
+        self.assertFalse(app.scrollbar.winfo_ismapped())
+        row = app._rows[last_key]["row"]
+        self.assertGreaterEqual(row.winfo_rooty(), app.scroll_canvas.winfo_rooty())
+        app.scroll_canvas.event_generate("<MouseWheel>", delta=-120)
+        app.root.update()
+        self.assertEqual(app.scroll_canvas.yview(), (0.0, 1.0))
+
+    def test_auto_height_is_bounded_and_width_tracks_manual_resize(self):
+        app = self.app
+        app.root.geometry("")
+        app.root.update()
+        self.assertLessEqual(app.root.winfo_height(), app.root.winfo_screenheight() * 0.8)
+        self.assertLess(app.root.winfo_height(), app.body.winfo_reqheight())
+        app.root.geometry("420x260")
+        app.root.update()
+        self.assertEqual(app.body.winfo_width(), app.scroll_canvas.winfo_width())
+        app.scroll_canvas.yview_moveto(1.0)
+        app.root.update()
+        self.assertAlmostEqual(app.scroll_canvas.yview()[1], 1.0)
+
+    def test_small_wheel_deltas_focus_and_empty_state(self):
+        app = self.app
+        for _ in range(12):
+            app.scroll_canvas.event_generate("<MouseWheel>", delta=-1)
+        app.root.update()
+        self.assertGreater(app.scroll_canvas.yview()[0], 0)
+        app.scroll_canvas.yview_moveto(0)
+        entry = app._rows[app._row_order[-1]]["audit_id"]
+        entry.focus_force()
+        app.root.update()
+        self.assertGreaterEqual(entry.winfo_rooty(), app.scroll_canvas.winfo_rooty())
+        self.assertLessEqual(entry.winfo_rooty() + entry.winfo_height(),
+                             app.scroll_canvas.winfo_rooty() + app.scroll_canvas.winfo_height())
+        app.runs.clear()
+        app._render()
+        app.root.update()
+        self.assertEqual(app.scroll_canvas.yview(), (0.0, 1.0))
+        self.assertTrue(app._empty_label.winfo_ismapped())
 
 
 class RealTkActionButtonSmokeTests(unittest.TestCase):

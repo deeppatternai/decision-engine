@@ -14,7 +14,7 @@ import shutil
 import subprocess
 import tempfile
 import unittest
-from pathlib import Path
+from pathlib import Path, PurePosixPath
 
 ROOT = Path(__file__).resolve().parents[2]
 INSTALL_SH = ROOT / "install.sh"
@@ -122,6 +122,7 @@ class InstallAqgClientOrchestrationTest(unittest.TestCase):
         verify_rc=0,
         target="de",
         include_wrapper=True,
+        git_file=False,
     ):
         tmp = Path(tempfile.mkdtemp(prefix="aqg-orch-"))
         self.addCleanup(shutil.rmtree, tmp, ignore_errors=True)
@@ -129,6 +130,9 @@ class InstallAqgClientOrchestrationTest(unittest.TestCase):
         home = tmp / "home"
         home.mkdir()
         aqg_dest = _make_usable_aqg_dest(tmp, include_wrapper=include_wrapper)
+        if git_file:
+            (aqg_dest / ".git").rmdir()
+            (aqg_dest / ".git").write_text("gitdir: fixture\n", encoding="utf-8")
         fake_bin = tmp / "fake-bin"
         fake_bin.mkdir()
 
@@ -170,6 +174,12 @@ class InstallAqgClientOrchestrationTest(unittest.TestCase):
         ]
         return completed, events, invocations
 
+    def test_updated_aqg_worktree_is_reused_without_cloning(self):
+        completed, events, _ = self._run_install(git_file=True)
+        self.assertEqual(completed.returncode, 0, msg=completed.stderr)
+        self.assertEqual(events, ["apply", "verify", "doctor", "de-core"])
+        self.assertNotIn("cloning", completed.stderr.lower())
+
     def test_r27_01_and_02_healthy_checkout_still_runs_wrapper_in_strict_order(self):
         completed, events, invocations = self._run_install(
             doctor_rc=0, apply_rc=0, verify_rc=0
@@ -192,8 +202,8 @@ class InstallAqgClientOrchestrationTest(unittest.TestCase):
             "expected strict apply -> verify -> Doctor -> DE core order, got %r"
             % (events,),
         )
-        script = str(Path(invocations[0][1]))
-        base = Path(script).parents[2]
+        script = str(PurePosixPath(invocations[0][1]))
+        base = PurePosixPath(script).parents[2]
         common = ["--home", str(base / "home"), "--aqg-root", str(base / "aqg dest")]
         self.assertEqual(
             invocations,

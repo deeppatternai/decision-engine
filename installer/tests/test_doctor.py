@@ -43,6 +43,11 @@ class CheckTests(unittest.TestCase):
         environment = mock.patch.dict(
             os.environ,
             {
+                "CLAUDE_DESKTOP_3P_CONFIG": str(
+                    Path(self._host_isolation.name)
+                    / "no-claude-desktop-3p"
+                    / "claude_desktop_config.json"
+                ),
                 "TRAE_WORK_CONFIG": str(
                     Path(self._host_isolation.name)
                     / "trae-work"
