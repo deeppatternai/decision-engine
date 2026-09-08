@@ -121,8 +121,7 @@ surfaced as an INFORMATIONAL block BELOW the table — NOT adjudicated per-row.
 
 ## Pre-flight reminders
 
-- Hub server reachable (`mcp__decision-engine__check_provider_health`)
-- Device token configured (`audit login --activation-secret '<secret>'`)
+- Device token configured through the masked setup flow (`python3 -m installer.permanent_setup`)
 - All `audit_id` references should be within the 7-day TTL window for
   retrieval via `check_audit_status`. If aged out, fall back to raw JSON
   paste or reply-text paste.

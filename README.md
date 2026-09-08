@@ -54,7 +54,7 @@ the local, no-account engineering-discipline toolkit. Install either one and bri
 the other along in the same step.
 
 > **Status:** internal test. Decision Engine needs an owner-issued endpoint +
-> API key to activate a device. AQG is local and needs no account.
+> activation secret to activate a device. AQG is local and needs no account.
 
 ## Not just reviewed — *seen*, and *shaped*
 
@@ -109,12 +109,12 @@ any of the skills below.
 Once an idea has a shape, `/audit-brainstorming` puts it in front of a
 thinking-partner panel — not to hunt bugs, but to think it through *with* you:
 where it's strong, where it's fragile, the counter-arguments you're not making, the
-assumptions you didn't notice you'd baked in. It hands back the honest epistemics
-too — what would *falsify* it, the base rate, and whether the evidence should move
-your confidence up or down.
+assumptions you didn't notice you'd baked in. It also explains how to test the
+idea: what would *falsify* it, how often similar ideas have worked before, and
+whether the evidence should raise or lower your confidence.
 
-Together they turn *"I think we should…"* into *"here's the bet, here's why,
-and here's exactly what would prove me wrong."*
+Together they turn *"I think we should…"* into *"here's our choice, here's why,
+and here's what evidence would make us reconsider."*
 
 ## Point it at the world outside — the market, and the odds
 
@@ -125,9 +125,9 @@ Some questions aren't about your artifact at all — they're about what's happen
 
 Ask a market, GTM, or positioning question and `/audit-market-research` builds you
 an **insight doc** — but not from a single model's imagination. A cross-vendor panel
-analyzes it from independent angles, **grounded in real retrieval** across web,
-social, and financial sources, and (optionally) run past a **synthetic customer
-panel**. Best of all, it tells you *how much to trust it*: an honest
+analyzes the question from independent angles, **grounded in real retrieval**
+across web, social, and financial sources. The resulting analysis can optionally
+be reviewed by a **synthetic customer panel**. It also tells you *how much to trust it*: an honest
 **convergence-quality** signal that separates "the reviewers genuinely agree" from
 "they just latched onto the same phrase."
 
@@ -142,30 +142,36 @@ what would flip it). It **never manufactures a number of its own** — every fig
 traces back to a real source, enforced server-side. An honest aggregate beats a
 confident hallucination.
 
-## What ships here (and what doesn't)
+## What is in this repository, and what runs on the server?
 
-| ships in this repo | lives only on the hosted server (never here) |
-|---|---|
-| installer (`installer/`) | prompts, model/voice roster, orchestration |
-| transport-only MCP shim | board / diagram rendering — HTML, layouts, generation |
-| native popup display shell (shows server-rendered boards & diagrams verbatim; no rendering logic of its own) | research / forecast pipelines |
-| your local device config (written at install time) | ad logic, server address, secrets |
-| these docs | — |
+This repository contains **the DE client source and supporting files**. The client
+handles installation, connects AI tools, opens local windows, and communicates with
+DE. The full implementation of hosted services such as reviews and research is
+not included here.
 
-The client is **display-and-transport only**: the shim forwards every JSON-RPC
-message verbatim to the server's `/mcp` endpoint and moves bytes, and the native
-popup shell shows what the server hands back — the interactive board and every
-diagram are generated server-side and delivered as finished bytes, so the shell
-carries no tool schema, prompt, roster, layout, or rendering logic of its own. The
-server is the single source of truth for which tools exist. See
-[`installer/LEAK_SCAN.md`](installer/LEAK_SCAN.md) for the enforced red-line and
-how it's verified.
+| Where it lives | What it contains | Example in use |
+|---|---|---|
+| **In this repository: client source and supporting files** | Installer, AI tool integrations, skill instructions, local window and display code, icons, tests, and documentation. | An AI tool submits a review request; your computer shows progress, a diagram, or a discussion board. |
+| **On the DE server: hosted implementations, not shipped here** | Dedicated review prompts, model selection and task orchestration, research and forecast workflows, board and diagram content generation, and server-held model-provider credentials. | The server receives a review request, coordinates multiple models, and returns the results. |
+| **On your computer: generated during installation or activation, not shipped here** | The DE service address, device identity, and device access credentials issued during activation. | You enter the service address and activation secret; the client saves the configuration this device needs for later connections. |
+
+The MCP shim bridges AI tools and DE. It forwards hosted tool requests and also
+handles local tools and display requests. The client includes local windows,
+interaction code, and some tool definitions. Hosted board and diagram content is
+generated by the server and displayed by the client; this does not mean the client
+has no user-interface code.
+
+Distributed source does not include a user's real service address or secrets.
+Those values and the issued device credentials are runtime configuration, distinct
+from the credentials the server uses to call model providers. See
+[`installer/LEAK_SCAN.md`](installer/LEAK_SCAN.md) for source leak-scan documentation.
 
 ## What you can do with it
 
 Installing DE routes a set of skills into your agent. Invoke one by name (e.g.
-`/audit`) or just describe the task — the agent picks the skill and forwards the
-request to the hosted engine. A one-line tour:
+`/audit`) or just describe the task — the agent picks the matching skill. Hosted
+workflows send requests to DE's service; local options are explained below the table.
+A one-line tour:
 
 | skill | what it does |
 |---|---|
@@ -181,91 +187,124 @@ request to the hosted engine. A one-line tour:
 | `/layer-check` | Local reasoning-discipline that catches category errors in comparative / competitive analysis (the "different-layer product treated as a substitute" trap). Runs entirely on your machine. |
 
 One install serves every registered host below; there is no per-agent Decision
-Engine variant to pick. Everything except `/layer-check` reaches the hosted
-engine and needs an activated device (below); `/layer-check` is local and works
-with no account.
+Engine variant to pick. Before device activation, the installed MCP can start in
+**DE Lite** mode: an explicitly requested `/audit` can return advisory review from
+the current agent session, without calling DE's cross-vendor panel. This still
+uses the host agent's model and does not imply offline inference.
+`/layer-check` also works locally without a DE account. Hosted reviews, research,
+forecasts, graphics, boards, and popup follow-up require device activation
+(below) and the corresponding service access.
 
-| Host | Installer ID | Current local-host scope |
+### Supported AI tools, grouped by family
+
+All products below support MCP, native windows, popup follow-up, and Stop Panel.
+Find your product by family, then expand the details for installer IDs, Skills
+support, and platform and version requirements.
+
+| Family | Supported products | Differences to note |
 |---|---|---|
-| Claude Code | `claude-code` | MCP, Skills, native windows, popup follow-up, Stop Panel |
-| Claude Desktop | `claude-desktop` | MCP, native windows, popup follow-up, Stop Panel |
-| Tencent CodeBuddy Agent CLI | `codebuddy` | Independent Agent CLI only; CodeBuddy Studio is a separate unsupported product; MCP, Skills, native windows, popup follow-up, Stop Panel |
-| Codex | `codex` | MCP, Skills, native windows, popup follow-up, Stop Panel |
-| Cursor | `cursor` | MCP, Skills, native windows, popup follow-up, Stop Panel |
-| Alibaba Qoder Desktop | `qoder` | Windows Desktop 1.106.3+; macOS Qoder.app 0.1.3+; MCP, Skills, native windows, popup follow-up, Stop Panel |
-| Alibaba Qoder CN Desktop | `qoder-cn` | macOS Qoder CN.app 0.1.4; MCP, Skills, native windows, popup follow-up, Stop Panel |
-| Alibaba Qoder IDE | `qoder-ide` | macOS Qoder IDE.app 1.106.3+; independent MCP identity, shared Qoder Skills and audit hook, native windows, popup follow-up, Stop Panel |
-| Alibaba Qoder CN IDE | `qoder-cn-ide` | macOS Qoder CN IDE.app 1.106.3+; independent MCP identity, shared Qoder CN Skills and audit hook, native windows, popup follow-up, Stop Panel |
-| TRAE Desktop | `trae` | macOS Trae.app 3.5.81; MCP, Skills, native windows, popup follow-up, Stop Panel |
-| TRAE Work | `trae-work` | Windows and macOS Desktop 0.1.48+; MCP, Skills, native windows, popup follow-up, Stop Panel |
-| TRAE CN Desktop | `trae-cn` | macOS Trae CN.app 3.3.95; MCP, Skills, native windows, popup follow-up, Stop Panel |
-| TRAE Work CN | `trae-work-cn` | Windows and macOS Desktop 0.1.48+; MCP, Skills, native windows, popup follow-up, Stop Panel |
-| Tencent WorkBuddy Desktop | `workbuddy` | Windows and macOS Desktop; MCP, Skills, native windows, popup follow-up, Stop Panel |
-| Tencent WorkBuddy AI Desktop | `workbuddy-ai` | macOS WorkBuddy AI.app 5.5.2+; MCP, Skills, native windows, popup follow-up, Stop Panel |
+| Claude | Claude Code, Claude Desktop | Claude Code also supports Skills. |
+| Codex | Codex | Supports Skills. |
+| Cursor | Cursor | Supports Skills. |
+| Tencent | CodeBuddy Agent CLI, WorkBuddy Desktop, WorkBuddy AI Desktop | CodeBuddy support is limited to the standalone Agent CLI, not CodeBuddy Studio; see details for platform requirements. |
+| Alibaba Qoder | Qoder Desktop, Qoder CN Desktop, Qoder IDE, Qoder CN IDE | Desktop/IDE and standard/CN variants are distinct; IDE variants have separate MCP identities and share Skills and audit hooks with the corresponding Qoder variant. |
+| TRAE | TRAE Desktop, TRAE CN Desktop, TRAE Work, TRAE Work CN | Desktop/Work and standard/CN variants are listed separately; see details for platform and version requirements. |
 
-The registered Qoder, TRAE, and WorkBuddy Desktop families, plus CodeBuddy Agent CLI, get the server-backed popup
-follow-up chat (hub-hosted, no local agent). The older local-CLI follow-up
-route stays limited to hosts with that contract; their Graphic Explanation /
-Discussion Board windows and audit Stop Panel use the shared native
-implementation.
-Their macOS adapters use the same contract on Intel and Apple Silicon; no
-architecture-specific Decision Engine configuration is required.
+<details>
+<summary>Expand all 15 products: installer IDs, platforms, and version requirements</summary>
 
-### Depth & what's coming
+| Family | Host | Installer ID | Current local-host scope |
+|---|---|---|---|
+| Claude | Claude Code | `claude-code` | MCP, Skills, native windows, popup follow-up, Stop Panel |
+| Claude | Claude Desktop | `claude-desktop` | MCP, native windows, popup follow-up, Stop Panel |
+| Codex | Codex | `codex` | MCP, Skills, native windows, popup follow-up, Stop Panel |
+| Cursor | Cursor | `cursor` | MCP, Skills, native windows, popup follow-up, Stop Panel |
+| Tencent | Tencent CodeBuddy Agent CLI | `codebuddy` | Independent Agent CLI only; CodeBuddy Studio is a separate unsupported product; MCP, Skills, native windows, popup follow-up, Stop Panel |
+| Tencent | Tencent WorkBuddy Desktop | `workbuddy` | Windows and macOS Desktop; MCP, Skills, native windows, popup follow-up, Stop Panel |
+| Tencent | Tencent WorkBuddy AI Desktop | `workbuddy-ai` | macOS WorkBuddy AI.app 5.5.2+; MCP, Skills, native windows, popup follow-up, Stop Panel |
+| Alibaba Qoder | Alibaba Qoder Desktop | `qoder` | Windows Desktop 1.106.3+; macOS Qoder.app 0.1.3+; MCP, Skills, native windows, popup follow-up, Stop Panel |
+| Alibaba Qoder | Alibaba Qoder CN Desktop | `qoder-cn` | macOS Qoder CN.app 0.1.4; MCP, Skills, native windows, popup follow-up, Stop Panel |
+| Alibaba Qoder | Alibaba Qoder IDE | `qoder-ide` | macOS Qoder IDE.app 1.106.3+; independent MCP identity, shared Qoder Skills and audit hook, native windows, popup follow-up, Stop Panel |
+| Alibaba Qoder | Alibaba Qoder CN IDE | `qoder-cn-ide` | macOS Qoder CN IDE.app 1.106.3+; independent MCP identity, shared Qoder CN Skills and audit hook, native windows, popup follow-up, Stop Panel |
+| TRAE | TRAE Desktop | `trae` | macOS Trae.app 3.5.81; MCP, Skills, native windows, popup follow-up, Stop Panel |
+| TRAE | TRAE CN Desktop | `trae-cn` | macOS Trae CN.app 3.3.95; MCP, Skills, native windows, popup follow-up, Stop Panel |
+| TRAE | TRAE Work | `trae-work` | Windows and macOS Desktop 0.1.48+; MCP, Skills, native windows, popup follow-up, Stop Panel |
+| TRAE | TRAE Work CN | `trae-work-cn` | Windows and macOS Desktop 0.1.48+; MCP, Skills, native windows, popup follow-up, Stop Panel |
 
-**`/audit` runs at three depths — each a different panel, not one panel scaled.**
+</details>
 
-- **fast** — a fixed cross-vendor quick scan at low reasoning effort. Sanity-check
-  a trivial change.
-- **standard** (the default) — a panel spanning several distinct training
-  distributions at full reasoning effort. Everyday code, docs, and plans.
-- **deep** — the standard panel plus further independent voices from additional
-  training distributions, run at a higher reasoning effort. High-stakes,
-  security-sensitive, or irreversible work.
+Follow-up questions in the diagram window are handled by DE's server by default,
+without starting an additional AI program on your computer.
 
-**`/graphic-explanation`** renders **comics**, **infographics**, and
-server-authored **SVG diagrams** (a flow, a sequence, a state machine, an
-architecture) — each generated on the server and returned as a finished artifact.
+### Audit depth
 
-**`/discussion-board`** today gives you **kanban** card boards, plus freehand
-annotation of a single **image** or a multi-page **document** you drop in.
-*Coming:*
+**`/audit` offers three review modes:**
 
-- **Structured diagram boards** — all 24: flow chart, mind map, org chart,
-  quadrants, cycle, swimlane, timeline, sequence, state machine, Gantt, Venn,
-  fishbone, funnel/pyramid, tree, concept map, decision matrix,
-  entity-relationship, truth table, affinity (KJ), decision table, SWOT,
-  business-model canvas, user journey, and user-story map. The engine renders each
-  one server-side; you view, annotate, and submit it back.
-- **Office & PDF files** — drop a DOCX / PPTX / XLSX / PDF onto the board and mark
-  it up. PDF works out of the box; Office files convert on your machine via
-  LibreOffice, which installs on demand (see [Requirements](#requirements)).
+- **fast** — a quick check explicitly requested by the user, such as a surface
+  review of prose or a typo sweep.
+- **standard** (default) — a regular review of substantive issues in code,
+  documents, and plans.
+- **deep** — an in-depth review for security-sensitive work, complex architecture,
+  or irreversible operations.
 
-> Items marked *Coming* are not available in the internal test yet.
+AQG separately determines whether to initiate an audit. **Trivial, non-sensitive
+changes such as renaming, formatting, or comments normally skip auditing.** Use
+`fast` when the user explicitly requests a quick check. Even a small change still
+requires deeper review under the policy when it affects permissions, secrets,
+installation integrity, or another sensitive area.
+
+### Diagrams and discussion boards
+
+**`/graphic-explanation`** turns a concept or plan into a comic, infographic, or SVG
+diagram, such as a flowchart, sequence, state machine, or architecture diagram.
+The server generates the content, which opens in a local window.
+
+**`/discussion-board`** helps you organize and revise a plan together. Drag cards
+and change priorities on a kanban board, or draw, highlight, and add text on an
+image or a document's page images. Submit your changes to continue the discussion.
+
+**Document annotation inputs:** original PDF, DOCX, PPTX, and XLSX files must first
+be converted to page images for the document annotation interface. This repository's
+`installer.office` only detects or helps install LibreOffice; it does not provide
+the complete file-conversion and import workflow. This section therefore does not
+promise automatic board import when an original PDF or Office file is dropped in.
+
+See the [discussion-board guide](skills/discussion-board/SKILL.md) for structured
+diagram boards and layout usage. Availability depends on the server and the
+current AI tool.
 
 ## Install
 
 ### Requirements
 
-The client is stdlib Python — no virtualenv is required to install it. Two extra
-dependencies are needed **only for the interactive boards**, and the client
-handles both for you:
+The client mainly uses Python's standard library, with `certifi` declared as a
+package dependency. Use the same Python environment for installation, MCP, and
+the checks below. If the selected system Python is marked `EXTERNALLY-MANAGED`,
+the installer requires a writable virtual environment. Native popups also need
+pywebview and a working platform GUI backend.
 
 | Dependency | Needed for | How it's installed |
 |---|---|---|
 | **Python 3.12+** | everything | the setup guide reuses any verified local version at or above the minimum; the installer checks version, SSL, venv, pip, and Tk before installation |
-| **pywebview** | the native board / diagram / graphic-explanation popup window | **auto-installed on first use** — the launcher pip-installs it into the client's own environment the first time you open a board. Nothing to do. |
-| **LibreOffice** | *optional* — converting **Office** files (DOCX / PPTX / XLSX) to a board. PDF boards work without it | **on demand** — run `python3 -m installer.office` when you need it: on macOS it installs via Homebrew; on Linux it prints the one `apt`/`dnf` line to run. `de doctor` flags it if it's missing. Or install it yourself ahead of time. |
+| **certifi >=2024.0.0** | CA certificates for HTTPS verification | declared in `pyproject.toml`; install the package dependencies in the Python environment used by MCP |
+| **pywebview** | native board / graphic-explanation popups and the default setup window | setup attempts to prepare it in the MCP Python environment; first visual use also attempts installation if the package is missing. If installation or the native GUI backend fails, follow the reported repair instructions. |
+| **LibreOffice** | *optional* — preparing an Office conversion environment; annotating existing page images does not require it | `python3 -m installer.office` only detects or helps install LibreOffice; it does not convert or import files. It can attempt Homebrew installation on macOS and print installation commands on Linux; the module has no Windows-specific installation flow. |
 
 Run `python3 -m installer.doctor` any time to check your setup (skills linked,
 Python OK, popup backend ready, LibreOffice present) — see [Check your setup](#check-your-setup).
 
 ### Install Decision Engine + AQG, then activate (recommended)
 
+The **device activation secret** (sometimes called an installation key) is issued
+by the DE service administrator. It lets the installed client obtain credentials
+for this device; it is not a model provider's API key. After activation, the client
+saves the device credentials, so normal use does not require entering the secret
+again.
+
 The Decision Engine client bundle ships in this repo. Clone it, then install
-from your local checkout. Do not put the owner-issued activation secret in a
-command or environment assignment; open the masked permanent-setup window
-after the core install:
+from your local checkout. Do not put the activation secret in a command or
+environment assignment; enter it in the masked permanent-setup window after
+the core install:
 
 ```bash
 git clone https://github.com/deeppatternai/decision-engine.git
@@ -445,8 +484,11 @@ version actually serving.
 
 ## Verify the shell is clean
 
-The shell must never carry a server address, secret, device token, prompt,
-layout, orchestration, or GUI/ad source. Prove it locally:
+Source prepared for distribution must not contain real service addresses, secrets,
+or device tokens, or the hosted server's dedicated prompts, layout templates,
+orchestration, or GUI/ad source. The client's own window and display code belongs
+in the distribution; local configuration generated after installation is separate.
+These checks detect the leak patterns the scanner recognizes:
 
 ```bash
 python3 -m installer.leak_scan                       # exit 0 = clean
@@ -455,7 +497,8 @@ python3 -m unittest installer.tests.test_leak_scan
 
 ## Run the tests
 
-Stdlib only, no virtualenv required:
+Run the unittest suite in the Python environment prepared above, with the declared
+package dependencies installed:
 
 ```bash
 python3 -m unittest \

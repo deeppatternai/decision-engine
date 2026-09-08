@@ -95,6 +95,6 @@ vague idea → /audit-explore (this skill) → /audit-brainstorming (stress-test
 Gate every transition on user confirmation; the panel is one input, not a verdict.
 
 ## Pre-flight
-- Hub reachable (`mcp__decision-engine__check_provider_health`); device token configured
+- Device token configured
 - P0 consent gate is mandatory — never bypass, even if the user seems eager
 - High-stakes/irreversible → `mode="deep"`; `panel_participation` audit_ids enable 7-day re-query

@@ -75,7 +75,7 @@ finishes.
 
 But a poll failure leaves the previous view in place, so a running row must not keep ticking a
 confident timer while the panel is blind — the run may already be finished. Rows go
-`连接中断 · 最后已知 <t>` after `STALE_AFTER_S` without a successful poll, anchored to the last real
+`Connection interrupted · Last known <t>` after `STALE_AFTER_S` without a successful poll, anchored to the last real
 poll rather than to now. **Terminal rows are never stale**: their duration is hub-derived, cannot
 change, and needs no network to stay correct. An outage of any length therefore self-heals — on
 reconnect the hub's timestamps give the exact answer, with no catch-up logic anywhere.

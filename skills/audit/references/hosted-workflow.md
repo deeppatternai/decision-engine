@@ -4,12 +4,15 @@ Read this file only after the current task exposes a Decision Engine audit submi
 
 ## Pre-flight
 
-- Check Hub/provider readiness with `check_provider_health`; use `fast_smoke` for deeper auth.
 - Confirm the device token is configured through the normal Decision Engine login flow.
 - Use `deep` for high-stakes or irreversible work; use `standard` for the normal defect panel and
   `fast` for an explicitly requested surface check.
 - Expect size pre-flight around 480 KB for `fast`/`standard` or 240 KB for `deep`, bounded by the
   smallest reasoner's context window.
+
+## Optional diagnostics
+
+For explicitly requested authentication diagnostics, use the `fast_smoke` profile.
 
 ## Submit
 

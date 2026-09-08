@@ -34,6 +34,13 @@ class _ScriptedTransport:
         return response
 
 
+class _ResponseWithHeaders:
+    def __init__(self, status, body, headers):
+        self.status = status
+        self.body = body
+        self.headers = headers
+
+
 class _Handler(BaseHTTPRequestHandler):
     protocol_version = "HTTP/1.1"
 
@@ -927,6 +934,30 @@ class HttpChatTurnTests(unittest.TestCase):
         session.create_or_restore_conversation()
         return session
 
+    def test_conversation_create_429_rate_limit_is_not_auto_retried(self):
+        transport = _ScriptedTransport(
+            _ResponseWithHeaders(
+                429,
+                b'{"error_code":"server_busy"}',
+                {"Retry-After": "7"},
+            ),
+            (200, json.dumps(_conversation_response()).encode("utf-8")),
+        )
+        session = HttpChatSession(
+            endpoint="https://example.test",
+            token="token",
+            run_id="run",
+            transport=transport,
+            sleep=lambda _seconds: None,
+        )
+
+        with self.assertRaises(ChatClientError) as caught:
+            session.create_or_restore_conversation()
+
+        self.assertEqual(caught.exception.code, "rate_limited")
+        self.assertTrue(caught.exception.retryable)
+        self.assertEqual(len(transport.calls), 1)
+
     def test_submit_unknown_response_reuses_identical_idempotency_key_and_accepts_zero_price(self):
         transport = _ScriptedTransport(
             (200, json.dumps(_conversation_response()).encode("utf-8")),
@@ -946,6 +977,45 @@ class HttpChatTurnTests(unittest.TestCase):
             self.assertEqual(call["headers"]["User-Agent"], runner.USER_AGENT)
             self.assertEqual(json.loads(call["body"]), {"text": "question", "images": []})
             self.assertEqual(call["timeout_s"], 120.0)
+
+    def test_submit_429_rate_limit_error_code_is_retryable(self):
+        transport = _ScriptedTransport(
+            (200, json.dumps(_conversation_response()).encode("utf-8")),
+            _ResponseWithHeaders(
+                429,
+                b'{"error_code":"server_busy"}',
+                {"Retry-After": "7"},
+            ),
+        )
+        session = self._session(transport, sleep=lambda _seconds: None)
+
+        with self.assertRaises(ChatClientError) as caught:
+            session.submit_turn("question", [], _TURN_KEY)
+
+        self.assertEqual(caught.exception.code, "rate_limited")
+        self.assertTrue(caught.exception.retryable)
+        self.assertEqual(caught.exception.http_status, 429)
+        submit_calls = [
+            call for call in transport.calls
+            if call["method"] == "POST" and call["url"].endswith("/turns")
+        ]
+        self.assertEqual(len(submit_calls), 1)
+
+    def test_submit_503_remains_temporary_service_failure(self):
+        transport = _ScriptedTransport(
+            (200, json.dumps(_conversation_response()).encode("utf-8")),
+            (503, b'{"error_code":"rate_limited"}'),
+            (503, b'{"error_code":"rate_limited"}'),
+            (503, b'{"error_code":"rate_limited"}'),
+        )
+        session = self._session(transport, sleep=lambda _seconds: None)
+
+        with self.assertRaises(ChatClientError) as caught:
+            session.submit_turn("question", [], _TURN_KEY)
+
+        self.assertEqual(caught.exception.code, "network_error")
+        self.assertTrue(caught.exception.retryable)
+        self.assertEqual(caught.exception.http_status, 503)
 
     def test_submit_accepts_strict_terminal_idempotency_replays(self):
         expected = {
@@ -2108,6 +2178,97 @@ class HttpChatTurnTests(unittest.TestCase):
         )
 
         self.assertEqual(errors, ["timeout"])
+
+    def test_submit_429_rate_limit_enters_retryable_state_and_later_retry_succeeds(self):
+        completed = _terminal_submit_response("completed")
+        completed["assistant_text"] = "answer after waiting"
+        transport = _ScriptedTransport(
+            (200, json.dumps(_conversation_response()).encode("utf-8")),
+            _ResponseWithHeaders(
+                429,
+                b'{"error_code":"server_busy"}',
+                {"Retry-After": "7"},
+            ),
+            (200, json.dumps(completed).encode("utf-8")),
+        )
+        session = self._session(transport, sleep=lambda _seconds: None, rng=_FixedRng())
+        states = []
+        done = []
+        errors = []
+        kwargs = {
+            "text": "question",
+            "images": [],
+            "on_delta": lambda _text: None,
+            "on_done": done.append,
+            "on_error": errors.append,
+            "on_action": lambda _action: None,
+            "client_turn_id": _TURN_KEY,
+            "privacy_version": "sha256:test",
+            "on_state": lambda state, payload: states.append((state, payload)),
+        }
+
+        asyncio.run(session.run_turn(**kwargs))
+        self.assertEqual(states, [
+            ("submitting", {}),
+            ("recovering", {"error_code": "rate_limited"}),
+        ])
+        self.assertEqual(done, [])
+        self.assertEqual(errors, [])
+
+        asyncio.run(session.run_turn(**kwargs))
+
+        self.assertEqual(done, ["answer after waiting"])
+        self.assertEqual(errors, [])
+
+    def test_submit_429_without_state_callback_releases_turn_and_reports_error(self):
+        first_completed = _terminal_submit_response("completed")
+        first_completed["assistant_text"] = "fresh turn answer"
+        transport = _ScriptedTransport(
+            (200, json.dumps(_conversation_response()).encode("utf-8")),
+            _ResponseWithHeaders(
+                429,
+                b'{"error_code":"server_busy"}',
+                {"Retry-After": "7"},
+            ),
+            (200, json.dumps(first_completed).encode("utf-8")),
+        )
+        session = self._session(transport, sleep=lambda _seconds: None, rng=_FixedRng())
+        errors = []
+
+        asyncio.run(
+            session.run_turn(
+                "question",
+                [],
+                lambda _text: None,
+                lambda _text: None,
+                errors.append,
+                lambda _action: None,
+                client_turn_id=_TURN_KEY,
+                privacy_version="sha256:test",
+                on_state=None,
+            )
+        )
+
+        self.assertEqual(errors, ["rate_limited"])
+        self.assertIsNone(session._active)
+
+        done = []
+        asyncio.run(
+            session.run_turn(
+                "fresh question",
+                [],
+                lambda _text: None,
+                done.append,
+                errors.append,
+                lambda _action: None,
+                client_turn_id=_TURN_KEY_2,
+                privacy_version="sha256:test",
+                on_state=None,
+            )
+        )
+
+        self.assertEqual(done, ["fresh turn answer"])
+        self.assertEqual(errors, ["rate_limited"])
 
     def test_callback_failure_isolated_and_terminal_cache_drops_payload_bytes(self):
         png = _data_url("image/png", b"\x89PNG\r\n\x1a\n")

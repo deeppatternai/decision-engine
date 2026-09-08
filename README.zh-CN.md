@@ -88,11 +88,11 @@ AQG 是本地、无需账户的工程纪律工具包。安装其中任一个，�
 
 一旦想法有了形状，`/audit-brainstorming` 把它摆到一个「思考伙伴」评审组面前 —— 不是去
 挑 bug，而是陪你把它想透：哪里过硬、哪里脆弱、你没说出口的反方论点、你没察觉自己已经
-默认下来的假设。它也把诚实的认识论一并交回来 —— 什么能*证伪*它、基准率是多少、证据到底
-该把你的信心往上调还是往下调。
+默认下来的假设。它还会说明如何验证这个想法：什么能*证伪*它、类似想法过去有多大成功率，
+以及现有证据应该让你更有信心，还是更谨慎。
 
-两个合起来，把*「我觉得我们应该……」*，变成*「这是这一注、这是为什么、以及到底什么会
-证明我错了。」*
+两个合起来，把*「我觉得我们应该……」*，变成*「我们选择这条路线的理由，以及什么证据
+会让我们改变判断。」*
 
 ## 把它对准外面的世界 —— 市场，和赔率
 
@@ -101,9 +101,9 @@ AQG 是本地、无需账户的工程纪律工具包。安装其中任一个，�
 ### 📊 一份不是单个模型瞎猜的市场解读 —— `/audit-market-research`
 
 问一个市场、GTM 或定位问题，`/audit-market-research` 给你搭一份**洞察文档** —— 但不是从
-单个模型的想象里来。一个跨厂商评审组从彼此独立的角度分析它，**扎根在真实检索上**（横跨
-网页、社媒、财经多个来源），并（可选）过一遍**合成客户评审组**。最妙的是，它会告诉你
-*该信几分*：一个诚实的**收敛质量**信号，把「评审者真的一致」和「他们只是抓住了同一个
+单个模型的想象里来。跨厂商评审组依据网页、社媒和财经来源的**真实检索结果**，
+从各自独立的角度分析问题。你还可以选择让**合成客户评审组**评估这份分析。
+结果也会说明*该信几分*：通过**收敛质量**信号，区分「评审者真的一致」和「他们只是抓住了同一个
 措辞」分开。
 
 ### 🎲 把赔率汇集起来 —— 而不是自己编 —— `/audit-forecast`
@@ -114,26 +114,30 @@ AQG 是本地、无需账户的工程纪律工具包。安装其中任一个，�
 共识在哪里强、在哪里分裂、关键催化剂、基准率、什么会把它翻盘）。它**绝不自造任何一个
 数字** —— 每个数都能追溯回一个真实来源，服务端强制。一份诚实的汇总，胜过一个自信的幻觉。
 
-## 本仓分发什么（以及不分发什么）
+## 这个仓库包含什么？哪些功能在服务端运行？
 
-| 随本仓分发 | 仅存在于托管服务端（永不随仓分发） |
-|---|---|
-| 安装器（`installer/`） | 提示词、模型/声部阵容、编排 |
-| 纯传输的 MCP shim | board / diagram 渲染 —— HTML、布局、生成 |
-| 原生弹窗显示外壳（逐字显示服务端渲染的 board 与 diagram；自身不含渲染逻辑） | 调研 / 预测流水线 |
-| 你的本地设备配置（安装时写入） | 广告逻辑、服务器地址、密钥 |
-| 这些文档 | — |
+下载本仓库，拿到的是 **DE 客户端的源码和配套文件**。它负责安装、连接 AI 工具、打开本地
+窗口，以及与 DE 服务通信。托管评审、调研等服务的完整实现不在这个仓库里。
 
-客户端只做**显示与传输**：shim 把每一条 JSON-RPC 消息原样转发到服务端的 `/mcp` 端点、
-只搬运字节，原生弹窗外壳则逐字显示服务端回传的内容 —— 交互式 board 和每一张 diagram 都在
-服务端生成、以成品字节递过来，所以外壳自身不含任何工具 schema、提示词、阵容、布局或渲染
-逻辑。哪些工具存在，以服务端为唯一真相源。红线（red-line）的具体内容与验证方式见
+| 内容放在哪里 | 包含什么 | 使用时的例子 |
+|---|---|---|
+| **仓库里：客户端源码和配套文件** | 安装器、AI 工具接入代码、skills 说明、本地窗口与显示代码、图标、测试和文档。 | 让 AI 发起评审请求，在电脑上显示进度、图解或讨论板。 |
+| **DE 服务端：托管功能的实现，不随本仓分发** | 托管评审使用的专用提示词、模型选择与任务编排、调研和预测流程、画板与图解内容生成，以及服务端持有的模型服务凭据。 | 服务端收到评审请求后组织多个模型处理，把结果返回客户端。 |
+| **用户电脑上：安装或激活时生成，不随本仓分发** | 连接 DE 的服务地址、设备标识，以及激活后取得的设备访问凭据。 | 用户填写服务地址和设备激活密钥后，客户端保存这台设备后续连接所需的配置。 |
+
+这里的 MCP shim 是 AI 工具与 DE 之间的通信桥梁。它会把托管工具请求发给服务端，也会处理
+本地工具和显示请求；客户端含有本地窗口、交互与部分工具定义。画板和图解的托管内容由服务端
+生成，再交给客户端显示，因此“服务端负责内容生成”不等于“客户端没有界面代码”。
+
+发布源码不会附带用户的真实服务地址或密钥。它们与激活后产生的设备凭据属于运行时配置，
+也不等于服务端调用模型所用的凭据。源码泄漏扫描说明见
 [`installer/LEAK_SCAN.md`](installer/LEAK_SCAN.md)。
 
 ## 你能用它做什么
 
 安装 DE 会把一组 skill 路由进你的 agent。可以按名字调用（例如 `/audit`），也可以直接
-描述任务 —— agent 会挑选 skill 并把请求转发给托管引擎。一句话速览：
+描述任务，agent 会选择对应的 skill。托管流程会将请求发送到 DE 服务端，本地可用范围
+见表格下方说明。一句话速览：
 
 | skill | 做什么 |
 |---|---|
@@ -149,78 +153,103 @@ AQG 是本地、无需账户的工程纪律工具包。安装其中任一个，�
 | `/layer-check` | 本地推理纪律，用于捕捉对比 / 竞争分析里的范畴错误（把「不同层级的产品当成替代品」的坑）。完全在你本机运行。 |
 
 一次安装即可服务下列全部注册宿主，不需要挑选按 agent 区分的 Decision Engine 变体。
-除 `/layer-check` 外，所有 skill 都会触达托管引擎、需要一台已激活的设备（见下文）；
-`/layer-check` 是本地的，无需账户即可用。
+设备尚未激活时，已安装的 MCP 仍可进入 **DE Lite** 模式：你明确要求 `/audit` 时，
+可由当前 agent 会话提供参考性审查，不调用 DE 的跨厂商评审组。这里仍使用宿主 agent
+的模型，不代表模型在本机离线运行。`/layer-check` 也可在本地使用，无需 DE 账户。
+托管审查、调研、预测、图解、画板和弹窗追问需要激活设备（见下文），并具备相应服务权限。
 
-| 宿主 | 安装器 ID | 当前本地宿主范围 |
+### 支持的 AI 工具（按系列汇总）
+
+下列产品均支持 MCP、原生窗口、弹窗追问和 Stop Panel。先按系列找产品，再展开详情查看
+安装器 ID、Skills 支持以及平台和版本要求。
+
+| 系列 | 支持的产品 | 需要注意的区别 |
 |---|---|---|
-| Claude Code | `claude-code` | MCP、Skills、原生窗口、弹窗右侧追问、Stop Panel |
-| Claude Desktop | `claude-desktop` | MCP、原生窗口、弹窗右侧追问、Stop Panel |
-| 腾讯 CodeBuddy Agent CLI | `codebuddy` | 仅支持独立 Agent CLI；CodeBuddy Studio 是另一个未支持产品；MCP、Skills、原生窗口、弹窗右侧追问、Stop Panel |
-| Codex | `codex` | MCP、Skills、原生窗口、弹窗右侧追问、Stop Panel |
-| Cursor | `cursor` | MCP、Skills、原生窗口、弹窗右侧追问、Stop Panel |
-| 阿里 Qoder Desktop | `qoder` | Windows Desktop 1.106.3+；macOS Qoder.app 0.1.3+；MCP、Skills、原生窗口、弹窗右侧追问、Stop Panel |
-| 阿里 Qoder CN Desktop | `qoder-cn` | macOS Qoder CN.app 0.1.4；MCP、Skills、原生窗口、弹窗右侧追问、Stop Panel |
-| 阿里 Qoder IDE | `qoder-ide` | macOS Qoder IDE.app 1.106.3+；独立 MCP 身份、共享 Qoder Skills 与审计 hook、原生窗口、弹窗右侧追问、Stop Panel |
-| 阿里 Qoder CN IDE | `qoder-cn-ide` | macOS Qoder CN IDE.app 1.106.3+；独立 MCP 身份、共享 Qoder CN Skills 与审计 hook、原生窗口、弹窗右侧追问、Stop Panel |
-| TRAE Desktop | `trae` | macOS Trae.app 3.5.81；MCP、Skills、原生窗口、弹窗右侧追问、Stop Panel |
-| TRAE Work | `trae-work` | Windows and macOS Desktop 0.1.48+；MCP、Skills、原生窗口、弹窗右侧追问、Stop Panel |
-| TRAE CN Desktop | `trae-cn` | macOS Trae CN.app 3.3.95；MCP、Skills、原生窗口、弹窗右侧追问、Stop Panel |
-| TRAE Work CN | `trae-work-cn` | Windows and macOS Desktop 0.1.48+；MCP、Skills、原生窗口、弹窗右侧追问、Stop Panel |
-| 腾讯 WorkBuddy Desktop | `workbuddy` | Windows and macOS Desktop；MCP、Skills、原生窗口、弹窗右侧追问、Stop Panel |
-| 腾讯 WorkBuddy AI Desktop | `workbuddy-ai` | macOS WorkBuddy AI.app 5.5.2+；MCP、Skills、原生窗口、弹窗右侧追问、Stop Panel |
+| Claude | Claude Code、Claude Desktop | Claude Code 另支持 Skills。 |
+| Codex | Codex | 支持 Skills。 |
+| Cursor | Cursor | 支持 Skills。 |
+| 腾讯 | CodeBuddy Agent CLI、WorkBuddy Desktop、WorkBuddy AI Desktop | CodeBuddy 仅支持独立 Agent CLI，不支持 CodeBuddy Studio；各产品的平台要求见详情。 |
+| 阿里 Qoder | Qoder Desktop、Qoder CN Desktop、Qoder IDE、Qoder CN IDE | 区分 Desktop／IDE 和普通版／CN 版；IDE 使用独立 MCP 身份，共享对应版本的 Skills 与审计 hook。 |
+| TRAE | TRAE Desktop、TRAE CN Desktop、TRAE Work、TRAE Work CN | Desktop 与 Work、普通版与 CN 版分别列出；平台和版本要求见详情。 |
 
-已注册的 Qoder、TRAE 与 WorkBuddy Desktop 产品系列以及 CodeBuddy Agent CLI 现在都提供服务端追问对话（由 hub 托管、
-不启动本地 agent）；旧的本地 CLI 追问路径仍只限于具备该契约的宿主。它们的 Graphic
-Explanation / Discussion Board 原生窗口和审计 Stop Panel 仍复用公共实现。
-它们在 macOS Intel 与 Apple Silicon 上使用同一套宿主契约，无需按芯片配置 Decision Engine。
+<details>
+<summary>展开查看全部 15 个产品的安装器 ID、平台和版本要求</summary>
 
-### 深度 & 即将到来
+| 系列 | 宿主 | 安装器 ID | 当前本地宿主范围 |
+|---|---|---|---|
+| Claude | Claude Code | `claude-code` | MCP、Skills、原生窗口、弹窗右侧追问、Stop Panel |
+| Claude | Claude Desktop | `claude-desktop` | MCP、原生窗口、弹窗右侧追问、Stop Panel |
+| Codex | Codex | `codex` | MCP、Skills、原生窗口、弹窗右侧追问、Stop Panel |
+| Cursor | Cursor | `cursor` | MCP、Skills、原生窗口、弹窗右侧追问、Stop Panel |
+| 腾讯 | 腾讯 CodeBuddy Agent CLI | `codebuddy` | 仅支持独立 Agent CLI；CodeBuddy Studio 是另一个未支持产品；MCP、Skills、原生窗口、弹窗右侧追问、Stop Panel |
+| 腾讯 | 腾讯 WorkBuddy Desktop | `workbuddy` | Windows and macOS Desktop；MCP、Skills、原生窗口、弹窗右侧追问、Stop Panel |
+| 腾讯 | 腾讯 WorkBuddy AI Desktop | `workbuddy-ai` | macOS WorkBuddy AI.app 5.5.2+；MCP、Skills、原生窗口、弹窗右侧追问、Stop Panel |
+| 阿里 Qoder | 阿里 Qoder Desktop | `qoder` | Windows Desktop 1.106.3+；macOS Qoder.app 0.1.3+；MCP、Skills、原生窗口、弹窗右侧追问、Stop Panel |
+| 阿里 Qoder | 阿里 Qoder CN Desktop | `qoder-cn` | macOS Qoder CN.app 0.1.4；MCP、Skills、原生窗口、弹窗右侧追问、Stop Panel |
+| 阿里 Qoder | 阿里 Qoder IDE | `qoder-ide` | macOS Qoder IDE.app 1.106.3+；独立 MCP 身份、共享 Qoder Skills 与审计 hook、原生窗口、弹窗右侧追问、Stop Panel |
+| 阿里 Qoder | 阿里 Qoder CN IDE | `qoder-cn-ide` | macOS Qoder CN IDE.app 1.106.3+；独立 MCP 身份、共享 Qoder CN Skills 与审计 hook、原生窗口、弹窗右侧追问、Stop Panel |
+| TRAE | TRAE Desktop | `trae` | macOS Trae.app 3.5.81；MCP、Skills、原生窗口、弹窗右侧追问、Stop Panel |
+| TRAE | TRAE CN Desktop | `trae-cn` | macOS Trae CN.app 3.3.95；MCP、Skills、原生窗口、弹窗右侧追问、Stop Panel |
+| TRAE | TRAE Work | `trae-work` | Windows and macOS Desktop 0.1.48+；MCP、Skills、原生窗口、弹窗右侧追问、Stop Panel |
+| TRAE | TRAE Work CN | `trae-work-cn` | Windows and macOS Desktop 0.1.48+；MCP、Skills、原生窗口、弹窗右侧追问、Stop Panel |
 
-**`/audit` 有三档深度 —— 每一档是不同的评审组，不是同一组调深浅。**
+</details>
 
-- **fast** —— 固定的跨厂商快扫，低推理强度。给 trivial 改动做 sanity check。
-- **standard**（默认）—— 横跨若干个不同训练分布的评审组，满推理强度。日常代码、文档、
-  方案。
-- **deep** —— 在 standard 评审组之上，再加来自更多训练分布的独立声音，并以更高的推理
-  effort 运行。高 stakes / 安全敏感 / 不可逆的活。
+图解窗口中的追问默认由 DE 服务端处理，无需在本机额外启动 AI 程序。
 
-**`/graphic-explanation`** 出**漫画**、**信息图**，以及服务端 authoring 的 **SVG 示意图**
-（流程图、时序图、状态机、架构图）—— 每一种都在服务端生成、以成品返回。
+### 审计深度
 
-**`/discussion-board`** 目前给你 **kanban** 卡片板，外加对丢进来的一张**图片**或一份多页
-**文档**做手绘标注。*即将到来：*
+**`/audit` 提供三个审查档位：**
 
-- **结构化图板 —— 全部 24 种**：流程图、思维导图、组织架构图、四象限、循环图、泳道图、
-  时间轴、时序图、状态机、甘特图、维恩图、鱼骨图、漏斗/金字塔、树图、概念图、决策矩阵、
-  实体关系图（ER）、真值表、亲和图（KJ）、决策表、SWOT、商业模式画布、用户旅程图、
-  用户故事地图。每一种都由引擎在**服务端**渲染；你查看、标注、提交回来。
-- **Office 与 PDF 文件** —— 把 DOCX / PPTX / XLSX / PDF 丢上板做标注。PDF 开箱即用；
-  Office 文件在你本机经 LibreOffice 转换 —— 按需安装（见[环境要求](#环境要求)）。
+- **fast** —— 快速检查。用于用户明确要求的轻量检查，例如检查文案表面问题或错别字。
+- **standard**（默认）—— 常规审查。适合日常代码、文档和方案中的实质性问题。
+- **deep** —— 深入审查。适合安全敏感、复杂架构或涉及不可逆操作的任务。
 
-> 标注为*即将到来*的项目，内测阶段尚未开放。
+是否发起审计另由 AQG 规则判断：改名、格式调整、注释等**非敏感的微小改动默认跳过审计**；
+用户明确要求快速检查时，才选用 `fast`。即使改动很少，只要涉及权限、密钥、安装完整性等
+敏感内容，仍应按规则进行深入审查。
+
+### 图解与讨论板
+
+**`/graphic-explanation`** 可以把一个概念或方案做成漫画、信息图或 SVG 示意图
+（如流程图、时序图、状态机、架构图）。内容由服务端生成，在本地窗口中显示。
+
+**`/discussion-board`** 用于一起整理和修改方案：可以拖动看板卡片、调整优先级，也可以在
+图片或文档的页面图片上画线、圈选和添加文字。修改完成后，提交结果继续讨论。
+
+**文档标注的输入范围：** PDF、DOCX、PPTX、XLSX 等原文件需要先转成页面图片，文档标注
+接口接收这些图片。本仓的 `installer.office` 只负责检测或帮助安装 LibreOffice，不负责
+完整的文件转换与导入流程；因此这里不承诺直接拖入 PDF／Office 原文件就能自动上板。
+
+结构化图板及各类布局的用法见[讨论板说明](skills/discussion-board/SKILL.md)，具体可用范围
+取决于服务端和当前 AI 工具的支持。
 
 ## 安装
 
 ### 环境要求
 
-客户端本身是 stdlib Python —— 安装它不需要虚拟环境。只有**交互式画板**需要两个
-额外依赖，且客户端都替你搞定：
+客户端主要使用 Python 标准库，同时声明了 `certifi` 包依赖。安装、MCP 运行和下面的
+检查应使用同一个 Python 环境。如果所选系统 Python 标记为 `EXTERNALLY-MANAGED`，
+安装器会要求改用可写的虚拟环境。原生弹窗还需要 pywebview 和可用的系统图形后端。
 
 | 依赖 | 用于 | 如何安装 |
 |---|---|---|
 | **Python 3.12+** | 一切 | 安装指南会复用满足最低版本且通过检查的本地版本；安装器会在安装前检查版本、SSL、venv、pip 和 Tk 支持 |
-| **pywebview** | 画板 / 图解 / 图形解释的原生弹窗 | **首次使用时自动安装** —— 首次打开画板时,launcher 会把它 pip 装进客户端自己的环境。无需你操作。 |
-| **LibreOffice** | *可选* —— 把 **Office** 文件（DOCX / PPTX / XLSX）转上板。PDF 板无需它 | **按需** —— 需要时跑 `python3 -m installer.office`：macOS 经 Homebrew 装；Linux 打印那一行 `apt`/`dnf` 让你跑。`de doctor` 会在缺失时提示。也可以自己提前装。 |
+| **certifi >=2024.0.0** | HTTPS 验证所用的 CA 证书 | 在 `pyproject.toml` 中声明；应将包依赖安装到 MCP 使用的 Python 环境中 |
+| **pywebview** | 画板 / 图解的原生弹窗，以及默认的配置窗口 | 配置阶段会尝试在 MCP 的 Python 环境中准备；首次打开图形窗口时，若缺少这个包，也会尝试补装。安装失败或系统图形后端不可用时，按报错提示修复。 |
+| **LibreOffice** | *可选* —— 准备 Office 文件转换环境；标注已生成的页面图片无需它 | `python3 -m installer.office` 仅检测或帮助安装 LibreOffice，不转换或导入文件。macOS 可尝试 Homebrew 安装；Linux 提供安装命令；当前模块没有 Windows 专用安装流程。 |
 
 随时跑 `python3 -m installer.doctor` 检查你的环境（skills 是否 link、Python、弹窗
 后端、LibreOffice）—— 见[检查你的环境](#检查你的环境)。
 
 ### 安装 Decision Engine + AQG，再完成激活（推荐）
 
-Decision Engine 客户端 bundle 就随本仓分发。先克隆本仓，再从你的本地检出安装 ——
-不要把 owner 发放的 activation secret 放进命令或环境变量赋值；核心安装完成后，通过掩码的永久
-配置窗口输入：
+这里的**设备激活密钥**（`activation secret`，也常被叫作“安装密钥”）由 DE 服务管理员发放，
+用于在安装后为这台设备申请访问凭据。它不是模型厂商的 API Key。激活成功后，客户端保存设备
+凭据，正常使用时不需要反复输入激活密钥。
+
+Decision Engine 客户端安装文件随本仓分发。先克隆本仓，再从本地源码目录安装。不要把设备激活
+密钥填进命令或环境变量赋值；安装完成后，在永久配置窗口的隐藏输入框中填写：
 
 ```bash
 git clone https://github.com/deeppatternai/decision-engine.git
@@ -241,7 +270,7 @@ cd decision-engine
 endpoint 和服务端签发的每设备凭据，绝不保存 owner 发放的 activation secret。
 
 > **在开发本仓库，或者你在固定路径上已经有一份不是刚 clone 出来的 checkout？**
-> 改用 `DE_DEV_MODE=1 ./install.sh`——这会让 agent 直接指向你正在跑的这份 checkout
+> 改用 `DE_DEV_MODE=1 ./install.sh` —— 这会让 agent 直接指向你正在跑的这份 checkout
 > （不做签名校验、不自动更新），改代码立刻生效。
 
 ### 只装 Decision Engine（无需写代码）
@@ -326,6 +355,10 @@ endpoint 和 secret；每用户配置只保存 endpoint 和服务端签发的设
 现有的首次使用激活弹窗仍为旧版/已预配 endpoint 的安装保留；managed 新用户应优先使用 Agent 主动
 运行的永久配置流程。
 
+如果已安装 Cursor，永久配置还会将 launcher 合并到 `~/.cursor/mcp.json`，并接入它支持的
+skills。普通的 agent 重启和自动更新不会新增宿主接入关系，也不会改写 Cursor 的 MCP
+配置；接入宿主仍由明确执行的安装或配置流程负责。
+
 完整细节（包括 fail-closed 的明文凭据规则）见
 [`installer/README.md`](installer/README.md)。
 
@@ -365,8 +398,9 @@ bootstrap 发布后，已迁移安装会在 MCP 启动前按有界的 GitHub→G
 
 ## 验证外壳是干净的
 
-外壳绝不能携带服务器地址、密钥、设备 token、提示词、布局、编排或 GUI/广告源码。本地即可
-证明：
+待分发的源码不应包含真实服务地址、密钥或设备 token，也不应混入托管服务端的专用提示词、
+布局模板、任务编排或 GUI／广告源码。客户端自身的窗口和显示代码属于正常分发内容；安装后
+生成的本机配置也与待分发源码不同。可用以下检查发现扫描器能识别的泄漏：
 
 ```bash
 python3 -m installer.leak_scan                       # exit 0 = 干净
@@ -375,7 +409,7 @@ python3 -m unittest installer.tests.test_leak_scan
 
 ## 跑测试
 
-仅用标准库，无需虚拟环境：
+使用上面准备好的 Python 环境运行 unittest 测试，并确保已安装声明的包依赖：
 
 ```bash
 python3 -m unittest \
@@ -383,7 +417,10 @@ python3 -m unittest \
   installer.tests.test_shim \
   installer.tests.test_activate \
   installer.tests.test_mcp_config \
-  installer.tests.test_leak_scan
+  installer.tests.test_leak_scan \
+  installer.tests.test_stopper_fallback \
+  installer.tests.test_window_icon \
+  client.popup.tests.test_visual_capture
 ```
 
 ## 许可

@@ -12,7 +12,7 @@ python3 desktop/icons/make_icons.py        # add --no-icns to skip the macOS bun
 | `logo.ico` | yes | `client/tk_icon.py` → the Windows stop panel and the setup dialogs |
 | `logo-64.png`, `logo-256.png` | yes | `client/tk_icon.py` → Tk's `iconphoto` on non-Windows |
 | `AppIcon.icns` | yes | `client/tk_icon.py` → the macOS Dock tile, at runtime; and the `Decision Engine Stopper.app` bundle, built out of band |
-| `../macos/bin/stopper_icon.png`, `@2x` | yes | the Swift panel's menu-bar item, and `client/popup/native_shell.py` |
+| `../macos/bin/stopper_icon.png` | yes | the Swift panel's menu-bar item, and `client/popup/native_shell.py` |
 
 The outputs are **committed**. The client body is delivered by `git pull` and nothing runs a build
 step on a user's machine, so a generated-but-uncommitted asset is an asset that does not exist.

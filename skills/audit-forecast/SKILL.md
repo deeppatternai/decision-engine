@@ -125,6 +125,6 @@ strips source-identity tokens. Do not surface pricing / credit cost in user-faci
 
 ## Pre-flight
 
-- Hub reachable (`mcp__decision-engine__check_provider_health`); device token configured
+- Device token configured
 - Build the `proposition` BEFORE calling — include `subject` (+ `source_hints`) or the run returns `no_market`; the gate rejects an inadmissible one before any work
 - High-stakes by nature → keep `mode="premium"` unless the user explicitly asks for a cheap/quick pass

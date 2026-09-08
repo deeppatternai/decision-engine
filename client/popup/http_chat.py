@@ -719,6 +719,10 @@ class HttpChatSession:
             server_code = error_value.get("error_code") if isinstance(error_value, dict) else None
         except (UnicodeDecodeError, json.JSONDecodeError, RecursionError, ValueError):
             server_code = None
+        if status == 429:
+            return _error("rate_limited", retryable=True, http_status=status)
+        if status == 503:
+            return _error("network_error", retryable=True, http_status=status)
         if isinstance(server_code, str) and server_code in _STABLE_CODES:
             return _error(
                 server_code,
@@ -734,8 +738,6 @@ class HttpChatSession:
             return _error("insufficient_credits", http_status=status)
         if status == 408 or status == 504:
             return _error("timeout", retryable=True, http_status=status)
-        if status == 429:
-            return _error("rate_limited", retryable=True, http_status=status)
         if 500 <= status <= 599:
             return _error("network_error", retryable=True, http_status=status)
         return _error("bad_response", http_status=status)
@@ -831,6 +833,8 @@ class HttpChatSession:
             try:
                 return operation()
             except ChatClientError as exc:
+                if exc.code == "rate_limited":
+                    raise
                 if not exc.retryable:
                     raise
                 last_error = exc
@@ -1644,6 +1648,11 @@ class HttpChatSession:
                 self._release_active(record)
                 emit_state("unavailable", {"error_code": exc.code})
                 self._notify(on_error, exc.code)
+            elif exc.code == "rate_limited":
+                self._release_active(record)
+                emit_state("recovering", {"error_code": exc.code})
+                if not callable(on_state):
+                    self._notify(on_error, exc.code)
             elif (
                 record.turn_code is None
                 and exc.http_status is not None

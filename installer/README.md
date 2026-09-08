@@ -6,7 +6,7 @@
 > release step P7 — never by copying git history (release design §11 P7 / §14).
 
 This is a **thin shell**. It contains an installer, a transport-only MCP shim,
-and these docs — and **no** product intelligence. Every audit / market-research
+and these docs — and **no** product intelligence. Every hosted audit / market-research
 / forecast / plan / image the Decision Engine produces is computed on the
 hosted server; the shell only authenticates your device and forwards requests.
 
@@ -22,10 +22,10 @@ What ships here, and what does not:
 
 ```
 installer/
-  install.py                     # unified installer: install de | aqg | all (body/config, no Git)
-  bootstrap_managed_install.py   # clone stable + verify signature + install + activate, or repair wiring
+  install.py                     # body/config installer: de | all; AQG is handled by install.sh
+  bootstrap_managed_install.py   # clone stable + verify signature + prepare managed install, or repair wiring
   managed_install.py             # fail-closed identity contract (.managed-install.json marker)
-  managed_activation.py          # one-time activation of an already-prepared signed checkout
+  managed_activation.py          # publish signed checkout state and launcher readiness, not device activation
   launcher.py                    # MCP entry point: bounded managed-update gate, then the shim
   mcp_config.py                  # print/--write the Agent MCP registration
   doctor.py                      # one-shot diagnostic (python/skills/mcp/dev-mode/update/...)
@@ -47,10 +47,13 @@ installer/
 **Normal path**: `./install.sh de` (see the repo root README) — this calls
 `bootstrap_managed_install`, which clones `stable` straight into the fixed
 canonical root (`~/.deeppattern/decision-engine`), verifies its signature,
-lands the body via `installer.install` underneath (see below), and activates
-it (writes the `.managed-install.json` identity, wires the Agent MCP). Wherever
-you ran `install.sh` *from* is irrelevant to where the product ends up — see
-the root README's recommended install section.
+lands the body via `installer.install` underneath (see below), and prepares the
+managed identity, protected release state, and launcher protocol marker.
+The outer `install.sh` then registers the launcher with detected Agent hosts,
+even when device activation is pending; those MCP entries contain no endpoint
+or credentials. Device activation is a separate `installer.permanent_setup`
+step. Wherever you ran `install.sh` *from* is irrelevant to where the product
+ends up — see the root README's recommended install section.
 
 ```bash
 # Fresh install / resume an interrupted one, or repair MCP wiring:
@@ -68,9 +71,11 @@ from an already-unpacked bundle root and writes the device config — it does no
 Git, no signature verification, and is what `bootstrap_managed_install` calls
 once the checkout is in place. It lays the real bodies down side-by-side under
 `~/.deeppattern/` and routes their skills into every detected registered host
-that declares a managed Skills directory in the table below. The `de` target **lays down both
-Decision Engine and AQG** side-by-side. AQG is local and needs no account;
-Decision Engine needs an owner-issued device activation key.
+that declares a managed Skills directory in the table below. Here, `de` installs
+**Decision Engine only**; `all` also includes EAF if its body is present.
+The outer `install.sh de` handles AQG separately by default, unless
+`WITH_AQG=0` is set. AQG needs no DE account; DE's hosted features require
+an owner-issued device activation key.
 
 | Host | Installer ID | User MCP config | Managed Skills | Launch/render contract |
 |---|---|---|---|---|
@@ -150,8 +155,10 @@ For normal managed onboarding, ask the Agent to open permanent setup:
 ( cd "$HOME/.deeppattern/decision-engine" && python3 -m installer.permanent_setup )
 ```
 
-It opens a tkinter desktop dialog on macOS and Windows; the activation-secret
-field is masked. The human enters the endpoint and secret directly; the secret
+On macOS and Windows, setup prefers a pywebview desktop window, with Tk as a
+fallback when pywebview is unavailable before native registration. Windows
+WorkBuddy uses the supported Tk form directly. The activation-secret field is
+masked. The human enters the endpoint and secret directly; the secret
 never enters argv, environment variables, shell history, or persistent config.
 On success the endpoint and server-issued device credentials are stored in the
 per-user config, MCP wiring is repaired, and Doctor runs. Future Agent and
@@ -188,8 +195,9 @@ host-specific launcher entry and route the supported Skills without replacing
 unrelated MCP servers or user Skills. The server-backed popup follow-up chat
 (hub-hosted, no local agent) is available on every host that can render a GE
 popup, including the registered Qoder and TRAE Desktop families plus WorkBuddy; the older
-local-CLI follow-up route stays limited to Codex, Claude, and Cursor where their
-local CLI contract is available. All hosts expose the shared local GE/DB windows
+local-CLI follow-up route is used only when `ge_chat_transport` is explicitly
+set to `legacy` in the local device config, and only where the host's local CLI
+contract is available. All hosts expose the shared local GE/DB windows
 and audit Stop Panel. A normal managed update changes the managed target in
 place and does not create or rewrite host MCP registrations.
 
@@ -208,14 +216,23 @@ python3 -m installer.activate --force     # re-bind this device (uses a device s
 API key over a plaintext `http://` endpoint (localhost excepted for dev) —
 including across an https→http redirect — and, on an invalid/expired/at-capacity
 key, prints the server's reason and exits nonzero **without** writing a token.
-Once tokens are issued the spent API key is dropped from the config so a
-reusable secret does not linger next to them; re-binding a device (`--force`)
-therefore means re-supplying the key via the installer's `--api-key`. If a
-token already exists `activate` is a no-op unless you pass `--force`. The
-installer preserves the token on any later re-install.
+Here, the legacy name `API key` means the DE **device activation secret**, not a
+model provider's API key. Once device credentials are issued, the activation
+secret is removed from the config. For interactive activation, use the masked
+permanent-setup window described above; do not pass the secret through `--api-key`
+or paste it into a shell command.
 
-> Until a device is activated the shim refuses to run (fail-closed) and tells
-> you to activate.
+If a token already exists, `activate` is a no-op unless `--force` is used. That
+legacy operation creates a new device binding and requires the activation secret
+again. Use the service administrator's recovery procedure for a rebind; reopening
+permanent setup does not force a rebind of an already-activated device. The
+installer preserves the token on later reinstalls.
+
+> Before device activation, the shim can start in DE Lite mode. An explicitly
+> requested `/audit` can use the current agent session for advisory review;
+> it does not call DE's cross-vendor panel or imply offline model inference.
+> `/layer-check` is also local. Hosted reviews, research, forecasts, graphics,
+> boards, and popup follow-up still require activation and service access.
 
 ## Use — wire the launcher into your agent
 
@@ -227,17 +244,19 @@ entry whose command, arguments, environment, optional `cwd`, and optional
 table above. Direct-Python hosts use `-m installer.launcher`; the TRAE and
 WorkBuddy adapters use desktop Python (Windows space-safe, macOS direct); Qoder uses the
 checkout-bound absolute `installer/mcp_bootstrap.py` entry.
-This now **requires** either an
-activated managed install or an explicit developer root — it no longer
-silently falls back to wherever this source checkout happens to sit:
+This requires either a prepared managed install with a valid launcher protocol
+marker or an explicit developer root. The marker confirms that the managed
+launcher is ready; it is separate from server-issued device credentials.
+MCP registration does not require a device token and does not silently fall
+back to wherever this source checkout happens to sit:
 
 ```bash
-python3 -m installer.mcp_config                       # activated managed root only; --name to rename the server
+python3 -m installer.mcp_config                       # prepared managed root; --name to rename the server
 python3 -m installer.mcp_config --dev-root             # this checkout, explicitly, in developer mode
 python3 -m installer.mcp_config --dev-root /some/path  # a different developer checkout
 ```
 
-A bare call with no activated managed install and no `--dev-root` prints an
+A bare call with no prepared managed install and no `--dev-root` prints an
 error naming both remedies rather than guessing.
 
 For example, Claude Code emits the following shape (paths resolved for your
@@ -264,22 +283,22 @@ update changes HEAD, a fresh child Python interpreter inherits the same MCP stdi
 connection and imports the selected checkout, so no second Agent restart is
 needed and old/new modules are never mixed. Once a filesystem mutation begins it
 must finish or roll back rather than being killed at the acquisition deadline.
-The shim reads `~/.deeppattern/decision-engine/config.json`, attaches your
-device token, and forwards each JSON-RPC message verbatim to the server's
-`/mcp` endpoint over HTTPS. It **refuses** to send your device token to a
-plaintext `http://` endpoint (localhost excepted for dev). The **server** is
-the source of truth for which tools exist —
-the shim hardcodes no tool list, so the catalog you see always matches what the
-server offers for your tier. Results (including privacy-masked `Voice 1..N`
-panels) pass through untouched.
+For hosted requests, the shim reads
+`~/.deeppattern/decision-engine/config.json`, attaches the device token, and
+communicates with the server's `/mcp` endpoint over HTTPS. It **refuses** to send
+the token to a plaintext `http://` endpoint (localhost excepted for dev).
+The server supplies the hosted tool catalog for the device's tier. The shim also
+defines local tools and handles display requests, so not every JSON-RPC message
+is forwarded unchanged to the server.
 
 ### Managed-update rollout gate
 
 `python3 -m installer.managed_activation` is only for a checkout already
 prepared at an officially signed stable tag with the exact GitHub/Gitee remotes.
-It writes protected release state, publishes the launcher protocol marker, and
-only then rewires selected Agent clients. A wiring failure can therefore leave
-some clients unchanged, but never points a changed client at a partial launcher.
+It writes protected release state and publishes the launcher protocol marker.
+It does not activate a device or write Agent MCP entries. The outer installer
+registers the prepared launcher; permanent setup activates the device and
+repairs host configuration.
 It deliberately refuses when the production
 public key or formal stable/mirror release is absent. It does not guess-reset an
 arbitrary legacy directory; the signed legacy bootstrap remains a release
@@ -305,7 +324,8 @@ See [LEAK_SCAN.md](LEAK_SCAN.md) for what the scanner covers and its limits.
 
 ## Run the tests
 
-Stdlib only, no virtualenv required:
+Run these unittest checks in the Python environment used for installation and MCP,
+with the dependencies declared in the root `pyproject.toml` installed:
 
 ```bash
 python3 -m unittest installer.tests.test_install \

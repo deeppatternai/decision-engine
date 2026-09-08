@@ -462,6 +462,13 @@ def _safe_error_code(value: Any, default: str = "chat_unavailable") -> str:
 def _safe_state_payload(state: Any, payload: Any) -> Optional[Dict[str, Any]]:
     if not isinstance(state, str) or not isinstance(payload, dict):
         return None
+    if state == "recovering":
+        if not payload:
+            return {}
+        if set(payload) != {"error_code"}:
+            return None
+        code = _safe_error_code(payload.get("error_code"), default="")
+        return {"error_code": code} if code else {}
     if state in _CHAT_STATES_EMPTY:
         return {} if not payload else None
     if state in _CHAT_STATES_PRICE:

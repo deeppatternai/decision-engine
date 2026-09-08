@@ -83,6 +83,36 @@ class CodexSkillRoutingContractTests(unittest.TestCase):
         self.assertIn("call the exact spelling the host exposes", text)
         self.assertIn("never invoke them literally", package)
 
+    def test_audit_adjudication_never_puts_activation_secret_in_argv(self):
+        text = self._skill("audit-adjudication")
+        self.assertNotIn("--activation-secret", text)
+        self.assertIn("installer.permanent_setup", text)
+
+    def test_audit_workflows_do_not_require_a_provider_probe_or_skip_preparation(self):
+        texts = {"audit": self._audit_package()}
+        for name in (
+            "audit-adjudication",
+            "audit-brainstorming",
+            "audit-explore",
+            "audit-forecast",
+            "audit-market-research",
+            "audit-writing-plans",
+        ):
+            texts[name] = self._skill(name)
+        for name, text in texts.items():
+            with self.subTest(skill=name):
+                self.assertNotIn("check_provider_health", text)
+                self.assertNotIn(
+                    "directly after the required authorization checks",
+                    " ".join(text.split()),
+                )
+
+    def test_audit_keeps_authentication_diagnostics_explicitly_requested(self):
+        self.assertIn(
+            "For explicitly requested authentication diagnostics, use the `fast_smoke` profile.",
+            self._audit_package(),
+        )
+
     def test_replacement_skills_keep_the_four_frontmatter_descriptions(self):
         for name in (
             "graphic-explanation",

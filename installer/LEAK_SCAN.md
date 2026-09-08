@@ -1,27 +1,32 @@
-# Leak scan — public shell red-line gate (release design §14)
+# Leak scan — public projection red-line gate (release design §14)
 
-The public shell must **never** contain: server IP / secrets / device token /
-production account metadata / prompts / the 24 layout definitions /
-orchestration / market-research·forecast pipeline / ad·GUI source.
+The public projection may include client-owned windows, display integrations,
+and other local UI code. It must **never** contain: real server addresses /
+secrets / device tokens / production account metadata / private prompts /
+private layout definitions / server orchestration /
+market-research·forecast pipelines / proprietary server-side UI or
+ad-generation source.
 
 This is enforced in two complementary layers.
 
-## 1. Structural (why the shell is clean by construction)
+## 1. Structural (why the private service boundary is clean by construction)
 
-The shell is **transport-only**. It has three moving parts:
+The public projection separates client-owned UI and transport code from private
+service behavior. Three boundary components matter here:
 
 - `install.py` — copies bundle bodies + symlinks skills + writes a local config.
   It embeds no endpoint (owner-provided at install time), no token (filled by
   activation), and no product logic.
-- `shim.py` — forwards JSON-RPC messages verbatim to the server's `/mcp`. It
-  does not know the tool catalog (`tools/list` is forwarded), so it hardcodes
-  no tool schemas, prompts, voice roster, or layouts. It moves bytes.
+- `shim.py` — handles local host, recovery, and display-routing concerns, then
+  forwards server-owned requests to the configured `/mcp`. It embeds no private
+  endpoint, prompt, layout, voice roster, or server orchestration.
 - `config.py` — filesystem + config helpers. No network endpoints baked in.
 
-Because no prompt / layout / orchestration / pipeline artifact is ever
+Because no private prompt / layout / orchestration / pipeline artifact is ever
 *present* in these files, there is nothing of that class to leak. The endpoint
 and token exist only in the per-device `config.json` the user's machine writes
-at install/activation time — outside the shippable source.
+at install/activation time — outside the shippable source. Public client UI is
+not evidence that private service rendering or advertising source was shipped.
 
 ## 2. Mechanical (`leak_scan.py`) — automated backstop
 
@@ -225,10 +230,10 @@ Ran 51 tests
 OK
 ```
 
-Manual review confirms: no server address, no secret, no token, no prompt /
-layout / orchestration / pipeline / GUI / ad source in the shell surface. The
-only server reference is the abstract `/mcp` path appended to an
-owner-provided, config-sourced endpoint.
+Manual review confirms: no real server address, no secret, no token, no private
+prompt / layout / orchestration / pipeline, and no proprietary server-side UI
+or ad-generation source in the public projection. The only server reference is
+the abstract `/mcp` path appended to an owner-provided, config-sourced endpoint.
 
 ### A trap this matching creates
 

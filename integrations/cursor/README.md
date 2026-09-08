@@ -49,24 +49,33 @@ by the other hosts.
 On Windows and macOS, Cursor supports:
 
 - Graphic Explanation and Discussion Board local windows;
-- text follow-up chat in the popup through the logged-in local Cursor Agent;
+- popup follow-up chat through the hosted API, after device activation;
 - the shared audit Stop panel.
 
-The follow-up transport resolves the official `cursor-agent` executable (and the
+The default follow-up runs on the DE service and does not launch a local Cursor
+agent or require a Cursor CLI login.
+
+## Legacy local follow-up
+
+The local bridge is used only when `ge_chat_transport` is explicitly set to
+`legacy` in the local device config and the host supports that path.
+This legacy transport resolves the official `cursor-agent` executable (and the
 official Windows desktop Agent location), runs Ask mode in an isolated empty
 workspace with a reduced environment, bounds stdout/stderr, and never persists
 the popup context or response. On Windows, Ask mode is read-only but is not an
 OS-level zero-read sandbox: the Agent can read other files available to the
 current user, and previously user-configured local MCP/tools may remain callable.
 The transport passes `--trust` only for the empty-workspace prompt, never passes
-`--approve-mcps`, and uses no automatic-write/force flag. To disable only Cursor
+`--approve-mcps`, and uses no automatic-write/force flag. To disable only this legacy Cursor
 follow-up for future GUI launches, run `setx GE_CURSOR_FOLLOWUP 0` on Windows or
 `launchctl setenv GE_CURSOR_FOLLOWUP 0` on macOS, then fully restart Cursor. The
 macOS command applies to the current login session and must be rerun after signing in again.
 To re-enable follow-up, run
 `[Environment]::SetEnvironmentVariable('GE_CURSOR_FOLLOWUP',$null,'User')`
 on Windows or `launchctl unsetenv GE_CURSOR_FOLLOWUP` on macOS, then restart Cursor.
-GE/DB display and Stop remain available.
+This switch does not control hosted follow-up; GE/DB display and Stop remain available.
+
+## Reload Cursor
 
 After install, repair, or update, fully quit and reopen Cursor so it reloads MCP,
 PATH, and the managed skill routes.

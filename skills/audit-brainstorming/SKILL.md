@@ -145,7 +145,6 @@ confirmation; the panel is one input not a verdict (no 敷衍附和 / sycophancy
 
 ## Pre-flight reminders
 
-- Hub reachable (`mcp__decision-engine__check_provider_health`)
 - Device token configured
 - For high-stakes irreversible ideas use mode="deep" (full panel)
 - Dedup: same hypothesis audited within 5 turns + unchanged → refer prior run_id

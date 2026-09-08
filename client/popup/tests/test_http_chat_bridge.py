@@ -1633,6 +1633,46 @@ class NativeServerLifecycleTests(unittest.TestCase):
         )
         self.assertEqual(api._win.evaluated, [])
 
+    def test_recovering_state_allows_safe_error_code_payload(self):
+        api, _chat = self._api()
+        generation = api._callback_generation
+
+        api._emit_chat(
+            generation,
+            "state",
+            1,
+            "recovering",
+            {"error_code": "rate_limited"},
+        )
+        delivered = list(api._win.evaluated)
+        api._emit_chat(
+            generation,
+            "state",
+            1,
+            "recovering",
+            {"error_code": "rate_limited", "device_token": "sentinel-device-token"},
+        )
+
+        self.assertEqual(len(delivered), 1)
+        self.assertIn('window.geChat.state(1,"recovering"', delivered[0])
+        self.assertIn('"error_code": "rate_limited"', delivered[0])
+        self.assertEqual(api._win.evaluated, delivered)
+
+    def test_recovering_state_with_unknown_error_code_degrades_to_empty_payload(self):
+        api, _chat = self._api()
+        generation = api._callback_generation
+
+        api._emit_chat(
+            generation,
+            "state",
+            1,
+            "recovering",
+            {"error_code": "daily_rate_limit"},
+        )
+
+        self.assertEqual(len(api._win.evaluated), 1)
+        self.assertIn('window.geChat.state(1,"recovering",{})', api._win.evaluated[0])
+
     def test_state_payload_numbers_stay_within_javascript_safe_integer_range(self):
         api, _chat = self._api()
         generation = api._callback_generation

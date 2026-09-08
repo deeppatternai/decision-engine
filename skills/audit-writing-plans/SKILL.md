@@ -105,7 +105,7 @@ vertically centered and never presses/overflows the border (the yoga-socks-repor
 - **Scope**: cell style + visual identity ONLY — does NOT dictate the document framework; each skill keeps its own sections/content.
 
 ## Pre-flight
-- Hub reachable (`mcp__decision-engine__check_provider_health`); device token configured
+- Device token configured
 - Want the full panel → `mode="deep"`; `stakes` is a severity hint, not a panel control
 - `validated_by` must come from a terminal `audit_skill_result` (poll `check_audit_status`
   to terminal first); never from a `pending` / non-terminal result

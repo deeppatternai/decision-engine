@@ -1,31 +1,35 @@
 # Codex integration
 
-Run the Decision Engine display tools (graphic explanation + discussion board) from **Codex**, with
-the in-popup follow-up chat on codex-cli (gpt-5.5). Two installed surfaces:
+Run Decision Engine's graphic explanation and discussion board tools from
+**Codex**. Popup follow-up uses the hosted API by default and does not launch a
+local Codex agent.
 
-## 1. Register the shim in `~/.codex/config.toml`
+## 1. Register the launcher in `~/.codex/config.toml`
 
-Emit the ready-to-paste block and add it to your `~/.codex/config.toml`:
+Normal installation detects Codex and merges the Decision Engine launcher into
+`~/.codex/config.toml`, preserving unrelated MCP entries. Permanent setup can
+repair that registration. Manual pasting is not required for the normal flow.
+
+To inspect the generated TOML, run this from the prepared managed checkout,
+using the Python environment selected during installation:
 
 ```bash
 python3 -m installer.mcp_config --codex
 ```
 
-It prints a `[mcp_servers.decision-engine]` table — the resolved interpreter, `-m installer.shim`, a
-pinned `cwd` at the shell root, and a generous `tool_timeout_sec` (headroom over Codex's 60s per-tool
-default so the bounded `db_board_result` poll never trips it). Example:
+The command prints a `[mcp_servers.decision-engine]` table with the resolved
+interpreter, `-m installer.launcher`, the managed working directory, and
+`tool_timeout_sec`. The launcher handles managed startup and then starts the
+shim. Use the generated paths rather than a hard-coded interpreter or a direct
+`installer.shim` entry. This command only prints; `installer.mcp_config --client codex --write`
+is the explicit configuration-writing path.
 
-```toml
-[mcp_servers.decision-engine]
-command = "/usr/bin/python3"
-args = ["-m", "installer.shim"]
-cwd = "/path/to/decision-engine"
-tool_timeout_sec = 120
-```
-
-This is **print-to-paste** — the installer never edits your `config.toml`; you paste the block in
-yourself. It bakes in no endpoint / token / secret; those stay in the per-device `config.json` the
-shim reads at runtime (run `python3 -m installer.activate` once to activate the device).
+Generating a managed entry requires a prepared installation with its launcher
+protocol marker; an explicit `--dev-root` selects a developer checkout.
+Device activation is separate: the MCP entry contains no endpoint, token, or
+activation secret. Without activation, DE Lite can provide advisory audit in
+the current agent session; hosted tools require permanent device activation.
+See [installation and activation](../../installer/README.md).
 
 ## 2. Install the Decision Engine skills
 
@@ -35,7 +39,14 @@ Decision Engine does not add instructions to project or global `AGENTS.md` files
 
 ## What Codex sees
 
-The `decision-engine` shim advertises the hub's forwarded tools plus the three local display tools
-(`open_ge_popup`, `open_db_board`, `db_board_result`). The rendered bytes are byte-isolated — the shim
-fetches them with the device token and shows them in a native popup; they never enter the model
-context. The GE popup's follow-up chat runs on codex-cli (caller=codex → gpt-5.5).
+After activation, the shim exposes the hosted tool catalog available to the
+device, along with local tools for native display and result handling. Rendered
+content is fetched with the device credentials and shown in a native popup.
+The selected skill defines which tool to call and how to read back the result.
+
+## Legacy local follow-up
+
+The local Codex CLI bridge remains a compatibility path. It is used only when
+`ge_chat_transport` is explicitly set to `legacy` in the local device config
+and the host supports that path. The default hosted follow-up does not require
+a local CLI login or a Codex CLI model setting.

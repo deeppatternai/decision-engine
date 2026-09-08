@@ -1510,6 +1510,44 @@ class HttpChatPageContractTestCase(unittest.TestCase):
         self.assertFalse(result["busy"])
         self.assertFalse(result["inputDisabled"])
 
+    def test_server_submit_rate_limited_shows_error_and_allows_retry(self):
+        result = _run_js(r"""
+          window.geChat.bootstrap({
+            ok: true, backend: 'server', state: 'ready',
+            conversation: {status: 'active', turn_count: 0, max_turns: 40, expires_at: 1787587200},
+            privacy_disclosure: {version: 'privacy:v429', providers: [{
+              category: 'approved-category', data_region: 'approved-region', training_enabled: false,
+              cache_ttl_seconds: 0, provider_retention_hours: 0, deletion_scope: 'contract-defined'
+            }]}, history: []
+          });
+          const uuids = ['123e4567-e89b-42d3-a456-426614174000', '123e4567-e89b-42d3-a456-426614174001'];
+          window.crypto.randomUUID = () => uuids.shift();
+          window.geChat.submit('Explain this', [], null);
+          window.geChat.state(1, 'recovering', {error_code: 'rate_limited'});
+          const limited = {
+            status: nodes['ge-chat-status'].textContent,
+            retryHidden: nodes['ge-retry'].hidden,
+            inputDisabled: nodes['composer-input'].disabled,
+            busy: window.geChat.isBusy()
+          };
+          nodes['ge-retry'].click();
+          finish({calls, limited});
+        """, language="zh-CN")
+
+        self.assertEqual(
+            result["limited"],
+            {
+                "status": "\u8bf7\u6c42\u8fc7\u4e8e\u9891\u7e41\uff0c\u8bf7\u7a0d\u540e\u91cd\u8bd5\u3002",
+                "retryHidden": False,
+                "inputDisabled": True,
+                "busy": True,
+            },
+        )
+        self.assertEqual(
+            [call for call in result["calls"] if call[0] == "retry_chat"],
+            [["retry_chat", "123e4567-e89b-42d3-a456-426614174000"]],
+        )
+
     def test_stale_callbacks_cannot_unlock_or_relock_a_newer_active_turn(self):
         result = _run_js(r"""
           function envelope() { return {ok: true, backend: 'server', state: 'ready',

@@ -1284,7 +1284,8 @@ _GE_CHAT_JS = """
       }
       if (_turnId != null && state === 'completed') terminalStates[_turnId] = 'completed';
       if (state === 'ready') bootTimedOut = false;
-      setStatus(state);
+      var recoverError = state === 'recovering' && payload && payload.error_code;
+      setStatus(state, recoverError ? localError(recoverError) : null);
       refreshComposer();
       return true;
     },

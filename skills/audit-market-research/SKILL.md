@@ -193,7 +193,7 @@ vertically centered and never presses/overflows the border (the yoga-socks repor
 Recommend as an ASK (do NOT auto-chain); the panel is one input, not a verdict.
 
 ## Pre-flight
-- Hub reachable (`mcp__decision-engine__check_provider_health`); device token configured
+- Device token configured
 - P0 consent gate is mandatory — never bypass
 - deep/quick = MOCK ground truth → surface the `mock_ground_truth` banner (treat as infra, not insight); premium = REAL sources
 - `panel_participation` audit_ids enable 7-day server-side re-query
