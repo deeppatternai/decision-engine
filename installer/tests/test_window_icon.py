@@ -342,6 +342,26 @@ class _NoApplicationAppKit:
         pass
 
 
+class _FakeProcessInfo:
+    def __init__(self):
+        self.names = []
+
+    def setProcessName_(self, name):
+        self.names.append(name)
+
+
+class _FakeFoundation:
+    def __init__(self):
+        self.process_info = _FakeProcessInfo()
+
+        class NSProcessInfo:
+            @staticmethod
+            def processInfo():
+                return self.process_info
+
+        self.NSProcessInfo = NSProcessInfo
+
+
 class ApplyDockIcon(unittest.TestCase):
     """The macOS half of the same defect the AppUserModelID fixed on Windows: a process that shows
     a Dock tile and never sets one is drawn as the interpreter that started it."""
@@ -361,6 +381,21 @@ class ApplyDockIcon(unittest.TestCase):
         with unittest.mock.patch.object(tk_icon.platform, "system", return_value="Darwin"), \
                 unittest.mock.patch.dict(sys.modules, {"AppKit": None}):
             self.assertFalse(tk_icon.apply_dock_icon())
+
+    def test_dock_app_name_is_set_to_the_localized_window_title(self):
+        """macOS Dock hover text reads the process/app name, not the frameless window title."""
+        fake_foundation = _FakeFoundation()
+        with unittest.mock.patch.object(tk_icon.platform, "system", return_value="Darwin"), \
+                unittest.mock.patch.dict(sys.modules, {"Foundation": fake_foundation}):
+            self.assertTrue(tk_icon.apply_dock_app_name("Decision Engine - 图解"))
+        self.assertEqual(fake_foundation.process_info.names, ["Decision Engine - 图解"])
+
+    def test_blank_dock_app_name_is_not_applied(self):
+        fake_foundation = _FakeFoundation()
+        with unittest.mock.patch.object(tk_icon.platform, "system", return_value="Darwin"), \
+                unittest.mock.patch.dict(sys.modules, {"Foundation": fake_foundation}):
+            self.assertFalse(tk_icon.apply_dock_app_name("   "))
+        self.assertEqual(fake_foundation.process_info.names, [])
 
     def test_it_refuses_to_create_the_application_itself(self):
         """The whole shape of the fix. Reading NSApp() instead of sharedApplication() is what keeps

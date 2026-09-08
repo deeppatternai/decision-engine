@@ -134,6 +134,54 @@ class BoardFetchWorkingPathTests(unittest.TestCase):
         self.assertEqual(html, "<html><body>chunked</body></html>")
 
 
+class OpenBoardPopupTitleTests(unittest.TestCase):
+    def test_default_title_uses_localized_discussion_board_surface_name(self):
+        seen = []
+
+        def fake_open(spec, **_kwargs):
+            seen.append(spec.title)
+            return {"ok": True, "outcome": "committed", "result": {}}
+
+        with mock.patch.object(launcher, "fetch_board_html", return_value="<html/>"), \
+                mock.patch.object(launcher, "open_popup", side_effect=fake_open), \
+                mock.patch.dict("os.environ", {"DE_UI_LOCALE": "zh-CN"}):
+            out = launcher.open_board_popup({}, base_url="https://hub.example", token="tok")
+
+        self.assertTrue(out["ok"])
+        self.assertEqual(seen, ["Decision Engine - \u8ba8\u8bba\u677f"])
+
+    def test_explicit_title_gets_product_prefix(self):
+        seen = []
+
+        def fake_open(spec, **_kwargs):
+            seen.append(spec.title)
+            return {"ok": True, "outcome": "committed", "result": {}}
+
+        with mock.patch.object(launcher, "fetch_board_html", return_value="<html/>"), \
+                mock.patch.object(launcher, "open_popup", side_effect=fake_open), \
+                mock.patch.dict("os.environ", {"DE_UI_LOCALE": "zh-CN"}):
+            launcher.open_board_popup(
+                {}, base_url="https://hub.example", token="tok", title="Board title"
+            )
+
+        self.assertEqual(seen, ["Decision Engine - Board title"])
+
+    def test_prefixed_title_is_not_prefixed_twice(self):
+        seen = []
+
+        def fake_open(spec, **_kwargs):
+            seen.append(spec.title)
+            return {"ok": True, "outcome": "committed", "result": {}}
+
+        with mock.patch.object(launcher, "fetch_board_html", return_value="<html/>"), \
+                mock.patch.object(launcher, "open_popup", side_effect=fake_open):
+            launcher.open_board_popup(
+                {}, base_url="https://hub.example", token="tok", title="Decision Engine - Board"
+            )
+
+        self.assertEqual(seen, ["Decision Engine - Board"])
+
+
 class BoardFetchByteCapTests(unittest.TestCase):
     def test_an_oversized_body_is_detected_not_truncated(self):
         # A body one byte past the cap must FAIL, not return a truncated prefix that renders clean.

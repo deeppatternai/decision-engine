@@ -50,6 +50,24 @@ from . import backend
 NATIVE_SHELL_MODULE = "client.popup.native_shell"
 
 
+def _default_surface_title(surface: str, locale_hint: Any = None,
+                           fallback: str = "Decision Engine") -> str:
+    """Localized fallback for OS-visible popup titles."""
+    try:
+        titles = i18n.shell(i18n.resolve_locale(locale_hint)).get("surface_title", {})
+        title = titles.get(surface) if isinstance(titles, dict) else None
+        return title if isinstance(title, str) and title else fallback
+    except Exception:  # aqg: top-level boundary — title i18n must not block popup launch
+        return fallback
+
+
+def _prefixed_popup_title(title: str) -> str:
+    stripped = title.strip()
+    if stripped.startswith("Decision Engine - "):
+        return stripped
+    return "Decision Engine - " + stripped
+
+
 def _json_for_script(obj: Any) -> str:
     """json.dumps that is safe to drop verbatim inside a <script> block.
 
@@ -2316,10 +2334,15 @@ def open_board_popup(
     ``BoardFetchError`` detail rides on ``error``) — the client never falls back to
     a local render or a system browser. All other outcomes are ``open_popup``'s
     (``committed`` / ``dismissed`` / ``closed`` / ``timeout`` / ``no-webview-backend`` …)."""
+    candidate_title = title or (board_spec.get("title") if isinstance(board_spec, dict) else None)
     resolved_title = (
-        title
-        or (board_spec.get("title") if isinstance(board_spec, dict) else None)
-        or "Discussion Board"
+        _prefixed_popup_title(candidate_title)
+        if isinstance(candidate_title, str) and candidate_title.strip()
+        else _default_surface_title(
+            "discussion_board",
+            board_spec.get("ui_locale") if isinstance(board_spec, dict) else None,
+            fallback="Discussion Board",
+        )
     )
     try:
         html_body = fetch_board_html(

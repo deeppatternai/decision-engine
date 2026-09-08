@@ -95,6 +95,16 @@ PANEL = {
         "cancelled": "%s · 已取消 · %s",
         "reviewing": "%s · 审核中 · %s ⏱",
     },
+    "auditor_status": {
+        "queued": "\u6392\u961f\u4e2d",
+        "pending": "\u5f85\u5904\u7406",
+        "running": "\u5ba1\u6838\u4e2d",
+        "completed": "\u5df2\u5b8c\u6210",
+        "partial": "\u90e8\u5206\u5b8c\u6210",
+        "failed": "\u5931\u8d25",
+        "cancelling": "\u505c\u6b62\u4e2d",
+        "cancelled": "\u5df2\u53d6\u6d88",
+    },
 }
 
 # GE follow-up-chat page-side JS strings (launcher._GE_CHAT_JS). See en_US.GE_CHAT for the injection model.
@@ -165,6 +175,13 @@ SHELL = {
     "maximize": "最大化窗口",
     "restore": "还原窗口",
     "tray_toggle": "%s（点击：显示／隐藏）",
+    "surface_title": {
+        "audit": "Decision Engine - \u5ba1\u8ba1",
+        "diagram": "Decision Engine - \u56fe\u89e3",
+        "comic": "Decision Engine - \u6f2b\u89e3",
+        "infographic": "Decision Engine - \u4fe1\u606f\u56fe",
+        "discussion_board": "Decision Engine - \u8ba8\u8bba\u677f",
+    },
 }
 
 # 由 Agent 拉起的设备永久激活表单（installer/permanent_setup.py）。见 en_US.PERMANENT_SETUP 的契约说明：

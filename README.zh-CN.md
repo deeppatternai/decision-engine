@@ -165,7 +165,7 @@ AQG 是本地、无需账户的工程纪律工具包。安装其中任一个，�
 
 | 系列 | 支持的产品 | 需要注意的区别 |
 |---|---|---|
-| Claude | Claude Code、Claude Desktop | Claude Code 另支持 Skills。 |
+| Claude | Claude Code、Claude Desktop、Claude 第三方提供商配置 | Claude Code 另支持 Skills；第三方提供商配置仅 macOS，使用独立 MCP 配置。 |
 | Codex | Codex | 支持 Skills。 |
 | Cursor | Cursor | 支持 Skills。 |
 | 腾讯 | CodeBuddy Agent CLI、WorkBuddy Desktop、WorkBuddy AI Desktop | CodeBuddy 仅支持独立 Agent CLI，不支持 CodeBuddy Studio；各产品的平台要求见详情。 |
@@ -190,7 +190,7 @@ AQG 是本地、无需账户的工程纪律工具包。安装其中任一个，�
 | 阿里 Qoder | 阿里 Qoder IDE | `qoder-ide` | macOS Qoder IDE.app 1.106.3+；独立 MCP 身份、共享 Qoder Skills 与审计 hook、原生窗口、弹窗右侧追问、Stop Panel |
 | 阿里 Qoder | 阿里 Qoder CN IDE | `qoder-cn-ide` | macOS Qoder CN IDE.app 1.106.3+；独立 MCP 身份、共享 Qoder CN Skills 与审计 hook、原生窗口、弹窗右侧追问、Stop Panel |
 | TRAE | TRAE Desktop | `trae` | macOS Trae.app 3.5.81；MCP、Skills、原生窗口、弹窗右侧追问、Stop Panel |
-| TRAE | TRAE CN Desktop | `trae-cn` | macOS Trae CN.app 3.3.95；MCP、Skills、原生窗口、弹窗右侧追问、Stop Panel |
+| TRAE | TRAE CN Desktop | `trae-cn` | Windows Trae Code CN 3.3.98+；macOS Trae CN.app 3.3.95；MCP、Skills、原生窗口、弹窗右侧追问、Stop Panel |
 | TRAE | TRAE Work | `trae-work` | Windows and macOS Desktop 0.1.48+；MCP、Skills、原生窗口、弹窗右侧追问、Stop Panel |
 | TRAE | TRAE Work CN | `trae-work-cn` | Windows and macOS Desktop 0.1.48+；MCP、Skills、原生窗口、弹窗右侧追问、Stop Panel |
 

@@ -9,6 +9,7 @@ from __future__ import annotations
 import copy
 import json
 import os
+import shutil
 import subprocess
 import tempfile
 import unittest
@@ -486,6 +487,60 @@ class ClaudeThirdPartyInstallerContractTestCase(unittest.TestCase):
             self.body,
             "an empty product directory is not a configured host profile",
         )
+
+    def test_installer_executes_the_profile_file_guard(self):
+        bash = shutil.which("bash")
+        if bash is None:
+            self.skipTest("bash executable not found on PATH")
+        start = self.body.index("claude_3p_profile_detected=0")
+        end = self.body.index("\ndetect_managed_clients()", start)
+        guard = self.body[start:end]
+
+        with tempfile.TemporaryDirectory() as tmp:
+            home = Path(tmp) / "home"
+            root = home / "Library" / "Application Support" / "Claude-3p"
+            root.mkdir(parents=True)
+            if os.name == "nt":
+                home_for_bash = subprocess.run(
+                    [bash, "--noprofile", "--norc", "-c", 'cygpath -u "$1"', "test", str(home)],
+                    check=True,
+                    capture_output=True,
+                    text=True,
+                ).stdout.strip()
+            else:
+                home_for_bash = str(home)
+
+            def detect() -> subprocess.CompletedProcess:
+                environment = os.environ.copy()
+                environment.update(HOME=home_for_bash)
+                return subprocess.run(
+                    [bash, "--noprofile", "--norc", "-c", (
+                        'CLAUDE_3P_ROOT="$HOME/Library/Application Support/Claude-3p"\n'
+                        'CLAUDE_3P_CONFIG="$CLAUDE_3P_ROOT/claude_desktop_config.json"\n'
+                        'blocked() { exit 3; }\n'
+                        f"{guard}\n"
+                        'printf "%s\\n" "$claude_3p_profile_detected"\n'
+                    )],
+                    env=environment,
+                    capture_output=True,
+                    text=True,
+                    timeout=15,
+                )
+
+            empty = detect()
+            self.assertEqual(empty.returncode, 0, empty.stderr)
+            self.assertEqual(empty.stdout.strip(), "0")
+
+            config = root / "claude_desktop_config.json"
+            config.write_text("{}", encoding="utf-8")
+            regular = detect()
+            self.assertEqual(regular.returncode, 0, regular.stderr)
+            self.assertEqual(regular.stdout.strip(), "1")
+
+            config.unlink()
+            config.mkdir()
+            invalid = detect()
+            self.assertEqual(invalid.returncode, 3, invalid.stderr)
 
 
 @unittest.skipUnless(os.name == "posix", "dp-uninstall.sh is POSIX-only")

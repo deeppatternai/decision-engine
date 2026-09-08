@@ -41,7 +41,7 @@
 | 阿里 Qoder CN IDE | `qoder-cn-ide` | `~/.qoder-cn/mcp.json` | `~/.qoder-cn/skills` | macOS Qoder CN IDE.app 1.106.3+；与 Qoder CN Desktop 共享同族 Skills 和 hook |
 | TRAE Desktop | `trae` | `~/Library/Application Support/Trae/User/mcp.json` | `~/.trae/skills` | macOS Trae.app 3.5.81 |
 | TRAE Work | `trae-work` | Windows：`%APPDATA%/TRAE SOLO/User/mcp.json`<br>macOS：`~/Library/Application Support/TRAE SOLO/User/mcp.json` | `~/.trae/skills` | Windows and macOS Desktop 0.1.48+ |
-| TRAE CN Desktop | `trae-cn` | `~/Library/Application Support/Trae CN/User/mcp.json` | `~/.trae-cn/skills` | macOS Trae CN.app 3.3.95 |
+| TRAE CN Desktop | `trae-cn` | Windows：`%APPDATA%/Trae CN/User/mcp.json`<br>macOS：`~/Library/Application Support/Trae CN/User/mcp.json` | `~/.trae-cn/skills` | Windows Trae Code CN 3.3.98+；macOS Trae CN.app 3.3.95 |
 | TRAE Work CN | `trae-work-cn` | Windows：`%APPDATA%/TRAE SOLO CN/User/mcp.json`<br>macOS：`~/Library/Application Support/TRAE SOLO CN/User/mcp.json` | `~/.trae-cn/skills` | Windows and macOS Desktop 0.1.48+ |
 | 腾讯 WorkBuddy Desktop | `workbuddy` | `~/.workbuddy/mcp.json` | `~/.workbuddy/skills` | Windows and macOS Desktop |
 | 腾讯 WorkBuddy AI Desktop | `workbuddy-ai` | `~/.workbuddy-ai/mcp.json` | `~/.workbuddy-ai/skills` | 仅 macOS WorkBuddy AI.app 5.5.2+ |

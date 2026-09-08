@@ -169,6 +169,15 @@ class MacOSStopperSourceContractTests(unittest.TestCase):
         self.assertIn("titleLabel(runTitle(run))", detail_body)
         self.assertIn('nonEmptyString(run["title"])', title_body)
 
+    def test_native_panel_height_cap_matches_python_panel(self):
+        update_body = _SOURCE.split("private func updatePanelSize", 1)[1].split(
+            "private func setPanelContentSize", 1
+        )[0]
+        self.assertIn("private let scrollMaxScreenFraction: CGFloat = 0.618", _SOURCE)
+        self.assertIn("floor(screenHeight * scrollMaxScreenFraction) - 24", update_body)
+        self.assertIn("max(CGFloat(72),", update_body)
+        self.assertNotIn("min(CGFloat(640), screenHeight - 24)", update_body)
+
     def test_native_stop_actions_and_depth_names_use_the_run_locale(self):
         self.assertIn("private func uiLocale", _SOURCE)
         self.assertIn("makeActionButton(action, locale: uiLocale(run))", _SOURCE)
@@ -180,6 +189,13 @@ class MacOSStopperSourceContractTests(unittest.TestCase):
         self.assertIn('private func makeActionButton(_ action: RowAction, locale: String)', _SOURCE)
         self.assertIn('case "completed":  return "DE Lite · Local review completed (reference only)', _SOURCE)
         self.assertIn('case "completed":  return "DE Lite · 本地审核完成（仅供参考）', _SOURCE)
+
+    def test_native_audit_chrome_uses_localized_surface_title(self):
+        self.assertIn("private func auditSurfaceTitle", _SOURCE)
+        self.assertIn('"Decision Engine - Audit"', _SOURCE)
+        self.assertIn('"Decision Engine - \\u5ba1\\u8ba1"', ascii(_SOURCE))
+        self.assertIn("button.toolTip = auditSurfaceTitle(locale: locale) +", _SOURCE)
+        self.assertIn("window.title = auditSurfaceTitle(locale: currentChromeLocale())", _SOURCE)
 
     def test_native_locale_resolution_matches_the_python_bcp47_contract(self):
         """The AppKit panel cannot import Python, so pin the small shared locale contract here:

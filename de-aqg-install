@@ -396,7 +396,7 @@ if ! source_detected_clients="$(
 fi
 
 verify_aqg_checkout() {
-  local actual_head actual_remote resolved parent version
+  local actual_head actual_remote resolved parent status_output version
   if [ -L "$AQG_ROOT" ]; then
     # AQG's updater atomically switches this link between versions/<commit>.
     # Resolve both sides so parent aliases (e.g. macOS /var) compare correctly.
@@ -430,6 +430,10 @@ verify_aqg_checkout() {
     "$AQG_REPO"|git@github.com:deeppatternai/agent-quality-gates.git|ssh://git@github.com/deeppatternai/agent-quality-gates.git) ;;
     *) fail "$AQG_ROOT has an unexpected Git origin; preserve it and stop" ;;
   esac
+  status_output="$(clean_exec "$GIT_BIN" -C "$AQG_ROOT" status --porcelain=v1 --untracked-files=all 2>/dev/null)" \
+    || fail "could not verify the AQG checkout state; preserve it and stop"
+  [ -z "$status_output" ] \
+    || fail "$AQG_ROOT has local changes; preserve it and stop"
 }
 
 run_aqg_clients() {

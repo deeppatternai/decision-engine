@@ -3998,20 +3998,22 @@ def _claim_app_identity() -> None:
         print("native_shell: app identity skipped (%s)" % exc, file=sys.stderr)
 
 
-def _install_dock_icon() -> None:
-    """macOS: replace the interpreter's Dock tile with the product's, once pywebview's app exists.
+def _install_dock_icon(title: str) -> None:
+    """macOS: replace the interpreter's Dock identity with the product's, once pywebview's app exists.
 
     On ``loaded`` rather than before ``create_window`` because ``apply_dock_icon`` deliberately
     refuses to instantiate the NSApplication itself — doing so is what aborts a Tk that starts
     afterwards, and the same restraint costs nothing here since pywebview has long since made one
     by the time a page loads."""
     try:
-        from client.tk_icon import apply_dock_icon
+        from client.tk_icon import apply_dock_app_name, apply_dock_icon
 
+        if not apply_dock_app_name(title):
+            print("native_shell: dock app name skipped", file=sys.stderr)
         if not apply_dock_icon():
             print("native_shell: dock icon skipped (no application or no icns)", file=sys.stderr)
     except Exception as exc:  # aqg: top-level boundary — an icon never blocks a window
-        print("native_shell: dock icon skipped (%s)" % exc, file=sys.stderr)
+        print("native_shell: dock identity skipped (%s)" % exc, file=sys.stderr)
 
 
 def _windows_hwnd(win) -> int:
@@ -4258,7 +4260,7 @@ def open_window(html_path: str, title: str, result_path: str,
     if cursor_profile:
         _arm_cursor_ready_watchdog(core_api, api.close)
     if _IS_MAC:
-        win.events.loaded += lambda *a: _install_dock_icon()        # …and stop being python3
+        win.events.loaded += lambda *a: _install_dock_icon(title)   # …and stop being python3
         win.events.loaded += lambda *a: _mac_after_show()          # focus the window after it shows
         win.events.loaded += lambda *a: _install_dock_reopen(win)  # Dock-icon click → show/hide toggle
         win.events.loaded += lambda *a: _install_mac_status_item(title, win)  # menu-bar backup toggle

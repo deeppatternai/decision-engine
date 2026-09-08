@@ -106,6 +106,16 @@ PANEL = {
         "cancelled": "%s · Cancelled · %s",
         "reviewing": "%s · Auditing · %s ⏱",
     },
+    "auditor_status": {
+        "queued": "Queued",
+        "pending": "Pending",
+        "running": "Auditing",
+        "completed": "Completed",
+        "partial": "Partially complete",
+        "failed": "Failed",
+        "cancelling": "Stopping",
+        "cancelled": "Cancelled",
+    },
 }
 
 # GE follow-up-chat page-side JS strings (launcher._GE_CHAT_JS). Python resolves the locale once and
@@ -178,6 +188,13 @@ SHELL = {
     "maximize": "Maximize",
     "restore": "Resize",
     "tray_toggle": "%s (Click: show / hide)",
+    "surface_title": {
+        "audit": "Decision Engine - Audit",
+        "diagram": "Decision Engine - Graphic Explanation",
+        "comic": "Decision Engine - Comic Explanation",
+        "infographic": "Decision Engine - Infographic",
+        "discussion_board": "Decision Engine - Discussion Board",
+    },
 }
 
 # Agent-launched permanent device-setup form (installer/permanent_setup.py). ONE table for both the

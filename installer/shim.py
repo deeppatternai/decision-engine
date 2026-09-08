@@ -42,6 +42,7 @@ from urllib.error import HTTPError, URLError
 from urllib.parse import quote, urlsplit
 from urllib.request import HTTPHandler, HTTPSHandler, Request, build_opener
 
+from client import i18n
 from client.http_safety import NoRedirect, read_within_budget  # shared hub-read guards (stdlib leaf)
 
 from . import mcp_config
@@ -1336,6 +1337,42 @@ _DISPLAY_TOOL_SCHEMAS = [
 _DISPLAY_TOOLS = {schema["name"] for schema in _DISPLAY_TOOL_SCHEMAS}
 
 
+def _localized_display_title(surface: str, locale_hint: Any = None,
+                             fallback: str = "Decision Engine") -> str:
+    """Default OS/Dock/taskbar title for a local display surface."""
+    try:
+        titles = i18n.shell(i18n.resolve_locale(locale_hint)).get("surface_title", {})
+        title = titles.get(surface) if isinstance(titles, dict) else None
+        return title if isinstance(title, str) and title else fallback
+    except Exception:  # aqg: top-level boundary — display-title i18n must not block popup launch
+        return fallback
+
+
+def _prefixed_display_title(title: str) -> str:
+    """OS-visible title when the caller supplies business text."""
+    stripped = title.strip()
+    if stripped.startswith("Decision Engine - "):
+        return stripped
+    return "Decision Engine - " + stripped
+
+
+def _display_window_title(args: Dict[str, Any], surface: str, *,
+                          spec: Optional[Dict[str, Any]] = None,
+                          fallback: str = "Decision Engine") -> str:
+    """Resolve the native popup title using a product prefix for caller/content titles."""
+    title = args.get("title")
+    if isinstance(title, str) and title.strip():
+        return _prefixed_display_title(title)
+    if spec is not None:
+        spec_title = spec.get("title")
+        if isinstance(spec_title, str) and spec_title.strip():
+            return _prefixed_display_title(spec_title)
+    locale_hint = args.get("ui_locale")
+    if locale_hint is None and spec is not None:
+        locale_hint = spec.get("ui_locale")
+    return _localized_display_title(surface, locale_hint, fallback=fallback)
+
+
 # tools/list descriptions are read by the CALLING MODEL, so they follow the host UI language. Resolve
 # it ONCE per process (this shim is long-running; the OS UI language does not change under it) and
 # memoize — mirrors client/native_shell.py's _SHELL_LOCALE. `_localize_tool` takes an explicit locale
@@ -1740,7 +1777,7 @@ def _run_ge_auto_open(
                     from client.popup import notice, session
                     title = popup_args.get("title")
                     if not isinstance(title, str) or not title.strip():
-                        title = "Decision Engine"
+                        title = _localized_display_title("diagram")
                     html = notice.render_ge_terminal_notice(status, run_id)
                     # A status-only page has none of the Cursor artifact bootstrap contract;
                     # use the shared legacy window API (close/minimize) for every host.
@@ -1882,7 +1919,7 @@ def _handle_display_call(
             except ShellError as exc:
                 _log("open_ge_popup fetch failed: %s" % exc)
                 return {"status": "failed", "reason": "artifact-fetch-failed", "run_id": run_id}
-            title = (args.get("title") or "Decision Engine")
+            title = _display_window_title(args, "diagram")
             profile = "cursor-ge" if popup_api_profile == "cursor" else popup_api_profile
             try:
                 popup_spec = launcher.PopupSpec(
@@ -1916,7 +1953,7 @@ def _handle_display_call(
         route, route_failure = resolve_ge_route()
         if route_failure is not None:
             return route_failure
-        title = (args.get("title") or spec.get("title") or "Decision Engine")
+        title = _display_window_title(args, mode, spec=spec)
         client_request_id = args.get("client_request_id")
         if client_request_id is None:
             client_request_id = str(uuid.uuid4())
@@ -2021,7 +2058,9 @@ def _handle_display_call(
         spec = args.get("spec")
         if not isinstance(spec, dict):
             return {"status": "failed", "reason": "spec required"}
-        title = (args.get("title") or spec.get("title") or "Discussion Board")
+        title = _display_window_title(
+            args, "discussion_board", spec=spec, fallback="Discussion Board"
+        )
         profile = "cursor-db" if popup_api_profile == "cursor" else popup_api_profile
         try:
             html = launcher.fetch_board_html(

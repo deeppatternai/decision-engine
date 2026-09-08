@@ -96,7 +96,7 @@ def test_aqg_update_pins_local_line_endings_before_git_operation(tmp_path, entry
     ):
         path = origin / name
         path.parent.mkdir(parents=True, exist_ok=True)
-        path.write_text("fixture\n", encoding="utf-8")
+        path.write_bytes(b"fixture\n")
     git(origin, "add", ".")
     git(origin, "commit", "-qm", "fixture")
     subprocess.run(
@@ -142,3 +142,6 @@ def test_aqg_update_pins_local_line_endings_before_git_operation(tmp_path, entry
     assert result.returncode == 0, result.stdout + result.stderr
     assert git(dest, "config", "--local", "--get", "core.autocrlf") == "false"
     assert git(dest, "config", "--local", "--get", "core.eol") == "lf"
+    assert (dest / "scripts" / "install.sh").read_bytes() == b"fixture\n"
+    git(dest, "update-index", "--refresh")
+    assert git(dest, "status", "--porcelain") == ""

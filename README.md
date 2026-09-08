@@ -228,7 +228,7 @@ support, and platform and version requirements.
 | Alibaba Qoder | Alibaba Qoder IDE | `qoder-ide` | macOS Qoder IDE.app 1.106.3+; independent MCP identity, shared Qoder Skills and audit hook, native windows, popup follow-up, Stop Panel |
 | Alibaba Qoder | Alibaba Qoder CN IDE | `qoder-cn-ide` | macOS Qoder CN IDE.app 1.106.3+; independent MCP identity, shared Qoder CN Skills and audit hook, native windows, popup follow-up, Stop Panel |
 | TRAE | TRAE Desktop | `trae` | macOS Trae.app 3.5.81; MCP, Skills, native windows, popup follow-up, Stop Panel |
-| TRAE | TRAE CN Desktop | `trae-cn` | macOS Trae CN.app 3.3.95; MCP, Skills, native windows, popup follow-up, Stop Panel |
+| TRAE | TRAE CN Desktop | `trae-cn` | Windows Trae Code CN 3.3.98+; macOS Trae CN.app 3.3.95; MCP, Skills, native windows, popup follow-up, Stop Panel |
 | TRAE | TRAE Work | `trae-work` | Windows and macOS Desktop 0.1.48+; MCP, Skills, native windows, popup follow-up, Stop Panel |
 | TRAE | TRAE Work CN | `trae-work-cn` | Windows and macOS Desktop 0.1.48+; MCP, Skills, native windows, popup follow-up, Stop Panel |
 

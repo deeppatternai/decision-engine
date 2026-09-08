@@ -91,13 +91,14 @@ an owner-issued device activation key.
 | Alibaba Qoder CN IDE | `qoder-cn-ide` | `~/.qoder-cn/mcp.json` | `~/.qoder-cn/skills/` | absolute `installer/mcp_bootstrap.py`; JSON omits `cwd`; omits `type` |
 | TRAE Desktop | `trae` | `~/Library/Application Support/Trae/User/mcp.json` | `~/.trae/skills/` | desktop Python (macOS direct); JSON includes `cwd`, omits `type` |
 | TRAE Work | `trae-work` | Windows: `%APPDATA%/TRAE SOLO/User/mcp.json`<br>macOS: `~/Library/Application Support/TRAE SOLO/User/mcp.json` | `~/.trae/skills/` | desktop Python (Windows space-safe, macOS direct); JSON includes `cwd`, omits `type` |
-| TRAE CN Desktop | `trae-cn` | `~/Library/Application Support/Trae CN/User/mcp.json` | `~/.trae-cn/skills/` | desktop Python (macOS direct); JSON includes `cwd`, omits `type` |
+| TRAE CN Desktop | `trae-cn` | Windows: `%APPDATA%/Trae CN/User/mcp.json`<br>macOS: `~/Library/Application Support/Trae CN/User/mcp.json` | `~/.trae-cn/skills/` | desktop Python (Windows space-safe, macOS direct); JSON includes `cwd`, omits `type` |
 | TRAE Work CN | `trae-work-cn` | Windows: `%APPDATA%/TRAE SOLO CN/User/mcp.json`<br>macOS: `~/Library/Application Support/TRAE SOLO CN/User/mcp.json` | `~/.trae-cn/skills/` | desktop Python (Windows space-safe, macOS direct); JSON includes `cwd`, omits `type` |
 | Tencent WorkBuddy Desktop | `workbuddy` | `~/.workbuddy/mcp.json` | `~/.workbuddy/skills/` | desktop Python (Windows space-safe, macOS direct); JSON omits `cwd`; omits `type` |
 | Tencent WorkBuddy AI Desktop | `workbuddy-ai` | `~/.workbuddy-ai/mcp.json` | `~/.workbuddy-ai/skills/` | desktop Python (macOS direct); JSON omits `cwd`; omits `type` |
 
-The Qoder and TRAE families are product-specific Desktop contracts. Qoder CN,
-TRAE, and TRAE CN are currently macOS-only; Qoder IDE and Qoder CN IDE are not
+The Qoder and TRAE families are product-specific Desktop contracts. Claude's
+third-party provider profile, Qoder CN, and TRAE are currently macOS-only;
+Qoder IDE and Qoder CN IDE are not
 silently accepted as their Desktop counterparts. Their host
 modules own the exact installed-product/version guards and launch shape; the
 macOS paths are architecture-neutral for Intel and Apple Silicon.

@@ -100,6 +100,7 @@ final class DecisionEngineStopper: NSObject, NSApplicationDelegate {
     // before it has registered the run; a real orphan (e.g. a stuck `cancelling` the hub no
     // longer recognizes) has been gone for far longer than 3 one-second polls.
     private let notFoundForgetThreshold = 3
+    private let scrollMaxScreenFraction: CGFloat = 0.618
     private var notFoundPolls: [String: Int] = [:]   // run_id → consecutive hub gone-replies
     private var autoShownRunIDs: Set<String> = []
     private var hiddenByUser = false
@@ -165,7 +166,7 @@ final class DecisionEngineStopper: NSObject, NSApplicationDelegate {
         button.contentTintColor = nil
         button.target = self
         button.action = #selector(statusItemClicked)
-        button.toolTip = "Decision Engine"
+        button.toolTip = auditSurfaceTitle(locale: uiLocale([:]))
     }
 
     private func acquireSingleInstanceLock() -> Bool {
@@ -645,7 +646,7 @@ final class DecisionEngineStopper: NSObject, NSApplicationDelegate {
         button.imagePosition = .imageOnly
         button.image = statusIconImage()
         button.contentTintColor = nil
-        button.toolTip = "Decision Engine: " + shortStatus(status, locale: locale)
+        button.toolTip = auditSurfaceTitle(locale: locale) + ": " + shortStatus(status, locale: locale)
     }
 
     private func statusIconImage() -> NSImage {
@@ -740,7 +741,7 @@ final class DecisionEngineStopper: NSObject, NSApplicationDelegate {
             backing: .buffered,
             defer: false
         )
-        window.title = "Decision Engine"
+        window.title = auditSurfaceTitle(locale: currentChromeLocale())
         window.titleVisibility = .hidden
         window.titlebarAppearsTransparent = true
         window.appearance = NSAppearance(named: .darkAqua)   // dark title bar + light traffic-light glyphs
@@ -879,7 +880,7 @@ final class DecisionEngineStopper: NSObject, NSApplicationDelegate {
         // 38 = 28 top inset (clears the traffic lights over the full-size content view) + 10 bottom.
         let listHeight = rowHeights.reduce(0, +) + CGFloat(max(0, rowHeights.count - 1) * 8)
         let screenHeight = (panelWindow.screen?.visibleFrame ?? bestVisibleFrame(for: panelWindow.frame))?.height ?? 800
-        let maxHeight = min(CGFloat(640), screenHeight - 24)
+        let maxHeight = max(CGFloat(72), floor(screenHeight * scrollMaxScreenFraction) - 24)
         setPanelContentSize(NSSize(width: width, height: min(38 + listHeight, maxHeight)))
         panelWindow.contentView?.layoutSubtreeIfNeeded()
         if let scroll = rowsScrollView {
@@ -1099,6 +1100,14 @@ final class DecisionEngineStopper: NSObject, NSApplicationDelegate {
             if normalized == "zh" || normalized.hasPrefix("zh-") { return "zh" }
         }
         return "en"
+    }
+
+    private func currentChromeLocale() -> String {
+        return visibleRuns().first.map { uiLocale($0) } ?? uiLocale([:])
+    }
+
+    private func auditSurfaceTitle(locale: String) -> String {
+        return locale == "en" ? "Decision Engine - Audit" : "Decision Engine - 审计"
     }
 
     private func localReason(_ run: [String: Any]) -> String {

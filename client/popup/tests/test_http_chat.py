@@ -1020,6 +1020,33 @@ class HttpChatTurnTests(unittest.TestCase):
         ]
         self.assertEqual(len(submit_calls), 1)
 
+    def test_submit_503_without_stable_server_code_uses_retryable_fallback(self):
+        error = HttpChatSession._http_error(
+            http_chat._HttpResponse(
+                status=503,
+                body=b'{"error_code":"server_busy"}',
+            )
+        )
+
+        self.assertEqual(error.code, "network_error")
+        self.assertTrue(error.retryable)
+        self.assertEqual(error.http_status, 503)
+
+    def test_submit_503_preserves_auth_required_and_latches_session(self):
+        transport = _ScriptedTransport(
+            (200, json.dumps(_conversation_response()).encode("utf-8")),
+            (503, b'{"error_code":"auth_required"}'),
+        )
+        session = self._session(transport, sleep=lambda _seconds: None)
+
+        with self.assertRaises(ChatClientError) as caught:
+            session.submit_turn("question", [], _TURN_KEY)
+
+        self.assertEqual(caught.exception.code, "auth_required")
+        self.assertFalse(caught.exception.retryable)
+        self.assertEqual(caught.exception.http_status, 503)
+        self.assertEqual(session._unavailable_code, "auth_required")
+
     def test_submit_429_preserves_terminal_stable_server_code(self):
         transport = _ScriptedTransport(
             (200, json.dumps(_conversation_response()).encode("utf-8")),

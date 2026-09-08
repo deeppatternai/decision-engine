@@ -672,6 +672,7 @@ ensure_aqg_ready() {
 }
 
 install_aqg_body() {
+  local aqg_archive
   # Returns non-zero on failure (does NOT die), so the caller can report the
   # AQG-before-DE failure at the correct boundary.
   echo "==> Installing Agent Quality Gates (local, no account) from ${AQG_REPO}"
@@ -681,9 +682,27 @@ install_aqg_body() {
   fi
   if [ -d "${AQG_DEST}/.git" ]; then
     echo "    Existing checkout at ${AQG_DEST} — updating."
+    [ -z "$(git -C "${AQG_DEST}" status --porcelain=v1 --untracked-files=all)" ] \
+      || { echo "install: AQG checkout at ${AQG_DEST} has local changes; preserve it and repair before retrying" >&2; return 1; }
     git -C "${AQG_DEST}" config --local core.autocrlf false \
       && git -C "${AQG_DEST}" config --local core.eol lf \
       || { echo "install: could not pin LF-safe Git configuration at ${AQG_DEST}" >&2; return 1; }
+    aqg_archive="$(mktemp)" \
+      || { echo "install: could not create a temporary AQG archive" >&2; return 1; }
+    if ! git -C "${AQG_DEST}" archive --output="${aqg_archive}" HEAD \
+        || ! tar -xf "${aqg_archive}" -C "${AQG_DEST}"; then
+      rm -f "${aqg_archive}"
+      echo "install: could not rematerialize LF-safe AQG files at ${AQG_DEST}" >&2
+      return 1
+    fi
+    rm -f "${aqg_archive}"
+    git -C "${AQG_DEST}" add --update \
+      || { echo "install: could not refresh the LF-safe AQG index at ${AQG_DEST}" >&2; return 1; }
+    if ! git -C "${AQG_DEST}" diff --cached --quiet HEAD --; then
+      git -C "${AQG_DEST}" reset --quiet HEAD -- .
+      echo "install: AQG files changed while line endings were normalized; preserve them and repair before retrying" >&2
+      return 1
+    fi
     git -C "${AQG_DEST}" pull --ff-only \
       || { echo "install: could not update AQG checkout at ${AQG_DEST}" >&2; return 1; }
   else

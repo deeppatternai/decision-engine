@@ -476,7 +476,7 @@ class RenderReconciliationTests(unittest.TestCase):
         self.assertEqual(
             widgets["audit_id_row"].parent.pack_slaves(),
             [widgets["title"], widgets["audit_id_row"], widgets["detail"]],
-            "the selectable audit ID must render on its own line below the title",
+            "the selectable audit ID must render on its own line above the detail",
         )
 
     def test_audit_id_column_label_follows_the_host_locale(self):
@@ -506,6 +506,54 @@ class RenderReconciliationTests(unittest.TestCase):
         app._render()
         self.assertEqual(audit_id.get(), "registry-real")
         self.assertIn(audit_id_row, audit_id_row.parent.pack_slaves())
+
+    def test_debug_auditors_render_below_detail_with_per_status_colors(self):
+        dot = chr(0xB7)
+        check = chr(0x2713)
+        timer = chr(0x23F1)
+        app = self._app()
+        app.runs["registry-real"].update(
+            profile="standard",
+            status="running",
+            started_at=905.0,
+            debug_authorized=True,
+            auditors=[
+                {"status": "completed", "model_id": "gpt-5.6-sol", "duration_ms": 12_000},
+                {"status": "failed", "model_alias": "gemini-3.1-pro-high"},
+                {"status": "running", "model": "claude-opus-5", "started_at": 940.0},
+            ],
+        )
+
+        with mock.patch.object(panel.time, "time", return_value=1_000.0):
+            app._render()
+
+        widgets = app._rows["registry-real"]
+        self.assertEqual(
+            widgets["detail"].cget("text"),
+            "%s Standard %s Auditing %s 1m 35s %s" % (dot, dot, dot, timer),
+            "the collapsed status stays a single summary line above model details",
+        )
+        self.assertEqual(
+            widgets["audit_id_row"].parent.pack_slaves(),
+            [
+                widgets["title"],
+                widgets["audit_id_row"],
+                widgets["detail"],
+                widgets["auditor_details"],
+            ],
+        )
+        self.assertEqual(
+            [label.cget("text") for label in widgets["auditor_labels"]],
+            [
+                "gpt-5.6-sol %s Completed %s 12s %s" % (dot, dot, check),
+                "gemini-3.1-pro-high %s Failed" % dot,
+                "claude-opus-5 %s Auditing %s 1m 0s" % (dot, dot),
+            ],
+        )
+        self.assertEqual(
+            [label.cget("fg") for label in widgets["auditor_labels"]],
+            [panel.FG_GREEN, panel.FG_RED, panel.FG_MUTED],
+        )
 
     def test_refresh_does_not_rewrite_an_unchanged_selectable_id(self):
         app = self._app()
@@ -586,6 +634,7 @@ class RealTkTaskScrollTests(unittest.TestCase):
         with mock.patch.object(tk, "Tk", return_value=root), \
              mock.patch.object(panel.tk_icon, "claim_app_identity"), \
              mock.patch.object(panel.tk_icon, "apply_window_icon"), \
+             mock.patch.object(panel.tk_icon, "apply_dock_app_name"), \
              mock.patch.object(panel.tk_icon, "apply_dock_icon"):
             self.app = panel.StopPanelApp()
         self.app.root.geometry("560x300+0+0")
@@ -635,7 +684,8 @@ class RealTkTaskScrollTests(unittest.TestCase):
         app = self.app
         app.root.geometry("")
         app.root.update()
-        self.assertLessEqual(app.root.winfo_height(), app.root.winfo_screenheight() * 0.8)
+        expected = int(app.root.winfo_screenheight() * panel.SCROLL_MAX_SCREEN_FRACTION) - 24
+        self.assertLessEqual(app.scroll_canvas.winfo_height(), expected)
         self.assertLess(app.root.winfo_height(), app.body.winfo_reqheight())
         app.root.geometry("420x260")
         app.root.update()
@@ -643,6 +693,17 @@ class RealTkTaskScrollTests(unittest.TestCase):
         app.scroll_canvas.yview_moveto(1.0)
         app.root.update()
         self.assertAlmostEqual(app.scroll_canvas.yview()[1], 1.0)
+
+    def test_scrollbar_uses_dark_panel_colors(self):
+        scrollbar = self.app.scrollbar
+        self.assertIsInstance(scrollbar, panel._DarkScrollbar)
+        self.assertEqual(scrollbar.cget("background"), panel.BG)
+        self.assertEqual(scrollbar.cget("highlightbackground"), panel.BG)
+        self.assertEqual(int(scrollbar.cget("highlightthickness")), 0)
+        self.assertEqual(int(scrollbar.cget("borderwidth")), 0)
+        self.app.root.update()
+        self.assertEqual(scrollbar.itemcget(scrollbar._track, "fill"), panel.BG)
+        self.assertEqual(scrollbar.itemcget(scrollbar._thumb, "fill"), panel.FG_MUTED)
 
     def test_small_wheel_deltas_focus_and_empty_state(self):
         app = self.app
@@ -2192,13 +2253,35 @@ class RegistryReapTests(unittest.TestCase):
 class DebugAuditorDisplayTests(unittest.TestCase):
     NOW = 1_000.0
 
-    def test_debug_authorized_reveals_models(self):
-        base = {"run_id": "a", "profile": "standard", "ui_locale": "en-US", "status": "running", "started_at": 905.0}
-        run = dict(base, debug_authorized=True, auditors=[{"status": "running", "model_id": "gpt-5.6-sol"}, {"status": "completed", "model_alias": "gemini-3.1-pro-high", "duration_ms": 12000}])
-        text = panel.depth_line_text(run, self.NOW, {})
-        self.assertIn("gpt-5.6-sol", text)
-        self.assertIn("gemini-3.1-pro-high", text)
-        self.assertIn("completed", text)
+    def test_debug_authorized_reveals_localized_models(self):
+        dot = chr(0xB7)
+        check = chr(0x2713)
+        auditors = [
+            {"status": "running", "model_id": "gpt-5.6-sol", "started_at": 940.0},
+            {"status": "completed", "model_alias": "gemini-3.1-pro-high", "duration_ms": 12000},
+            {"status": "failed", "model": "claude-opus-5"},
+        ]
+        english = {"run_id": "a", "profile": "standard", "ui_locale": "en-US",
+                   "status": "running", "started_at": 905.0,
+                   "debug_authorized": True, "auditors": auditors}
+        chinese = {**english, "ui_locale": "zh-CN"}
+
+        self.assertEqual(
+            panel._debug_auditor_lines(english, self.NOW),
+            [
+                "gpt-5.6-sol %s Auditing %s 1m 0s" % (dot, dot),
+                "gemini-3.1-pro-high %s Completed %s 12s %s" % (dot, dot, check),
+                "claude-opus-5 %s Failed" % dot,
+            ],
+        )
+        self.assertEqual(
+            panel._debug_auditor_lines(chinese, self.NOW),
+            [
+                "gpt-5.6-sol %s \u5ba1\u6838\u4e2d %s 1m 0s" % (dot, dot),
+                "gemini-3.1-pro-high %s \u5df2\u5b8c\u6210 %s 12s %s" % (dot, dot, check),
+                "claude-opus-5 %s \u5931\u8d25" % dot,
+            ],
+        )
 
     def test_debug_authorized_fails_closed_for_unauthorized_or_malformed_auditors(self):
         base = {"run_id": "a", "profile": "standard", "ui_locale": "en-US", "status": "running", "started_at": 905.0}

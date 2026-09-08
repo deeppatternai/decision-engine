@@ -43,6 +43,7 @@ TERMINAL_STATUSES = {"completed", "partial", "failed", "cancelled"}
 FINISHED_LINGER_S = 30.0     # keep a finished run visible this long before pruning
 IDLE_EXIT_S = 2.0            # quit the app this long after the last run disappears
 POLL_INTERVAL_MS = 1000
+SCROLL_MAX_SCREEN_FRACTION = 0.618
 # A running row goes "连接中断" after this long with no successful poll. Polls run at 1 Hz, so this
 # tolerates a long burst of failures (transient drop / hub restart / laptop resume) before we admit
 # we're blind — but stays far under the minutes a real outage lasts.
@@ -249,11 +250,7 @@ def _local_advisory_line(run: Dict[str, Any], now: float, frozen: Dict[str, floa
 
 
 def depth_line_text(run: Dict[str, Any], now: float, frozen: Dict[str, float]) -> str:
-    collapsed = _collapsed_depth_line_text(run, now, frozen)
-    debug_lines = _debug_auditor_lines(run, now)
-    if debug_lines:
-        return collapsed + chr(10) + chr(10).join(debug_lines)
-    return collapsed
+    return _collapsed_depth_line_text(run, now, frozen)
 
 def _collapsed_depth_line_text(run: Dict[str, Any], now: float, frozen: Dict[str, float]) -> str:
     if run.get("local"):
@@ -274,6 +271,10 @@ def _collapsed_depth_line_text(run: Dict[str, Any], now: float, frozen: Dict[str
 
 
 def _debug_auditor_lines(run: Dict[str, Any], now: float) -> List[str]:
+    return [detail["text"] for detail in _debug_auditor_details(run, now)]
+
+
+def _debug_auditor_details(run: Dict[str, Any], now: float) -> List[Dict[str, str]]:
     if run.get("debug_authorized") is not True:
         return []
     auditors = run.get("auditors")
@@ -281,7 +282,23 @@ def _debug_auditor_lines(run: Dict[str, Any], now: float) -> List[str]:
         return []
     if any(not isinstance(auditor, dict) for auditor in auditors):
         return []
-    return [_auditor_display_text(auditor, now) for auditor in auditors]
+    return [
+        {
+            "text": _auditor_display_text(run, auditor, now),
+            "color": _auditor_status_color(str(auditor.get("status") or "pending").lower()),
+        }
+        for auditor in auditors
+    ]
+
+
+def _auditor_status_color(status: str) -> str:
+    if status == "completed":
+        return FG_GREEN
+    if status == "failed":
+        return FG_RED
+    if status in ("partial", "cancelled"):
+        return FG_AMBER
+    return FG_MUTED
 
 def depth_line_color(run: Dict[str, Any], now: Optional[float] = None) -> str:
     if run.get("local"):
@@ -447,6 +464,75 @@ def _display_scale(widget: Any, tk: Any) -> float:
     except (AttributeError, TypeError, ValueError, tk.TclError):
         return 1.0
     return min(max(dpi / 96.0, 1.0), 4.0)
+
+
+class _DarkScrollbar:
+    """Canvas-backed vertical scrollbar so Windows themes cannot paint a white trough."""
+
+    def __init__(self, tk: Any, parent: Any, command: Any, width: int = 12) -> None:
+        self._tk = tk
+        self._command = command
+        self._width = width
+        self._first = 0.0
+        self._last = 1.0
+        self._command_name: Optional[str] = None
+        self._canvas = tk.Canvas(
+            parent, width=width, bg=BG, bd=0, highlightthickness=0,
+            highlightbackground=BG, highlightcolor=BG, takefocus=False,
+        )
+        self._track = self._canvas.create_rectangle(0, 0, width, 1, fill=BG, outline=BG)
+        self._thumb = self._canvas.create_rectangle(3, 0, width - 3, 1, fill=FG_MUTED, outline=FG_MUTED)
+        self._canvas.bind("<Configure>", self._redraw)
+        self._canvas.bind("<Button-1>", self._move_to_event)
+        self._canvas.bind("<B1-Motion>", self._move_to_event)
+
+    def set(self, first: Any, last: Any) -> None:
+        self._first = max(0.0, min(1.0, float(first)))
+        self._last = max(self._first, min(1.0, float(last)))
+        self._redraw()
+
+    def _redraw(self, _event: Any = None) -> None:
+        height = max(1, self._canvas.winfo_height())
+        self._canvas.coords(self._track, 0, 0, self._width, height)
+        if self._last >= 1.0 and self._first <= 0.0:
+            self._canvas.itemconfigure(self._thumb, state="hidden")
+            return
+        thumb_top = int(height * self._first)
+        thumb_bottom = max(thumb_top + 24, int(height * self._last))
+        if thumb_bottom > height:
+            thumb_top = max(0, height - (thumb_bottom - thumb_top))
+            thumb_bottom = height
+        self._canvas.coords(self._thumb, 3, thumb_top, self._width - 3, thumb_bottom)
+        self._canvas.itemconfigure(self._thumb, state="normal")
+
+    def _move_to_event(self, event: Any) -> str:
+        height = max(1, self._canvas.winfo_height())
+        span = max(0.01, self._last - self._first)
+        fraction = max(0.0, min(1.0 - span, (event.y / height) - (span / 2.0)))
+        self._command("moveto", fraction)
+        return "break"
+
+    def _command_proxy(self, *args: Any) -> Any:
+        return self._command(*args)
+
+    def cget(self, option: str) -> Any:
+        if option == "command":
+            if self._command_name is None:
+                self._command_name = self._canvas.register(self._command_proxy)
+            return self._command_name
+        return self._canvas.cget(option)
+
+    def itemcget(self, *args: Any) -> Any:
+        return self._canvas.itemcget(*args)
+
+    def grid(self, *args: Any, **kwargs: Any) -> Any:
+        return self._canvas.grid(*args, **kwargs)
+
+    def grid_remove(self) -> None:
+        self._canvas.grid_remove()
+
+    def winfo_ismapped(self) -> int:
+        return self._canvas.winfo_ismapped()
 
 
 class _RoundedActionButton:
@@ -696,11 +782,14 @@ class StopPanelApp:
         tk_icon.claim_app_identity()
         self.root = tk.Tk()
         # Panel chrome → host locale (like the empty-state label at _create_row), not any single run.
-        self.root.title(i18n.panel(i18n.resolve_locale(None))["window_title"])  # native title bar → taskbar button, minimise, close
+        shell_titles = i18n.shell(i18n.resolve_locale(None)).get("surface_title", {})
+        audit_title = shell_titles.get("audit", "Decision Engine") if isinstance(shell_titles, dict) else "Decision Engine"
+        self.root.title(audit_title)  # native title bar -> taskbar button, minimise, close
         tk_icon.apply_window_icon(self.root)     # …and the title bar shows an icon; Tk's default is a feather
         # AFTER Tk(), unlike the AUMID above. macOS has the same fall-back-to-the-interpreter defect
         # but the opposite ordering rule: Tk installs its own NSApplication subclass, and anything
         # that instantiates a plain one first makes Tk_Init abort the process. See apply_dock_icon.
+        tk_icon.apply_dock_app_name(audit_title)
         tk_icon.apply_dock_icon()
         self.root.configure(bg=BG)
         self.root.minsize(320, 96)
@@ -719,7 +808,7 @@ class StopPanelApp:
             yscrollincrement=1, takefocus=True,
         )
         self.scroll_canvas.grid(row=0, column=0, sticky="nsew")
-        self.scrollbar = tk.Scrollbar(viewport, orient="vertical", command=self.scroll_canvas.yview)
+        self.scrollbar = _DarkScrollbar(tk, viewport, self.scroll_canvas.yview)
         self.scroll_canvas.configure(yscrollcommand=self.scrollbar.set)
         self.body = tk.Frame(self.scroll_canvas, bg=BG)
         self._body_window = self.scroll_canvas.create_window(0, 0, anchor="nw", window=self.body)
@@ -744,7 +833,8 @@ class StopPanelApp:
         canvas = self.scroll_canvas
         height = self.body.winfo_reqheight()
         # Let Tk auto-fit a short list, leaving room for the taskbar/Dock and native chrome.
-        canvas.configure(height=min(height, max(72, int(self.root.winfo_screenheight() * 0.75) - 24)))
+        max_height = max(72, int(self.root.winfo_screenheight() * SCROLL_MAX_SCREEN_FRACTION) - 24)
+        canvas.configure(height=min(height, max_height))
         canvas.configure(scrollregion=(0, 0, canvas.winfo_width(), max(height, canvas.winfo_height())))
         if height > canvas.winfo_height():
             self.scrollbar.grid(row=0, column=1, sticky="ns")
@@ -1082,8 +1172,10 @@ class StopPanelApp:
         audit_id.pack(side="left", fill="x", expand=True)
         detail = tk.Label(text, bg=BG, font=(_UI, 12), anchor="w", justify="left")
         detail.pack(anchor="w")
+        auditor_details = tk.Frame(text, bg=BG)
         return {
             "row": row, "button": button, "title": title,
+            "auditor_details": auditor_details, "auditor_labels": [],
             "audit_id_row": audit_id_row, "audit_id_label": audit_id_label,
             "audit_id": audit_id, "detail": detail,
         }
@@ -1143,6 +1235,28 @@ class StopPanelApp:
             text="· " + depth_line_text(render_run, now, self._frozen),
             fg=depth_line_color(render_run, now),
         )
+        self._update_auditor_details(widgets, render_run, now)
+
+    def _update_auditor_details(
+        self, widgets: Dict[str, Any], render_run: Dict[str, Any], now: float,
+    ) -> None:
+        details = _debug_auditor_details(render_run, now)
+        frame = widgets["auditor_details"]
+        labels = widgets["auditor_labels"]
+        while len(labels) > len(details):
+            labels.pop().destroy()
+        for index, detail in enumerate(details):
+            if index >= len(labels):
+                label = self._tk.Label(
+                    frame, bg=BG, font=(_UI, 12), anchor="w", justify="left",
+                )
+                label.pack(anchor="w")
+                labels.append(label)
+            labels[index].configure(text=detail["text"], fg=detail["color"])
+        if details:
+            frame.pack(fill="x", anchor="w", pady=(2, 0), after=widgets["detail"])
+        else:
+            frame.pack_forget()
 
     def _render(self) -> None:
         tk = self._tk
@@ -1233,18 +1347,20 @@ def _auditor_elapsed(auditor: Dict[str, Any], now: float) -> str:
     return "0s"
 
 
-def _auditor_display_text(auditor: Dict[str, Any], now: float) -> str:
+def _auditor_display_text(run: Dict[str, Any], auditor: Dict[str, Any], now: float) -> str:
     model = _auditor_model_label(auditor)
     status = str(auditor.get("status") or "pending").lower()
+    label = _panel(run)["auditor_status"].get(status, status)
+    dot = chr(0xB7)
     if status == "completed":
         elapsed = _auditor_elapsed(auditor, now)
-        return model + " · completed · " + elapsed + " ✓"
+        return "%s %s %s %s %s %s" % (model, dot, label, dot, elapsed, chr(0x2713))
     if status == "failed":
-        return model + " · failed"
+        return "%s %s %s" % (model, dot, label)
     if status == "running":
         elapsed = _auditor_elapsed(auditor, now)
-        return model + " · running · " + elapsed
-    return model + " · " + status
+        return "%s %s %s %s %s" % (model, dot, label, dot, elapsed)
+    return "%s %s %s" % (model, dot, label)
 
 
 if __name__ == "__main__":

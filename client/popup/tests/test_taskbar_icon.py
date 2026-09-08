@@ -104,5 +104,19 @@ class ClaimAppIdentity(unittest.TestCase):
             native_shell._claim_app_identity()   # must not raise
 
 
+class DockIdentity(unittest.TestCase):
+    def test_the_localized_title_reaches_macos_dock_identity(self):
+        with mock.patch("client.tk_icon.apply_dock_app_name", return_value=True) as app_name, \
+                mock.patch("client.tk_icon.apply_dock_icon", return_value=True) as icon:
+            native_shell._install_dock_icon("Decision Engine - \u56fe\u89e3")
+        app_name.assert_called_once_with("Decision Engine - \u56fe\u89e3")
+        icon.assert_called_once_with()
+
+    def test_a_raising_dock_identity_never_escapes(self):
+        with mock.patch("client.tk_icon.apply_dock_app_name", side_effect=OSError("no app")), \
+                mock.patch("client.tk_icon.apply_dock_icon", return_value=True):
+            native_shell._install_dock_icon("Decision Engine - \u56fe\u89e3")
+
+
 if __name__ == "__main__":
     unittest.main()

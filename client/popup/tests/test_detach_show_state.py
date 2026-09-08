@@ -684,7 +684,7 @@ class MacStatusItemLifecycle(unittest.TestCase):
              mock.patch.object(native_shell, "_IS_WINDOWS", False), \
              mock.patch.object(native_shell, "_mac_visible_frame", return_value=None), \
              mock.patch.object(native_shell, "_claim_app_identity", side_effect=lambda: calls.append("claim_identity")), \
-             mock.patch.object(native_shell, "_install_dock_icon", side_effect=lambda: calls.append("dock_icon")), \
+             mock.patch.object(native_shell, "_install_dock_icon", side_effect=lambda _title: calls.append("dock_icon")), \
              mock.patch.object(native_shell, "_mac_after_show", side_effect=lambda: calls.append("mac_after_show")), \
              mock.patch.object(native_shell, "_install_dock_reopen", side_effect=lambda _win: calls.append("dock_reopen")), \
              mock.patch.object(native_shell, "_run_on_mac_main_queue", side_effect=lambda callback: calls.append("schedule_status") or callback()), \

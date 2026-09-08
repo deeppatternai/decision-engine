@@ -500,7 +500,7 @@ verify_aqg_checkout() {
 }
 
 sync_aqg_checkout() {
-  local target_sha
+  local aqg_archive target_sha
   verify_aqg_checkout
   if [ -L "$AQG_ROOT" ]; then
     tty_print "Reusing the managed AQG version; subsequent updates belong to AQG's signed channel."
@@ -511,6 +511,20 @@ sync_aqg_checkout() {
     || fail "could not pin LF-safe Git configuration for the AQG checkout; preserve it and stop"
   clean_exec "$GIT_BIN" -C "$AQG_ROOT" config --local core.eol lf \
     || fail "could not pin LF-safe Git configuration for the AQG checkout; preserve it and stop"
+  aqg_archive="$(clean_exec mktemp)" \
+    || fail "could not create a temporary AQG archive; preserve it and stop"
+  if ! clean_exec "$GIT_BIN" -C "$AQG_ROOT" archive --output="$aqg_archive" HEAD \
+      || ! clean_exec tar -xf "$aqg_archive" -C "$AQG_ROOT"; then
+    clean_exec rm -f "$aqg_archive"
+    fail "could not rematerialize LF-safe AQG files; preserve it and stop"
+  fi
+  clean_exec rm -f "$aqg_archive"
+  clean_exec "$GIT_BIN" -C "$AQG_ROOT" add --update \
+    || fail "could not refresh the LF-safe AQG index; preserve it and stop"
+  if ! clean_exec "$GIT_BIN" -C "$AQG_ROOT" diff --cached --quiet HEAD --; then
+    clean_exec "$GIT_BIN" -C "$AQG_ROOT" reset --quiet HEAD -- . || true
+    fail "AQG files changed while line endings were normalized; preserve them and stop"
+  fi
   if ! clean_exec env GIT_TERMINAL_PROMPT=0 "$GIT_BIN" -C "$AQG_ROOT" fetch \
       --depth 1 "$AQG_REPO" "refs/heads/$AQG_REF"; then
     fail "could not read the AQG product target $AQG_REF; the existing checkout was preserved"

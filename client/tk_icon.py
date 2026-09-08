@@ -121,6 +121,28 @@ def apply_dock_icon() -> bool:
         return False
 
 
+def apply_dock_app_name(app_name: str) -> bool:
+    """Give macOS Dock hover text the product/window name instead of the interpreter name.
+
+    A frameless pywebview window can have the right ``create_window(title=...)`` title while the
+    Dock still labels the app as ``python3.12`` because the process was started by the interpreter.
+    ``NSProcessInfo.setProcessName_`` changes that Dock-visible app name without touching argv or
+    creating an NSApplication. Best-effort like the icon helpers: a name failure must never block
+    the popup itself.
+    """
+    if platform.system() != "Darwin":
+        return False
+    if not isinstance(app_name, str) or not app_name.strip():
+        return False
+    try:
+        from Foundation import NSProcessInfo
+
+        NSProcessInfo.processInfo().setProcessName_(app_name)
+        return True
+    except Exception:  # aqg: top-level boundary — no pyobjc/window server, or AppKit rejected name
+        return False
+
+
 def native_window_handle(window: Any) -> int:
     """A pywebview window's Win32 handle, or 0 when this build does not expose one.
 

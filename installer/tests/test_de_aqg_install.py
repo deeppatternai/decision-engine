@@ -142,6 +142,21 @@ sync_aqg_checkout
     return verify
 
 
+def test_managed_version_with_tracked_changes_is_rejected(
+    verify_checkout, tmp_path,
+):
+    target, _commit = _managed_checkout(tmp_path)
+    root = _link(tmp_path / "agent-quality-gates", target)
+    changed = target / "scripts" / "install_aqg_clients.py"
+    changed.write_text("modified fixture\n", encoding="utf-8")
+
+    result = verify_checkout(root)
+
+    assert result.returncode == 2, result.stderr
+    assert "local changes" in result.stderr
+    assert changed.read_text(encoding="utf-8") == "modified fixture\n"
+
+
 def test_repeat_install_does_not_checkout_inside_a_managed_version(verify_checkout, tmp_path):
     target, _commit = _managed_checkout(tmp_path)
     root = _link(tmp_path / "agent-quality-gates", target)

@@ -3695,6 +3695,8 @@ class OpenGeDisplayTestCase(unittest.TestCase):
         self.assertEqual(calls[1], {
             "name": "visual_status", "arguments": {"run_id": "vis_987654321"},
         })
+        self.assertEqual(calls[0]["arguments"]["title"], "Decision Engine - T")
+        self.assertEqual(self.spawned[-1][1], "Decision Engine - T")
         self.assertEqual(fwd.fetched, ["vis_987654321"])
         self.assertEqual(out.get("popup_id"), "pop_1")
 
@@ -3744,6 +3746,66 @@ class OpenGeDisplayTestCase(unittest.TestCase):
                 self.assertEqual(
                     fwd.sent[0]["params"]["arguments"]["client_request_id"], forwarded,
                 )
+
+    def test_open_ge_default_window_title_is_localized_by_mode(self):
+        cases = (
+            ("diagram", "zh-CN", "Decision Engine - \u56fe\u89e3"),
+            ("comic", "zh-CN", "Decision Engine - \u6f2b\u89e3"),
+            ("infographic", "zh-CN", "Decision Engine - \u4fe1\u606f\u56fe"),
+            ("diagram", "en-US", "Decision Engine - Graphic Explanation"),
+        )
+        for mode, locale, expected in cases:
+            with self.subTest(mode=mode, locale=locale), \
+                    mock.patch.dict(os.environ, {"DE_UI_LOCALE": locale}), \
+                    mock.patch.object(shim, "_GE_RENDER_POLL_DEADLINE_S", 5.0), \
+                    mock.patch.object(shim.time, "sleep"):
+                self.spawned.clear()
+                fwd = _GeFakeForwarder(statuses=["completed"], submit_run_id="vis_title")
+                out = shim._handle_display_call(fwd, "open_ge", {"mode": mode, "spec": {}})
+                self.assertEqual(out.get("popup_id"), "pop_1")
+                self.assertEqual(self.spawned[-1][1], expected)
+                self.assertEqual(fwd.sent[0]["params"]["arguments"]["title"], expected)
+
+    def test_open_ge_explicit_title_gets_product_prefix(self):
+        fwd = _GeFakeForwarder(statuses=["completed"], submit_run_id="vis_explicit_title")
+        with mock.patch.dict(os.environ, {"DE_UI_LOCALE": "zh-CN"}), \
+                mock.patch.object(shim, "_GE_RENDER_POLL_DEADLINE_S", 5.0), \
+                mock.patch.object(shim.time, "sleep"):
+            shim._handle_display_call(
+                fwd,
+                "open_ge",
+                {"mode": "diagram", "spec": {}, "title": "\u7528\u6237\u81ea\u5b9a\u4e49\u6807\u9898"},
+            )
+        self.assertEqual(self.spawned[-1][1], "Decision Engine - \u7528\u6237\u81ea\u5b9a\u4e49\u6807\u9898")
+        self.assertEqual(
+            fwd.sent[0]["params"]["arguments"]["title"],
+            "Decision Engine - \u7528\u6237\u81ea\u5b9a\u4e49\u6807\u9898",
+        )
+
+    def test_open_ge_prefixed_title_is_not_prefixed_twice(self):
+        fwd = _GeFakeForwarder(statuses=["completed"], submit_run_id="vis_prefixed_title")
+        with mock.patch.object(shim, "_GE_RENDER_POLL_DEADLINE_S", 5.0), \
+                mock.patch.object(shim.time, "sleep"):
+            shim._handle_display_call(
+                fwd,
+                "open_ge",
+                {"mode": "diagram", "spec": {}, "title": "Decision Engine - Existing"},
+            )
+        self.assertEqual(self.spawned[-1][1], "Decision Engine - Existing")
+
+    def test_open_db_board_default_window_title_is_localized(self):
+        for locale, expected in (
+            ("zh-CN", "Decision Engine - \u8ba8\u8bba\u677f"),
+            ("en-US", "Decision Engine - Discussion Board"),
+        ):
+            with self.subTest(locale=locale), \
+                    mock.patch.dict(os.environ, {"DE_UI_LOCALE": locale}):
+                self.spawned.clear()
+                out = shim._handle_display_call(
+                    _GeFakeForwarder(statuses=[]), "open_db_board", {"spec": {}}
+                )
+                self.assertEqual(out.get("popup_id"), "pop_1")
+                self.assertEqual(self.spawned[-1][1], expected)
 
     def test_cursor_open_ge_uses_shared_renderer_and_followup(self):
         fwd = _GeFakeForwarder(
@@ -3843,7 +3905,7 @@ class OpenGeDisplayTestCase(unittest.TestCase):
         schedule.assert_called_once_with(
             fwd,
             "ge_run_2",
-            {"context": "ctx", "title": "Decision Engine"},
+            {"context": "ctx", "title": "Decision Engine - \u56fe\u89e3"},
             client_host="trae-work",
             popup_followup=False,
             popup_api_profile="legacy",
@@ -3877,7 +3939,7 @@ class OpenGeDisplayTestCase(unittest.TestCase):
         self.assertTrue(scheduled)
         self.assertEqual(fwd.fetched, ["ge_slow"])
         self.assertEqual(len(self.spawned), 1)
-        self.assertEqual(self.spawned[0][1:], ("Slow diagram", None))
+        self.assertEqual(self.spawned[0][1:], ("Decision Engine - Slow diagram", None))
         self.assertEqual(self.context_calls, [])
 
     def test_scheduled_ge_failure_opens_native_notice_instead_of_going_silent(self):
