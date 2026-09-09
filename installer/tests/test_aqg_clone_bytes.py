@@ -10,7 +10,7 @@ import pytest
 REPO = Path(__file__).resolve().parents[2]
 
 
-@pytest.mark.parametrize("entry", ["install.sh", "dp-install.sh", "de-aqg-install", "dp-install.ps1"])
+@pytest.mark.parametrize("entry", ["install.sh", "dp-install.sh", "dp-install.ps1"])
 def test_aqg_clone_preserves_bytes_with_global_crlf_conversion(tmp_path, entry):
     if entry == "dp-install.ps1" and os.name != "nt":
         pytest.skip("PowerShell bootstrap clone runs on native Windows")

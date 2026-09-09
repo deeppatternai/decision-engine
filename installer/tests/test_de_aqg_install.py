@@ -4,6 +4,7 @@ import os
 import re
 import shutil
 import subprocess
+import sys
 from pathlib import Path
 
 import pytest
@@ -80,8 +81,8 @@ def _link(root, target):
     return root
 
 
-@pytest.fixture(params=["de-aqg-install", "dp-install.sh"])
-def verify_checkout(request):
+@pytest.fixture(params=["dp-install.sh"])
+def verify_checkout(request, tmp_path):
     bash = shutil.which("bash")
     if bash is None:
         pytest.skip("bash executable not found on PATH")
@@ -103,6 +104,7 @@ def verify_checkout(request):
             "tty_print() { printf '%s\\n' \"$*\"; }",
             'AQG_ROOT="$1"',
             'AQG_REPO="$2"',
+            'PYTHON_BIN="$3"',
             'GIT_BIN="$(command -v git)"',
             *functions,
             "verify_aqg_checkout",
@@ -111,6 +113,24 @@ def verify_checkout(request):
     environment = os.environ.copy()
     environment.pop("BASH_ENV", None)
     environment.pop("ENV", None)
+    git_guard = tmp_path / "git-guard"
+    git_guard.write_text(
+        """#!/bin/bash
+case " $* " in
+  *" fetch "*)
+    head="$($AQG_TEST_REAL_GIT -C "$AQG_ROOT" rev-parse HEAD)"
+    git_dir="$($AQG_TEST_REAL_GIT -C "$AQG_ROOT" rev-parse --git-dir)"
+    case "$git_dir" in /*) ;; *) git_dir="$AQG_ROOT/$git_dir" ;; esac
+    printf '%s\t\tfixture\n' "$head" >"$git_dir/FETCH_HEAD"
+    exit 0
+    ;;
+  *" checkout "*|*" pull "*) exit 79 ;;
+esac
+exec "$AQG_TEST_REAL_GIT" "$@"
+""",
+        encoding="utf-8",
+    )
+    git_guard.chmod(0o755)
 
     def verify(root, *, synchronize=False):
         invocation = script
@@ -118,20 +138,16 @@ def verify_checkout(request):
             # Refuse mutating Git operations at the dependency boundary: no
             # test may fetch the public repository if the reuse path regresses.
             invocation = invocation.rsplit("verify_aqg_checkout", 1)[0] + '''
-real_git="$GIT_BIN"
-git_guard() {
-  case " $* " in *" fetch "*|*" checkout "*|*" pull "*) exit 79;; esac
-  "$real_git" "$@"
-}
-export real_git
-export -f git_guard
+AQG_TEST_REAL_GIT="$GIT_BIN"
+export AQG_TEST_REAL_GIT AQG_ROOT
 clean_exec() { "$@"; }
-GIT_BIN=git_guard
+GIT_BIN="$4"
 sync_aqg_checkout
 '''
         return subprocess.run(
             [bash, "--noprofile", "--norc", "-s", "--",
-             _bash_path(root, bash, environment), AQG_REPO],
+             _bash_path(root, bash, environment), AQG_REPO, sys.executable,
+             str(git_guard)],
             input=invocation,
             capture_output=True,
             text=True,
@@ -234,7 +250,11 @@ def test_unmanaged_links_are_rejected(verify_checkout, tmp_path, target_name):
     result = verify_checkout(root)
 
     assert result.returncode == 2, result.stderr
-    assert "managed versions" in result.stderr
+    if target_name == "versions" or target_name.startswith("versions/"):
+        expected = "not an AQG-managed versions/<commit> symlink"
+    else:
+        expected = "symlink without a regular sibling versions directory"
+    assert expected in result.stderr
     assert root.is_symlink()
     assert root.readlink() == before
     assert (target / "AI_SETUP.md").read_text(encoding="utf-8") == "fixture\n"
@@ -255,7 +275,11 @@ def test_managed_path_cannot_escape_via_another_link(
     result = verify_checkout(root)
 
     assert result.returncode == 2, result.stderr
-    assert "managed versions" in result.stderr
+    if linked_component == "versions":
+        expected = "symlink without a regular sibling versions directory"
+    else:
+        expected = "not an AQG-managed versions/<commit> symlink"
+    assert expected in result.stderr
 
 
 @pytest.mark.parametrize("kind", ["missing", "file", "dangling", "link-to-file"])
@@ -327,4 +351,4 @@ def test_managed_link_rejects_directory_name_that_does_not_match_head(
     result = verify_checkout(root)
 
     assert result.returncode == 2, result.stderr
-    assert "does not match its version directory" in result.stderr
+    assert "target name does not match its checked-out commit" in result.stderr

@@ -45,6 +45,11 @@ CredentialSubmitHandler = Callable[[str, str], object]
 RECOVERY_REQUIRED_EXIT_CODE = activate.RECOVERY_REQUIRED_EXIT_CODE
 
 _DEFAULT_ENDPOINT = "https://endpoint.deeppattern.ai"
+# The HTML form gets `value` + `placeholder` from the browser for free; ttk has no placeholder, so
+# the Tk fallback repaints the same two states by hand and needs both text colours by name. They
+# mirror the stylesheet above: `input{color:#172b4d}` and a lighter grey for the hint state.
+_ENDPOINT_TEXT_FG = "#172B4D"
+_PLACEHOLDER_FG = "#8A94A6"
 _MAX_ENDPOINT_INPUT = 2048
 _MAX_SECRET_INPUT = 4096
 # The masked-credential form, ONE per backend. Visible copy and the page-side JS strings are baked in
@@ -63,7 +68,7 @@ input:focus{border-color:#2f6feb;box-shadow:0 0 0 3px rgba(47,111,235,.13)}.hint
 button{min-width:96px;height:38px;padding:0 18px;border-radius:8px;border:1px solid #cbd5e1;font-size:13px;font-weight:650;cursor:pointer}.cancel{color:#344054;background:#fff}.primary{color:#fff;background:#2f6feb;border-color:#2f6feb}.primary:hover{background:#2459bd}
 </style></head><body><header class="header"><div class="title">__DE_TITLE__</div><div class="subtitle">__DE_SUBTITLE__</div></header>
 <main class="wrap"><form class="card" id="setup-form"><label for="endpoint">__DE_ENDPOINT_LABEL__</label>
-<input id="endpoint" required autocomplete="url" maxlength="2048" value="__DE_DEFAULT_ENDPOINT__" autofocus><div class="hint">__DE_ENDPOINT_HINT__</div>
+<input id="endpoint" required autocomplete="url" maxlength="2048" value="__DE_DEFAULT_ENDPOINT__" placeholder="__DE_DEFAULT_ENDPOINT__" autofocus><div class="hint">__DE_ENDPOINT_HINT__</div>
 <label for="secret">__DE_SECRET_LABEL__</label><input id="secret" type="password" required autocomplete="off" maxlength="4096" spellcheck="false" placeholder="__DE_SECRET_PLACEHOLDER__">
 <div class="hint">__DE_SECRET_HINT__</div><div class="error" id="form-error" role="alert" aria-live="polite"></div><div class="actions"><button type="button" class="cancel" id="cancel">__DE_CANCEL__</button><button type="submit" class="primary" id="activate">__DE_ACTIVATE__</button></div></form></main>
 <script>const S=__DE_SETUP_STRINGS__;const endpoint=document.getElementById('endpoint'),secret=document.getElementById('secret'),form=document.getElementById('setup-form'),cancel=document.getElementById('cancel'),activate=document.getElementById('activate'),error=document.getElementById('form-error');let submitting=false;
@@ -861,7 +866,7 @@ def _prompt_credentials_tk(
             "HeaderTitle.TLabel",
             background="#132238",
             foreground="#FFFFFF",
-            font=("Segoe UI", 19, "bold"),
+            font=("Segoe UI", 18, "bold"),  # ~= HTML .title 24px at 96 dpi
         )
         style.configure(
             "HeaderSubtitle.TLabel",
@@ -876,6 +881,9 @@ def _prompt_credentials_tk(
             borderwidth=1,
             relief="solid",
         )
+        # Inner rows sit ON the card, so they share its white fill but must NOT carry the border,
+        # or the 1px edge shows through gaps (e.g. between the Cancel/Activate buttons).
+        style.configure("CardInner.TFrame", background="#FFFFFF")
         style.configure(
             "Field.TLabel",
             background="#FFFFFF",
@@ -897,12 +905,20 @@ def _prompt_credentials_tk(
         style.configure(
             "Setup.TEntry",
             fieldbackground="#FFFFFF",
-            foreground="#172B4D",
+            foreground=_ENDPOINT_TEXT_FG,
             bordercolor="#C9D2E0",
             lightcolor="#C9D2E0",
             darkcolor="#C9D2E0",
-            padding=(10, 8),
+            padding=(12, 9),  # ~= HTML input 42px tall with 12px side padding
             font=("Segoe UI", 11),
+        )
+        # HTML `input:focus{border-color:#2f6feb}`. ttk cannot draw the accompanying box-shadow ring,
+        # so the border colour alone carries the focus affordance.
+        style.map(
+            "Setup.TEntry",
+            bordercolor=[("focus", "#2F6FEB")],
+            lightcolor=[("focus", "#2F6FEB")],
+            darkcolor=[("focus", "#2F6FEB")],
         )
         style.configure(
             "Secondary.TButton",
@@ -917,7 +933,7 @@ def _prompt_credentials_tk(
             background="#2F6FEB",
             foreground="#FFFFFF",
             bordercolor="#2F6FEB",
-            padding=(20, 9),
+            padding=(18, 8),  # match Secondary; HTML gives both buttons a uniform padding:0 18px
             font=("Segoe UI", 10, "bold"),
         )
         style.map(
@@ -937,11 +953,33 @@ def _prompt_credentials_tk(
             "%P",
         )
 
+        # ttk has no placeholder, so the hint text lives in the same StringVar as real input. This
+        # flag is the out-of-band truth about which of the two the variable currently holds: while it
+        # is set, `endpoint_var` holds hint text that must read as EMPTY everywhere downstream, so a
+        # blurred-empty field hits the required-endpoint validator instead of activating against the
+        # hint URL. Read the field through `endpoint_value()` — never `endpoint_var.get()` directly.
+        showing_placeholder = [False]
+
+        def endpoint_value() -> str:
+            return "" if showing_placeholder[0] else endpoint_var.get()
+
+        def show_endpoint_placeholder(_event=None) -> None:
+            if not showing_placeholder[0] and not endpoint_var.get():
+                showing_placeholder[0] = True
+                endpoint_var.set(_DEFAULT_ENDPOINT)
+                endpoint_entry.configure(foreground=_PLACEHOLDER_FG)
+
+        def clear_endpoint_placeholder(_event=None) -> None:
+            if showing_placeholder[0]:
+                showing_placeholder[0] = False
+                endpoint_var.set("")
+                endpoint_entry.configure(foreground=_ENDPOINT_TEXT_FG)
+
         def submit() -> None:
             nonlocal result
             try:
                 result = _validate_form_credentials(
-                    endpoint_var.get(), secret_var.get(), errors
+                    endpoint_value(), secret_var.get(), errors
                 )
             except _CredentialFormValidationError as exc:
                 error_label.configure(text=str(exc))
@@ -1024,27 +1062,38 @@ def _prompt_credentials_tk(
         )
         error_label.grid(row=6, column=0, sticky="ew", padx=24)
 
-        actions = widgets.Frame(card, style="Card.TFrame")
+        actions = widgets.Frame(card, style="CardInner.TFrame")
         actions.grid(row=7, column=0, sticky="e", padx=24, pady=(8, 20))
+        # `hand2` is the Tk spelling of the HTML buttons' `cursor:pointer`; it is one of the few
+        # cursor names X11, Win32 and Aqua all resolve to a pointing hand.
         widgets.Button(
             actions,
             text=strings["cancel"],
             command=close,
             style="Secondary.TButton",
+            cursor="hand2",
         ).pack(side="left", padx=(0, 10))
         widgets.Button(
             actions,
             text=strings["activate"],
             command=submit,
             style="Primary.TButton",
+            cursor="hand2",
         ).pack(side="left")
 
         root.protocol("WM_DELETE_WINDOW", close)
+        endpoint_entry.bind("<FocusIn>", clear_endpoint_placeholder)
+        endpoint_entry.bind("<FocusOut>", show_endpoint_placeholder)
         endpoint_entry.bind("<Return>", lambda _event: submit())
         secret_entry.bind("<Return>", lambda _event: submit())
         root.bind("<Escape>", lambda _event: close())
         root.update_idletasks()
-        width, height = 520, 430
+        # Size to the content, never to a guess. A fixed height clipped the Cancel/Activate row as
+        # soon as anything grew the card (input padding, font, DPI, a longer locale), and the window
+        # is `resizable(False, False)` so the owner could not drag it back open. The constants stay
+        # as a floor so short locales still get a roomy window.
+        width = max(520, root.winfo_reqwidth())
+        height = max(430, root.winfo_reqheight())
         x = max(0, (root.winfo_screenwidth() - width) // 2)
         y = max(0, (root.winfo_screenheight() - height) // 2)
         root.geometry("%dx%d+%d+%d" % (width, height, x, y))

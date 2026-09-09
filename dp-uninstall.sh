@@ -19,7 +19,7 @@ if [[ -z "${python_bin}" || ! -x "${python_bin}" ]]; then
   exit 2
 fi
 
-exec "${python_bin}" - "$@" <<'PY'
+exec "${python_bin}" - "$@" 3<&0 <<'PY'
 from __future__ import annotations
 
 import argparse
@@ -28,6 +28,7 @@ import json
 import os
 import plistlib
 import re
+import signal
 import shlex
 import shutil
 import stat
@@ -43,6 +44,7 @@ EXIT_OK = 0
 EXIT_USAGE = 2
 EXIT_BLOCKED = 3
 EXIT_UNSUPPORTED = 4
+PROMPT_INPUT_FD = 3
 
 HOSTBRIDGE_LABEL = "com.decision-engine.stopper.hostbridge"
 HOSTBRIDGE_MARKER = "DE_STOPPER_HOSTBRIDGE_MANAGED"
@@ -97,8 +99,19 @@ QODER_PROCESS_MARKERS = (
     "/Applications/Qoder CN.app/",
     "/Applications/Qoder CN IDE.app/",
 )
-
-
+PROCESS_HOST_MARKERS = (
+    (("qoder cn ide.app",), "Qoder CN IDE"),
+    (("qoder ide.app",), "Qoder IDE"),
+    (("qodercn.app", "qoder cn.app", "/qoder-cn/"), "Qoder CN"),
+    (("qoder.app", "/qoder/"), "Qoder"),
+    (("trae solo cn.app", "trae cn.app", "/trae-cn/"), "TRAE Code CN"),
+    (("trae solo.app", "trae.app", "/trae/"), "TRAE Code"),
+    (("workbuddy ai.app", "/workbuddy-ai/"), "WorkBuddy AI"),
+    (("codebuddy studio.app", "codebuddy.app", "/codebuddy"), "CodeBuddy"),
+    (("cursor.app", "/cursor/"), "Cursor"),
+    (("claude.app", "/claude/", "claude-code"), "Claude"),
+    (("codex.app", "/codex/"), "Codex"),
+)
 def lex(path: Path) -> Path:
     """Normalize without resolving the final path through a symlink."""
     return Path(os.path.abspath(os.path.expanduser(str(path))))
@@ -165,6 +178,47 @@ def flatten_strings(value: Any) -> Iterable[str]:
             yield from flatten_strings(item)
 
 
+def trusted_system_tool(*candidates: str) -> str | None:
+    for candidate in candidates:
+        path = Path(candidate)
+        try:
+            metadata = path.stat()
+        except OSError:
+            continue
+        if (
+            path.is_symlink()
+            or not stat.S_ISREG(metadata.st_mode)
+            or metadata.st_uid != 0
+            or metadata.st_mode & 0o022
+            or not os.access(path, os.X_OK)
+        ):
+            continue
+        return str(path)
+    return None
+
+
+def process_file_refs_with(command: str, pid: str) -> tuple[str, ...] | None:
+    if not re.fullmatch(r"\d+", pid):
+        return None
+    try:
+        result = subprocess.run(
+            [command, "-a", "-n", "-P", "-p", pid, "-d", "cwd,txt,mem", "-Fn"],
+            text=True,
+            stdout=subprocess.PIPE,
+            stderr=subprocess.STDOUT,
+            check=False,
+        )
+    except OSError:
+        return None
+    if result.returncode != 0:
+        return None
+    return tuple(
+        line[1:]
+        for line in result.stdout.splitlines()
+        if line.startswith("n") and len(line) > 1
+    )
+
+
 class Inventory:
     def __init__(self, home: Path, scope: str) -> None:
         self.home = lex(home)
@@ -191,12 +245,22 @@ class Inventory:
         self.launchagent: Path | None = None
         self.launchagent_loaded = False
         self.processes: list[dict[str, str]] = []
+        self.process_blockers: list[str] = []
         self.aqg_uninstaller: Path | None = None
         self.aqg_managed_target: Path | None = None
         self.qoder_residue_paths: list[tuple[Path, str]] = []
 
-    def add_action(self, kind: str, path: Path, detail: str = "") -> None:
-        self.actions.append({"kind": kind, "path": str(path), "detail": detail})
+    def add_action(self, kind: str, path: Path, detail: str = "", **metadata: Any) -> None:
+        self.actions.append(
+            {"kind": kind, "path": str(path), "detail": detail, **metadata}
+        )
+
+    def add_process_blocker(self, message: str) -> None:
+        self.process_blockers.append(message)
+        self.blockers.append(message)
+
+    def has_only_process_blockers(self) -> bool:
+        return bool(self.blockers) and self.blockers == self.process_blockers
 
     def path_ref(self, path: Path, *, component: str) -> bool:
         path = lex(path)
@@ -1378,19 +1442,7 @@ class Inventory:
         command = self.process_files_command()
         if not command:
             return None
-        try:
-            result = subprocess.run(
-                [command, "-a", "-n", "-P", "-p", pid, "-d", "cwd,txt,mem", "-Fn"],
-                text=True,
-                stdout=subprocess.PIPE,
-                stderr=subprocess.STDOUT,
-                check=False,
-            )
-        except OSError:
-            return None
-        if result.returncode != 0:
-            return None
-        return tuple(line[1:] for line in result.stdout.splitlines() if line.startswith("n") and len(line) > 1)
+        return process_file_refs_with(command, pid)
 
     @staticmethod
     def looks_like_de_launcher(command_line: str) -> bool:
@@ -1398,9 +1450,22 @@ class Inventory:
         return (
             "-m installer.launcher" in normalized
             or "installer/launcher.py" in normalized
+            or (" -c " in normalized and " --managed-root " in normalized)
+            or (
+                "installer/mcp_bootstrap.py" in normalized
+                and " --managed-root " in normalized
+            )
             or "stopper_launch_agent" in normalized
             or "decision-engine-stopper" in normalized
         )
+
+    @staticmethod
+    def process_host_label(command_line: str) -> str:
+        normalized = command_line.lower()
+        for markers, label in PROCESS_HOST_MARKERS:
+            if any(marker in normalized for marker in markers):
+                return label
+        return "Unknown Agent"
 
     def inspect_processes(self) -> None:
         command = self.process_command()
@@ -1422,23 +1487,49 @@ class Inventory:
             self.blockers.append("live process state is unknown: ps returned a non-zero status")
             return
         components = ("de",) if self.scope == "de" else ("aqg",) if self.scope == "aqg" else ("de", "aqg")
+        rows: list[tuple[str, str, str]] = []
         for raw_line in result.stdout.splitlines():
             line = raw_line.strip()
-            match = re.match(r"^(\d+)\s+(?:\d+\s+)?(.+)$", line)
+            match = re.match(r"^(\d+)\s+(\d+)\s+(.+)$", line)
             if not match:
                 continue
-            pid = match.group(1)
-            command_line = match.group(2)
+            rows.append((match.group(1), match.group(2), match.group(3)))
+        commands_by_pid = {pid: command_line for pid, _ppid, command_line in rows}
+        parents_by_pid = {pid: ppid for pid, ppid, _command_line in rows}
+        for pid, ppid, command_line in rows:
+            host = self.process_host_label(command_line)
+            ancestor = ppid
+            visited: set[str] = set()
+            while host == "Unknown Agent" and ancestor and ancestor not in visited:
+                visited.add(ancestor)
+                host = self.process_host_label(commands_by_pid.get(ancestor, ""))
+                ancestor = parents_by_pid.get(ancestor, "")
             if self.qoder_residue_paths and any(
                 marker in command_line for marker in QODER_PROCESS_MARKERS
             ):
-                self.processes.append({"pid": pid, "family": "qoder-plugin-host"})
-                self.add_action("process-blocker", Path(pid), "qoder-plugin-host")
-                self.blockers.append(
-                    f"Qoder host must be stopped before plugin cleanup: pid={pid}"
+                self.processes.append(
+                    {
+                        "pid": pid,
+                        "ppid": ppid,
+                        "family": "qoder-plugin-host",
+                        "host": host,
+                        "command_line": command_line,
+                        "proof": "host-marker",
+                        "term_eligible": "false",
+                    }
                 )
+                self.add_action(
+                    "process-blocker",
+                    Path(pid),
+                    "qoder-plugin-host",
+                    ppid=ppid,
+                    host=host,
+                    term_eligible=False,
+                )
+                self.add_process_blocker(f"Qoder host must be stopped before plugin cleanup: pid={pid}")
                 continue
             owned = any(self.text_has_ref(command_line, component=component) for component in components)
+            proof = "command"
             if not owned and self.looks_like_de_launcher(command_line):
                 file_refs = self.process_file_refs(pid)
                 owned = bool(
@@ -1449,16 +1540,62 @@ class Inventory:
                         for component in components
                     )
                 )
+                proof = "files"
                 if not owned:
-                    self.blockers.append(
-                        f"live process ownership is unknown: pid={pid} command={command_line}"
+                    self.processes.append(
+                        {
+                            "pid": pid,
+                            "ppid": ppid,
+                            "family": "unverified-de-launcher",
+                            "host": host,
+                            "command_line": command_line,
+                            "proof": "unknown",
+                            "term_eligible": "false",
+                        }
                     )
+                    self.add_action(
+                        "process-blocker",
+                        Path(pid),
+                        "unverified-de-launcher",
+                        ppid=ppid,
+                        host=host,
+                        term_eligible=False,
+                    )
+                    self.add_process_blocker(f"live process ownership is unknown: pid={pid}")
                     continue
             if owned:
                 family = "stopper" if "stopper" in command_line.lower() else "mcp-launcher"
-                self.processes.append({"pid": pid, "family": family})
-                self.add_action("process-blocker", Path(pid), family)
-                self.blockers.append(f"live {family} process must be stopped before uninstall: pid={pid}")
+                process = {
+                    "pid": pid,
+                    "ppid": ppid,
+                    "family": family,
+                    "host": host,
+                    "command_line": command_line,
+                    "proof": proof,
+                    "term_eligible": "false",
+                }
+                if self.looks_like_de_launcher(command_line):
+                    identity = read_process_identity(self, process)
+                    if (
+                        identity is not None
+                        and identity.get("pid") == pid
+                        and identity.get("ppid") == ppid
+                        and identity.get("uid") == str(os.getuid())
+                        and identity.get("command_line") == command_line
+                    ):
+                        process["start_time"] = identity["start_time"]
+                        process["term_eligible"] = "true"
+                term_eligible = process_term_eligible(process)
+                self.processes.append(process)
+                self.add_action(
+                    "process-blocker",
+                    Path(pid),
+                    family,
+                    ppid=ppid,
+                    host=host,
+                    term_eligible=term_eligible,
+                )
+                self.add_process_blocker(f"live {family} process must be stopped before uninstall: pid={pid}")
 
     def aqg_hook_paths(self) -> tuple[Path, ...]:
         relative = (
@@ -1697,7 +1834,191 @@ class Inventory:
         return self
 
 
-def print_inventory(inv: Inventory, *, apply: bool) -> None:
+def process_term_eligible(process: dict[str, str]) -> bool:
+    return process.get("term_eligible") in (True, "true")
+
+
+def read_process_identity(inv: Inventory, process: dict[str, str]) -> dict[str, str] | None:
+    command = trusted_system_tool("/bin/ps", "/usr/bin/ps")
+    if not command:
+        return None
+    try:
+        result = subprocess.run(
+            [
+                command,
+                "-p",
+                process["pid"],
+                "-o",
+                "pid=,ppid=,uid=,lstart=,command=",
+            ],
+            text=True,
+            stdout=subprocess.PIPE,
+            stderr=subprocess.STDOUT,
+            check=False,
+        )
+    except OSError:
+        return None
+    if result.returncode != 0:
+        return None
+    for raw_line in result.stdout.splitlines():
+        match = re.match(
+            r"^\s*(\d+)\s+(\d+)\s+(\d+)\s+"
+            r"(\S+\s+\S+\s+\S+\s+\S+\s+\S+)\s+(.+)$",
+            raw_line,
+        )
+        if match:
+            return {
+                "pid": match.group(1),
+                "ppid": match.group(2),
+                "uid": match.group(3),
+                "start_time": match.group(4),
+                "command_line": match.group(5),
+            }
+    return None
+
+
+def revalidate_term_target(inv: Inventory, process: dict[str, str]) -> tuple[bool, str]:
+    if not process_term_eligible(process):
+        return False, "process is not eligible for managed termination"
+    identity = read_process_identity(inv, process)
+    if identity is None:
+        return False, "process disappeared or could not be re-read"
+    frozen = (
+        process.get("pid"),
+        process.get("ppid"),
+        process.get("start_time"),
+        process.get("command_line"),
+    )
+    current = (
+        identity.get("pid"),
+        identity.get("ppid"),
+        identity.get("start_time"),
+        identity.get("command_line"),
+    )
+    if current != frozen:
+        return False, "process identity changed before TERM"
+    if identity.get("uid") != str(os.getuid()):
+        return False, "process is not owned by the current user"
+    command_line = identity["command_line"]
+    if not inv.looks_like_de_launcher(command_line):
+        return False, "process command no longer matches a managed DE launcher"
+    components = (
+        ("de",)
+        if inv.scope == "de"
+        else ("aqg",)
+        if inv.scope == "aqg"
+        else ("de", "aqg")
+    )
+    if process.get("proof") == "command":
+        owned = any(inv.text_has_ref(command_line, component=item) for item in components)
+    elif process.get("proof") == "files":
+        lsof = trusted_system_tool("/usr/sbin/lsof", "/usr/bin/lsof")
+        refs = process_file_refs_with(lsof, process["pid"]) if lsof else None
+        owned = bool(
+            refs
+            and any(
+                inv.text_has_ref(path, component=item)
+                for path in refs
+                for item in components
+            )
+        )
+    else:
+        owned = False
+    if not owned:
+        return False, "managed DE/AQG ownership proof no longer matches"
+    return True, ""
+
+
+def prompt_tty(message: str) -> str | None:
+    try:
+        with open("/dev/tty", "r", encoding="utf-8", buffering=1) as tty_in:
+            try:
+                with open("/dev/tty", "w", encoding="utf-8", buffering=1) as tty_out:
+                    tty_out.write(message)
+                    tty_out.flush()
+            except OSError:
+                print(message, end="", file=sys.stderr, flush=True)
+            response = tty_in.readline()
+    except OSError:
+        try:
+            if not os.isatty(PROMPT_INPUT_FD):
+                raise OSError("inherited input is not interactive")
+            print(message, end="", file=sys.stderr, flush=True)
+            with os.fdopen(
+                os.dup(PROMPT_INPUT_FD),
+                "r",
+                encoding="utf-8",
+                buffering=1,
+            ) as tty_in:
+                response = tty_in.readline()
+        except (OSError, ValueError):
+            print(
+                "BLOCKED: interactive process confirmation requires a terminal; "
+                "quit all Agent hosts and rerun the command in a terminal.",
+                file=sys.stderr,
+            )
+            return None
+    return response.strip().lower()
+
+
+def offer_term_for_managed_processes(inv: Inventory) -> bool:
+    eligible = [process for process in inv.processes if process_term_eligible(process)]
+    if not eligible:
+        print(
+            "No remaining process is eligible for TERM. Fully quit the listed Agent hosts; "
+            "unknown and host-owned processes remain blocked."
+        )
+        return False
+    pids = ", ".join(process["pid"] for process in eligible)
+    answer = prompt_tty(
+        f"Send TERM to the verified managed DE/AQG process(es) pid={pids}? [y/N] "
+    )
+    if answer not in ("y", "yes"):
+        print("TERM was not sent; uninstall remains blocked.")
+        return False
+    for process in eligible:
+        valid, reason = revalidate_term_target(inv, process)
+        if not valid:
+            print(f"BLOCKED PROCESS pid={process['pid']} TERM refused: {reason}")
+            return False
+        try:
+            os.kill(int(process["pid"]), signal.SIGTERM)
+        except (OSError, ValueError) as exc:
+            print(
+                f"BLOCKED PROCESS pid={process['pid']} TERM failed: {exc.__class__.__name__}"
+            )
+            return False
+        print(f"TERM sent to verified managed process pid={process['pid']}")
+    return True
+
+
+def resolve_process_blockers(inv: Inventory) -> Inventory:
+    hosts = sorted({process.get("host", "Unknown Agent") for process in inv.processes})
+    print("Active DE/AQG runtime processes were detected.")
+    print("Completely quit these Agent hosts before uninstall: " + ", ".join(hosts))
+    response = prompt_tty(
+        "After quitting them, press Enter to recheck immediately (or type N to cancel): "
+    )
+    if response is None or response in ("n", "no", "q", "quit"):
+        print("Process cleanup was cancelled; uninstall remains blocked.")
+        return inv
+    refreshed = Inventory(inv.home, inv.scope).collect()
+    if not refreshed.processes:
+        print("All blocking Agent processes exited normally.")
+        return refreshed
+    if not refreshed.has_only_process_blockers():
+        return refreshed
+    if not offer_term_for_managed_processes(refreshed):
+        return refreshed
+    return Inventory(inv.home, inv.scope).collect()
+
+
+def print_inventory(
+    inv: Inventory,
+    *,
+    apply: bool,
+    process_resolution_pending: bool = False,
+) -> None:
     print("Deep Pattern uninstall plan")
     print(f"platform={sys.platform} scope={inv.scope} mode={'APPLY' if apply else 'DRY-RUN'}")
     for item in inv.actions:
@@ -1705,7 +2026,10 @@ def print_inventory(inv: Inventory, *, apply: bool) -> None:
         path = item["path"]
         detail = f" ({item['detail']})" if item.get("detail") else ""
         if kind == "process-blocker":
-            print(f"BLOCKED PROCESS pid={path} {item['detail']}")
+            print(
+                f"BLOCKED PROCESS pid={path} ppid={item.get('ppid', '?')} "
+                f"host={item.get('host', 'Unknown Agent')} family={item['detail']}"
+            )
         elif kind == "aqg-official-uninstall":
             print(f"RUN {path}{detail}")
         else:
@@ -1716,7 +2040,9 @@ def print_inventory(inv: Inventory, *, apply: bool) -> None:
         print(f"BLOCKED {blocker}")
     if not inv.actions:
         print("NO IN-SCOPE INSTALLATION FOUND")
-    if inv.blockers:
+    if inv.blockers and process_resolution_pending:
+        print("ACTION REQUIRED: close the listed Agent hosts; guided process cleanup follows.")
+    elif inv.blockers:
         print("STOP: ownership or runtime state is not fully provable; no mutation is allowed.")
     elif not apply:
         print("DRY-RUN only: add --apply after reviewing this plan.")
@@ -2215,7 +2541,20 @@ def main(argv: list[str]) -> int:
         print(f"home directory does not exist: {home}")
         return EXIT_USAGE
     inventory = Inventory(home, args.scope).collect()
-    print_inventory(inventory, apply=args.apply)
+    process_resolution_pending = (
+        args.apply
+        and bool(inventory.processes)
+        and inventory.has_only_process_blockers()
+    )
+    print_inventory(
+        inventory,
+        apply=args.apply,
+        process_resolution_pending=process_resolution_pending,
+    )
+    if process_resolution_pending:
+        inventory = resolve_process_blockers(inventory)
+        print("Rechecked uninstall plan after process cleanup:")
+        print_inventory(inventory, apply=args.apply)
     if inventory.blockers:
         return EXIT_BLOCKED
     if not args.apply:

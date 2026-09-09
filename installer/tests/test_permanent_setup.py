@@ -28,6 +28,11 @@ def _credential_tk_double(answers, *, action="Activate"):
     root = mock.MagicMock()
     root.winfo_screenwidth.return_value = 1920
     root.winfo_screenheight.return_value = 1080
+    # What Tk reports the laid-out content needs. Real Tk returns pixels here; tests that care about
+    # window sizing override these to stand in for a taller card (bigger font, higher DPI, longer
+    # locale) and assert the window grows with it.
+    root.winfo_reqwidth.return_value = 520
+    root.winfo_reqheight.return_value = 430
     root.register.side_effect = lambda callback: callback
 
     def string_var(_parent=None):
@@ -434,6 +439,120 @@ class PermanentSetupTestCase(unittest.TestCase):
 
         self.assertEqual(result, ("https://endpoint.deeppattern.ai", "owner_invite_value"))
 
+    def test_tk_form_repaints_placeholder_on_blur_and_clears_it_on_focus(self):
+        """R2: once the owner empties the prefilled endpoint and tabs away, the same default address
+        must reappear as the grey placeholder (never a blank box); focusing back in clears it so the
+        owner types over nothing."""
+        tk_module, widgets, root = _credential_tk_double([None, "owner_invite_value"])
+
+        def drive_focus_cycle():
+            endpoint_var = widgets.Entry.call_args_list[0].kwargs["textvariable"]
+            endpoint_entry = widgets.entry_instances[0]
+            bind = {
+                call.args[0]: call.args[1]
+                for call in endpoint_entry.bind.call_args_list
+                if call.args
+            }
+            endpoint_var.set("")  # owner cleared the field
+            bind["<FocusOut>"]()
+            self.assertEqual(endpoint_var.get(), "https://endpoint.deeppattern.ai")
+            endpoint_entry.configure.assert_any_call(
+                foreground=permanent_setup._PLACEHOLDER_FG
+            )
+            bind["<FocusIn>"]()
+            self.assertEqual(endpoint_var.get(), "")
+            endpoint_entry.configure.assert_any_call(
+                foreground=permanent_setup._ENDPOINT_TEXT_FG
+            )
+
+        root.wait_window.side_effect = drive_focus_cycle
+        permanent_setup._prompt_credentials_tk(tk_module, widgets)
+
+    def test_tk_form_rejects_a_showing_placeholder_as_empty(self):
+        """R3: activating while the placeholder is showing must be treated as an empty endpoint and
+        hit the required-field validator, never activate against the hint URL."""
+        tk_module, widgets, root = _credential_tk_double([None, "owner_invite_value"])
+
+        def blur_then_activate():
+            endpoint_var = widgets.Entry.call_args_list[0].kwargs["textvariable"]
+            endpoint_entry = widgets.entry_instances[0]
+            focus_out = next(
+                call.args[1]
+                for call in endpoint_entry.bind.call_args_list
+                if call.args and call.args[0] == "<FocusOut>"
+            )
+            endpoint_var.set("")
+            focus_out()  # placeholder now showing
+            activate = next(
+                call.kwargs["command"]
+                for call in widgets.Button.call_args_list
+                if call.kwargs.get("text") == "Activate"
+            )
+            activate()
+
+        root.wait_window.side_effect = blur_then_activate
+
+        result = permanent_setup._prompt_credentials_tk(tk_module, widgets)
+
+        self.assertIsNone(result)
+        widgets.labels_by_style["Error.TLabel"][0].configure.assert_called_once_with(
+            text="Endpoint is required."
+        )
+
+    def test_tk_window_is_never_shorter_than_the_content_it_lays_out(self):
+        """R4: the window height was hardcoded, so anything that grew the card — a wider input
+        padding, a bigger font, a higher DPI, a longer locale — pushed the Cancel/Activate row past
+        the bottom edge. `resizable(False, False)` means the owner cannot drag it back open, so the
+        form must size itself to what Tk says the content needs."""
+        tk_module, widgets, root = _credential_tk_double(
+            ["https://endpoint.deeppattern.ai", "owner_invite_value"]
+        )
+        root.winfo_reqheight.return_value = 512  # a card taller than the old fixed height
+
+        permanent_setup._prompt_credentials_tk(tk_module, widgets)
+
+        size, _, offset = root.geometry.call_args.args[0].partition("+")
+        height = int(size.split("x")[1])
+        self.assertGreaterEqual(height, 512)
+        # still centred on the screen it reported
+        self.assertEqual(offset.split("+")[1], str((1080 - height) // 2))
+
+    def test_tk_action_row_does_not_draw_a_second_card_border(self):
+        """R5: the button row reused `Card.TFrame`, which carries `borderwidth=1, relief=solid`, so
+        it painted its own 1px border and a stray grey line showed through the gap between Cancel
+        and Activate. Only the card itself may carry that border."""
+        tk_module, widgets, root = _credential_tk_double(
+            ["https://endpoint.deeppattern.ai", "owner_invite_value"]
+        )
+
+        permanent_setup._prompt_credentials_tk(tk_module, widgets)
+
+        bordered = [
+            call
+            for call in widgets.Frame.call_args_list
+            if call.kwargs.get("style") == "Card.TFrame"
+        ]
+        self.assertEqual(
+            len(bordered),
+            1,
+            "only the card frame may use the bordered card style; inner rows must be borderless",
+        )
+
+    def test_tk_buttons_show_a_hand_cursor_like_the_html(self):
+        """R6: the HTML form gives both buttons `cursor:pointer`. The Tk fallback must match, so the
+        controls read as clickable on hover instead of keeping the plain arrow."""
+        tk_module, widgets, root = _credential_tk_double(
+            ["https://endpoint.deeppattern.ai", "owner_invite_value"]
+        )
+
+        permanent_setup._prompt_credentials_tk(tk_module, widgets)
+
+        cursors = {
+            call.kwargs.get("text"): call.kwargs.get("cursor")
+            for call in widgets.Button.call_args_list
+        }
+        self.assertEqual(cursors, {"Cancel": "hand2", "Activate": "hand2"})
+
     def test_tk_form_keeps_invalid_required_input_open_with_feedback(self):
         tk_module, widgets, root = _credential_tk_double(
             ["   ", "owner_invite_value"]
@@ -540,7 +659,10 @@ class PermanentSetupTestCase(unittest.TestCase):
         self.assertIn('id="form-error"', captured["html"])
         self.assertIn('id="endpoint" required', captured["html"])
         endpoint_input = captured["html"].split('<input id="endpoint"', 1)[1].split(">", 1)[0]
+        # Prefilled AND hinted: the field opens on the default and, once the owner clears it, the
+        # same address stays visible as the grey placeholder rather than leaving a blank box.
         self.assertIn('value="https://endpoint.deeppattern.ai"', endpoint_input)
+        self.assertIn('placeholder="https://endpoint.deeppattern.ai"', endpoint_input)
         self.assertNotIn("readonly", endpoint_input)
         self.assertNotIn("disabled", endpoint_input)
         self.assertIn('id="secret" type="password" required', captured["html"])

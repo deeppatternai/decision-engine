@@ -24,6 +24,7 @@ $DecisionEngineRepository = "https://github.com/deeppatternai/decision-engine.gi
 $AqgRepository = "https://github.com/deeppatternai/agent-quality-gates.git"
 $ManagedRoot = Join-Path $HOME ".deeppattern\decision-engine"
 $AqgRoot = Join-Path $HOME ".deeppattern\agent-quality-gates"
+$ExitFailure = 1
 $ExitUsage = 2
 $ExitBlocked = 3
 $ExitPartial = 4
@@ -33,7 +34,7 @@ function Stop-Install {
         [Parameter(Mandatory = $true)][string]$Message,
         [int]$Code = $ExitUsage
     )
-    [Console]::Error.WriteLine(("{0}: ERROR: {1}" -f $ProgramName, $Message))
+    [Console]::Error.WriteLine("{0}: ERROR: {1}" -f $ProgramName, $Message)
     exit $Code
 }
 
@@ -214,36 +215,6 @@ function Test-ReparsePoint {
     return ($item.Attributes -band [System.IO.FileAttributes]::ReparsePoint) -ne 0
 }
 
-function Test-AqgManagedRoot {
-    param([Parameter(Mandatory = $true)][string]$Path)
-    $item = Get-Item -LiteralPath $Path -Force
-    if ($item.LinkType -ne "SymbolicLink" -or -not $item.PSIsContainer) {
-        return $false
-    }
-    $targets = @($item.Target)
-    if ($targets.Count -ne 1) { return $false }
-    $target = [string]$targets[0]
-    if ($target.StartsWith('\\?\')) { $target = $target.Substring(4) }
-    if (-not [System.IO.Path]::IsPathRooted($target)) {
-        $target = Join-Path (Split-Path -Parent $Path) $target
-    }
-    $target = [System.IO.Path]::GetFullPath($target)
-    $versions = [System.IO.Path]::GetFullPath((Join-Path (Split-Path -Parent $Path) "versions"))
-    $version = Split-Path -Leaf $target
-    if (((Split-Path -Parent $target) -ne $versions) -or `
-        ($version -cnotmatch '^[0-9a-f]{40}$') -or `
-        (-not (Test-Path -LiteralPath $target -PathType Container)) -or `
-        (Test-ReparsePoint -Path $versions) -or `
-        (Test-ReparsePoint -Path $target)) {
-        return $false
-    }
-    $head = Invoke-WithCleanEnvironment -FilePath $GitPath -ArgumentList @(
-        "-C", $target, "rev-parse", "--verify", "HEAD"
-    ) -Capture
-    return $head.ExitCode -eq 0 -and `
-        (($head.Output -join "").Trim() -ceq $version)
-}
-
 function Invoke-ManagedPython {
     param(
         [Parameter(Mandatory = $true)][string[]]$Arguments,
@@ -259,6 +230,208 @@ function Invoke-ManagedPython {
     finally {
         Pop-Location
     }
+}
+
+function Test-ManagedRootGitState {
+    $status = Invoke-WithCleanEnvironment -FilePath $GitPath -ArgumentList @(
+        "-C", $ManagedRoot, "status", "--porcelain=v1", "--untracked-files=all"
+    ) -Capture
+    if ($status.ExitCode -ne 0) {
+        return $false
+    }
+    foreach ($rawLine in $status.Output) {
+        $line = ([string]$rawLine).TrimEnd()
+        if ([string]::IsNullOrWhiteSpace($line)) {
+            continue
+        }
+        if ($line -eq "?? stopper-ui.json") {
+            $stopperUi = Join-Path $ManagedRoot "stopper-ui.json"
+            if ((Test-Path -LiteralPath $stopperUi -PathType Leaf) -and
+                -not (Test-ReparsePoint -Path $stopperUi)) {
+                continue
+            }
+        }
+        return $false
+    }
+    return $true
+}
+
+function Test-CompleteManagedRoot {
+    if (-not (Test-Path -LiteralPath $ManagedRoot -PathType Container) -or
+        (Test-ReparsePoint -Path $ManagedRoot)) {
+        return $false
+    }
+    $gitDirectory = Join-Path $ManagedRoot ".git"
+    if (-not (Test-Path -LiteralPath $gitDirectory -PathType Container) -or
+        (Test-ReparsePoint -Path $gitDirectory)) {
+        return $false
+    }
+    foreach ($relativePath in @(
+        ".managed-install.json",
+        ".runtime\update-state.json",
+        ".runtime\update-protocol.json",
+        "config.json",
+        "VERSION",
+        "installer\permanent_setup.py",
+        "installer\mcp_config.py"
+    )) {
+        $requiredPath = Join-Path $ManagedRoot $relativePath
+        if (-not (Test-Path -LiteralPath $requiredPath -PathType Leaf) -or
+            (Test-ReparsePoint -Path $requiredPath)) {
+            return $false
+        }
+    }
+    if (-not (Test-ManagedRootGitState)) {
+        return $false
+    }
+
+    $validationScript = @'
+from pathlib import Path
+import sys
+from installer import managed_install, update_transaction, updater
+
+root = Path(sys.argv[1])
+reader = updater._GitReader(root)
+identity = managed_install.validate_managed_identity(
+    root, updater._read_remotes(reader)
+)
+state = updater._read_update_state(identity.canonical_root)
+update_transaction._require_protocol_ready(identity.canonical_root)
+_code, head_output = reader.run("head")
+head = updater._single_commit(head_output, "managed HEAD")
+version = (identity.canonical_root / "VERSION").read_text(encoding="utf-8").strip()
+if head != state.last_release_commit or version != state.last_version:
+    raise SystemExit(1)
+'@
+    $validation = Invoke-ManagedPython -Arguments @(
+        "-c", $validationScript, $ManagedRoot
+    ) -Capture
+    return $validation.ExitCode -eq 0
+}
+
+function Get-ManagedActivationState {
+    $probe = Invoke-ManagedPython -Arguments @(
+        "-c",
+        "from installer import activate, config; print('activated' if activate.is_permanently_activated(config.load_json(config.de_config_path())) else 'unactivated')"
+    ) -Capture
+    if ($probe.ExitCode -ne 0) {
+        return $null
+    }
+    $state = ($probe.Output -join "").Trim()
+    if ($state -notin @("activated", "unactivated")) {
+        return $null
+    }
+    return $state
+}
+
+function Test-ManagedActivationRecoveryPending {
+    $probe = Invoke-ManagedPython -Arguments @(
+        "-c",
+        "from installer import activate, config; raise SystemExit(0 if activate.activation_recovery_marker_path(config.de_config_path()).exists() else 1)"
+    ) -Capture
+    return $probe.ExitCode -eq 0
+}
+
+function Get-ManagedConfigDigest {
+    $configPath = Join-Path $ManagedRoot "config.json"
+    if (-not (Test-Path -LiteralPath $configPath -PathType Leaf) -or
+        (Test-ReparsePoint -Path $configPath)) {
+        return $null
+    }
+    return (Get-FileHash -LiteralPath $configPath -Algorithm SHA256).Hash.ToLowerInvariant()
+}
+
+function Invoke-ManagedStableUpdate {
+    $updateScript = @'
+from pathlib import Path
+import sys
+import time
+
+from installer import (
+    launcher,
+    update_coordination,
+    update_transaction,
+    updater,
+)
+from installer.config import ShellError
+from installer.release_acquisition import load_trusted_release_keys
+
+root = Path(sys.argv[1])
+deadline = time.monotonic() + launcher.STARTUP_UPDATE_BUDGET_SECONDS
+wait_budget = (
+    launcher.STARTUP_UPDATE_BUDGET_SECONDS
+    + launcher.STARTUP_LEADER_GRACE_SECONDS
+)
+try:
+    with update_coordination.startup_update_gate(
+        root, timeout_seconds=wait_budget
+    ) as startup_gate:
+        recovery = launcher._finalize_journal(root)
+        if recovery is not None and recovery.status in {
+            "repair_required",
+            "retry_pending",
+            "deferred_active_session",
+            "skipped_locked",
+        }:
+            raise ShellError(f"managed update recovery returned {recovery.status}")
+        if getattr(startup_gate, "waited", False):
+            raise ShellError(
+                "another managed update attempt completed; retry to verify the current signed stable release"
+            )
+        if not launcher._updates_enabled(root):
+            raise ShellError("managed update protocol is not ready")
+        state = updater._read_update_state(root)
+        if launcher._head_commit(root) != state.last_release_commit:
+            raise ShellError("managed HEAD differs from the protected release state")
+        trusted_keys = load_trusted_release_keys(
+            root,
+            deadline=deadline,
+            expected_commit=state.last_release_commit,
+        )
+        if not trusted_keys:
+            raise ShellError("managed release trust store contains no active key")
+        result = launcher._attempt_update(root, trusted_keys, deadline=deadline)
+except (
+    ShellError,
+    OSError,
+    ValueError,
+    update_coordination.InstallTransactionBusy,
+) as exc:
+    print(f"dp-install: managed stable update refused: {exc}", file=sys.stderr)
+    raise SystemExit(1)
+
+accepted_statuses = {"up_to_date", "candidate_ready", "updated"}
+print(result.status)
+if result.status not in accepted_statuses:
+    blocker_pids = ",".join(
+        str(blocker.pid) for blocker in result.blockers if blocker.pid is not None
+    )
+    details = [f"status={result.status}"]
+    if result.error_code:
+        details.append(f"error_code={result.error_code}")
+    if blocker_pids:
+        details.append(f"active_shim_pids={blocker_pids}")
+    print(
+        "dp-install: managed stable update did not apply: " + ", ".join(details),
+        file=sys.stderr,
+    )
+raise SystemExit(0 if result.status in accepted_statuses else 1)
+'@
+    $result = Invoke-ManagedPython -Arguments @(
+        "-c", $updateScript, $ManagedRoot
+    ) -Capture
+    $acceptedStatuses = @("up_to_date", "candidate_ready", "updated")
+    $status = $null
+    foreach ($rawLine in $result.Output) {
+        $line = ([string]$rawLine).Trim()
+        if ($line -in $acceptedStatuses) {
+            $status = $line
+        }
+        elseif (-not [string]::IsNullOrWhiteSpace($line)) {
+            [Console]::Error.WriteLine($line)
+        }
+    }
+    return [pscustomobject]@{ ExitCode = $result.ExitCode; Status = $status }
 }
 
 if (-not (Test-NativeWindows)) {
@@ -280,8 +453,7 @@ if (Test-ReparsePoint -Path (Join-Path $HOME ".deeppattern")) {
     Stop-Install "$HOME\.deeppattern is a reparse point; preserve it and use an owner-guided install." $ExitBlocked
 }
 if (Test-Path -LiteralPath $AqgRoot) {
-    if (-not (Test-Path -LiteralPath $AqgRoot -PathType Container) -or
-        ((Test-ReparsePoint -Path $AqgRoot) -and -not (Test-AqgManagedRoot -Path $AqgRoot))) {
+    if (-not (Test-Path -LiteralPath $AqgRoot -PathType Container) -or (Test-ReparsePoint -Path $AqgRoot)) {
         Stop-Install "$AqgRoot is not a regular AQG checkout; preserve it and use the managed replacement flow." $ExitBlocked
     }
     $aqgOrigin = Invoke-WithCleanEnvironment -FilePath $GitPath -ArgumentList @(
@@ -296,6 +468,64 @@ if (Test-Path -LiteralPath $AqgRoot) {
     if ($aqgStatus.ExitCode -ne 0 -or -not [string]::IsNullOrWhiteSpace(($aqgStatus.Output -join ""))) {
         Stop-Install "$AqgRoot contains local changes; it was preserved." $ExitBlocked
     }
+}
+
+# Repeated installs must update through the signed transaction before the
+# temporary main checkout performs bootstrap repair or writes host state.
+$managedRootItem = Get-Item -LiteralPath $ManagedRoot -Force -ErrorAction SilentlyContinue
+$managedRootWasPresent = $null -ne $managedRootItem
+if ($managedRootWasPresent) {
+    if (-not (Test-CompleteManagedRoot)) {
+        Stop-Install "$ManagedRoot exists but is not a complete, clean, verified managed stable install. Preserve it and use the managed uninstall or replacement flow." $ExitBlocked
+    }
+    $activationStateBeforeUpdate = Get-ManagedActivationState
+    if ($null -eq $activationStateBeforeUpdate) {
+        Stop-Install "The managed activation state could not be verified before update. Preserve the managed root and use the owner-guided repair flow." $ExitBlocked
+    }
+    if (Test-ManagedActivationRecoveryPending) {
+        Stop-Install "The managed root has an activation recovery marker. Do not retry automatically; use the owner-guided activation recovery flow." $ExitBlocked
+    }
+    $configDigestBeforeUpdate = Get-ManagedConfigDigest
+    if ($null -eq $configDigestBeforeUpdate) {
+        Stop-Install "The Decision Engine configuration could not be fingerprinted before update." $ExitBlocked
+    }
+
+    if ($activationStateBeforeUpdate -eq "activated") {
+        Write-Host "Found a complete signed and activated Decision Engine install; updating signed stable before host repair without reopening activation."
+    }
+    else {
+        Write-Host "Found a complete signed Decision Engine stable install with activation pending; updating signed stable before resuming setup."
+    }
+    Write-Host "Checking and applying the newest signed Decision Engine stable release before continuing..."
+    $managedUpdate = Invoke-ManagedStableUpdate
+    if ($managedUpdate.ExitCode -ne 0 -or [string]::IsNullOrWhiteSpace($managedUpdate.Status)) {
+        $preserved = Test-CompleteManagedRoot
+        if ($preserved) {
+            $activationStateAfterFailure = Get-ManagedActivationState
+            $configDigestAfterFailure = Get-ManagedConfigDigest
+            $preserved = (
+                $activationStateAfterFailure -eq $activationStateBeforeUpdate -and
+                $configDigestAfterFailure -eq $configDigestBeforeUpdate
+            )
+        }
+        if ($preserved) {
+            $failedStatus = if ($null -eq $managedUpdate.Status) { "unknown" } else { $managedUpdate.Status }
+            Stop-Install "Signed stable update status $failedStatus; the existing release and activation state were verified and preserved. Close every configured Agent host and retry." $ExitFailure
+        }
+        Stop-Install "Signed stable update did not complete and the previous release could not be re-verified. Preserve the managed root and use the owner-guided recovery flow." $ExitBlocked
+    }
+    if (-not (Test-CompleteManagedRoot)) {
+        Stop-Install "Signed stable update returned $($managedUpdate.Status), but the managed release no longer validates." $ExitBlocked
+    }
+    $activationStateAfterUpdate = Get-ManagedActivationState
+    if ($activationStateAfterUpdate -ne $activationStateBeforeUpdate) {
+        Stop-Install "Signed stable update returned $($managedUpdate.Status), but the activation state changed." $ExitBlocked
+    }
+    $configDigestAfterUpdate = Get-ManagedConfigDigest
+    if ($configDigestAfterUpdate -ne $configDigestBeforeUpdate) {
+        Stop-Install "Signed stable update returned $($managedUpdate.Status), but the protected activation configuration changed." $ExitBlocked
+    }
+    Write-Host "Decision Engine signed stable update status: $($managedUpdate.Status)"
 }
 
 $tempRoot = Join-Path ([System.IO.Path]::GetTempPath()) ("dp-install-" + [Guid]::NewGuid().ToString("N"))
@@ -315,8 +545,7 @@ try {
 
     $sourceRoot = Join-Path $tempRoot "decision-engine"
     $clone = Invoke-WithCleanEnvironment -FilePath $GitPath -ArgumentList @(
-        "clone", "--config", "core.autocrlf=false", "--config", "core.eol=lf",
-        "--depth", "1", "--branch", "main", "--single-branch",
+        "clone", "--depth", "1", "--branch", "main", "--single-branch",
         "--", $DecisionEngineRepository, $sourceRoot
     )
     if ($clone -ne 0) {

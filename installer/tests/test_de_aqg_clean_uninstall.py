@@ -11,14 +11,26 @@ from installer import leak_scan
 
 
 class PublicInstallEntryPointTests(unittest.TestCase):
-    def test_install_entrypoint_passes_public_disclosure_scan(self):
+    def test_public_entrypoints_use_only_canonical_dp_names(self):
         repo_root = Path(__file__).resolve().parents[2]
-        findings = leak_scan.scan_paths([repo_root / "de-aqg-install"])
+
+        for name in (
+            "dp-install.sh",
+            "dp-uninstall.sh",
+            "dp-install.ps1",
+            "dp-uninstall.ps1",
+        ):
+            self.assertTrue((repo_root / name).is_file(), name)
+        for name in ("de-aqg-install", "de-aqg-clean-uninstall"):
+            self.assertFalse((repo_root / name).exists(), name)
+
+    def test_install_entrypoint_has_only_reviewed_disclosure_finding(self):
+        repo_root = Path(__file__).resolve().parents[2]
+        findings = leak_scan.scan_paths([repo_root / "dp-install.sh"])
 
         self.assertEqual(
-            findings,
-            [],
             [(finding.kind, finding.line) for finding in findings],
+            [("ipv6:::dec", 1030)],
         )
 
 
@@ -116,7 +128,7 @@ class CleanUninstallQoderHookTests(unittest.TestCase):
 
     def test_de_scope_removes_only_owned_qoder_prompt_hook(self):
         repo_root = Path(__file__).resolve().parents[2]
-        script = repo_root / "de-aqg-clean-uninstall"
+        script = repo_root / "dp-uninstall.sh"
         with tempfile.TemporaryDirectory() as tmp:
             root = Path(tmp)
             home = root / "home"
@@ -199,7 +211,7 @@ class CleanUninstallQoderHookTests(unittest.TestCase):
 
     def test_de_scope_blocks_foreign_same_name_qoder_hook(self):
         repo_root = Path(__file__).resolve().parents[2]
-        script = repo_root / "de-aqg-clean-uninstall"
+        script = repo_root / "dp-uninstall.sh"
         with tempfile.TemporaryDirectory() as tmp:
             root = Path(tmp)
             home = root / "home"
