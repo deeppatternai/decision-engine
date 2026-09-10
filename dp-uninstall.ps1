@@ -39,6 +39,32 @@ function Stop-Uninstall {
     exit 2
 }
 
+function Get-VerifiedAuthenticodePath {
+    param(
+        [Parameter(Mandatory = $true)][string]$Path,
+        [Parameter(Mandatory = $true)][string]$PublisherPattern
+    )
+
+    if ([string]::IsNullOrWhiteSpace($Path) -or
+        -not [IO.Path]::IsPathRooted($Path) -or
+        -not (Test-Path -LiteralPath $Path -PathType Leaf)) {
+        return $null
+    }
+    try {
+        $fullPath = (Get-Item -LiteralPath $Path -Force).FullName
+        $signature = Get-AuthenticodeSignature -LiteralPath $fullPath -ErrorAction Stop
+        if ($signature.Status -ne [System.Management.Automation.SignatureStatus]::Valid -or
+            $null -eq $signature.SignerCertificate -or
+            $signature.SignerCertificate.Subject -notmatch $PublisherPattern) {
+            return $null
+        }
+        return $fullPath
+    }
+    catch {
+        return $null
+    }
+}
+
 function Invoke-Clean {
     param(
         [Parameter(Mandatory = $true)][string]$FilePath,
@@ -46,6 +72,11 @@ function Invoke-Clean {
         [switch]$Capture
     )
     $names = @("DE_ENDPOINT", "DE_ACTIVATION_SECRET", "PYTHONPATH")
+    $names += @(
+        [Environment]::GetEnvironmentVariables("Process").Keys |
+            ForEach-Object { [string]$_ } |
+            Where-Object { $_ -match "^(?i:GIT_)" }
+    )
     $saved = @{}
     foreach ($name in $names) {
         $saved[$name] = [Environment]::GetEnvironmentVariable($name, "Process")
@@ -91,8 +122,14 @@ function Test-Python {
     if (-not (Test-Path -LiteralPath $Candidate -PathType Leaf)) {
         return $false
     }
-    $probe = Invoke-Clean -FilePath $Candidate -ArgumentList @(
-        "-c", "import sys; raise SystemExit(0 if sys.version_info[:2] >= (3, 12) else 1)"
+    $verified = Get-VerifiedAuthenticodePath `
+        -Path $Candidate `
+        -PublisherPattern "(?i:Python Software Foundation|Microsoft Corporation|Anaconda)"
+    if ($null -eq $verified) {
+        return $false
+    }
+    $probe = Invoke-Clean -FilePath $verified -ArgumentList @(
+        "-I", "-c", "import sys; raise SystemExit(0 if sys.version_info[:2] >= (3, 12) else 1)"
     ) -Capture
     if ($probe.ExitCode -ne 0) {
         return $false
@@ -109,11 +146,26 @@ function Resolve-Python {
     if (Test-Path -LiteralPath $managedPython -PathType Leaf) {
         $candidates.Add($managedPython)
     }
-    $py = Get-Command py.exe -ErrorAction SilentlyContinue
-    if ($null -ne $py) {
+    $launchers = New-Object System.Collections.Generic.List[string]
+    foreach ($entry in @(
+        @($env:WINDIR, "py.exe"),
+        @($env:LOCALAPPDATA, "Programs\Python\Launcher\py.exe"),
+        @($env:ProgramFiles, "Python Launcher\py.exe")
+    )) {
+        if (-not [string]::IsNullOrWhiteSpace([string]$entry[0])) {
+            $launchers.Add((Join-Path ([string]$entry[0]) ([string]$entry[1])))
+        }
+    }
+    foreach ($launcher in ($launchers | Select-Object -Unique)) {
+        $py = Get-VerifiedAuthenticodePath `
+            -Path $launcher `
+            -PublisherPattern "(?i:Python Software Foundation|Microsoft Corporation)"
+        if ($null -eq $py) {
+            continue
+        }
         foreach ($selector in @("-3.14", "-3.13", "-3.12", "-3")) {
-            $probe = Invoke-Clean -FilePath $py.Source -ArgumentList @(
-                $selector, "-c", "import sys; print(sys.executable)"
+            $probe = Invoke-Clean -FilePath $py -ArgumentList @(
+                $selector, "-I", "-c", "import sys; print(sys.executable)"
             ) -Capture
             if ($probe.ExitCode -eq 0 -and $probe.Output.Count -gt 0) {
                 $resolved = $probe.Output
@@ -121,10 +173,22 @@ function Resolve-Python {
             }
         }
     }
-    foreach ($name in @("python3.exe", "python.exe")) {
-        $command = Get-Command $name -ErrorAction SilentlyContinue
-        if ($null -ne $command) {
-            $candidates.Add($command.Source)
+    foreach ($root in @($env:LOCALAPPDATA, $env:ProgramFiles)) {
+        if ([string]::IsNullOrWhiteSpace($root)) {
+            continue
+        }
+        foreach ($relative in @(
+            "Programs\Python\Python314\python.exe",
+            "Programs\Python\Python313\python.exe",
+            "Programs\Python\Python312\python.exe",
+            "Python\pythoncore-3.14-64\python.exe",
+            "Python\pythoncore-3.13-64\python.exe",
+            "Python\pythoncore-3.12-64\python.exe",
+            "Python314\python.exe",
+            "Python313\python.exe",
+            "Python312\python.exe"
+        )) {
+            $candidates.Add((Join-Path $root $relative))
         }
     }
     foreach ($candidate in ($candidates | Select-Object -Unique)) {
@@ -133,6 +197,69 @@ function Resolve-Python {
         }
     }
     Stop-Uninstall "Python 3.12 or newer is required."
+}
+
+function Get-GitCandidates {
+    $candidates = New-Object System.Collections.Generic.List[string]
+    foreach ($entry in @(
+        @([Environment]::GetEnvironmentVariable("ProgramFiles"), "Git\cmd\git.exe"),
+        @([Environment]::GetEnvironmentVariable("ProgramFiles(x86)"), "Git\cmd\git.exe"),
+        @($env:LOCALAPPDATA, "Programs\Git\cmd\git.exe"),
+        @($env:LOCALAPPDATA, "Git\cmd\git.exe")
+    )) {
+        if (-not [string]::IsNullOrWhiteSpace([string]$entry[0])) {
+            $candidates.Add((Join-Path ([string]$entry[0]) ([string]$entry[1])))
+        }
+    }
+    foreach ($registryPath in @(
+        "Registry::HKEY_LOCAL_MACHINE\SOFTWARE\GitForWindows",
+        "Registry::HKEY_LOCAL_MACHINE\SOFTWARE\WOW6432Node\GitForWindows",
+        "Registry::HKEY_CURRENT_USER\SOFTWARE\GitForWindows"
+    )) {
+        try {
+            $installPath = [string](Get-ItemProperty -LiteralPath $registryPath -ErrorAction Stop).InstallPath
+            if (-not [string]::IsNullOrWhiteSpace($installPath)) {
+                $candidates.Add((Join-Path $installPath "cmd\git.exe"))
+            }
+        }
+        catch {
+            # Non-default installs may omit one or more registry views.
+        }
+    }
+    return @($candidates | Select-Object -Unique)
+}
+
+function Resolve-Git {
+    foreach ($candidate in (Get-GitCandidates)) {
+        $verified = Get-VerifiedAuthenticodePath `
+            -Path $candidate `
+            -PublisherPattern "(?i:Johannes Schindelin|Git for Windows)"
+        if ($null -ne $verified) {
+            return $verified
+        }
+    }
+    return $null
+}
+
+function Write-ProcessInventory {
+    param([Parameter(Mandatory = $true)][string]$Path)
+
+    try {
+        $rows = @(
+            Get-CimInstance -ClassName Win32_Process -ErrorAction Stop |
+                Select-Object ProcessId, ParentProcessId, Name, ExecutablePath, CommandLine
+        )
+        $json = ConvertTo-Json -InputObject $rows -Compress -Depth 3
+        [IO.File]::WriteAllText(
+            $Path,
+            [string]$json,
+            (New-Object System.Text.UTF8Encoding($false))
+        )
+        return (Get-FileHash -LiteralPath $Path -Algorithm SHA256).Hash.ToLowerInvariant()
+    }
+    catch {
+        Stop-Uninstall ("Windows process inventory failed: {0}" -f $_.Exception.GetType().Name)
+    }
 }
 
 function Confirm-UserAction {
@@ -378,9 +505,11 @@ if ([System.Environment]::OSVersion.Platform -ne [System.PlatformID]::Win32NT) {
 }
 
 $PythonPath = Resolve-Python
+$GitPath = Resolve-Git
 $temporaryRoot = Join-Path ([IO.Path]::GetTempPath()) ("dp-uninstall-" + [Guid]::NewGuid().ToString("N"))
 New-Item -ItemType Directory -Path $temporaryRoot | Out-Null
 $helperPath = Join-Path $temporaryRoot "dp_windows_uninstall.py"
+$processInventoryPath = Join-Path $temporaryRoot "process-inventory.json"
 
 $helperSource = @'
 from __future__ import annotations
@@ -408,6 +537,13 @@ EXIT_BLOCKED = 3
 EXIT_PROCESS_BLOCKED = 5
 SERVER_NAME = "decision-engine"
 MAX_CONFIG_BYTES = 4 * 1024 * 1024
+GIT_EXE = ""
+PROCESS_INVENTORY_PATH: Path | None = None
+PROCESS_INVENTORY_SHA256 = ""
+GUIDABLE_PROCESS_BLOCKER_PREFIXES = (
+    "live managed DE MCP process must be stopped before uninstall:",
+    "live DE launcher process ownership is unknown:",
+)
 HOOK_MARKERS = (
     "decision-engine-audit-routing-v1",
     "decision-engine-audit-routing-experiment",
@@ -544,23 +680,22 @@ def path_key(path: Path) -> str:
 
 
 def windows_process_rows() -> tuple[dict[str, Any], ...]:
-    command = (
-        "$ErrorActionPreference='Stop'; "
-        "@(Get-CimInstance -ClassName Win32_Process | "
-        "Select-Object ProcessId,ParentProcessId,Name,ExecutablePath,CommandLine) | "
-        "ConvertTo-Json -Compress"
-    )
-    completed = subprocess.run(
-        ["powershell.exe", "-NoProfile", "-NonInteractive", "-Command", command],
-        text=True,
-        stdout=subprocess.PIPE,
-        stderr=subprocess.DEVNULL,
-        timeout=20,
-        check=False,
-    )
-    if completed.returncode != 0:
-        raise RuntimeError("PowerShell process inventory failed")
-    decoded = json.loads(completed.stdout or "[]")
+    if PROCESS_INVENTORY_PATH is None:
+        raise RuntimeError("PowerShell process inventory path is unavailable")
+    before = PROCESS_INVENTORY_PATH.lstat()
+    if is_reparse(PROCESS_INVENTORY_PATH) or not stat.S_ISREG(before.st_mode):
+        raise RuntimeError("PowerShell process inventory is not a regular file")
+    if before.st_size > MAX_CONFIG_BYTES:
+        raise RuntimeError("PowerShell process inventory is too large")
+    payload = PROCESS_INVENTORY_PATH.read_bytes()
+    after = PROCESS_INVENTORY_PATH.lstat()
+    identity_before = (before.st_dev, before.st_ino, before.st_size, before.st_mtime_ns)
+    identity_after = (after.st_dev, after.st_ino, after.st_size, after.st_mtime_ns)
+    if identity_before != identity_after:
+        raise RuntimeError("PowerShell process inventory changed while being read")
+    if hashlib.sha256(payload).hexdigest() != PROCESS_INVENTORY_SHA256:
+        raise RuntimeError("PowerShell process inventory digest mismatch")
+    decoded = json.loads(payload.decode("utf-8"))
     if isinstance(decoded, dict):
         decoded = [decoded]
     if not isinstance(decoded, list) or not all(isinstance(item, dict) for item in decoded):
@@ -579,8 +714,10 @@ def looks_like_de_launcher(command_line: str) -> bool:
 
 
 def git_output(root: Path, *args: str) -> str:
+    if not GIT_EXE:
+        raise ValueError("trusted Git for Windows is unavailable")
     completed = subprocess.run(
-        ["git.exe", "-C", str(root), *args],
+        [GIT_EXE, "-C", str(root), *args],
         text=True,
         stdout=subprocess.PIPE,
         stderr=subprocess.DEVNULL,
@@ -1254,6 +1391,14 @@ class Inventory:
                 self.blockers.append("AQG official uninstaller ownership cannot be proven")
 
 
+def has_only_guidable_process_blockers(blockers: Iterable[str]) -> bool:
+    items = tuple(blockers)
+    return bool(items) and all(
+        any(item.startswith(prefix) for prefix in GUIDABLE_PROCESS_BLOCKER_PREFIXES)
+        for item in items
+    )
+
+
 def print_inventory(inv: Inventory, apply: bool) -> None:
     print("Deep Pattern uninstall plan")
     print("platform=win32 scope=%s mode=%s" % (inv.scope, "APPLY" if apply else "DRY-RUN"))
@@ -1266,7 +1411,9 @@ def print_inventory(inv: Inventory, apply: bool) -> None:
         print(note)
     for blocker in inv.blockers:
         print("BLOCKED %s" % blocker)
-    if inv.blockers:
+    if inv.blockers and apply and has_only_guidable_process_blockers(inv.blockers):
+        print("ACTION REQUIRED: close the listed Agent hosts; guided process cleanup follows.")
+    elif inv.blockers:
         print("STOP: ownership or runtime state is not fully provable; no mutation is allowed.")
     elif not apply:
         print("DRY-RUN only: add -Apply after reviewing this plan.")
@@ -1398,7 +1545,11 @@ def invoke_aqg_uninstaller(inv: Inventory) -> None:
     script = inv.aqg_uninstaller
     environment = os.environ.copy()
     for key in tuple(environment):
-        if key in ("DE_ENDPOINT", "DE_ACTIVATION_SECRET") or key.upper().startswith("PYTHON"):
+        if (
+            key in ("DE_ENDPOINT", "DE_ACTIVATION_SECRET")
+            or key.upper().startswith("PYTHON")
+            or key.upper().startswith("GIT_")
+        ):
             environment.pop(key, None)
     environment["AQG_ROOT"] = str(root)
     environment["HOME"] = str(inv.home)
@@ -1471,6 +1622,7 @@ def invoke_aqg_uninstaller(inv: Inventory) -> None:
         )
         command = [
             sys.executable,
+            "-I",
             "-c",
             bootstrap,
             str(root),
@@ -1554,21 +1706,43 @@ def parse_args(argv: list[str]) -> argparse.Namespace:
     parser.add_argument("--scope", choices=("de", "aqg", "both"), required=True)
     parser.add_argument("--apply", action="store_true")
     parser.add_argument("--home", type=Path, required=True)
+    parser.add_argument("--git", type=Path)
+    parser.add_argument("--process-inventory", type=Path, required=True)
+    parser.add_argument("--process-inventory-sha256", required=True)
     return parser.parse_args(argv)
 
 
 def main(argv: list[str]) -> int:
+    global GIT_EXE, PROCESS_INVENTORY_PATH, PROCESS_INVENTORY_SHA256
     args = parse_args(argv)
     if os.name != "nt" or sys.platform != "win32":
         print("unsupported platform: native Windows is required", file=sys.stderr)
         return EXIT_USAGE
+    try:
+        process_inventory_path = args.process_inventory.resolve(strict=True)
+        git_path = args.git.resolve(strict=True) if args.git is not None else None
+    except OSError as exc:
+        print("verified tool path is unavailable: %s" % exc, file=sys.stderr)
+        return EXIT_USAGE
+    if (
+        not process_inventory_path.is_file()
+        or (git_path is not None and not git_path.is_file())
+    ):
+        print("verified tool path is not a regular file", file=sys.stderr)
+        return EXIT_USAGE
+    if re.fullmatch(r"[0-9a-f]{64}", args.process_inventory_sha256) is None:
+        print("process inventory digest is invalid", file=sys.stderr)
+        return EXIT_USAGE
+    GIT_EXE = str(git_path) if git_path is not None else ""
+    PROCESS_INVENTORY_PATH = process_inventory_path
+    PROCESS_INVENTORY_SHA256 = args.process_inventory_sha256
     inv = Inventory(args.home, args.scope)
     inv.inspect()
     if inv.scope in ("aqg", "both") and inv.aqg_uninstaller is not None:
         inv.actions.insert(0, Action("aqg-uninstall", inv.aqg_uninstaller, "all detected user-scope adapters; project scope is preserved"))
     print_inventory(inv, args.apply)
     if inv.blockers:
-        if all(item.startswith("live managed DE MCP process") for item in inv.blockers):
+        if has_only_guidable_process_blockers(inv.blockers):
             return EXIT_PROCESS_BLOCKED
         return EXIT_BLOCKED
     if not args.apply:
@@ -1593,11 +1767,25 @@ try {
         $helperSource,
         (New-Object System.Text.UTF8Encoding($false))
     )
-    $arguments = @($helperPath, "--scope", $Scope, "--home", $HomePath)
-    if ($Apply) {
-        $arguments += "--apply"
+    function Invoke-UninstallHelper {
+        $inventoryDigest = Write-ProcessInventory -Path $processInventoryPath
+        $arguments = @(
+            "-I", $helperPath,
+            "--scope", $Scope,
+            "--home", $HomePath,
+            "--process-inventory", $processInventoryPath,
+            "--process-inventory-sha256", $inventoryDigest
+        )
+        if (-not [string]::IsNullOrWhiteSpace($GitPath)) {
+            $arguments += @("--git", $GitPath)
+        }
+        if ($Apply) {
+            $arguments += "--apply"
+        }
+        return Invoke-Clean -FilePath $PythonPath -ArgumentList $arguments
     }
-    $code = Invoke-Clean -FilePath $PythonPath -ArgumentList $arguments
+
+    $code = Invoke-UninstallHelper
     if ($code -eq $ExitProcessBlocked) {
         if (-not $Apply) {
             exit 3
@@ -1607,7 +1795,7 @@ try {
             exit 3
         }
         Write-Host "Rechecking the uninstall plan immediately after process cleanup..."
-        $code = Invoke-Clean -FilePath $PythonPath -ArgumentList $arguments
+        $code = Invoke-UninstallHelper
         if ($code -eq $ExitProcessBlocked) {
             [Console]::Error.WriteLine(("{0}: ERROR: a managed process is still active after the immediate recheck" -f $ProgramName))
             exit 3

@@ -61,6 +61,32 @@ function Confirm-UserAction {
     return $answer -match "^(?i:y|yes)$"
 }
 
+function Get-VerifiedAuthenticodePath {
+    param(
+        [Parameter(Mandatory = $true)][string]$Path,
+        [Parameter(Mandatory = $true)][string]$PublisherPattern
+    )
+
+    if ([string]::IsNullOrWhiteSpace($Path) -or
+        -not [IO.Path]::IsPathRooted($Path) -or
+        -not (Test-Path -LiteralPath $Path -PathType Leaf)) {
+        return $null
+    }
+    try {
+        $fullPath = (Get-Item -LiteralPath $Path -Force).FullName
+        $signature = Get-AuthenticodeSignature -LiteralPath $fullPath -ErrorAction Stop
+        if ($signature.Status -ne [System.Management.Automation.SignatureStatus]::Valid -or
+            $null -eq $signature.SignerCertificate -or
+            $signature.SignerCertificate.Subject -notmatch $PublisherPattern) {
+            return $null
+        }
+        return $fullPath
+    }
+    catch {
+        return $null
+    }
+}
+
 function Invoke-WithCleanEnvironment {
     param(
         [Parameter(Mandatory = $true)][string]$FilePath,
@@ -82,6 +108,11 @@ function Invoke-WithCleanEnvironment {
         "AQG_ROOT", "AQG_STATE_ROOT",
         "CLAUDE_DESKTOP_CONFIG", "WORKBUDDY_APP_ROOT", "WORKBUDDY_CONFIG",
         "WORKBUDDY_SKILLS_DIR", "BASH_ENV", "ENV"
+    )
+    $remove += @(
+        [System.Environment]::GetEnvironmentVariables("Process").Keys |
+            ForEach-Object { [string]$_ } |
+            Where-Object { $_ -match "^(?i:GIT_)" }
     )
     $saved = @{}
     foreach ($name in ($remove + @($effectiveEnvironment.Keys) | Select-Object -Unique)) {
@@ -147,15 +178,9 @@ function Invoke-PythonScript {
     $scriptPath = Join-Path (
         [System.IO.Path]::GetTempPath()
     ) ("dp-install-python-" + [Guid]::NewGuid().ToString("N") + ".py")
-    $source = @"
-import sys
-from pathlib import Path
-sys.path.insert(0, str(Path.cwd()))
-$ScriptText
-"@
-    [IO.File]::WriteAllText($scriptPath, $source, $script:Utf8NoBom)
+    [IO.File]::WriteAllText($scriptPath, $ScriptText, $script:Utf8NoBom)
     try {
-        [string[]]$arguments = @($scriptPath) + @($ScriptArguments)
+        [string[]]$arguments = @("-I", $scriptPath) + @($ScriptArguments)
         if (-not [string]::IsNullOrWhiteSpace($WorkingDirectory)) {
             Push-Location -LiteralPath $WorkingDirectory
         }
@@ -177,28 +202,59 @@ $ScriptText
 }
 
 function Resolve-WinGet {
-    $command = Get-Command winget.exe -ErrorAction SilentlyContinue
-    if ($null -eq $command) {
-        return $null
+    $candidates = New-Object System.Collections.Generic.List[string]
+    try {
+        Get-AppxPackage -Name "Microsoft.DesktopAppInstaller" -ErrorAction Stop |
+            Sort-Object -Property Version -Descending |
+            ForEach-Object {
+                if (-not [string]::IsNullOrWhiteSpace([string]$_.InstallLocation)) {
+                    $candidates.Add((Join-Path ([string]$_.InstallLocation) "winget.exe"))
+                }
+            }
     }
-    return (Get-Item -LiteralPath $command.Source).FullName
+    catch {
+        # The App Installer package may be absent on a clean Windows image.
+    }
+    if (-not [string]::IsNullOrWhiteSpace($env:LOCALAPPDATA)) {
+        $candidates.Add((Join-Path $env:LOCALAPPDATA "Microsoft\WindowsApps\winget.exe"))
+    }
+    foreach ($candidate in ($candidates | Select-Object -Unique)) {
+        $verified = Get-VerifiedAuthenticodePath `
+            -Path $candidate `
+            -PublisherPattern "(?i:Microsoft Corporation|Microsoft Windows)"
+        if ($null -ne $verified) {
+            return $verified
+        }
+    }
+    return $null
 }
 
 function Get-GitCandidates {
     $candidates = New-Object System.Collections.Generic.List[string]
-    $command = Get-Command git.exe -ErrorAction SilentlyContinue
-    if ($null -ne $command) {
-        $candidates.Add($command.Source)
-    }
-    foreach ($root in @(
-        [Environment]::GetEnvironmentVariable("ProgramFiles"),
-        [Environment]::GetEnvironmentVariable("ProgramFiles(x86)"),
-        $env:LOCALAPPDATA
+    foreach ($entry in @(
+        @([Environment]::GetEnvironmentVariable("ProgramFiles"), "Git\cmd\git.exe"),
+        @([Environment]::GetEnvironmentVariable("ProgramFiles(x86)"), "Git\cmd\git.exe"),
+        @($env:LOCALAPPDATA, "Programs\Git\cmd\git.exe"),
+        @($env:LOCALAPPDATA, "Git\cmd\git.exe")
     )) {
-        if ([string]::IsNullOrWhiteSpace($root)) {
-            continue
+        if (-not [string]::IsNullOrWhiteSpace([string]$entry[0])) {
+            $candidates.Add((Join-Path ([string]$entry[0]) ([string]$entry[1])))
         }
-        $candidates.Add((Join-Path $root "Git\cmd\git.exe"))
+    }
+    foreach ($registryPath in @(
+        "Registry::HKEY_LOCAL_MACHINE\SOFTWARE\GitForWindows",
+        "Registry::HKEY_LOCAL_MACHINE\SOFTWARE\WOW6432Node\GitForWindows",
+        "Registry::HKEY_CURRENT_USER\SOFTWARE\GitForWindows"
+    )) {
+        try {
+            $installPath = [string](Get-ItemProperty -LiteralPath $registryPath -ErrorAction Stop).InstallPath
+            if (-not [string]::IsNullOrWhiteSpace($installPath)) {
+                $candidates.Add((Join-Path $installPath "cmd\git.exe"))
+            }
+        }
+        catch {
+            # Non-default installs may omit one or more registry views.
+        }
     }
     return @($candidates | Select-Object -Unique)
 }
@@ -208,7 +264,13 @@ function Find-Git {
         if (-not (Test-Path -LiteralPath $candidate -PathType Leaf)) {
             continue
         }
-        $result = Invoke-WithCleanEnvironment -FilePath $candidate -ArgumentList @("--version") -Capture
+        $verified = Get-VerifiedAuthenticodePath `
+            -Path $candidate `
+            -PublisherPattern "(?i:Johannes Schindelin|Git for Windows)"
+        if ($null -eq $verified) {
+            continue
+        }
+        $result = Invoke-WithCleanEnvironment -FilePath $verified -ArgumentList @("--version") -Capture
         $joined = ($result.Output -join "`n")
         if ($result.ExitCode -ne 0 -or $joined -notmatch "git version ([0-9]+)\.([0-9]+)") {
             continue
@@ -216,7 +278,7 @@ function Find-Git {
         $major = [int]$Matches[1]
         $minor = [int]$Matches[2]
         if ($major -gt 2 -or ($major -eq 2 -and $minor -ge 45)) {
-            return (Get-Item -LiteralPath $candidate).FullName
+            return $verified
         }
     }
     return $null
@@ -268,10 +330,6 @@ function Resolve-GitBash {
         (Join-Path $gitRoot "bin\bash.exe"),
         (Join-Path $gitRoot "usr\bin\bash.exe")
     )
-    $pathBash = Get-Command bash.exe -ErrorAction SilentlyContinue
-    if ($null -ne $pathBash) {
-        $candidates += $pathBash.Source
-    }
     foreach ($candidate in ($candidates | Select-Object -Unique)) {
         if (-not (Test-Path -LiteralPath $candidate -PathType Leaf)) {
             continue
@@ -292,20 +350,26 @@ function Test-PythonExecutable {
     if (-not (Test-Path -LiteralPath $Candidate -PathType Leaf)) {
         return $false
     }
-    $version = Invoke-WithCleanEnvironment -FilePath $Candidate -ArgumentList @(
-        "-c", "import sys; raise SystemExit(0 if sys.version_info[:2] >= (3, 12) else 1)"
+    $verified = Get-VerifiedAuthenticodePath `
+        -Path $Candidate `
+        -PublisherPattern "(?i:Python Software Foundation|Microsoft Corporation|Anaconda)"
+    if ($null -eq $verified) {
+        return $false
+    }
+    $version = Invoke-WithCleanEnvironment -FilePath $verified -ArgumentList @(
+        "-I", "-c", "import sys; raise SystemExit(0 if sys.version_info[:2] >= (3, 12) else 1)"
     ) -Capture
     if ($version.ExitCode -ne 0) {
         return $false
     }
-    $modules = Invoke-WithCleanEnvironment -FilePath $Candidate -ArgumentList @(
-        "-c", "import ssl, venv, tkinter"
+    $modules = Invoke-WithCleanEnvironment -FilePath $verified -ArgumentList @(
+        "-I", "-c", "import ssl, venv, tkinter"
     ) -Capture
     if ($modules.ExitCode -ne 0) {
         return $false
     }
-    $pip = Invoke-WithCleanEnvironment -FilePath $Candidate -ArgumentList @(
-        "-m", "pip", "--version"
+    $pip = Invoke-WithCleanEnvironment -FilePath $verified -ArgumentList @(
+        "-I", "-m", "pip", "--version"
     ) -Capture
     return $pip.ExitCode -eq 0
 }
@@ -316,11 +380,26 @@ function Find-Python {
         $candidates.Add($env:DE_PYTHON)
     }
 
-    $py = Get-Command py.exe -ErrorAction SilentlyContinue
-    if ($null -ne $py) {
+    $launchers = New-Object System.Collections.Generic.List[string]
+    foreach ($entry in @(
+        @($env:WINDIR, "py.exe"),
+        @($env:LOCALAPPDATA, "Programs\Python\Launcher\py.exe"),
+        @($env:ProgramFiles, "Python Launcher\py.exe")
+    )) {
+        if (-not [string]::IsNullOrWhiteSpace([string]$entry[0])) {
+            $launchers.Add((Join-Path ([string]$entry[0]) ([string]$entry[1])))
+        }
+    }
+    foreach ($launcher in ($launchers | Select-Object -Unique)) {
+        $py = Get-VerifiedAuthenticodePath `
+            -Path $launcher `
+            -PublisherPattern "(?i:Python Software Foundation|Microsoft Corporation)"
+        if ($null -eq $py) {
+            continue
+        }
         foreach ($selector in @("-3.14", "-3.13", "-3.12", "-3")) {
-            $probe = Invoke-WithCleanEnvironment -FilePath $py.Source -ArgumentList @(
-                $selector, "-c", "import sys; print(sys.executable)"
+            $probe = Invoke-WithCleanEnvironment -FilePath $py -ArgumentList @(
+                $selector, "-I", "-c", "import sys; print(sys.executable)"
             ) -Capture
             if ($probe.ExitCode -eq 0 -and $probe.Output.Count -gt 0) {
                 $resolved = [string]$probe.Output[$probe.Output.Count - 1]
@@ -328,12 +407,6 @@ function Find-Python {
                     $candidates.Add($resolved.Trim())
                 }
             }
-        }
-    }
-    foreach ($name in @("python3.exe", "python.exe")) {
-        $command = Get-Command $name -ErrorAction SilentlyContinue
-        if ($null -ne $command) {
-            $candidates.Add($command.Source)
         }
     }
     foreach ($root in @($env:LOCALAPPDATA, $env:ProgramFiles)) {
@@ -344,6 +417,9 @@ function Find-Python {
             "Programs\Python\Python314\python.exe",
             "Programs\Python\Python313\python.exe",
             "Programs\Python\Python312\python.exe",
+            "Python\pythoncore-3.14-64\python.exe",
+            "Python\pythoncore-3.13-64\python.exe",
+            "Python\pythoncore-3.12-64\python.exe",
             "Python314\python.exe",
             "Python313\python.exe",
             "Python312\python.exe"
@@ -355,7 +431,7 @@ function Find-Python {
     foreach ($candidate in ($candidates | Select-Object -Unique)) {
         if (Test-PythonExecutable -Candidate $candidate) {
             $identity = Invoke-WithCleanEnvironment -FilePath $candidate -ArgumentList @(
-                "-c", "import os, sys; print(os.path.abspath(sys.executable))"
+                "-I", "-c", "import os, sys; print(os.path.abspath(sys.executable))"
             ) -Capture
             if ($identity.ExitCode -eq 0 -and $identity.Output.Count -gt 0) {
                 return ([string]$identity.Output[$identity.Output.Count - 1]).Trim()
@@ -742,9 +818,11 @@ function Test-CompleteManagedRoot {
     $validationScript = @'
 from pathlib import Path
 import sys
+
+root = Path(sys.argv[1]).resolve(strict=True)
+sys.path.insert(0, str(root))
 from installer import managed_install, update_transaction, updater
 
-root = Path(sys.argv[1])
 reader = updater._GitReader(root)
 identity = managed_install.validate_managed_identity(
     root, updater._read_remotes(reader)
@@ -818,6 +896,8 @@ from pathlib import Path
 import sys
 import time
 
+root = Path(sys.argv[1]).resolve(strict=True)
+sys.path.insert(0, str(root))
 from installer import (
     launcher,
     update_coordination,
@@ -827,7 +907,6 @@ from installer import (
 from installer.config import ShellError
 from installer.release_acquisition import load_trusted_release_keys
 
-root = Path(sys.argv[1])
 deadline = time.monotonic() + launcher.STARTUP_UPDATE_BUDGET_SECONDS
 wait_budget = (
     launcher.STARTUP_UPDATE_BUDGET_SECONDS
@@ -961,9 +1040,11 @@ function Test-ManagedLeasePid {
     $script = @'
 from pathlib import Path
 import sys
+
+root = Path(sys.argv[1]).resolve(strict=True)
+sys.path.insert(0, str(root))
 from installer import update_coordination
 
-root = Path(sys.argv[1])
 expected = int(sys.argv[2])
 live = update_coordination.live_shim_sessions(root)
 raise SystemExit(0 if any(item.pid == expected for item in live) else 1)
@@ -1481,11 +1562,14 @@ try {
     $routeScript = @'
 import json
 import sys
+from pathlib import Path
 
+root = Path(sys.argv[1]).resolve(strict=True)
+sys.path.insert(0, str(root))
 from installer import config, install, mcp_config
 from installer.config import ShellError
 
-clients = sys.argv[1:]
+clients = sys.argv[2:]
 if (
     not isinstance(clients, list)
     or not all(isinstance(client, str) and client for client in clients)
@@ -1531,7 +1615,7 @@ raise SystemExit(1 if failed else 0)
     $routeCode = Invoke-PythonScript `
         -PythonPath $script:PythonPath `
         -ScriptText $routeScript `
-        -ScriptArguments ([string[]]$configuredClients.ToArray()) `
+        -ScriptArguments (@($ManagedRoot) + @([string[]]$configuredClients.ToArray())) `
         -WorkingDirectory $ManagedRoot
     if ($routeCode -ne 0) {
         [Console]::Error.WriteLine(("{0}: ERROR: managed skill routing failed" -f $ProgramName))

@@ -32,22 +32,22 @@ class PublicInstallEntryPointTests(unittest.TestCase):
                 ("ipv6:::e", line)
                 for line in (
                     44,
-                    474,
-                    909,
-                    984,
-                    1253,
-                    1418,
-                    1427,
-                    1437,
-                    1445,
-                    1465,
-                    1475,
-                    1537,
-                    1605,
+                    550,
+                    988,
+                    1065,
+                    1334,
+                    1499,
+                    1508,
+                    1518,
+                    1526,
+                    1546,
+                    1556,
+                    1621,
+                    1689,
                 )
             ],
             "dp-uninstall.ps1": [
-                ("ipv6:::e", line) for line in (38, 253, 1606, 1612)
+                ("ipv6:::e", line) for line in (38, 380, 1794, 1800)
             ],
         }
 
