@@ -7,8 +7,10 @@ Safely uninstalls or quarantines Deep Pattern managed state on native Windows.
 The default mode is read-only. Pass -Apply only after reviewing the dry-run
 plan. The uninstaller removes only integrations whose current managed fields
 still match Decision Engine ownership evidence. Foreign or modified entries,
-unexpected reparse points, active host processes, and unknown root layouts stop
-the entire operation before mutation.
+unexpected reparse points, active managed runtime processes, and unknown root
+layouts stop the entire operation before mutation. Apply mode first asks the
+user to quit the owning Agent and can then terminate only a revalidated,
+current-user managed DE MCP launcher process.
 
 Source/worktree checkouts are always preserved. Removed managed roots and
 configuration snapshots are retained under the current user's private
@@ -29,17 +31,19 @@ param(
 Set-StrictMode -Version Latest
 $ErrorActionPreference = "Stop"
 $ProgramName = "dp-uninstall"
+$ExitProcessBlocked = 5
 
 function Stop-Uninstall {
     param([Parameter(Mandatory = $true)][string]$Message)
-    [Console]::Error.WriteLine("{0}: ERROR: {1}" -f $ProgramName, $Message)
+    [Console]::Error.WriteLine(("{0}: ERROR: {1}" -f $ProgramName, $Message))
     exit 2
 }
 
 function Invoke-Clean {
     param(
         [Parameter(Mandatory = $true)][string]$FilePath,
-        [Parameter()][string[]]$ArgumentList = @()
+        [Parameter()][string[]]$ArgumentList = @(),
+        [switch]$Capture
     )
     $names = @("DE_ENDPOINT", "DE_ACTIVATION_SECRET", "PYTHONPATH")
     $saved = @{}
@@ -48,10 +52,31 @@ function Invoke-Clean {
         [Environment]::SetEnvironmentVariable($name, $null, "Process")
     }
     try {
-        & $FilePath @ArgumentList | ForEach-Object {
-            [Console]::Out.WriteLine([string]$_)
+        if ($Capture) {
+            $previousErrorActionPreference = $ErrorActionPreference
+            try {
+                # Native stderr is diagnostic output during prerequisite probing;
+                # the process exit code remains the authoritative result.
+                $ErrorActionPreference = "Continue"
+                $output = @(& $FilePath @ArgumentList 2>&1)
+                $code = $LASTEXITCODE
+            }
+            finally {
+                $ErrorActionPreference = $previousErrorActionPreference
+            }
+            return [pscustomobject]@{ ExitCode = $code; Output = $output }
         }
-        $code = $LASTEXITCODE
+        $previousErrorActionPreference = $ErrorActionPreference
+        try {
+            $ErrorActionPreference = "Continue"
+            & $FilePath @ArgumentList 2>&1 | ForEach-Object {
+                [Console]::Out.WriteLine([string]$_)
+            }
+            $code = $LASTEXITCODE
+        }
+        finally {
+            $ErrorActionPreference = $previousErrorActionPreference
+        }
         return $code
     }
     finally {
@@ -66,8 +91,10 @@ function Test-Python {
     if (-not (Test-Path -LiteralPath $Candidate -PathType Leaf)) {
         return $false
     }
-    $output = @(& $Candidate -c "import sys; raise SystemExit(0 if sys.version_info[:2] >= (3, 12) else 1)" 2>$null)
-    if ($LASTEXITCODE -ne 0) {
+    $probe = Invoke-Clean -FilePath $Candidate -ArgumentList @(
+        "-c", "import sys; raise SystemExit(0 if sys.version_info[:2] >= (3, 12) else 1)"
+    ) -Capture
+    if ($probe.ExitCode -ne 0) {
         return $false
     }
     return $true
@@ -85,8 +112,11 @@ function Resolve-Python {
     $py = Get-Command py.exe -ErrorAction SilentlyContinue
     if ($null -ne $py) {
         foreach ($selector in @("-3.14", "-3.13", "-3.12", "-3")) {
-            $resolved = @(& $py.Source $selector -c "import sys; print(sys.executable)" 2>$null)
-            if ($LASTEXITCODE -eq 0 -and $resolved.Count -gt 0) {
+            $probe = Invoke-Clean -FilePath $py.Source -ArgumentList @(
+                $selector, "-c", "import sys; print(sys.executable)"
+            ) -Capture
+            if ($probe.ExitCode -eq 0 -and $probe.Output.Count -gt 0) {
+                $resolved = $probe.Output
                 $candidates.Add(([string]$resolved[$resolved.Count - 1]).Trim())
             }
         }
@@ -105,6 +135,244 @@ function Resolve-Python {
     Stop-Uninstall "Python 3.12 or newer is required."
 }
 
+function Confirm-UserAction {
+    param([Parameter(Mandatory = $true)][string]$Message)
+
+    try {
+        $answer = Read-Host ("{0} [y/N]" -f $Message)
+    }
+    catch {
+        return $false
+    }
+    return $answer -match "^(?i:y|yes)$"
+}
+
+function Test-ReparsePoint {
+    param([Parameter(Mandatory = $true)][string]$Path)
+
+    if (-not (Test-Path -LiteralPath $Path)) {
+        return $false
+    }
+    $item = Get-Item -LiteralPath $Path -Force
+    return ($item.Attributes -band [IO.FileAttributes]::ReparsePoint) -ne 0
+}
+
+function Invoke-ManagedPython {
+    param(
+        [Parameter(Mandatory = $true)][string[]]$Arguments,
+        [switch]$Capture
+    )
+
+    $managedRoot = Join-Path $HomePath ".deeppattern\decision-engine"
+    if (-not (Test-Path -LiteralPath $managedRoot -PathType Container) -or
+        (Test-ReparsePoint -Path $managedRoot)) {
+        return $null
+    }
+    Push-Location -LiteralPath $managedRoot
+    try {
+        return Invoke-Clean -FilePath $PythonPath -ArgumentList $Arguments -Capture:$Capture
+    }
+    finally {
+        Pop-Location
+    }
+}
+
+function Get-LiveManagedLeasePids {
+    $managedRoot = Join-Path $HomePath ".deeppattern\decision-engine"
+    $script = @'
+from pathlib import Path
+import sys
+from installer import update_coordination
+
+root = Path(sys.argv[1])
+for session in update_coordination.live_shim_sessions(root):
+    if session.pid is not None:
+        print(session.pid)
+'@
+    $probe = Invoke-ManagedPython -Arguments @("-c", $script, $managedRoot) -Capture
+    if ($null -eq $probe -or $probe.ExitCode -ne 0) {
+        return @()
+    }
+    return @(
+        $probe.Output |
+            ForEach-Object { ([string]$_).Trim() } |
+            Where-Object { $_ -match "^[0-9]+$" } |
+            ForEach-Object { [int]$_ } |
+            Select-Object -Unique
+    )
+}
+
+function Test-ManagedLeasePid {
+    param([Parameter(Mandatory = $true)][int]$ProcessId)
+    return (Get-LiveManagedLeasePids) -contains $ProcessId
+}
+
+function Get-ProcessSnapshot {
+    param([Parameter(Mandatory = $true)][int]$ProcessId)
+
+    try {
+        $process = Get-CimInstance -ClassName Win32_Process -Filter ("ProcessId = {0}" -f $ProcessId) -ErrorAction Stop
+        if ($null -eq $process) {
+            return $null
+        }
+        $ownerResult = Invoke-CimMethod -InputObject $process -MethodName GetOwner -ErrorAction Stop
+        if ($ownerResult.ReturnValue -ne 0) {
+            return $null
+        }
+        $owner = if ([string]::IsNullOrWhiteSpace([string]$ownerResult.Domain)) {
+            [string]$ownerResult.User
+        }
+        else {
+            "{0}\{1}" -f $ownerResult.Domain, $ownerResult.User
+        }
+        $started = if ($process.CreationDate -is [datetime]) {
+            $process.CreationDate.ToUniversalTime().ToString("o")
+        }
+        else {
+            [string]$process.CreationDate
+        }
+        return [pscustomobject]@{
+            ProcessId = [int]$process.ProcessId
+            ParentProcessId = [int]$process.ParentProcessId
+            Name = [string]$process.Name
+            ExecutablePath = [string]$process.ExecutablePath
+            CommandLine = [string]$process.CommandLine
+            Owner = $owner
+            Started = $started
+        }
+    }
+    catch {
+        return $null
+    }
+}
+
+function Test-ManagedLauncherSnapshot {
+    param([Parameter(Mandatory = $true)]$Snapshot)
+
+    $currentIdentity = [Security.Principal.WindowsIdentity]::GetCurrent().Name
+    if (-not [string]::Equals($Snapshot.Owner, $currentIdentity, [StringComparison]::OrdinalIgnoreCase)) {
+        return $false
+    }
+    if ([string]::IsNullOrWhiteSpace($Snapshot.ExecutablePath) -or
+        [string]::IsNullOrWhiteSpace($Snapshot.CommandLine)) {
+        return $false
+    }
+    $executableName = [IO.Path]::GetFileName($Snapshot.ExecutablePath)
+    if ($executableName -notmatch "^(?i:python(?:w)?(?:[0-9.]*)?\.exe)$") {
+        return $false
+    }
+    return $Snapshot.CommandLine -match "(?i:installer\.(?:launcher|shim)|mcp_bootstrap\.py)"
+}
+
+function Get-LikelyHostForProcess {
+    param([Parameter(Mandatory = $true)][int]$ProcessId)
+
+    $current = $ProcessId
+    for ($depth = 0; $depth -lt 8 -and $current -gt 0; $depth++) {
+        $snapshot = Get-ProcessSnapshot -ProcessId $current
+        if ($null -eq $snapshot) {
+            break
+        }
+        switch -Regex ($snapshot.Name) {
+            "^(?i:claude\.exe)$" { return "Claude Desktop" }
+            "^(?i:codebuddy.*\.exe)$" { return "CodeBuddy" }
+            "^(?i:codex.*\.exe)$" { return "Codex" }
+            "^(?i:cursor.*\.exe)$" { return "Cursor" }
+            "^(?i:qoder.*\.exe)$" { return "Qoder" }
+            "^(?i:trae.*\.exe)$" { return "TRAE" }
+            "^(?i:workbuddy.*\.exe)$" { return "WorkBuddy" }
+        }
+        $current = $snapshot.ParentProcessId
+    }
+    return "Unknown Agent"
+}
+
+function Test-SameProcessSnapshot {
+    param(
+        [Parameter(Mandatory = $true)]$Expected,
+        [Parameter(Mandatory = $true)]$Actual
+    )
+
+    return (
+        $Expected.ProcessId -eq $Actual.ProcessId -and
+        $Expected.ParentProcessId -eq $Actual.ParentProcessId -and
+        $Expected.Started -eq $Actual.Started -and
+        $Expected.ExecutablePath -eq $Actual.ExecutablePath -and
+        $Expected.CommandLine -eq $Actual.CommandLine -and
+        $Expected.Owner -eq $Actual.Owner
+    )
+}
+
+function Resolve-ActiveManagedSessions {
+    $processIds = @(Get-LiveManagedLeasePids)
+    if ($processIds.Count -eq 0) {
+        Write-Host "Live DE MCP sessions were reported, but their process identities could not be read safely."
+        return $false
+    }
+
+    Write-Host "Active DE/AQG runtime processes were detected."
+    foreach ($processId in $processIds) {
+        $snapshot = Get-ProcessSnapshot -ProcessId $processId
+        $parent = if ($null -eq $snapshot) { "unknown" } else { [string]$snapshot.ParentProcessId }
+        Write-Host ("BLOCKED PROCESS pid={0} ppid={1} host={2} family=mcp-launcher" -f $processId, $parent, (Get-LikelyHostForProcess -ProcessId $processId))
+    }
+    Write-Host "Completely quit the listed Agent hosts; closing only their windows is not sufficient."
+    try {
+        $answer = Read-Host "After quitting them, press Enter to recheck immediately (or type N to cancel)"
+    }
+    catch {
+        return $false
+    }
+    if ($answer -match "^(?i:n|no|q|quit)$") {
+        return $false
+    }
+
+    $remaining = @(Get-LiveManagedLeasePids)
+    if ($remaining.Count -eq 0) {
+        Write-Host "All blocking Agent processes exited normally."
+        return $true
+    }
+
+    $frozen = New-Object System.Collections.Generic.List[object]
+    foreach ($processId in $remaining) {
+        $snapshot = Get-ProcessSnapshot -ProcessId $processId
+        if ($null -ne $snapshot -and
+            (Test-ManagedLauncherSnapshot -Snapshot $snapshot) -and
+            (Test-ManagedLeasePid -ProcessId $processId)) {
+            $frozen.Add($snapshot)
+        }
+    }
+    if ($frozen.Count -ne $remaining.Count) {
+        Write-Host "No remaining process is eligible for managed termination. Fully quit the listed Agent hosts and rerun the uninstaller."
+        return $false
+    }
+
+    $pidList = ($frozen | ForEach-Object { [string]$_.ProcessId }) -join ", "
+    if (-not (Confirm-UserAction -Message ("Terminate the verified managed DE/AQG process(es) pid={0}?" -f $pidList))) {
+        Write-Host "Managed processes were not terminated; uninstall remains blocked."
+        return $false
+    }
+    foreach ($snapshot in $frozen) {
+        $current = Get-ProcessSnapshot -ProcessId $snapshot.ProcessId
+        if ($null -eq $current -or
+            -not (Test-SameProcessSnapshot -Expected $snapshot -Actual $current) -or
+            -not (Test-ManagedLauncherSnapshot -Snapshot $current) -or
+            -not (Test-ManagedLeasePid -ProcessId $snapshot.ProcessId)) {
+            Write-Host ("BLOCKED PROCESS pid={0} termination refused because its identity changed or ownership could not be re-proven." -f $snapshot.ProcessId)
+            return $false
+        }
+        try {
+            Stop-Process -Id $snapshot.ProcessId -Force -ErrorAction Stop
+            Write-Host ("Terminated verified managed process pid={0}." -f $snapshot.ProcessId)
+        }
+        catch {
+            Write-Host ("BLOCKED PROCESS pid={0} termination failed: {1}" -f $snapshot.ProcessId, $_.Exception.GetType().Name)
+            return $false
+        }
+    }
+    return $true
+}
+
 if ([System.Environment]::OSVersion.Platform -ne [System.PlatformID]::Win32NT) {
     Stop-Uninstall "This entrypoint supports native Windows only."
 }
@@ -118,11 +386,11 @@ $helperSource = @'
 from __future__ import annotations
 
 import argparse
-import csv
 import hashlib
 import json
 import os
 import re
+import shlex
 import shutil
 import stat
 import subprocess
@@ -137,6 +405,7 @@ from typing import Any, Iterable
 EXIT_OK = 0
 EXIT_USAGE = 2
 EXIT_BLOCKED = 3
+EXIT_PROCESS_BLOCKED = 5
 SERVER_NAME = "decision-engine"
 MAX_CONFIG_BYTES = 4 * 1024 * 1024
 HOOK_MARKERS = (
@@ -150,15 +419,26 @@ HOOK_SCRIPTS = (
     "workbuddy_audit_prompt_hook.py",
     "trae_cn_audit_prompt_hook.py",
 )
-HOST_PROCESSES = {
-    "claude.exe",
-    "codebuddy.exe",
-    "codex.exe",
-    "cursor.exe",
-    "qoder.exe",
-    "trae.exe",
-    "workbuddy.exe",
-}
+ORPHAN_DE_SKILLS = frozenset(
+    {
+        "audit",
+        "audit-adjudication",
+        "audit-brainstorming",
+        "audit-explore",
+        "audit-forecast",
+        "audit-market-research",
+        "audit-writing-plans",
+        "discussion-board",
+        "graphic-explanation",
+        "layer-check",
+    }
+)
+ORPHAN_LAUNCHER_MARKERS = (
+    "installer.launcher",
+    "installer/shim",
+    "installer\\shim",
+    "mcp_bootstrap.py",
+)
 DE_PRODUCT_REMOTES = {
     "github": "https://github.com/deeppatternai/decision-engine.git",
     "gitee": "https://gitee.com/deeppatternai/decision-engine.git",
@@ -196,8 +476,20 @@ def known_windows_skill_roots(home: Path) -> tuple[Path, ...]:
     )
 
 
+def _strip_windows_device_prefix(value: str) -> str:
+    """Make Win32 device-form paths comparable to ordinary drive paths."""
+    if os.name != "nt":
+        return value
+    if value.startswith("\\\\?\\UNC\\"):
+        return "\\\\" + value[8:]
+    if value.startswith("\\\\?\\") or value.startswith("\\??\\"):
+        return value[4:]
+    return value
+
+
 def lex(path: Path) -> Path:
-    return Path(os.path.abspath(os.path.expanduser(str(path))))
+    value = _strip_windows_device_prefix(os.path.expanduser(str(path)))
+    return Path(os.path.abspath(value))
 
 
 def lexists(path: Path) -> bool:
@@ -251,6 +543,41 @@ def path_key(path: Path) -> str:
     return os.path.normcase(os.path.normpath(os.path.abspath(str(path))))
 
 
+def windows_process_rows() -> tuple[dict[str, Any], ...]:
+    command = (
+        "$ErrorActionPreference='Stop'; "
+        "@(Get-CimInstance -ClassName Win32_Process | "
+        "Select-Object ProcessId,ParentProcessId,Name,ExecutablePath,CommandLine) | "
+        "ConvertTo-Json -Compress"
+    )
+    completed = subprocess.run(
+        ["powershell.exe", "-NoProfile", "-NonInteractive", "-Command", command],
+        text=True,
+        stdout=subprocess.PIPE,
+        stderr=subprocess.DEVNULL,
+        timeout=20,
+        check=False,
+    )
+    if completed.returncode != 0:
+        raise RuntimeError("PowerShell process inventory failed")
+    decoded = json.loads(completed.stdout or "[]")
+    if isinstance(decoded, dict):
+        decoded = [decoded]
+    if not isinstance(decoded, list) or not all(isinstance(item, dict) for item in decoded):
+        raise RuntimeError("PowerShell process inventory has an unexpected shape")
+    return tuple(decoded)
+
+
+def looks_like_de_launcher(command_line: str) -> bool:
+    normalized = command_line.lower().replace("\\", "/")
+    return (
+        "-m installer.launcher" in normalized
+        or "-m installer.shim" in normalized
+        or "installer/mcp_bootstrap.py" in normalized
+        or (" -c " in normalized and " --managed-root " in normalized)
+    )
+
+
 def git_output(root: Path, *args: str) -> str:
     completed = subprocess.run(
         ["git.exe", "-C", str(root), *args],
@@ -292,6 +619,20 @@ def aqg_checkout_has_product_remote(root: Path) -> bool:
         return False
 
 
+def aqg_managed_target_name_matches(root: Path, head: str) -> bool:
+    if re.fullmatch(r"[0-9a-f]{40}", root.name):
+        return root.name == head
+    if re.fullmatch(
+        r"v?[0-9]+(?:\.[0-9]+){2}(?:[-+][0-9A-Za-z.-]+)?", root.name
+    ) is None:
+        return False
+    try:
+        version = (root / "VERSION").read_text(encoding="utf-8").strip()
+    except (OSError, UnicodeError):
+        return False
+    return version == root.name and re.fullmatch(r"[0-9a-f]{40}", head) is not None
+
+
 def json_object_without_duplicates(pairs: list[tuple[str, Any]]) -> dict[str, Any]:
     value: dict[str, Any] = {}
     for key, item in pairs:
@@ -314,6 +655,83 @@ def read_json(path: Path) -> dict[str, Any]:
     if not isinstance(data, dict):
         raise ValueError("configuration root is not an object")
     return data
+
+
+def _orphan_path_present(value: str, managed_root: Path) -> bool:
+    normalized = value.replace("\\", "/").lower()
+    root = str(lex(managed_root)).replace("\\", "/").lower().rstrip("/")
+    if not root or root not in normalized:
+        return False
+    suffix = normalized.split(root, 1)[1]
+    return not suffix or suffix[0] in "/\\\"' :;,)]}"
+
+
+def _orphan_entry_strings(entry: dict[str, Any]) -> tuple[str, ...]:
+    values: list[str] = []
+    command = entry.get("command")
+    if isinstance(command, str):
+        values.append(command)
+    args = entry.get("args")
+    if isinstance(args, list) and all(isinstance(item, str) for item in args):
+        values.extend(args)
+    cwd = entry.get("cwd")
+    if isinstance(cwd, str):
+        values.append(cwd)
+    env = entry.get("env")
+    if isinstance(env, dict):
+        for value in env.values():
+            if isinstance(value, str):
+                values.append(value)
+    return tuple(values)
+
+
+def orphan_mcp_entry_is_owned(entry: Any, managed_root: Path) -> bool:
+    """Prove a server entry belongs to a removed DE root without using its name alone."""
+    if not isinstance(entry, dict) or not isinstance(entry.get("command"), str):
+        return False
+    values = _orphan_entry_strings(entry)
+    if not any(_orphan_path_present(value, managed_root) for value in values):
+        return False
+    launch_text = " ".join(values).lower().replace("\\", "/")
+    return any(marker.replace("\\", "/") in launch_text for marker in ORPHAN_LAUNCHER_MARKERS)
+
+
+def orphan_json_entry(path: Path, managed_root: Path) -> bool:
+    data = read_json(path)
+    servers = data.get("mcpServers")
+    return isinstance(servers, dict) and orphan_mcp_entry_is_owned(
+        servers.get(SERVER_NAME), managed_root
+    )
+
+
+def orphan_toml_entry(path: Path, managed_root: Path) -> bool:
+    try:
+        import tomllib
+    except ImportError:
+        return False
+    text = path.read_text(encoding="utf-8")
+    data = tomllib.loads(text)
+    servers = data.get("mcp_servers") if isinstance(data, dict) else None
+    return isinstance(servers, dict) and orphan_mcp_entry_is_owned(
+        servers.get(SERVER_NAME), managed_root
+    )
+
+
+def orphan_entry_state(path: Path, managed_root: Path) -> bool | None:
+    """Return owned/unowned for a real DE MCP entry, or None when absent."""
+    if path.suffix.lower() == ".toml":
+        try:
+            import tomllib
+        except ImportError:
+            raise ValueError("TOML parser is unavailable")
+        data = tomllib.loads(path.read_text(encoding="utf-8"))
+        servers = data.get("mcp_servers") if isinstance(data, dict) else None
+    else:
+        data = read_json(path)
+        servers = data.get("mcpServers")
+    if not isinstance(servers, dict) or SERVER_NAME not in servers:
+        return None
+    return orphan_mcp_entry_is_owned(servers[SERVER_NAME], managed_root)
 
 
 def atomic_write(path: Path, text: str) -> None:
@@ -422,6 +840,7 @@ class Inventory:
     source_root: Path = field(init=False)
     aqg_target: Path | None = None
     aqg_uninstaller: Path | None = None
+    de_root_proven: bool = False
 
     def __post_init__(self) -> None:
         self.home = lex(self.home)
@@ -437,34 +856,83 @@ class Inventory:
         self.actions.append(Action(kind, lex(path), detail, **kw))
 
     def inspect_processes(self) -> None:
-        roots = []
-        if self.scope in ("de", "both"):
-            roots.append(self.de_root)
-        if self.scope in ("aqg", "both"):
-            roots.append(self.aqg_root)
-        if not any(lexists(root) for root in roots):
+        if self.scope not in ("de", "both"):
+            return
+        if not self.de_root_proven:
+            try:
+                rows = windows_process_rows()
+            except Exception as exc:
+                self.blockers.append(
+                    "running DE MCP sessions could not be inspected: %s"
+                    % type(exc).__name__
+                )
+                return
+            root_markers = tuple(
+                str(root).lower().replace("\\", "/")
+                for root in (self.de_root, self.aqg_root)
+            )
+            for row in rows:
+                raw_pid = row.get("ProcessId")
+                command_line = row.get("CommandLine")
+                if not isinstance(raw_pid, int) or not isinstance(command_line, str):
+                    continue
+                if not looks_like_de_launcher(command_line):
+                    continue
+                normalized = command_line.lower().replace("\\", "/")
+                if any(marker in normalized for marker in root_markers):
+                    self.blockers.append(
+                        "live managed DE MCP process must be stopped before uninstall: pid=%s"
+                        % raw_pid
+                    )
+                else:
+                    self.blockers.append(
+                        "live DE launcher process ownership is unknown: pid=%s" % raw_pid
+                    )
             return
         try:
-            result = subprocess.run(
-                ["tasklist.exe", "/fo", "csv", "/nh"],
-                text=True,
-                stdout=subprocess.PIPE,
-                stderr=subprocess.DEVNULL,
-                timeout=15,
-                check=False,
+            sys.path.insert(0, str(self.de_root))
+            from installer import update_coordination
+
+            sessions = update_coordination.live_shim_sessions(self.de_root)
+            rows = windows_process_rows()
+        except Exception as exc:
+            self.blockers.append(
+                "running managed MCP sessions could not be inspected: %s"
+                % type(exc).__name__
             )
-        except (OSError, subprocess.SubprocessError):
-            self.blockers.append("running host processes could not be inspected")
             return
-        if result.returncode != 0:
-            self.blockers.append("running host processes could not be inspected")
-            return
-        for row in csv.reader(result.stdout.splitlines()):
-            if len(row) < 2:
+        live_pids = {session.pid for session in sessions if session.pid is not None}
+        reported_pids: set[int] = set()
+        root_markers = tuple(
+            str(root).lower().replace("\\", "/")
+            for root in (self.de_root, self.aqg_root)
+        )
+        for row in rows:
+            raw_pid = row.get("ProcessId")
+            command_line = row.get("CommandLine")
+            if not isinstance(raw_pid, int) or not isinstance(command_line, str):
                 continue
-            image = row[0].strip().lower()
-            if image in HOST_PROCESSES:
-                self.blockers.append("live host process must be stopped before uninstall: %s pid=%s" % (row[0], row[1]))
+            if not looks_like_de_launcher(command_line):
+                continue
+            normalized = command_line.lower().replace("\\", "/")
+            if raw_pid in live_pids or any(marker in normalized for marker in root_markers):
+                self.blockers.append(
+                    "live managed DE MCP process must be stopped before uninstall: pid=%s"
+                    % raw_pid
+                )
+            else:
+                self.blockers.append(
+                    "live DE launcher process ownership is unknown: pid=%s" % raw_pid
+                )
+            reported_pids.add(raw_pid)
+        for session in sessions:
+            if session.pid is None:
+                self.blockers.append("live managed DE MCP session has no provable process id")
+            elif session.pid not in reported_pids:
+                self.blockers.append(
+                    "live managed DE MCP process must be stopped before uninstall: pid=%s"
+                    % session.pid
+                )
 
     def inspect_root(self, root: Path, component: str) -> None:
         if not lexists(root):
@@ -498,8 +966,7 @@ class Inventory:
             if (
                 not aqg_checkout_has_product_remote(target)
                 or not checkout_is_clean(target)
-                or not re.fullmatch(r"[0-9a-f]{40}", target.name)
-                or target_head != target.name
+                or not aqg_managed_target_name_matches(target, target_head)
             ):
                 self.blockers.append("AQG managed target source identity is unknown: %s" % target)
                 return
@@ -533,6 +1000,8 @@ class Inventory:
             return
         if component == "aqg":
             self.aqg_uninstaller = root / "scripts" / "install_aqg_clients.py"
+        else:
+            self.de_root_proven = True
         self.add("quarantine-root", root, component)
 
     def import_de(self):
@@ -547,6 +1016,9 @@ class Inventory:
             return None
 
     def inspect_de_integrations(self) -> None:
+        if not self.de_root_proven:
+            self.inspect_unprovable_residue()
+            return
         modules = self.import_de()
         if modules is None:
             self.inspect_unprovable_residue()
@@ -714,15 +1186,26 @@ class Inventory:
             if not path.is_file() or is_reparse(path):
                 continue
             try:
-                if SERVER_NAME in path.read_text(encoding="utf-8"):
+                owned = orphan_entry_state(path, self.de_root)
+                if owned is None:
+                    continue
+                if owned:
+                    self.add(
+                        "edit-toml" if path.suffix.lower() == ".toml" else "edit-json",
+                        path,
+                        "remove orphaned owned Decision Engine MCP entry and hook",
+                        expected_sha256=sha256_file(path),
+                    )
+                    found = True
+                else:
                     self.blockers.append(
                         "Decision Engine root is unavailable, so host entry ownership cannot be proven: %s" % path
                     )
                     found = True
-            except (OSError, UnicodeError):
+            except (OSError, UnicodeError, ValueError, TypeError, RecursionError):
                 self.blockers.append("host configuration cannot be inspected safely: %s" % path)
                 found = True
-        expected_parent = path_key(self.de_root / "skills")
+        expected_skills = self.de_root / "skills"
         for skills_root in known_windows_skill_roots(self.home):
             if not skills_root.is_dir() or is_reparse(skills_root):
                 continue
@@ -744,7 +1227,11 @@ class Inventory:
                     self.blockers.append("skill reparse target cannot be read: %s" % route)
                     found = True
                     continue
-                if path_key(target.parent) == expected_parent:
+                expected = lex(expected_skills / route.name)
+                if path_key(target) == path_key(expected) and route.name in ORPHAN_DE_SKILLS:
+                    self.add("remove-skill-route", route, "orphaned owned DE skill junction")
+                    found = True
+                elif path_key(target.parent) == path_key(expected_skills):
                     self.blockers.append(
                         "Decision Engine root is unavailable, so orphaned skill ownership requires recovery: %s" % route
                     )
@@ -753,11 +1240,14 @@ class Inventory:
             self.notes.append("PRESERVE no provable DE integration residue without a managed root")
 
     def inspect(self) -> None:
-        self.inspect_processes()
-        self.notes.append("PRESERVE protected source/worktree %s" % self.source_root)
+        if lexists(self.source_root):
+            self.notes.append("PRESERVE protected source/worktree %s" % self.source_root)
+        else:
+            self.notes.append("PRESERVE absent protected source/worktree %s" % self.source_root)
         if self.scope in ("de", "both"):
             self.inspect_root(self.de_root, "de")
             self.inspect_de_integrations()
+            self.inspect_processes()
         if self.scope in ("aqg", "both"):
             self.inspect_root(self.aqg_root, "aqg")
             if lexists(self.aqg_root) and self.aqg_uninstaller is None:
@@ -841,6 +1331,15 @@ def apply_config(action: Action, managed_root: Path, backup: Path, manifest: Man
         raise RuntimeError("configuration changed before apply: %s" % path)
     if sha256_file(path) != action.expected_sha256:
         raise RuntimeError("configuration changed after review: %s" % path)
+    orphan_recovery = action.detail.startswith("remove orphaned owned")
+    if orphan_recovery:
+        owned = (
+            orphan_json_entry(path, managed_root)
+            if action.kind == "edit-json"
+            else orphan_toml_entry(path, managed_root)
+        )
+        if not owned:
+            raise RuntimeError("orphaned configuration ownership could not be re-proven: %s" % path)
     copy_config_backup(path, backup, manifest, index)
     if action.kind == "edit-json":
         data = read_json(path)
@@ -896,20 +1395,97 @@ def invoke_aqg_uninstaller(inv: Inventory) -> None:
     if inv.aqg_uninstaller is None:
         return
     root = inv.aqg_target or inv.aqg_root
-    command = [
-        sys.executable,
-        str(inv.aqg_uninstaller),
-        "--installed-supported",
-        "--uninstall",
-        "--aqg-root",
-        str(root),
-        "--home",
-        str(inv.home),
-    ]
+    script = inv.aqg_uninstaller
     environment = os.environ.copy()
-    for key in ("DE_ENDPOINT", "DE_ACTIVATION_SECRET", "PYTHONPATH"):
-        environment.pop(key, None)
-    completed = subprocess.run(command, env=environment, check=False)
+    for key in tuple(environment):
+        if key in ("DE_ENDPOINT", "DE_ACTIVATION_SECRET") or key.upper().startswith("PYTHON"):
+            environment.pop(key, None)
+    environment["AQG_ROOT"] = str(root)
+    environment["HOME"] = str(inv.home)
+    environment.pop("PROJECT_ROOT", None)
+    # AQG's registry intentionally expresses cross-platform adapter commands as
+    # ``python3 ...`` shell snippets.  On Windows that name can resolve to a
+    # different launcher/interpreter than this already-verified process, and a
+    # Windows PATH prefix is not a reliable Git Bash command override. Import
+    # the verified official wrapper, then prefix each of its registry-owned Bash
+    # commands with a local python3() function that invokes the runpy relay.
+    shim_root = Path(tempfile.mkdtemp(prefix="dp-aqg-python-"))
+    try:
+        executable = Path(sys.executable)
+        drive, tail = os.path.splitdrive(str(executable))
+        if not re.fullmatch(r"[A-Za-z]:", drive):
+            raise RuntimeError("verified Python does not have a local Windows drive path")
+        msys_executable = "/%s%s" % (
+            drive[0].lower(), tail.replace("\\", "/")
+        )
+        relay = shim_root / "run_aqg_child.py"
+        relay.write_text(
+            "from pathlib import Path\n"
+            "import os, runpy, sys\n"
+            # Windows Agent hosts commonly emit UTF-8 JSON with a BOM. AQG's
+            # adapters request plain utf-8 and json.loads rejects the decoded
+            # U+FEFF. Keep the compatibility shim child-local and JSON-only;
+            # it changes no file and preserves every byte after the BOM.
+            "original_read_text = Path.read_text\n"
+            + "def read_text_compatible(path, encoding=None, errors=None):\n"
+            + "    text = original_read_text(path, encoding=encoding, errors=errors)\n"
+            + "    if encoding == 'utf-8' and path.suffix.lower() == '.json':\n"
+            + "        return text.removeprefix('\\ufeff')\n"
+            + "    return text\n"
+            + "Path.read_text = read_text_compatible\n"
+            + "root = Path(%r)\n" % str(root)
+            + "arguments = sys.argv[1:]\n"
+            + "if arguments and arguments[0].lower().endswith('.py'):\n"
+            + "    script = Path(arguments[0])\n"
+            + "    sys.path[:0] = [str(root), str(script.parent)]\n"
+            + "    sys.argv = [str(script), *arguments[1:]]\n"
+            + "    runpy.run_path(str(script), run_name='__main__')\n"
+            + "else:\n"
+            + "    os.execv(sys.executable, [sys.executable, *arguments])\n",
+            encoding="utf-8",
+            newline="\n",
+        )
+        relay_drive, relay_tail = os.path.splitdrive(str(relay))
+        if not re.fullmatch(r"[A-Za-z]:", relay_drive):
+            raise RuntimeError("AQG Python relay does not have a local Windows drive path")
+        msys_relay = "/%s%s" % (
+            relay_drive[0].lower(), relay_tail.replace("\\", "/")
+        )
+        shell_prefix = "python3() { %s %s \"$@\"; }; " % (
+            shlex.quote(msys_executable),
+            shlex.quote(msys_relay),
+        )
+        bootstrap = (
+            "from pathlib import Path\n"
+            "import sys\n"
+            "root = Path(sys.argv[1])\n"
+            "script = Path(sys.argv[2])\n"
+            "prefix = sys.argv[3]\n"
+            "sys.path[:0] = [str(root), str(script.parent)]\n"
+            "from scripts import install_aqg_clients as wrapper\n"
+            "if Path(wrapper.__file__).resolve() != script.resolve():\n"
+            "    raise RuntimeError('AQG wrapper identity mismatch')\n"
+            "original = wrapper._run_command\n"
+            "wrapper._run_command = lambda command, env: original(prefix + command, env)\n"
+            "raise SystemExit(wrapper.main(sys.argv[4:]))\n"
+        )
+        command = [
+            sys.executable,
+            "-c",
+            bootstrap,
+            str(root),
+            str(script),
+            shell_prefix,
+            "--installed-supported",
+            "--uninstall",
+            "--aqg-root",
+            str(root),
+            "--home",
+            str(inv.home),
+        ]
+        completed = subprocess.run(command, cwd=str(root), env=environment, check=False)
+    finally:
+        shutil.rmtree(shim_root, ignore_errors=True)
     if completed.returncode != 0:
         raise RuntimeError("AQG official user-scope uninstaller failed: exit %d" % completed.returncode)
 
@@ -992,6 +1568,8 @@ def main(argv: list[str]) -> int:
         inv.actions.insert(0, Action("aqg-uninstall", inv.aqg_uninstaller, "all detected user-scope adapters; project scope is preserved"))
     print_inventory(inv, args.apply)
     if inv.blockers:
+        if all(item.startswith("live managed DE MCP process") for item in inv.blockers):
+            return EXIT_PROCESS_BLOCKED
         return EXIT_BLOCKED
     if not args.apply:
         return EXIT_OK
@@ -1020,6 +1598,21 @@ try {
         $arguments += "--apply"
     }
     $code = Invoke-Clean -FilePath $PythonPath -ArgumentList $arguments
+    if ($code -eq $ExitProcessBlocked) {
+        if (-not $Apply) {
+            exit 3
+        }
+        if (-not (Resolve-ActiveManagedSessions)) {
+            [Console]::Error.WriteLine(("{0}: ERROR: uninstall remains blocked by active managed processes" -f $ProgramName))
+            exit 3
+        }
+        Write-Host "Rechecking the uninstall plan immediately after process cleanup..."
+        $code = Invoke-Clean -FilePath $PythonPath -ArgumentList $arguments
+        if ($code -eq $ExitProcessBlocked) {
+            [Console]::Error.WriteLine(("{0}: ERROR: a managed process is still active after the immediate recheck" -f $ProgramName))
+            exit 3
+        }
+    }
     exit $code
 }
 finally {

@@ -817,7 +817,8 @@ fi
 if ! source_detected_clients="$(
   cd "$source_root"
   de_exec "$PYTHON_BIN" -c \
-    'from installer import mcp_config; print("\n".join(mcp_config.detect_clients()))'
+    'from installer import mcp_config; print("\n".join(mcp_config.detect_clients()))' \
+    | tr -d '\r'
 )"; then
   fail "could not inspect the current Decision Engine host adapter catalog"
 fi
@@ -1120,7 +1121,8 @@ if ! aqg_detected_clients="$(
     'from scripts import install_aqg_clients
 
 for client in install_aqg_clients.installed_supported_clients():
-    print(client)'
+    print(client)' \
+    | tr -d '\r'
 )"; then
   fail "could not inspect the current AQG host adapter catalog"
 fi
@@ -1297,7 +1299,8 @@ fi
 
 detect_managed_clients() {
   run_managed_python -c \
-    'from installer import mcp_config; print("\n".join(mcp_config.detect_clients()))'
+    'from installer import mcp_config; print("\n".join(mcp_config.detect_clients()))' \
+    | tr -d '\r'
 }
 
 normalize_managed_clients_for_variant() {

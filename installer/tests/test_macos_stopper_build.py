@@ -49,6 +49,67 @@ def _last_commit_epoch(path: Path) -> int:
 
 
 class SwiftSourceCompiles(unittest.TestCase):
+    @unittest.skipUnless(sys.platform == "darwin",
+                         "Native model-row regression requires macOS")
+    def test_native_model_rows_show_elapsed_and_freeze_terminal_durations(self):
+        source = SOURCE.read_text(encoding="utf-8").split("let app = NSApplication.shared", 1)[0]
+        harness = r'''
+extension DecisionEngineStopper {
+    func verifyModelRows() {
+        let failed: [String: Any] = ["model_id": "model-a", "status": "failed",
+            "started_at": 940.0, "completed_at": 1000.0]
+        var run: [String: Any] = ["run_id": "test-run", "auditors": [failed]]
+        precondition(debugAuditorRows(run).isEmpty, "Unauthorized rows leaked")
+        run["debug_authorized"] = false
+        precondition(debugAuditorRows(run).isEmpty)
+        run["debug_authorized"] = true
+        precondition(debugAuditorRows(run) == ["model-a · failed · 1m0s ×"])
+        let completed: [String: Any] = ["model_id": "model-b", "status": "completed",
+            "duration_ms": 12000]
+        run["auditors"] = [failed, completed]
+        precondition(debugAuditorRows(run) == ["model-a · failed · 1m0s ×",
+            "model-b · completed · 12s ✓"])
+        for status in ["completed", "failed"] {
+            let runID = "legacy-\(status)"
+            let cacheKey = "\(runID):0:legacy"
+            let before = Date().timeIntervalSince1970
+            let started = before - 60.0
+            var legacy: [String: Any] = ["model_id": "legacy", "status": status,
+                "started_at": started]
+            let first = auditorElapsed(legacy, runID: runID, index: 0)
+            let after = Date().timeIntervalSince1970
+            let frozen = finishedElapsedByAuditor[cacheKey]!
+            precondition(frozen >= before - started && frozen <= after - started)
+            precondition(first == formatElapsed(frozen))
+            // A fixed cached duration distinguishes reuse from recomputing wall time.
+            finishedElapsedByAuditor[cacheKey] = 7.0
+            precondition(auditorElapsed(legacy, runID: runID, index: 0) == "7s")
+            legacy["status"] = "running"
+            _ = auditorElapsed(legacy, runID: runID, index: 0)
+            precondition(finishedElapsedByAuditor[cacheKey] == nil)
+        }
+        let pending: [String: Any] = ["model_id": "model-c", "status": "pending"]
+        run["auditors"] = [pending]
+        precondition(debugAuditorRows(run) == ["model-c · pending · 0s"])
+        print("Native model rows OK")
+    }
+}
+let app = NSApplication.shared
+app.setActivationPolicy(.accessory)
+DecisionEngineStopper().verifyModelRows()
+'''
+        with tempfile.TemporaryDirectory() as directory:
+            test_source = Path(directory) / "main.swift"
+            binary = Path(directory) / "model-row-test"
+            test_source.write_text(source + harness, encoding="utf-8")
+            built = subprocess.run(["xcrun", "swiftc", str(test_source), "-o", str(binary)],
+                                   capture_output=True, text=True, encoding="utf-8", timeout=120)
+            self.assertEqual(built.returncode, 0, built.stderr)
+            result = subprocess.run([str(binary)], capture_output=True, text=True,
+                                    encoding="utf-8", timeout=30)
+            self.assertEqual(result.returncode, 0, result.stderr)
+            self.assertIn("Native model rows OK", result.stdout)
+
     @unittest.skipUnless(sys.platform == "darwin" and shutil.which("swiftc"),
                          "AppKit scrolling regression requires macOS + swiftc")
     def test_many_tasks_scroll_refresh_and_shrink_in_appkit(self):

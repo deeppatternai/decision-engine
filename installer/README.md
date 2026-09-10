@@ -1,7 +1,7 @@
 # Decision Engine — client shell (staging draft)
 
 > **Status:** private-staging draft inside the server repo. This directory is
-> the candidate content for the future public, source-available
+> the candidate content for the future public, MIT-licensed
 > `decision-engine` shell repo. It is lifted into a clean-room public repo at
 > release step P7 — never by copying git history (release design §11 P7 / §14).
 

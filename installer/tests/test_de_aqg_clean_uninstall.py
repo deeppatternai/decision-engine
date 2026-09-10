@@ -24,14 +24,40 @@ class PublicInstallEntryPointTests(unittest.TestCase):
         for name in ("de-aqg-install", "de-aqg-clean-uninstall"):
             self.assertFalse((repo_root / name).exists(), name)
 
-    def test_install_entrypoint_has_only_reviewed_disclosure_finding(self):
+    def test_public_entrypoints_have_only_reviewed_disclosure_findings(self):
         repo_root = Path(__file__).resolve().parents[2]
-        findings = leak_scan.scan_paths([repo_root / "dp-install.sh"])
+        expected = {
+            "dp-install.sh": [("ipv6:::dec", 1031)],
+            "dp-install.ps1": [
+                ("ipv6:::e", line)
+                for line in (
+                    44,
+                    474,
+                    909,
+                    984,
+                    1253,
+                    1418,
+                    1427,
+                    1437,
+                    1445,
+                    1465,
+                    1475,
+                    1537,
+                    1605,
+                )
+            ],
+            "dp-uninstall.ps1": [
+                ("ipv6:::e", line) for line in (38, 253, 1606, 1612)
+            ],
+        }
 
-        self.assertEqual(
-            [(finding.kind, finding.line) for finding in findings],
-            [("ipv6:::dec", 1030)],
-        )
+        for name, reviewed_findings in expected.items():
+            with self.subTest(name=name):
+                findings = leak_scan.scan_paths([repo_root / name])
+                self.assertEqual(
+                    [(finding.kind, finding.line) for finding in findings],
+                    reviewed_findings,
+                )
 
 
 class CleanUninstallQoderHookTests(unittest.TestCase):

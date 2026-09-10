@@ -341,7 +341,14 @@ class SwiftDebugAuditorDisplayTests(unittest.TestCase):
         self.assertIn("run[\"debug_authorized\"] as? Bool) == true", _SOURCE)
         self.assertIn("let debugRows = debugAuditorRows(run).count", _SOURCE)
         self.assertIn("for rowText in debugAuditorRows(run)", _SOURCE)
-        self.assertIn("return auditors.map { auditorDisplayText($0) }", _SOURCE)
+        rows_body = _SOURCE.split("private func debugAuditorRows", 1)[1].split(
+            "\n    private func ", 1
+        )[0]
+        self.assertIn('run["debug_authorized"]', rows_body)
+        self.assertIn("auditors.enumerated().map", rows_body)
+        self.assertLess(rows_body.index('run["debug_authorized"]'),
+                        rows_body.index("auditors.enumerated().map"))
+        self.assertIn("auditorDisplayText(auditor, runID: runID, index: index)", rows_body)
 
 if __name__ == "__main__":
     unittest.main()

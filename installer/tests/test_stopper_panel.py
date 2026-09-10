@@ -200,6 +200,7 @@ class RenderReconciliationTests(unittest.TestCase):
             }
         }
         app._frozen = {}
+        app._auditor_frozen = {}
         app._retired = set()
         app._cancel_inflight = set()
         app._server_verified = {"registry-real"}
@@ -549,7 +550,7 @@ class RenderReconciliationTests(unittest.TestCase):
             [label.cget("text") for label in widgets["auditor_labels"]],
             [
                 "gpt-5.6-sol %s Completed %s 12s %s" % (dot, dot, check),
-                "gemini-3.1-pro-high %s Failed" % dot,
+                "gemini-3.1-pro-high %s Failed %s 0s %s" % (dot, dot, chr(0xD7)),
                 "claude-opus-5 %s Auditing %s 1m 0s" % (dot, dot),
             ],
         )
@@ -2268,6 +2269,7 @@ class DebugAuditorDisplayTests(unittest.TestCase):
             {"status": "running", "model_id": "gpt-5.6-sol", "started_at": 940.0},
             {"status": "completed", "model_alias": "gemini-3.1-pro-high", "duration_ms": 12000},
             {"status": "failed", "model": "claude-opus-5"},
+            {"status": "pending", "model": "deepseek-v4-pro", "started_at": 940.0},
         ]
         english = {"run_id": "a", "profile": "standard", "ui_locale": "en-US",
                    "status": "running", "started_at": 905.0,
@@ -2279,7 +2281,8 @@ class DebugAuditorDisplayTests(unittest.TestCase):
             [
                 "gpt-5.6-sol %s Auditing %s 1m 0s" % (dot, dot),
                 "gemini-3.1-pro-high %s Completed %s 12s %s" % (dot, dot, check),
-                "claude-opus-5 %s Failed" % dot,
+                "claude-opus-5 %s Failed %s 0s %s" % (dot, dot, chr(0xD7)),
+                "deepseek-v4-pro %s Pending %s 1m 0s" % (dot, dot),
             ],
         )
         self.assertEqual(
@@ -2287,8 +2290,83 @@ class DebugAuditorDisplayTests(unittest.TestCase):
             [
                 "gpt-5.6-sol %s \u5ba1\u6838\u4e2d %s 1m 0s" % (dot, dot),
                 "gemini-3.1-pro-high %s \u5df2\u5b8c\u6210 %s 12s %s" % (dot, dot, check),
-                "claude-opus-5 %s \u5931\u8d25" % dot,
+                "claude-opus-5 %s \u5931\u8d25 %s 0s %s" % (dot, dot, chr(0xD7)),
+                "deepseek-v4-pro %s \u5f85\u5904\u7406 %s 1m 0s" % (dot, dot),
             ],
+        )
+
+    def test_failed_auditor_shows_elapsed_and_terminal_icon(self):
+        dot = chr(0xB7)
+        cross = chr(0xD7)
+        run = {
+            "run_id": "a",
+            "profile": "standard",
+            "ui_locale": "zh-CN",
+            "status": "running",
+            "debug_authorized": True,
+            "auditors": [
+                {
+                    "status": "failed",
+                    "model_id": "claude-opus-5",
+                    "started_at": 940.0,
+                    "completed_at": 1_000.0,
+                },
+            ],
+        }
+
+        self.assertEqual(
+            panel._debug_auditor_lines(run, 1_100.0),
+            ["claude-opus-5 %s \u5931\u8d25 %s 1m 0s %s" % (dot, dot, cross)],
+        )
+
+    def test_completed_auditor_without_duration_stops_ticking(self):
+        dot = chr(0xB7)
+        check = chr(0x2713)
+        run = {
+            "run_id": "a",
+            "profile": "standard",
+            "ui_locale": "en-US",
+            "status": "running",
+            "debug_authorized": True,
+            "auditors": [
+                {
+                    "status": "completed",
+                    "model_id": "gemini-3.1-pro-high",
+                    "started_at": 940.0,
+                },
+            ],
+        }
+        frozen = {}
+
+        self.assertEqual(
+            panel._debug_auditor_lines(run, 1_000.0, frozen),
+            ["gemini-3.1-pro-high %s Completed %s 1m 0s %s" % (dot, dot, check)],
+        )
+        self.assertEqual(
+            panel._debug_auditor_lines(run, 1_100.0, frozen),
+            ["gemini-3.1-pro-high %s Completed %s 1m 0s %s" % (dot, dot, check)],
+        )
+
+    def test_completed_auditor_uses_its_completion_timestamp(self):
+        run = {
+            "run_id": "a",
+            "profile": "standard",
+            "ui_locale": "en-US",
+            "status": "running",
+            "debug_authorized": True,
+            "auditors": [
+                {
+                    "status": "completed",
+                    "model_id": "gemini-3.1-pro-high",
+                    "started_at": 940.0,
+                    "completed_at": 1_000.0,
+                },
+            ],
+        }
+
+        self.assertIn(
+            "1m 0s",
+            panel._debug_auditor_lines(run, 1_100.0)[0],
         )
 
     def test_debug_authorized_fails_closed_for_unauthorized_or_malformed_auditors(self):

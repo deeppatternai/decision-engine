@@ -426,5 +426,4 @@ python3 -m unittest \
 
 ## 许可
 
-在 [PolyForm Shield License 1.0.0](LICENSE.md) 下源码可见 —— 可用于任何目的，但不得用于
-构建一个与之竞争的产品。与 AQG 同一许可。
+本项目采用 [MIT License](LICENSE.md) 开源。

@@ -1,7 +1,7 @@
 """Decision Engine public shell (private staging draft).
 
 This package is the *public shell* candidate for the future
-``deeppatternai/decision-engine`` source-available repo. It contains only:
+``deeppatternai/decision-engine`` MIT-licensed repo. It contains only:
 
 - ``install``  — the unified ``install de|aqg|all`` installer
 - ``shim``     — an MCP-over-HTTP forwarding shim (transport only, no IP)

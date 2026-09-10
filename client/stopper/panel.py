@@ -270,11 +270,15 @@ def _collapsed_depth_line_text(run: Dict[str, Any], now: float, frozen: Dict[str
     return strings["hub"].get(status, strings["hub"]["reviewing"]) % (depth, elapsed)
 
 
-def _debug_auditor_lines(run: Dict[str, Any], now: float) -> List[str]:
-    return [detail["text"] for detail in _debug_auditor_details(run, now)]
+def _debug_auditor_lines(
+    run: Dict[str, Any], now: float, frozen: Optional[Dict[str, float]] = None,
+) -> List[str]:
+    return [detail["text"] for detail in _debug_auditor_details(run, now, frozen)]
 
 
-def _debug_auditor_details(run: Dict[str, Any], now: float) -> List[Dict[str, str]]:
+def _debug_auditor_details(
+    run: Dict[str, Any], now: float, frozen: Optional[Dict[str, float]] = None,
+) -> List[Dict[str, str]]:
     if run.get("debug_authorized") is not True:
         return []
     auditors = run.get("auditors")
@@ -284,10 +288,10 @@ def _debug_auditor_details(run: Dict[str, Any], now: float) -> List[Dict[str, st
         return []
     return [
         {
-            "text": _auditor_display_text(run, auditor, now),
+            "text": _auditor_display_text(run, auditor, now, frozen, index),
             "color": _auditor_status_color(str(auditor.get("status") or "pending").lower()),
         }
-        for auditor in auditors
+        for index, auditor in enumerate(auditors)
     ]
 
 
@@ -762,6 +766,7 @@ class StopPanelApp:
         self._tk = tk
         self.runs: Dict[str, Dict[str, Any]] = {}
         self._frozen: Dict[str, float] = {}
+        self._auditor_frozen: Dict[str, float] = {}
         self._polling: set = set()
         self._cancel_inflight: set = set()
         # Disk state is only a discovery seed. A queued row is cancellable only after this process
@@ -1240,7 +1245,7 @@ class StopPanelApp:
     def _update_auditor_details(
         self, widgets: Dict[str, Any], render_run: Dict[str, Any], now: float,
     ) -> None:
-        details = _debug_auditor_details(render_run, now)
+        details = _debug_auditor_details(render_run, now, self._auditor_frozen)
         frame = widgets["auditor_details"]
         labels = widgets["auditor_labels"]
         while len(labels) > len(details):
@@ -1337,30 +1342,62 @@ def _auditor_model_label(auditor: Dict[str, Any]) -> str:
     )
 
 
-def _auditor_elapsed(auditor: Dict[str, Any], now: float) -> str:
+def _auditor_elapsed(
+    run: Dict[str, Any],
+    auditor: Dict[str, Any],
+    now: float,
+    frozen: Dict[str, float],
+    index: int,
+) -> str:
+    status = str(auditor.get("status") or "pending").lower()
+    started_at = _num(auditor.get("started_at"))
+    cache_key = "%s:%d:%s" % (
+        str(run.get("run_id") or id(run)),
+        index,
+        _auditor_model_label(auditor),
+    )
     duration_ms = _num(auditor.get("duration_ms"))
     if duration_ms > 0:
-        return elapsed_string(duration_ms / 1000.0)
-    started_at = _num(auditor.get("started_at"))
+        elapsed = duration_ms / 1000.0
+        if status in TERMINAL_STATUSES:
+            frozen[cache_key] = elapsed
+        return elapsed_string(elapsed)
+    if status in TERMINAL_STATUSES:
+        completed_at = _num(auditor.get("completed_at"))
+        if started_at > 0 and completed_at > started_at:
+            elapsed = completed_at - started_at
+            frozen[cache_key] = elapsed
+            return elapsed_string(elapsed)
+        if cache_key in frozen:
+            return elapsed_string(frozen[cache_key])
+        elapsed = max(0.0, now - started_at) if started_at > 0 else 0.0
+        frozen[cache_key] = elapsed
+        return elapsed_string(elapsed)
+    if status in ("running", "queued", "pending", "cancelling"):
+        frozen.pop(cache_key, None)
     if started_at > 0:
         return elapsed_string(max(0.0, now - started_at))
     return "0s"
 
 
-def _auditor_display_text(run: Dict[str, Any], auditor: Dict[str, Any], now: float) -> str:
+def _auditor_display_text(
+    run: Dict[str, Any],
+    auditor: Dict[str, Any],
+    now: float,
+    frozen: Optional[Dict[str, float]] = None,
+    index: int = 0,
+) -> str:
+    frozen = frozen if frozen is not None else {}
     model = _auditor_model_label(auditor)
     status = str(auditor.get("status") or "pending").lower()
     label = _panel(run)["auditor_status"].get(status, status)
     dot = chr(0xB7)
+    elapsed = _auditor_elapsed(run, auditor, now, frozen, index)
     if status == "completed":
-        elapsed = _auditor_elapsed(auditor, now)
         return "%s %s %s %s %s %s" % (model, dot, label, dot, elapsed, chr(0x2713))
     if status == "failed":
-        return "%s %s %s" % (model, dot, label)
-    if status == "running":
-        elapsed = _auditor_elapsed(auditor, now)
-        return "%s %s %s %s %s" % (model, dot, label, dot, elapsed)
-    return "%s %s %s" % (model, dot, label)
+        return "%s %s %s %s %s %s" % (model, dot, label, dot, elapsed, chr(0xD7))
+    return "%s %s %s %s %s" % (model, dot, label, dot, elapsed)
 
 
 if __name__ == "__main__":

@@ -106,6 +106,7 @@ final class DecisionEngineStopper: NSObject, NSApplicationDelegate {
     private var hiddenByUser = false
     private var noAuditItemsSince: TimeInterval?
     private var finishedElapsedByRun: [String: TimeInterval] = [:]   // freeze elapsed once a run is terminal
+    private var finishedElapsedByAuditor: [String: TimeInterval] = [:] // freeze completed model rows
     private var panelWindow: NSPanel?
     private var rowsStack: NSStackView?
     private var rowsScrollView: NSScrollView?
@@ -1334,18 +1335,19 @@ final class DecisionEngineStopper: NSObject, NSApplicationDelegate {
         return label
     }
 
-    private func auditorDisplayText(_ auditor: [String: Any]) -> String {
+    private func auditorDisplayText(
+        _ auditor: [String: Any], runID: String, index: Int
+    ) -> String {
         let model = structuredModelLabel(auditor)
-        let status = auditor["status"] as? String ?? "pending"
+        let status = (auditor["status"] as? String ?? "pending").lowercased()
+        let elapsed = auditorElapsed(auditor, runID: runID, index: index)
         switch status {
         case "completed":
-            return "\(model) · \(auditorElapsed(auditor)) ✓"
+            return "\(model) · completed · \(elapsed) ✓"
         case "failed":
-            return "\(model) · failed"
-        case "running":
-            return "\(model) · \(auditorElapsed(auditor))"
+            return "\(model) · failed · \(elapsed) ×"
         default:
-            return "\(model) · pending"
+            return "\(model) · \(status) · \(elapsed)"
         }
     }
 
@@ -1356,14 +1358,43 @@ final class DecisionEngineStopper: NSObject, NSApplicationDelegate {
         return model ?? nonEmptyString(auditor["provider"]) ?? "auditor"
     }
 
-    private func auditorElapsed(_ auditor: [String: Any]) -> String {
+    private func auditorElapsed(
+        _ auditor: [String: Any], runID: String, index: Int
+    ) -> String {
+        let status = (auditor["status"] as? String ?? "pending").lowercased()
+        let startedAt = numeric(auditor["started_at"])
+        let cacheKey = "\(runID):\(index):\(structuredModelLabel(auditor))"
         if let durationMS = auditor["duration_ms"] as? Double, durationMS > 0 {
+            if terminalStatuses.contains(status) {
+                finishedElapsedByAuditor[cacheKey] = durationMS / 1000.0
+            }
             return formatElapsed(durationMS / 1000.0)
         }
         if let durationMS = auditor["duration_ms"] as? Int, durationMS > 0 {
+            if terminalStatuses.contains(status) {
+                finishedElapsedByAuditor[cacheKey] = Double(durationMS) / 1000.0
+            }
             return formatElapsed(Double(durationMS) / 1000.0)
         }
-        if let startedAt = auditor["started_at"] as? Double, startedAt > 0 {
+        if terminalStatuses.contains(status) {
+            let completedAt = numeric(auditor["completed_at"])
+            if startedAt > 0, completedAt > startedAt {
+                finishedElapsedByAuditor[cacheKey] = completedAt - startedAt
+                return formatElapsed(completedAt - startedAt)
+            }
+            if let frozen = finishedElapsedByAuditor[cacheKey] {
+                return formatElapsed(frozen)
+            }
+            let elapsed = startedAt > 0
+                ? max(0, Date().timeIntervalSince1970 - startedAt)
+                : 0
+            finishedElapsedByAuditor[cacheKey] = elapsed
+            return formatElapsed(elapsed)
+        }
+        if status == "running" || status == "queued" || status == "pending" || status == "cancelling" {
+            finishedElapsedByAuditor.removeValue(forKey: cacheKey)
+        }
+        if startedAt > 0 {
             return formatElapsed(max(0, Date().timeIntervalSince1970 - startedAt))
         }
         return "0s"
@@ -1373,7 +1404,10 @@ final class DecisionEngineStopper: NSObject, NSApplicationDelegate {
         guard (run["debug_authorized"] as? Bool) == true else { return [] }
         let auditors = (run["auditors"] as? [[String: Any]]) ?? []
         if auditors.isEmpty { return [] }
-        return auditors.map { auditorDisplayText($0) }
+        let runID = (run["run_id"] as? String) ?? ""
+        return auditors.enumerated().map { index, auditor in
+            auditorDisplayText(auditor, runID: runID, index: index)
+        }
     }
 
     private func auditorColor(_ auditor: [String: Any]) -> NSColor {
