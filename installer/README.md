@@ -38,7 +38,6 @@ installer/
   config.py                      # small stdlib filesystem/config helpers
   config.example.json            # device config template (no real values)
   leak_scan.py                   # red-line scanner (release design §14)
-  LEAK_SCAN.md                   # leak-scan method + latest result
   tests/                         # stdlib unittest suite
 ```
 
@@ -315,14 +314,17 @@ run refuse, not that module's own logic.
 ## Verify the shell is clean
 
 The shell must never carry server addresses, secrets, device tokens, prompts,
-layouts, orchestration, or GUI/ad source (release design §14). Prove it:
+layouts, orchestration, or GUI/ad source (release design §14). Run its mechanical
+backstop:
 
 ```bash
 python3 -m installer.leak_scan          # scans this dir; exit 0 = clean
 python3 -m unittest installer.tests.test_leak_scan
 ```
 
-See [LEAK_SCAN.md](LEAK_SCAN.md) for what the scanner covers and its limits.
+These checks cover known-shape secrets, IP literals, configured internal
+identifiers, and scanner regressions. They complement rather than replace the
+public allowlist and manual review of the client/service boundary.
 
 ## Run the tests
 

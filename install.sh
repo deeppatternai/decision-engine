@@ -19,8 +19,7 @@
 # window collects owner-issued values without putting them in argv, shell
 # history, or persistent environment. The client bundle it installs (thin
 # routing skills + transport shim) carries no product intelligence; the engine
-# — prompts, orchestration, rendering — lives only on the hosted server (see
-# installer/LEAK_SCAN.md).
+# — prompts, orchestration, rendering — lives only on the hosted server.
 #
 # Usage:
 #   ./install.sh                 # or: ./install.sh de (DE, with AQG alongside)

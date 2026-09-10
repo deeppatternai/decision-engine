@@ -162,7 +162,7 @@ class ScanTextTestCase(unittest.TestCase):
         # Accepted limitation, pinned so it stays known: 2001:db8::/32 leaves 96
         # free bits, into which a *deliberate* exfiltrator could hand-encode an
         # address. Out of this gate's threat model (accidental leak / careless
-        # copy-paste); recorded in LEAK_SCAN.md under "What it does NOT catch".
+        # copy-paste); pinned here so the accepted boundary remains explicit.
         self.assertEqual(leak_scan.scan_text("e = %s\n" % _v6("2001", "db8", "", "128d", "ddef")), [])
 
     def test_unparseable_dotted_quad_stays_suspicious(self):
@@ -345,19 +345,18 @@ class SeparatorInsensitiveIdentifierTestCase(unittest.TestCase):
         self.assertIn("internal-identifier:crimson_widget_works",
                       self._kinds("xcrimson_widget_works\n", idents=("crimson_widget_works",)))
 
-    def test_zero_width_separators_are_a_documented_residual_miss(self):
+    def test_zero_width_separators_are_an_accepted_residual_miss(self):
         # NOT a bug to fix here: this gate catches ACCIDENTAL disclosure of our
         # own names, not adversarial evasion of our own scanner. Pinned so the
-        # gap is a recorded decision rather than an unnoticed hole. Documented
-        # under "Residual risk" in LEAK_SCAN.md.
+        # gap is a recorded decision rather than an unnoticed hole.
         # Written as escapes on purpose: a literal U+200B in source is invisible
         # to a reader and to grep.
         self.assertEqual(self._kinds("crimson\u200bwidget\u200bworks\n"), [])
         self.assertEqual(self._kinds("crimson%20widget%20works\n"), [])
 
-    def test_line_wrapped_name_is_a_documented_residual_miss(self):
+    def test_line_wrapped_name_is_an_accepted_residual_miss(self):
         # scan_text is line-scoped; a prose wrap between two words of the slug
-        # splits it. Also recorded under "Residual risk".
+        # splits it. This accepted boundary is pinned by the assertion below.
         self.assertEqual(self._kinds("the crimson widget\nworks pipeline\n"), [])
 
     def test_env_injected_denylist(self):
@@ -391,8 +390,9 @@ class SeparatorInsensitiveIdentifierTestCase(unittest.TestCase):
 class ShellSurfaceCleanTestCase(unittest.TestCase):
     def test_shippable_shell_surface_is_clean(self):
         # `scan_paths` has no exclusion mechanism, so this covers the scanner,
-        # its doc, and this very file. If it passes, the release gate's exit
-        # code carries no baseline noise and a non-zero result means a finding.
+        # co-located sources, and this very file. If it passes, the release
+        # gate's exit code carries no baseline noise and a non-zero result means
+        # a finding.
         root = Path(leak_scan.__file__).resolve().parent
         findings = leak_scan.scan_paths([root])
         self.assertEqual(
@@ -491,11 +491,10 @@ class WidenedFileCoverageTestCase(unittest.TestCase):
         findings = self._scan_tmp({"credentials": "password = %s\n" % key})
         self.assertTrue(any(f.kind.startswith("secret:openai-key") for f in findings))
 
-    def test_oversized_unknown_type_is_a_documented_residual_miss(self):
+    def test_oversized_unknown_type_is_an_accepted_residual_miss(self):
         # Pinned, not a bug to fix here: the text-sniff arm is size-bounded, so
         # a >256 KiB file with NO recognised suffix/name is left unopened even
-        # if it is plain text with a secret. Recorded as an accepted residual in
-        # LEAK_SCAN.md's "Exit 0 means" paragraph. A recognised suffix/name has
+        # if it is plain text with a secret. A recognised suffix/name has
         # no cap (see the .yaml/.env tests above), so this is the narrow corner.
         key = "sk-" + "x" * 40
         big = "harmless padding line\n" * 20000  # ~440 KB, over the 256 KiB cap

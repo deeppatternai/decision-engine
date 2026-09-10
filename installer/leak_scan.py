@@ -100,7 +100,7 @@ _PATH_SEPARATOR = re.compile(r"(?<=\w)[./](?=\w)")
 _SEPARATOR_RUN = re.compile(r"[-_\s]+")
 
 # Other punctuation is deliberately NOT a separator: "beta; gamma" stays two
-# things. See LEAK_SCAN.md "Residual risk" for the spellings left uncovered.
+# things. Regression tests pin the accepted residual spellings left uncovered.
 
 # 4. Case-splitting cannot resolve an acronym boundary — it reads ``OAuthProxy``
 #    as ``O Auth Proxy`` and ``IPv6Gateway`` as ``I Pv6 Gateway``, neither of
@@ -413,11 +413,12 @@ def _looks_like_small_text(path: Path) -> bool:
     binary" signal. Final UTF-8 validation is left to ``scan_paths``' existing
     ``read_text`` guard, which already drops undecodable bytes.
 
-    Two deliberate bounds, BOTH accepted residuals recorded in LEAK_SCAN.md: an
-    unknown-suffix file larger than the cap, or one that raises ``OSError``, is
-    not opened. A *recognised* suffix / name skips this arm entirely and is
-    scanned at any size, so the cap only bounds the open-ended text-sniff
-    fallback — not the config/code formats a leak actually tends to land in.
+    Two deliberate bounds, BOTH pinned by regression tests as accepted
+    residuals: an unknown-suffix file larger than the cap, or one that raises
+    ``OSError``, is not opened. A *recognised* suffix / name skips this arm
+    entirely and is scanned at any size, so the cap only bounds the open-ended
+    text-sniff fallback — not the config/code formats a leak actually tends to
+    land in.
     """
     try:
         if path.stat().st_size > _TEXT_SNIFF_MAX_BYTES:

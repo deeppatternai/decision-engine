@@ -163,8 +163,7 @@ has no user-interface code.
 
 Distributed source does not include a user's real service address or secrets.
 Those values and the issued device credentials are runtime configuration, distinct
-from the credentials the server uses to call model providers. See
-[`installer/LEAK_SCAN.md`](installer/LEAK_SCAN.md) for source leak-scan documentation.
+from the credentials the server uses to call model providers.
 
 ## What you can do with it
 
