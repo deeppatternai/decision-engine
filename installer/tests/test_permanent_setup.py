@@ -1901,16 +1901,22 @@ class PermanentSetupTestCase(unittest.TestCase):
                 self.assertEqual(exit_code, 0)
                 self.assertIn(notice, stdout.getvalue())
 
-    def test_gui_success_dialog_renders_host_notice(self):
+    def test_gui_success_dialog_omits_host_notice_and_keeps_base_copy(self):
         notice = "host-specific manual follow-up"
-        result = permanent_setup.PermanentSetupResult(
-            permanent=True,
-            post_mcp_write_notices=(notice,),
-        )
-
-        _title, message = permanent_setup._localized_setup_success_dialog(result)
-
-        self.assertIn(notice, message)
+        strings = permanent_setup._setup_strings()
+        for already_activated, message_key in (
+            (False, "setup_succeeded"),
+            (True, "already_activated_success"),
+        ):
+            with self.subTest(already_activated=already_activated):
+                result = permanent_setup.PermanentSetupResult(
+                    permanent=True, already_activated=already_activated,
+                    post_mcp_write_notices=(notice,)
+                )
+                title, message = permanent_setup._localized_setup_success_dialog(result)
+                self.assertEqual(title, strings["setup_success_title"])
+                self.assertEqual(message, strings[message_key])
+                self.assertNotIn(notice, message)
 
     def test_run_propagates_host_notice_after_first_or_repeated_activation(self):
         notice = "host-specific manual follow-up"
@@ -2858,7 +2864,9 @@ class PermanentSetupTestCase(unittest.TestCase):
     def test_main_success_gui_uses_zh_cn_result_copy(self):
         cases = (
             (
-                permanent_setup.PermanentSetupResult(permanent=True),
+                permanent_setup.PermanentSetupResult(
+                    permanent=True, post_mcp_write_notices=("host-specific manual follow-up",)
+                ),
                 "永久配置成功。激活密钥未被保留。"
                 "请完全重启 Agent；后续重启无需重复输入。",
             ),
