@@ -23,15 +23,14 @@ from typing import Any, Dict
 
 from client import windows_security
 
-# Real bodies install side-by-side under here (release design §9):
+# Real bodies install side-by-side under here:
 #   ~/.deeppattern/decision-engine/   ~/.deeppattern/agent-quality-gates/
 # Only the first is this module's business — component_root() is for bodies THIS installer lays
 # down. AQG is cloned and installed by its own repo's scripts/install.sh (install.sh drives it),
 # and is named for that repo; ~/.deeppattern/aqg/ is a path nothing creates.
 DEFAULT_DEEPPATTERN_HOME = Path.home() / ".deeppattern"
 
-# Skills are routed (symlinked) into each supported agent's skills dir
-# (release design §9, implemented here in stdlib Python).
+# Skills are routed (symlinked) into each supported agent's skills dir.
 DEFAULT_CLAUDE_SKILLS_DIR = Path.home() / ".claude" / "skills"
 DEFAULT_CODEX_SKILLS_DIR = Path.home() / ".codex" / "skills"
 ACTIVATION_RECOVERY_RELATIVE_PATH = Path(".runtime") / "activation-recovery-required.json"
@@ -92,8 +91,7 @@ def managed_component_root(component: str) -> Path:
 def de_config_path() -> Path:
     """Per-device Decision Engine config (API key/binding/endpoint).
 
-    Release design §9: token stored in
-    ``~/.deeppattern/decision-engine/config.json``.
+    The token is stored in ``~/.deeppattern/decision-engine/config.json``.
     """
     override = os.getenv("DE_CONFIG_PATH")
     if override:
@@ -107,12 +105,12 @@ def device_name_default() -> str:
 
 
 def device_fingerprint() -> str:
-    """Stable-ish device fingerprint (release design §9, honest soft binding).
+    """Stable-ish device fingerprint with honest soft binding.
 
     Software-level only: copying the config file or resetting a VM defeats it.
-    That residual is accepted upstream (§9) and bounded by max-devices + revoke
-    + per-account daily caps. This value is a plain hash of non-secret host
-    attributes — it is not a credential.
+    That residual is bounded by max-devices + revoke + per-account daily caps.
+    This value is a plain hash of non-secret host attributes — it is not a
+    credential.
     """
     raw = "|".join(
         [

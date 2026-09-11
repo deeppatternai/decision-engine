@@ -1,11 +1,7 @@
-# Decision Engine — client shell (staging draft)
+# Decision Engine — client shell
 
-> **Status:** private-staging draft inside the server repo. This directory is
-> the candidate content for the future public, MIT-licensed
-> `decision-engine` shell repo. It is lifted into a clean-room public repo at
-> release step P7 — never by copying git history (release design §11 P7 / §14).
-
-This is a **thin shell**. It contains an installer, a transport-only MCP shim,
+This directory contains the public, MIT-licensed Decision Engine **thin shell**.
+It contains an installer, a transport-only MCP shim,
 and these docs — and **no** product intelligence. Every hosted audit / market-research
 / forecast / plan / image the Decision Engine produces is computed on the
 hosted server; the shell only authenticates your device and forwards requests.
@@ -37,7 +33,7 @@ installer/
   shim.py                        # MCP-over-HTTP forwarding shim (transport only)
   config.py                      # small stdlib filesystem/config helpers
   config.example.json            # device config template (no real values)
-  leak_scan.py                   # red-line scanner (release design §14)
+  leak_scan.py                   # public client-boundary scanner
   tests/                         # stdlib unittest suite
 ```
 
@@ -314,7 +310,7 @@ run refuse, not that module's own logic.
 ## Verify the shell is clean
 
 The shell must never carry server addresses, secrets, device tokens, prompts,
-layouts, orchestration, or GUI/ad source (release design §14). Run its mechanical
+layouts, orchestration, or GUI/ad source. Run its mechanical
 backstop:
 
 ```bash
@@ -345,13 +341,13 @@ signature verification against a local fixture, no network) test in the suite �
 everything else mocks the Git/crypto boundary.
 
 (The api-key→activate→audit-tool-visible end-to-end smoke against a real server
-lives in the server repo at `tests/test_de_client_smoke.py`; it imports the
-server and so stays out of this shell, which must never depend on it.)
+is maintained with the hosted service tests. It imports the server and so stays
+out of this shell, which must never depend on it.)
 
 ## Honest limits
 
 Device binding is software-level (no hardware root of trust); copying the
 config or resetting a VM can defeat it. That residual is accepted upstream and
-bounded by max-devices + revoke + per-account daily caps (release design §9).
+bounded by max-devices + revoke + per-account daily caps.
 This shell does not attempt cryptographic binding or anti-tamper — those are
-post-internal-test concerns tied to the ad subsystem.
+not part of the current client security model.

@@ -76,7 +76,7 @@ browser (you never hold the HTML anyway — the shim does).
      an effect spine with category bones / a scatter axis-cross with scale ticks / point events
      on tracks under a time ruler, each with its axis / band / lane / set / category labels; see
      the per-family field table below).
-   - **Out of scope for the internal test**: `embed`, `liveUrl`. The server **fails
+   - **Out of scope for the current release**: `embed`, `liveUrl`. The server **fails
      cleanly** on these (a `400` with a stable error code) — surface that the stage is
      unsupported and stop; do **NOT** fall back.
 2. **Assemble the board `spec`** from the current decision — this is **user content

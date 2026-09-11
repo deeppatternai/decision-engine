@@ -1,4 +1,4 @@
-"""Red-line leak scanner for the Decision Engine public shell (release design §14).
+"""Red-line leak scanner for the Decision Engine public shell.
 
 Machine-checkable half of the "prove the shell is clean" gate. It walks the
 shippable shell surface and flags anything that looks like:

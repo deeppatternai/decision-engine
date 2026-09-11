@@ -2,7 +2,7 @@
 
 Exchanges the owner-issued **API key** (staged by the installer as
 ``api_key`` in the per-device ``config.json``) for a per-device access token
-via ``POST /v1/devices/activate`` (release design §9), then writes the returned
+via ``POST /v1/devices/activate``, then writes the returned
 ``access_token`` + ``device_id`` back into that same ``config.json`` so the shim
 can authenticate.
 

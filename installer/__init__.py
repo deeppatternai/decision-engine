@@ -1,7 +1,7 @@
-"""Decision Engine public shell (private staging draft).
+"""Decision Engine public client shell.
 
-This package is the *public shell* candidate for the future
-``deeppatternai/decision-engine`` MIT-licensed repo. It contains only:
+This package is the open-source client layer of the MIT-licensed
+``deeppatternai/decision-engine`` repository. It contains only:
 
 - ``install``  — the unified ``install de|aqg|all`` installer
 - ``shim``     — an MCP-over-HTTP forwarding shim (transport only, no IP)
@@ -10,11 +10,7 @@ This package is the *public shell* candidate for the future
 By design it carries **no** orchestration, prompts, voice roster, layout
 definitions, market-research / forecast pipeline, ad logic, GUI source, server
 IP, secrets, or device tokens. See ``tests/test_leak_scan.py`` for the enforced
-red-line (release design §14).
-
-Staging note: this lives in the private server repo (repo B) as a draft and is
-intended to be lifted into a clean-room public repo at P7 (never by copying git
-history — release design §11 P7, §14).
+public client boundary.
 """
 
 from __future__ import annotations

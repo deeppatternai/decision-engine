@@ -1,6 +1,6 @@
 # Decision Engine
 
-**English** · [简体中文](README.zh-CN.md) · **v0.2.85**
+**English** · [简体中文](README.zh-CN.md) · **v0.2.86**
 
 > **A second opinion you can actually trust — because it comes from many
 > independent minds, not one model agreeing with itself.**
@@ -53,8 +53,9 @@ Decision Engine runs standalone, and it's also the hosted engine that
 the local, no-account engineering-discipline toolkit. Install either one and bring
 the other along in the same step.
 
-> **Status:** internal test. Decision Engine needs an owner-issued endpoint +
-> activation secret to activate a device. AQG is local and needs no account.
+> **Status:** public source preview. Access to the hosted Decision Engine service
+> remains invite-only and requires an owner-issued endpoint + activation secret.
+> AQG is local and needs no account.
 
 ## Not just reviewed — *seen*, and *shaped*
 

@@ -1,6 +1,6 @@
 # Decision Engine
 
-[English](README.md) · **简体中文** · **v0.2.85**
+[English](README.md) · **简体中文** · **v0.2.86**
 
 > **一个你真正敢信的第二意见 —— 因为它来自许多个彼此独立的头脑，而不是一个模型在自我认同。**
 
@@ -42,8 +42,8 @@ Decision Engine 可独立运行，同时它也是**补全
 [Agent Quality Gates（AQG）](https://github.com/deeppatternai/agent-quality-gates)** 的托管引擎 ——
 AQG 是本地、无需账户的工程纪律工具包。安装其中任一个，都可以在同一步把另一个一并带上。
 
-> **状态：** 内测。Decision Engine 需要 owner 发放的 endpoint + 设备激活密钥才能激活设备。
-> AQG 是本地的，无需账户。
+> **状态：** 源码公开预览。托管的 Decision Engine 服务仍为邀请制，需要 owner 发放的
+> endpoint + 设备激活密钥才能激活设备。AQG 是本地的，无需账户。
 
 ## 不只是被评审 —— 还能被*看见*、被*塑形*
 

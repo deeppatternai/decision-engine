@@ -5,7 +5,7 @@
     install all  [--bundle-root DIR] [--server-endpoint URL] [--api-key KEY]
     install --repair-client CLIENT
 
-What it does (release design §9):
+What it does:
 
 - Lays the *real bodies* down side-by-side under ``~/.deeppattern/`` —
   ``decision-engine/`` and ``aqg/`` — copied from an unpacked shell bundle.

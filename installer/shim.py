@@ -5,7 +5,7 @@ agent (Claude Code / Codex / Cursor) connects to, which forwards every JSON-RPC 
 verbatim to the hosted Decision Engine server's ``/mcp`` endpoint over HTTPS,
 attaching the device's bearer token from ``config.json``.
 
-Deliberately carries **no** intelligence (release design §10 / §14):
+Deliberately carries **no** intelligence:
 
 - It does not know the tool catalog — ``tools/list`` is *forwarded*, so the
   server (which holds the IP) is the single source of truth for what tools
