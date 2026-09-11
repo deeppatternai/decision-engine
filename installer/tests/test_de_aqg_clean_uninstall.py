@@ -27,27 +27,26 @@ class PublicInstallEntryPointTests(unittest.TestCase):
     def test_public_entrypoints_have_only_reviewed_disclosure_findings(self):
         repo_root = Path(__file__).resolve().parents[2]
         expected = {
-            "dp-install.sh": [("ipv6:::dec", 1031)],
+            "dp-install.sh": [("ipv6:::dec", 1273)],
             "dp-install.ps1": [
                 ("ipv6:::e", line)
                 for line in (
-                    44,
-                    550,
-                    988,
-                    1065,
-                    1334,
-                    1499,
-                    1508,
-                    1518,
-                    1526,
-                    1546,
-                    1556,
-                    1621,
-                    1689,
+                    45,
+                    1242,
+                    1319,
+                    1588,
+                    1757,
+                    1766,
+                    1776,
+                    1784,
+                    1804,
+                    1814,
+                    1879,
+                    1947,
                 )
             ],
             "dp-uninstall.ps1": [
-                ("ipv6:::e", line) for line in (38, 380, 1794, 1800)
+                ("ipv6:::e", line) for line in (38, 392, 1816, 1822)
             ],
         }
 

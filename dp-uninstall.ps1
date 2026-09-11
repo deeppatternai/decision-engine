@@ -80,9 +80,14 @@ function Invoke-Clean {
     $saved = @{}
     foreach ($name in $names) {
         $saved[$name] = [Environment]::GetEnvironmentVariable($name, "Process")
-        [Environment]::SetEnvironmentVariable($name, $null, "Process")
     }
     try {
+        # Delete the variable; an empty GIT_* value still changes Git behavior.
+        foreach ($name in $saved.Keys) {
+            if (Test-Path -LiteralPath "Env:$name") {
+                Remove-Item -LiteralPath "Env:$name" -ErrorAction Stop
+            }
+        }
         if ($Capture) {
             $previousErrorActionPreference = $ErrorActionPreference
             try {
@@ -112,7 +117,14 @@ function Invoke-Clean {
     }
     finally {
         foreach ($name in $saved.Keys) {
-            [Environment]::SetEnvironmentVariable($name, $saved[$name], "Process")
+            if ($null -eq $saved[$name]) {
+                if (Test-Path -LiteralPath "Env:$name") {
+                    Remove-Item -LiteralPath "Env:$name" -ErrorAction Stop
+                }
+            }
+            else {
+                [Environment]::SetEnvironmentVariable($name, $saved[$name], "Process")
+            }
         }
     }
 }
@@ -757,17 +769,27 @@ def aqg_checkout_has_product_remote(root: Path) -> bool:
 
 
 def aqg_managed_target_name_matches(root: Path, head: str) -> bool:
+    if re.fullmatch(r"[0-9a-f]{40}", head) is None:
+        return False
     if re.fullmatch(r"[0-9a-f]{40}", root.name):
         return root.name == head
-    if re.fullmatch(
-        r"v?[0-9]+(?:\.[0-9]+){2}(?:[-+][0-9A-Za-z.-]+)?", root.name
-    ) is None:
+    if re.fullmatch(r"[0-9A-Za-z.+-]{1,40}", root.name) is None:
         return False
     try:
         version = (root / "VERSION").read_text(encoding="utf-8").strip()
     except (OSError, UnicodeError):
         return False
-    return version == root.name and re.fullmatch(r"[0-9a-f]{40}", head) is not None
+    def release(value):
+        return len(value) <= 40 and re.fullmatch(
+            r"[0-9]+\.[0-9]+\.[0-9]+(?:-[0-9A-Za-z]+(?:[.-][0-9A-Za-z]+)*)?"
+            r"(?:\+[0-9A-Za-z-]+(?:\.[0-9A-Za-z-]+)*)?", value
+        ) is not None
+    reissue = f"{version}-{head[:12]}"
+    bases = {version if release(version) else head, reissue if release(reissue) else head}
+    legacy = root.name == version and re.fullmatch(r"v?[0-9]+(?:\.[0-9]+){2}(?:[-+][0-9A-Za-z.-]+)?", version)
+    return bool(legacy or root.name in bases or any(
+        re.fullmatch(re.escape(base[:23]) + r"-[0-9a-f]{16}", root.name) for base in bases
+    ))
 
 
 def json_object_without_duplicates(pairs: list[tuple[str, Any]]) -> dict[str, Any]:

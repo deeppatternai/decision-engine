@@ -6,14 +6,16 @@ from __future__ import annotations
 import hashlib
 import json
 import re
+import subprocess
+import sys
 import tempfile
 import unittest
 from pathlib import Path
 
 
-ROOT = Path(__file__).resolve().parents[2]
-INSTALL = ROOT / "dp-install.ps1"
-UNINSTALL = ROOT / "dp-uninstall.ps1"
+TOOLS = Path(__file__).resolve().parents[2]
+INSTALL = TOOLS / "dp-install.ps1"
+UNINSTALL = TOOLS / "dp-uninstall.ps1"
 
 
 def embedded_python(source: str) -> tuple[str, ...]:
@@ -28,6 +30,11 @@ class WindowsIntegrityHardeningTests(unittest.TestCase):
     def setUpClass(cls) -> None:
         cls.install = INSTALL.read_text(encoding="utf-8")
         cls.uninstall = UNINSTALL.read_text(encoding="utf-8")
+        cls.aqg_layout_resolver = next(
+            snippet
+            for snippet in embedded_python(cls.install)
+            if "versions = Path(sys.argv[2])" in snippet
+        )
         cls.helper_source = embedded_python(cls.uninstall)[-1]
         cls.helper: dict[str, object] = {"__name__": __name__}
         exec(compile(cls.helper_source, str(UNINSTALL), "exec"), cls.helper)
@@ -65,6 +72,47 @@ class WindowsIntegrityHardeningTests(unittest.TestCase):
             self.assertIn('GetEnvironmentVariables("Process").Keys', source)
             self.assertIn('$_ -match "^(?i:GIT_)"', source)
         self.assertIn('key.upper().startswith("GIT_")', self.uninstall)
+
+    def run_aqg_layout_resolver(self, target_name: str, version: str | None) -> int:
+        with tempfile.TemporaryDirectory() as temporary:
+            versions = Path(temporary) / "versions"
+            target = versions / target_name
+            target.mkdir(parents=True)
+            if version is not None:
+                (target / "VERSION").write_text(version + "\n", encoding="utf-8")
+            result = subprocess.run(
+                [
+                    sys.executable,
+                    "-I",
+                    "-c",
+                    self.aqg_layout_resolver,
+                    str(target),
+                    str(versions),
+                ],
+                capture_output=True,
+                check=False,
+                text=True,
+            )
+            if result.returncode:
+                return result.returncode
+            name_check = re.search(r"\$aqgNameScript\s*=\s*@'\n(.*?)\n'@", self.install, re.S)
+            self.assertIsNotNone(name_check)
+            return subprocess.run(
+                [sys.executable, '-I', '-c', name_check.group(1), str(target), 'a' * 40],
+                capture_output=True, check=False, text=True,
+            ).returncode
+
+    def test_aqg_layout_accepts_release_named_target_with_matching_version(self) -> None:
+        self.assertEqual(self.run_aqg_layout_resolver("0.14.14", "0.14.14"), 0)
+
+    def test_aqg_layout_rejects_release_named_target_with_mismatched_version(self) -> None:
+        self.assertNotEqual(self.run_aqg_layout_resolver("0.14.14", "0.14.13"), 0)
+
+    def test_aqg_layout_continues_to_accept_commit_named_target(self) -> None:
+        self.assertEqual(self.run_aqg_layout_resolver("a" * 40, None), 0)
+
+    def test_aqg_layout_rejects_ambiguous_target_name(self) -> None:
+        self.assertNotEqual(self.run_aqg_layout_resolver("latest", "latest"), 0)
 
     def test_path_lookup_is_not_used_for_integrity_critical_tools(self) -> None:
         combined = self.install + self.uninstall

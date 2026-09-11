@@ -35,6 +35,7 @@ $ExitFailure = 1
 $ExitUsage = 2
 $ExitBlocked = 3
 $ExitPartial = 4
+$script:AqgUpdatePending = $false
 
 function Stop-Install {
     param(
@@ -103,6 +104,7 @@ function Invoke-WithCleanEnvironment {
     foreach ($name in $Environment.Keys) {
         $effectiveEnvironment[[string]$name] = [string]$Environment[$name]
     }
+    $effectiveEnvironment["AQG_BACKUP_DIR"] = Join-Path $HOME ".deeppattern\aqg-backups"
     $remove = @(
         "DE_ENDPOINT", "DE_ACTIVATION_SECRET", "PYTHONPATH", "PROJECT_ROOT",
         "AQG_ROOT", "AQG_STATE_ROOT",
@@ -117,17 +119,21 @@ function Invoke-WithCleanEnvironment {
     $saved = @{}
     foreach ($name in ($remove + @($effectiveEnvironment.Keys) | Select-Object -Unique)) {
         $saved[$name] = [System.Environment]::GetEnvironmentVariable($name, "Process")
-        [System.Environment]::SetEnvironmentVariable($name, $null, "Process")
-    }
-    foreach ($name in $effectiveEnvironment.Keys) {
-        [System.Environment]::SetEnvironmentVariable(
-            [string]$name,
-            [string]$effectiveEnvironment[$name],
-            "Process"
-        )
     }
 
     try {
+        # A null .NET string can become an empty value on newer runtimes.
+        # Git distinguishes an absent variable from a present empty one.
+        foreach ($name in $saved.Keys) {
+            if (Test-Path -LiteralPath "Env:$name") {
+                Remove-Item -LiteralPath "Env:$name" -ErrorAction Stop
+            }
+        }
+        foreach ($name in $effectiveEnvironment.Keys) {
+            [System.Environment]::SetEnvironmentVariable(
+                [string]$name, [string]$effectiveEnvironment[$name], "Process"
+            )
+        }
         if ($Capture) {
             $previousErrorActionPreference = $ErrorActionPreference
             try {
@@ -157,11 +163,14 @@ function Invoke-WithCleanEnvironment {
     }
     finally {
         foreach ($name in $saved.Keys) {
-            [System.Environment]::SetEnvironmentVariable(
-                [string]$name,
-                $saved[$name],
-                "Process"
-            )
+            if ($null -eq $saved[$name]) {
+                if (Test-Path -LiteralPath "Env:$name") {
+                    Remove-Item -LiteralPath "Env:$name" -ErrorAction Stop
+                }
+            }
+            else {
+                [System.Environment]::SetEnvironmentVariable([string]$name, $saved[$name], "Process")
+            }
         }
     }
 }
@@ -171,6 +180,7 @@ function Invoke-PythonScript {
         [Parameter(Mandatory = $true)][string]$PythonPath,
         [Parameter(Mandatory = $true)][string]$ScriptText,
         [Parameter()][string[]]$ScriptArguments = @(),
+        [Parameter()][hashtable]$Environment = @{},
         [string]$WorkingDirectory,
         [switch]$Capture
     )
@@ -188,6 +198,7 @@ function Invoke-PythonScript {
             return Invoke-WithCleanEnvironment `
                 -FilePath $PythonPath `
                 -ArgumentList $arguments `
+                -Environment $Environment `
                 -Capture:$Capture
         }
         finally {
@@ -477,6 +488,9 @@ function Get-VerifiedAqgLayout {
     $target = $AqgRoot
     if (Test-ReparsePoint -Path $AqgRoot) {
         $versionsRoot = Join-Path (Split-Path -Parent $AqgRoot) "versions"
+        if (Test-ReparsePoint -Path $versionsRoot) {
+            Stop-Install "The AQG versions directory is a reparse point; preserve it and stop." $ExitBlocked
+        }
         $resolveScript = @'
 from pathlib import Path
 import re
@@ -491,9 +505,10 @@ except OSError:
     raise SystemExit(1)
 if (
     target.parent != versions
-    or re.fullmatch(r"[0-9a-f]{40}", target.name) is None
     or not target.is_dir()
 ):
+    raise SystemExit(1)
+if re.fullmatch(r"[0-9A-Za-z.+-]{1,40}", target.name) is None:
     raise SystemExit(1)
 print(target)
 '@
@@ -503,7 +518,7 @@ print(target)
             -ScriptArguments @($AqgRoot, $versionsRoot) `
             -Capture
         if ($resolved.ExitCode -ne 0 -or $resolved.Output.Count -ne 1) {
-            Stop-Install "$AqgRoot is not an AQG-managed versions\<commit> junction; preserve it and stop." $ExitBlocked
+            Stop-Install "$AqgRoot is not an AQG-managed versions\<release-or-commit> junction; preserve it and stop." $ExitBlocked
         }
         $target = ([string]$resolved.Output[0]).Trim()
         $layout = "managed"
@@ -514,6 +529,7 @@ print(target)
         "AI_SETUP.md",
         "scripts\install_aqg_clients.py",
         "scripts\aqg_doctor.py",
+        "VERSION",
         "requirements.txt"
     )) {
         $required = Join-Path $AqgRoot $relativePath
@@ -546,16 +562,223 @@ print(target)
     if ($headResult.ExitCode -ne 0 -or $head -notmatch "^[0-9a-f]{40}$") {
         Stop-Install "$AqgRoot does not resolve to a full Git commit; it was preserved." $ExitBlocked
     }
-    if ($layout -eq "managed" -and
-        -not [string]::Equals((Split-Path -Leaf $target), $head, [StringComparison]::OrdinalIgnoreCase)) {
-        Stop-Install "$AqgRoot target name does not match its checked-out commit; it was preserved." $ExitBlocked
+    if ($layout -eq "managed") {
+        if (-not (Test-AqgManagedTargetName -Target $target -Head $head)) {
+            Stop-Install "$AqgRoot target name does not match VERSION/HEAD or the official retry rule; it was preserved." $ExitBlocked
+        }
     }
     return [pscustomobject]@{ Layout = $layout; Target = $target; Head = $head }
+}
+
+function Test-AqgManagedTargetName {
+    param([string]$Target, [string]$Head)
+    $aqgNameScript = @'
+from pathlib import Path
+import re
+import sys
+
+root, head = Path(sys.argv[1]), sys.argv[2]
+if re.fullmatch(r"[0-9a-f]{40}", head) is None:
+    raise SystemExit(1)
+if re.fullmatch(r"[0-9a-f]{40}", root.name):
+    raise SystemExit(0 if root.name == head else 1)
+if re.fullmatch(r"[0-9A-Za-z.+-]{1,40}", root.name) is None:
+    raise SystemExit(1)
+version = (root / "VERSION").read_text(encoding="utf-8").strip()
+def release(value):
+    return len(value) <= 40 and re.fullmatch(
+        r"[0-9]+\.[0-9]+\.[0-9]+(?:-[0-9A-Za-z]+(?:[.-][0-9A-Za-z]+)*)?"
+        r"(?:\+[0-9A-Za-z-]+(?:\.[0-9A-Za-z-]+)*)?", value
+    ) is not None
+reissue = f"{version}-{head[:12]}"
+bases = {version if release(version) else head, reissue if release(reissue) else head}
+legacy = root.name == version and re.fullmatch(r"v?[0-9]+(?:\.[0-9]+){2}(?:[-+][0-9A-Za-z.-]+)?", version)
+matches = legacy or root.name in bases or any(
+    re.fullmatch(re.escape(base[:23]) + r"-[0-9a-f]{16}", root.name) for base in bases
+)
+raise SystemExit(0 if matches else 1)
+'@
+    $result = Invoke-PythonScript -PythonPath $script:PythonPath -ScriptText $aqgNameScript `
+        -ScriptArguments @($Target, $Head) -Capture
+    return $result.ExitCode -eq 0
+}
+
+function Assert-OwnedAqgDirectory {
+    param([string]$Path)
+    $item = Get-Item -LiteralPath $Path -Force -ErrorAction SilentlyContinue
+    if ($null -eq $item) { return }
+    if (-not $item.PSIsContainer -or (Test-ReparsePoint -Path $Path)) {
+        Stop-Install "AQG backup path is not a regular directory: $Path" $ExitBlocked
+    }
+    $acl = Get-Acl -LiteralPath $Path -ErrorAction Stop
+    $owner = $acl.GetOwner([System.Security.Principal.SecurityIdentifier]).Value
+    if ($owner -ne [System.Security.Principal.WindowsIdentity]::GetCurrent().User.Value) {
+        Stop-Install "AQG backup directory is not owned by the current Windows user: $Path" $ExitBlocked
+    }
+    foreach ($rule in $acl.Access) {
+        $sid = $rule.IdentityReference.Translate([System.Security.Principal.SecurityIdentifier]).Value
+        # Deny use of directories writable by Everyone, Authenticated Users or Users.
+        if ($rule.AccessControlType -eq "Allow" -and
+            $sid -in @("S-1-1-0", "S-1-5-11", "S-1-5-32-545") -and
+            (([int]$rule.FileSystemRights -band 0xD0156) -ne 0)) {
+            Stop-Install "AQG backup directory grants broad write access: $Path" $ExitBlocked
+        }
+    }
+}
+
+function Invoke-AqgBackupResidue {
+    param([string]$Mode, [string]$Identity = "", [switch]$Capture)
+    $aqgBackupScript = @'
+from pathlib import Path
+import os
+import stat
+import sys
+import tempfile
+
+dp, action = Path(sys.argv[1]), sys.argv[2]
+source, destination = dp / "versions/aqg-backups", dp / "aqg-backups"
+def directory(path):
+    info = path.lstat()
+    if not stat.S_ISDIR(info.st_mode) or getattr(info, "st_file_attributes", 0) & 0x400:
+        raise ValueError(f"not a regular non-reparse directory: {path}")
+    return info
+def identity():
+    parts = []
+    for path in (dp, source.parent, source):
+        info = directory(path)
+        parts.extend((info.st_dev, info.st_ino, info.st_mtime_ns))
+    return ":".join(map(str, parts))
+try:
+    if action == "inspect" and not os.path.lexists(source):
+        raise SystemExit(0)
+    frozen = identity()
+    if action == "inspect":
+        print(frozen)
+        raise SystemExit(0)
+    if action != "move" or len(sys.argv) != 4 or frozen != sys.argv[3]:
+        raise ValueError("backup directory identity changed after confirmation; nothing moved")
+    if os.path.lexists(destination):
+        directory(destination)
+    else:
+        destination.mkdir(mode=0o700)
+    archive = Path(tempfile.mkdtemp(prefix="legacy-versions-", dir=destination))
+    try:
+        for path in (dp, source.parent, destination):
+            directory(path)
+        info = directory(source)
+        if ":".join(map(str, (info.st_dev, info.st_ino, info.st_mtime_ns))) != ":".join(frozen.split(":")[-3:]):
+            raise ValueError("backup directory changed before move; nothing moved")
+        os.rename(source, archive / "aqg-backups")
+    except BaseException:
+        archive.rmdir()
+        raise
+    print(f"PRESERVE archived legacy AQG backups: {archive / 'aqg-backups'}")
+except (OSError, ValueError) as exc:
+    print(f"AQG backup relocation refused: {exc}", file=sys.stderr)
+    raise SystemExit(2)
+'@
+    return Invoke-PythonScript -PythonPath $script:PythonPath -ScriptText $aqgBackupScript `
+        -ScriptArguments @((Join-Path $HOME ".deeppattern"), $Mode, $Identity) -Capture:$Capture
+}
+
+function Repair-AqgBackupResidue {
+    $dp = Join-Path $HOME ".deeppattern"
+    $source = Join-Path $dp "versions\aqg-backups"
+    $destination = Join-Path $dp "aqg-backups"
+    $probe = Invoke-AqgBackupResidue -Mode inspect -Capture
+    if ($probe.ExitCode -ne 0) {
+        Stop-Install "Cannot safely inspect legacy AQG backups: $($probe.Output -join ' ')" $ExitBlocked
+    }
+    if ($probe.Output.Count -eq 0) { return }
+    if ($probe.Output.Count -ne 1 -or [string]$probe.Output[0] -notmatch '^\d+(?::\d+){8}$') {
+        Stop-Install "Unexpected legacy AQG backup identity; nothing moved." $ExitBlocked
+    }
+    foreach ($path in @($dp, (Split-Path -Parent $source), $source, $destination)) {
+        Assert-OwnedAqgDirectory -Path $path
+    }
+    Write-Host "AQG version migration is blocked by historical backups at $source."
+    Write-Host "Fully quit Agent hosts first. Backups will be moved intact, not deleted, merged or overwritten."
+    if (-not (Confirm-UserAction "Move these backups into a new legacy-versions archive under $destination and continue?")) {
+        Stop-Install "Legacy backups were preserved; installation paused before AQG host configuration." $ExitPartial
+    }
+    foreach ($path in @($dp, (Split-Path -Parent $source), $source, $destination)) {
+        Assert-OwnedAqgDirectory -Path $path
+    }
+    $code = Invoke-AqgBackupResidue -Mode move -Identity ([string]$probe.Output[0])
+    if ($code -ne 0) {
+        Stop-Install "Could not relocate legacy backups. Close applications using the directory and retry; no copy/delete fallback was attempted." $ExitBlocked
+    }
+}
+
+function Invoke-AqgUpdateContract {
+    param([ValidateSet("migrate", "update")][string]$Mode)
+    $null = Get-VerifiedAqgLayout
+    Write-Host ("AQG official managed-update phase: {0}..." -f $Mode)
+    $aqgUpdateScript = @'
+from pathlib import Path
+import os
+import sys
+
+root = Path(sys.argv[1]).resolve(strict=True)
+logical = Path(sys.argv[1]).absolute()
+mode, remote = sys.argv[2:4]
+sys.dont_write_bytecode = True
+sys.path.insert(0, str(root))
+os.environ["AQG_ROOT"] = str(logical)
+os.chdir(logical.parent)
+# The official updater currently distinguishes directory symlinks from junctions.
+# Never pass an unrecognized junction to a migration that could move its target.
+if getattr(logical.lstat(), "st_reparse_tag", 0) == 0xA0000003:
+    print("AQG status=legacy-junction: configuration can be retained, but automatic update compatibility is unverified.")
+    raise SystemExit(5)
+if mode == "migrate":
+    from scripts.aqg_update.migrate import ensure_managed_layout
+    result = ensure_managed_layout(logical)
+    print(f"AQG layout: {result.reason}")
+    if not result.managed or not logical.is_symlink():
+        print("AQG layout is pending. Resolve the reason above; if Windows denies symlink creation, enable Developer Mode or use an approved elevated terminal, then retry.")
+        raise SystemExit(4)
+    print(f"AQG managed entrance: {logical} -> {logical.resolve(strict=True)}")
+    raise SystemExit(0)
+from scripts.aqg_update.run import check
+result = check(root=logical, remote=remote, channel="stable", apply=True)
+print(f"AQG signed update: status={result.outcome}; {result.detail}")
+if result.pending:
+    print("AQG host approvals remain pending: " + ", ".join(result.pending))
+    raise SystemExit(4)
+if result.outcome in {"current", "applied"}:
+    raise SystemExit(0)
+if result.outcome in {"disabled", "too-soon"}:
+    print("AQG update check skipped by official policy; latest release is not confirmed.")
+    raise SystemExit(0)
+raise SystemExit(4 if result.outcome in {"pending", "busy", "deferred"} else 2)
+'@
+    $code = Invoke-PythonScript -PythonPath $script:PythonPath -ScriptText $aqgUpdateScript `
+        -ScriptArguments @($AqgRoot, $Mode, $AqgRepository) `
+        -Environment @{ "PATH" = "$(Split-Path -Parent $GitPath);$env:PATH"; "AQG_BASH" = $BashPath } `
+        -WorkingDirectory (Split-Path -Parent $AqgRoot)
+    if ($code -eq 5) {
+        $script:AqgUpdatePending = $true
+        Write-Warning "Preserving the verified legacy AQG junction. Automatic update support remains pending; no version tree was replaced."
+        return
+    }
+    if ($code -ne 0) {
+        $exitCode = if ($code -eq 4) { $ExitPartial } else { $ExitBlocked }
+        Stop-Install "AQG $Mode did not complete; inspect the reason above. No forced checkout or replacement was attempted." $exitCode
+    }
+    $after = Get-VerifiedAqgLayout
+    if ($after.Layout -ne "managed") {
+        Stop-Install "AQG did not produce a verified managed versions directory." $ExitBlocked
+    }
 }
 
 function Sync-AqgCheckout {
     param([Parameter(Mandatory = $true)]$LayoutInfo)
 
+    if ($LayoutInfo.Layout -eq "managed") {
+        Invoke-AqgUpdateContract -Mode update
+        return
+    }
     if ($LayoutInfo.Layout -eq "absent") {
         Write-Host ("Cloning Agent Quality Gates from {0} at {1}..." -f $AqgRepository, $AqgRef)
         $parent = Split-Path -Parent $AqgRoot
@@ -612,13 +835,6 @@ function Sync-AqgCheckout {
     if ($targetResult.ExitCode -ne 0 -or $targetSha -notmatch "^[0-9a-f]{40}$") {
         Stop-Install "The AQG product target did not resolve to a valid commit; the existing checkout was preserved." $ExitBlocked
     }
-    if ($LayoutInfo.Layout -eq "managed") {
-        if ($LayoutInfo.Head -ne $targetSha) {
-            Stop-Install "AQG managed install is at $($LayoutInfo.Head) but $AqgRef is $targetSha; preserve the versioned layout and use AQG's transactional multi-host update flow." $ExitBlocked
-        }
-        Write-Host ("AQG managed checkout already matches {0} at {1}; preserving the versioned layout." -f $AqgRef, $targetSha)
-        return
-    }
 
     $checkout = Invoke-WithCleanEnvironment -FilePath $GitPath -ArgumentList @(
         "-C", $AqgRoot, "checkout", "--detach", $targetSha
@@ -652,6 +868,42 @@ function Install-AqgDependencies {
     }
 }
 
+function Repair-AqgCodexHookEntrance {
+    $null = Get-VerifiedAqgLayout
+    $aqgHookScript = @'
+from pathlib import Path
+import sys
+
+root = Path(sys.argv[1]).resolve(strict=True)
+logical = Path(sys.argv[1]).absolute()
+sys.dont_write_bytecode = True
+sys.path.insert(0, str(root))
+from scripts import install_aqg_clients, install_aqg_codex_hooks
+
+# Match the existing Windows client relay's BOM-tolerant JSON reads.
+original_read_text = Path.read_text
+def read_text_compatible(path, encoding=None, errors=None):
+    text = original_read_text(path, encoding=encoding, errors=errors)
+    return text.removeprefix("\ufeff") if encoding == "utf-8" and path.suffix.lower() == ".json" else text
+Path.read_text = read_text_compatible
+if "codex" not in install_aqg_clients.installed_supported_clients():
+    raise SystemExit(0)
+arguments = ["--aqg-root", str(logical)]
+if install_aqg_codex_hooks.main(["--verify", *arguments]) == 0:
+    raise SystemExit(0)
+print("Rebinding AQG Codex hooks to the stable managed entrance...")
+if install_aqg_codex_hooks.main(["--apply", *arguments]) != 0:
+    raise SystemExit(2)
+raise SystemExit(install_aqg_codex_hooks.main(["--verify", *arguments]))
+'@
+    $code = Invoke-PythonScript -PythonPath $script:PythonPath -ScriptText $aqgHookScript `
+        -ScriptArguments @($AqgRoot) -WorkingDirectory (Split-Path -Parent $AqgRoot) `
+        -Environment @{ "PATH" = "$(Split-Path -Parent $GitPath);$env:PATH"; "AQG_ROOT" = $AqgRoot; "AQG_BASH" = $BashPath }
+    if ($code -ne 0) {
+        Stop-Install "AQG Codex hooks could not be verified against the stable managed entrance." $ExitBlocked
+    }
+}
+
 function Invoke-AqgClientWrapper {
     param(
         [Parameter(Mandatory = $true)][string[]]$ArgumentList,
@@ -668,12 +920,13 @@ import sys
 import tempfile
 
 root = Path(sys.argv[1]).resolve()
+logical_root = Path(sys.argv[1]).absolute()
 wrapper_path = Path(sys.argv[2]).resolve()
 arguments = sys.argv[3:]
 if wrapper_path.parent != root / "scripts":
     raise RuntimeError("AQG wrapper is outside the verified checkout")
 
-os.environ["AQG_ROOT"] = str(root)
+os.environ["AQG_ROOT"] = str(logical_root)
 os.environ["PYTHONPATH"] = os.pathsep.join((str(root), str(wrapper_path.parent)))
 sys.path[:0] = [str(root), str(wrapper_path.parent)]
 
@@ -734,7 +987,8 @@ raise SystemExit(result)
         -PythonPath $script:PythonPath `
         -ScriptText $bridgeScript `
         -ScriptArguments (@($AqgRoot) + @($ArgumentList)) `
-        -WorkingDirectory $AqgRoot `
+        -Environment @{ "PATH" = "$(Split-Path -Parent $GitPath);$env:PATH"; "AQG_BASH" = $BashPath } `
+        -WorkingDirectory (Split-Path -Parent $AqgRoot) `
         -Capture:$Capture
 }
 
@@ -1343,6 +1597,8 @@ try {
     }
     $sourceSha = (($sourceShaResult.Output -join "").Trim())
 
+    Repair-AqgBackupResidue
+    $aqgLayoutInfo = Get-VerifiedAqgLayout
     Sync-AqgCheckout -LayoutInfo $aqgLayoutInfo
     Install-AqgDependencies
 
@@ -1382,10 +1638,12 @@ try {
         if ($aqgApplyCode -ne 0 -and $aqgApplyCode -ne 3) {
             Stop-Install "AQG host adapter apply failed; Decision Engine was not installed." $ExitBlocked
         }
-        $aqgVerifyCode = Invoke-AqgClientWrapper -ArgumentList $aqgVerifyArguments
-        if ($aqgVerifyCode -ne 0 -and $aqgVerifyCode -ne 3) {
-            Stop-Install "AQG host adapter verify failed; Decision Engine was not installed." $ExitBlocked
-        }
+    }
+    Invoke-AqgUpdateContract -Mode migrate
+    Repair-AqgCodexHookEntrance
+    $aqgVerifyCode = Invoke-AqgClientWrapper -ArgumentList $aqgVerifyArguments
+    if ($aqgVerifyCode -ne 0 -and $aqgVerifyCode -ne 3) {
+        Stop-Install "AQG host adapter verify failed; Decision Engine was not installed." $ExitBlocked
     }
     $aqgRouteTimer.Stop()
     Write-Host ("Agent Quality Gates host routing ready in {0:N1} seconds." -f $aqgRouteTimer.Elapsed.TotalSeconds)
@@ -1679,14 +1937,14 @@ raise SystemExit(1 if failed else 0)
     Write-Host ("{0}: source={1}" -f $ProgramName, $sourceSha)
     Write-Host ("{0}: activation={1}" -f $ProgramName, $activationState)
     Write-Host ("{0}: restart every configured host before runtime verification" -f $ProgramName)
-    if ($unsupported.Count -gt 0 -or $skippedClients.Count -gt 0 -or $aqgVerifyFailed -or $doctorVerifyFailed) {
+    if ($unsupported.Count -gt 0 -or $skippedClients.Count -gt 0 -or $aqgVerifyFailed -or $doctorVerifyFailed -or $script:AqgUpdatePending) {
         if ($unsupported.Count -gt 0) {
             Write-Host "Unsupported or unconfigured installed products:"
             foreach ($item in $unsupported) {
                 Write-Host $item
             }
         }
-        [Console]::Error.WriteLine(("{0}: PARTIAL: supported components were installed, but one or more detected hosts are unsupported, unconfigured, or unverifiable." -f $ProgramName))
+        [Console]::Error.WriteLine(("{0}: PARTIAL: supported components were installed, but host verification or AQG automatic update compatibility remains incomplete." -f $ProgramName))
         exit $ExitPartial
     }
     Write-Host ("{0}: PASS: installation completed; runtime verification requires host restart" -f $ProgramName)

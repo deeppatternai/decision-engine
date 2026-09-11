@@ -7,6 +7,13 @@
 # broaden what this tool is allowed to remove.
 set -euo pipefail
 
+# Clear inherited Git redirection before the helper or any descendant starts.
+for git_env_name in ${(k)parameters}; do
+  case "$git_env_name" in
+    GIT_*) unset "$git_env_name" ;;
+  esac
+done
+
 python_bin="${DE_AQG_PYTHON:-}"
 if [[ -z "${python_bin}" ]]; then
   python_bin="$(command -v python3 2>/dev/null || true)"
@@ -45,6 +52,9 @@ EXIT_USAGE = 2
 EXIT_BLOCKED = 3
 EXIT_UNSUPPORTED = 4
 PROMPT_INPUT_FD = 3
+MAX_JSON_CONFIG_BYTES = 8 * 1024 * 1024
+ZED_SETTINGS_RELATIVE = Path(".config/zed/settings.json")
+CLAUDE_SETTINGS_RELATIVE = Path(".claude/settings.json")
 
 HOSTBRIDGE_LABEL = "com.decision-engine.stopper.hostbridge"
 HOSTBRIDGE_MARKER = "DE_STOPPER_HOSTBRIDGE_MANAGED"
@@ -73,7 +83,39 @@ AQG_HOOK_MARKERS = (
     "agent_client_aqg_hook.py",
     "qoder_hook_adapter.py",
     "run_aqg_codex_hook.py",
+    "agent-packs/claude-code/hooks/",
     "$AQG_ROOT/agent-packs/claude-code/hooks/",
+)
+AQG_CLAUDE_HOOK_SCRIPTS = frozenset(
+    {
+        "pretooluse_bash_skill_validator.sh",
+        "pretooluse_memory_write_guard.sh",
+        "pretooluse_secret_scan.sh",
+        "posttooluse_bash_error_debugging_reminder.sh",
+        "posttooluse_skill_edit_reminder.sh",
+        "posttooluse_code_construction_reminder.sh",
+        "posttooluse_test_quality_reminder.sh",
+        "posttooluse_security_review_reminder.sh",
+        "precompact_closeout_reminder.sh",
+        "sessionstart_preflight.sh",
+        "userpromptsubmit_handoff_mandate.sh",
+        "wip_checkpoint_save.sh",
+        "wip_checkpoint_recover.sh",
+    }
+)
+AQG_CLAUDE_BLOCKING_HOOK_SCRIPTS = frozenset(
+    {
+        "pretooluse_bash_skill_validator.sh",
+        "pretooluse_memory_write_guard.sh",
+        "pretooluse_secret_scan.sh",
+    }
+)
+AQG_CLAUDE_PROJECT_DIR_HOOK_SCRIPTS = frozenset(
+    {
+        "sessionstart_preflight.sh",
+        "wip_checkpoint_save.sh",
+        "wip_checkpoint_recover.sh",
+    }
 )
 AQG_ROOT_PATH_MARKERS = (
     "/scripts/aqg_doctor.py",
@@ -84,11 +126,234 @@ AQG_ROOT_PATH_MARKERS = (
     "/agent-packs/claude-code/",
 )
 AQG_WORK_MARKER_MANAGERS = {"AQG", "aqg-work-client-support"}
+DE_JSON_OWNERSHIP_MARKERS = (
+    b"decision-engine",
+    b"decision_engine",
+    b"deeppattern",
+    b"installer.launcher",
+    b"installer.shim",
+    b"mcp_bootstrap.py",
+    b"de_endpoint",
+    b"de_activation_secret",
+)
+AQG_JSON_OWNERSHIP_MARKERS = (
+    b"agent-quality-gates",
+    b"aqg-support",
+    b"aqg_root",
+    b"aqg-",
+    b"aqg_",
+)
 AQG_PRODUCT_REMOTES = {
     "https://github.com/deeppatternai/agent-quality-gates.git",
     "git@github.com:deeppatternai/agent-quality-gates.git",
     "ssh://git@github.com/deeppatternai/agent-quality-gates.git",
 }
+
+
+def _strip_jsonc_comments(text: str) -> str:
+    chars = list(text)
+    index = 0
+    in_string = False
+    escaped = False
+    while index < len(chars):
+        char = chars[index]
+        if in_string:
+            if escaped:
+                escaped = False
+            elif char == "\\":
+                escaped = True
+            elif char == '"':
+                in_string = False
+            index += 1
+            continue
+        if char == '"':
+            in_string = True
+            index += 1
+            continue
+        if char == "/" and index + 1 < len(chars) and chars[index + 1] == "/":
+            chars[index] = chars[index + 1] = " "
+            index += 2
+            while index < len(chars) and chars[index] not in "\r\n":
+                chars[index] = " "
+                index += 1
+            continue
+        if char == "/" and index + 1 < len(chars) and chars[index + 1] == "*":
+            chars[index] = chars[index + 1] = " "
+            index += 2
+            while index + 1 < len(chars) and not (
+                chars[index] == "*" and chars[index + 1] == "/"
+            ):
+                if chars[index] not in "\r\n":
+                    chars[index] = " "
+                index += 1
+            if index + 1 >= len(chars):
+                raise ValueError("unterminated JSONC block comment")
+            chars[index] = chars[index + 1] = " "
+            index += 2
+            continue
+        index += 1
+    if in_string:
+        raise ValueError("unterminated JSON string")
+    return "".join(chars)
+
+
+def _jsonc_tokens(text: str) -> list[tuple[str, Any, int, int]]:
+    tokens: list[tuple[str, Any, int, int]] = []
+    index = 0
+    while index < len(text):
+        char = text[index]
+        if char.isspace():
+            index += 1
+            continue
+        if char == "/" and index + 1 < len(text) and text[index + 1] == "/":
+            index += 2
+            while index < len(text) and text[index] not in "\r\n":
+                index += 1
+            continue
+        if char == "/" and index + 1 < len(text) and text[index + 1] == "*":
+            end = text.find("*/", index + 2)
+            if end < 0:
+                raise ValueError("unterminated JSONC block comment")
+            index = end + 2
+            continue
+        if char in "{}[]:,":
+            tokens.append((char, char, index, index + 1))
+            index += 1
+            continue
+        if char == '"':
+            start = index
+            index += 1
+            escaped = False
+            while index < len(text):
+                if escaped:
+                    escaped = False
+                elif text[index] == "\\":
+                    escaped = True
+                elif text[index] == '"':
+                    index += 1
+                    break
+                index += 1
+            else:
+                raise ValueError("unterminated JSON string")
+            raw = text[start:index]
+            tokens.append(("string", json.loads(raw), start, index))
+            continue
+        start = index
+        while index < len(text) and not text[index].isspace() and text[index] not in "{}[]:,":
+            if text[index : index + 2] in ("//", "/*"):
+                break
+            index += 1
+        if index == start:
+            raise ValueError("invalid JSONC token")
+        tokens.append(("atom", text[start:index], start, index))
+    return tokens
+
+
+def parse_jsonc(text: str) -> Any:
+    stripped = _strip_jsonc_comments(text)
+    chars = list(stripped)
+    tokens = _jsonc_tokens(stripped)
+    for index, token in enumerate(tokens[:-1]):
+        if token[0] == "," and tokens[index + 1][0] in ("}", "]"):
+            chars[token[2] : token[3]] = " " * (token[3] - token[2])
+    return json.loads("".join(chars))
+
+
+def jsonc_pointer_ranges(
+    text: str,
+) -> dict[tuple[str, ...], tuple[int, int]]:
+    tokens = _jsonc_tokens(text)
+    ranges: dict[tuple[str, ...], tuple[int, int]] = {}
+    cursor = 0
+
+    def take(kind: str) -> tuple[str, Any, int, int]:
+        nonlocal cursor
+        if cursor >= len(tokens) or tokens[cursor][0] != kind:
+            raise ValueError(f"expected JSONC token {kind}")
+        token = tokens[cursor]
+        cursor += 1
+        return token
+
+    def parse_value(pointer: tuple[str, ...]) -> tuple[int, int]:
+        nonlocal cursor
+        if cursor >= len(tokens):
+            raise ValueError("unexpected end of JSONC input")
+        token = tokens[cursor]
+        if token[0] == "{":
+            opening = take("{")
+            members: list[
+                tuple[tuple[str, ...], int, int, tuple[str, Any, int, int] | None]
+            ] = []
+            if cursor < len(tokens) and tokens[cursor][0] != "}":
+                while True:
+                    key = take("string")
+                    take(":")
+                    _, value_end = parse_value(pointer + (str(key[1]),))
+                    comma = take(",") if cursor < len(tokens) and tokens[cursor][0] == "," else None
+                    members.append((pointer + (str(key[1]),), key[2], value_end, comma))
+                    if comma is None or (cursor < len(tokens) and tokens[cursor][0] == "}"):
+                        break
+            closing = take("}")
+            for index, (member_pointer, key_start, value_end, comma) in enumerate(members):
+                if member_pointer in ranges:
+                    raise ValueError("duplicate JSONC object key")
+                if index == 0:
+                    start = key_start
+                    end = comma[3] if comma is not None else value_end
+                else:
+                    previous_comma = members[index - 1][3]
+                    if previous_comma is None:
+                        raise ValueError("missing JSONC object separator")
+                    start = previous_comma[2]
+                    if index == len(members) - 1:
+                        end = comma[3] if comma is not None else value_end
+                    else:
+                        if comma is None:
+                            raise ValueError("missing JSONC object separator")
+                        end = comma[2]
+                ranges[member_pointer] = (start, end)
+            return opening[2], closing[3]
+        if token[0] == "[":
+            opening = take("[")
+            items: list[tuple[tuple[str, ...], int, int, tuple[str, Any, int, int] | None]] = []
+            item_index = 0
+            if cursor < len(tokens) and tokens[cursor][0] != "]":
+                while True:
+                    item_start, item_end = parse_value(pointer + (str(item_index),))
+                    comma = take(",") if cursor < len(tokens) and tokens[cursor][0] == "," else None
+                    items.append((pointer + (str(item_index),), item_start, item_end, comma))
+                    item_index += 1
+                    if comma is None or (cursor < len(tokens) and tokens[cursor][0] == "]"):
+                        break
+            closing = take("]")
+            for index, (item_pointer, item_start, item_end, comma) in enumerate(items):
+                if index == 0:
+                    start = item_start
+                    end = comma[3] if comma is not None else item_end
+                else:
+                    previous_comma = items[index - 1][3]
+                    if previous_comma is None:
+                        raise ValueError("missing JSONC array separator")
+                    start = previous_comma[2]
+                    if index == len(items) - 1:
+                        end = comma[3] if comma is not None else item_end
+                    else:
+                        if comma is None:
+                            raise ValueError("missing JSONC array separator")
+                        end = comma[2]
+                ranges[item_pointer] = (start, end)
+            return opening[2], closing[3]
+        if token[0] not in ("string", "atom"):
+            raise ValueError("expected JSONC value")
+        cursor += 1
+        return token[2], token[3]
+
+    parse_value(())
+    if cursor != len(tokens):
+        raise ValueError("unexpected trailing JSONC input")
+    return ranges
+
+
 QODER_DE_PLUGIN_ID = "decision-engine@de-bundler"
 QODER_DE_PLUGIN_HOMEPAGES = {
     "https://github.com/deeppatternai/decision-engine",
@@ -112,6 +377,24 @@ PROCESS_HOST_MARKERS = (
     (("claude.app", "/claude/", "claude-code"), "Claude"),
     (("codex.app", "/codex/"), "Codex"),
 )
+REGISTERED_DE_HOST_LABELS = {
+    "claude-code": "Claude Code",
+    "claude-desktop": "Claude Desktop",
+    "claude-desktop-3p": "Claude Desktop 3p",
+    "codebuddy": "CodeBuddy",
+    "codex": "Codex",
+    "cursor": "Cursor",
+    "qoder": "Qoder",
+    "qoder-cn": "Qoder CN",
+    "qoder-ide": "Qoder IDE",
+    "qoder-cn-ide": "Qoder CN IDE",
+    "trae": "TRAE",
+    "trae-work": "TRAE SOLO",
+    "trae-cn": "TRAE CN",
+    "trae-work-cn": "TRAE SOLO CN",
+    "workbuddy": "WorkBuddy",
+    "workbuddy-ai": "WorkBuddy AI",
+}
 def lex(path: Path) -> Path:
     """Normalize without resolving the final path through a symlink."""
     return Path(os.path.abspath(os.path.expanduser(str(path))))
@@ -234,6 +517,7 @@ class Inventory:
         self.blockers: list[str] = []
         self.notes: list[str] = []
         self.json_targets: list[tuple[Path, tuple[tuple[str, ...], ...]]] = []
+        self.jsonc_targets: set[Path] = set()
         self.toml_ranges: list[tuple[Path, tuple[tuple[int, int], ...]]] = []
         self.agents_target: Path | None = None
         self.skill_links: list[Path] = []
@@ -248,6 +532,8 @@ class Inventory:
         self.process_blockers: list[str] = []
         self.aqg_uninstaller: Path | None = None
         self.aqg_managed_target: Path | None = None
+        self.aqg_alias_env_target: Path | None = None
+        self.orphaned_aqg_hook_targets: tuple[tuple[str, ...], ...] = ()
         self.qoder_residue_paths: list[tuple[Path, str]] = []
 
     def add_action(self, kind: str, path: Path, detail: str = "", **metadata: Any) -> None:
@@ -260,7 +546,15 @@ class Inventory:
         self.blockers.append(message)
 
     def has_only_process_blockers(self) -> bool:
-        return bool(self.blockers) and self.blockers == self.process_blockers
+        if not self.blockers:
+            return False
+        remaining = list(self.process_blockers)
+        for blocker in self.blockers:
+            try:
+                remaining.remove(blocker)
+            except ValueError:
+                return False
+        return not remaining
 
     def path_ref(self, path: Path, *, component: str) -> bool:
         path = lex(path)
@@ -435,7 +729,8 @@ class Inventory:
             target = root.parent / target
         target = lex(target)
         versions = self.dp / "versions"
-        if target.parent != versions or re.fullmatch(r"[0-9a-f]{40}", target.name) is None:
+        commit_name = re.fullmatch(r"[0-9a-f]{40}", target.name) is not None
+        if target.parent != versions or re.fullmatch(r"[0-9A-Za-z.+-]{1,40}", target.name) is None:
             return None
         if (
             path_has_symlink_component(versions, self.home)
@@ -490,9 +785,36 @@ class Inventory:
             )
         except (OSError, subprocess.TimeoutExpired):
             return None
+        head_text = head.stdout.strip()
+        try:
+            version_text = (target / "VERSION").read_text(encoding="utf-8").strip()
+        except (OSError, UnicodeError):
+            return None
+        def release(value):
+            return len(value) <= 40 and re.fullmatch(
+                r"[0-9]+\.[0-9]+\.[0-9]+(?:-[0-9A-Za-z]+(?:[.-][0-9A-Za-z]+)*)?"
+                r"(?:\+[0-9A-Za-z-]+(?:\.[0-9A-Za-z-]+)*)?", value
+            ) is not None
+
+        # Same bounded reissue/retry rule as AQG stage.version_name.
+        reissue = f"{version_text}-{head_text[:12]}"
+        bases = {version_text if release(version_text) else head_text,
+                 reissue if release(reissue) else head_text}
+        legacy = target.name == version_text and re.fullmatch(
+            r"v?[0-9]+(?:\.[0-9]+){2}(?:[-+][0-9A-Za-z.-]+)?", version_text
+        )
+        release_matches = legacy or target.name in bases or any(
+            re.fullmatch(re.escape(base[:23]) + r"-[0-9a-f]{16}", target.name) for base in bases
+        )
+        name_matches = (
+            target.name == head_text
+            if commit_name
+            else release_matches
+        )
         if (
             head.returncode != 0
-            or head.stdout.strip() != target.name
+            or re.fullmatch(r"[0-9a-f]{40}", head_text) is None
+            or not name_matches
             or remote.returncode != 0
             or remote.stdout.strip() not in AQG_PRODUCT_REMOTES
             or status_result.returncode != 0
@@ -835,10 +1157,99 @@ class Inventory:
             self.blockers.append(f"JSON config ownership is unknown through symlink: {link}")
             return
         try:
-            data = json.loads(path.read_text(encoding="utf-8"))
-        except (OSError, UnicodeError, json.JSONDecodeError) as exc:
-            self.blockers.append(f"cannot parse JSON config {path}: {exc.__class__.__name__}")
+            before = path.lstat()
+            if not stat.S_ISREG(before.st_mode):
+                self.blockers.append(f"JSON config is not a regular file: {path}")
+                return
+            if before.st_size > MAX_JSON_CONFIG_BYTES:
+                self.blockers.append(
+                    f"JSON config exceeds the safe inspection limit: {path}"
+                )
+                return
+            flags = os.O_RDONLY
+            if hasattr(os, "O_NOFOLLOW"):
+                flags |= os.O_NOFOLLOW
+            descriptor = os.open(path, flags)
+            try:
+                opened = os.fstat(descriptor)
+                if (
+                    opened.st_dev != before.st_dev
+                    or opened.st_ino != before.st_ino
+                    or not stat.S_ISREG(opened.st_mode)
+                ):
+                    self.blockers.append(
+                        f"JSON config changed while ownership was inspected: {path}"
+                    )
+                    return
+                chunks: list[bytes] = []
+                remaining = MAX_JSON_CONFIG_BYTES + 1
+                while remaining:
+                    chunk = os.read(descriptor, min(1024 * 1024, remaining))
+                    if not chunk:
+                        break
+                    chunks.append(chunk)
+                    remaining -= len(chunk)
+                raw = b"".join(chunks)
+                after = os.fstat(descriptor)
+            finally:
+                os.close(descriptor)
+            current = path.lstat()
+            if (
+                len(raw) > MAX_JSON_CONFIG_BYTES
+                or after.st_dev != before.st_dev
+                or after.st_ino != before.st_ino
+                or after.st_size != before.st_size
+                or after.st_mtime_ns != before.st_mtime_ns
+                or current.st_dev != before.st_dev
+                or current.st_ino != before.st_ino
+                or current.st_size != before.st_size
+                or current.st_mtime_ns != before.st_mtime_ns
+            ):
+                self.blockers.append(
+                    f"JSON config changed while ownership was inspected: {path}"
+                )
+                return
+        except OSError as exc:
+            self.blockers.append(
+                f"cannot safely read JSON config {path}: {exc.__class__.__name__}"
+            )
             return
+        parsed: Any = None
+        parse_error: UnicodeError | json.JSONDecodeError | None = None
+        try:
+            text = raw.decode("utf-8")
+        except UnicodeError as exc:
+            parse_error = exc
+        else:
+            try:
+                parsed = json.loads(text)
+            except json.JSONDecodeError as exc:
+                if path == self.home / ZED_SETTINGS_RELATIVE:
+                    try:
+                        parsed = parse_jsonc(text)
+                    except (ValueError, json.JSONDecodeError):
+                        parse_error = exc
+                else:
+                    parse_error = exc
+        if parse_error is not None:
+            marker_view = raw.lower().replace(b"\x00", b"")
+            markers: tuple[bytes, ...] = ()
+            if self.scope in ("de", "both"):
+                markers += DE_JSON_OWNERSHIP_MARKERS
+            if self.scope in ("aqg", "both"):
+                markers += AQG_JSON_OWNERSHIP_MARKERS
+            if any(marker in marker_view for marker in markers):
+                self.blockers.append(
+                    f"cannot parse JSON config containing managed ownership markers "
+                    f"{path}: {parse_error.__class__.__name__}"
+                )
+            else:
+                self.notes.append(
+                    f"preserve malformed unrelated JSON config {path}: "
+                    f"{parse_error.__class__.__name__}"
+                )
+            return
+        data = parsed
         if not isinstance(data, (dict, list)):
             self.blockers.append(f"JSON config has unexpected top-level type: {path}")
             return
@@ -900,6 +1311,24 @@ class Inventory:
             return
         if targets:
             frozen = tuple(targets)
+            if path == self.home / ZED_SETTINGS_RELATIVE:
+                try:
+                    json.loads(text)
+                except json.JSONDecodeError:
+                    try:
+                        spans = jsonc_pointer_ranges(text)
+                    except (ValueError, json.JSONDecodeError) as exc:
+                        self.blockers.append(
+                            f"cannot safely map owned JSONC entries {path}: "
+                            f"{exc.__class__.__name__}"
+                        )
+                        return
+                    if any(pointer not in spans for pointer in frozen):
+                        self.blockers.append(
+                            f"cannot safely map every owned JSONC entry: {path}"
+                        )
+                        return
+                    self.jsonc_targets.add(path)
             self.json_targets.append((path, frozen))
             suffix = "entry" if len(targets) == 1 else "entries"
             self.add_action("edit-json", path, f"remove {len(targets)} owned decision-engine {suffix}")
@@ -997,6 +1426,36 @@ class Inventory:
             return
         for path in self.json_paths():
             self.inspect_json_file(path)
+
+    def inspect_managed_aqg_alias_env(self) -> None:
+        if self.scope not in ("aqg", "both"):
+            return
+        path = self.home / CLAUDE_SETTINGS_RELATIVE
+        if not lexists(path):
+            return
+        link = path_has_symlink_component(path, self.home)
+        if link:
+            return
+        try:
+            before = path.lstat()
+            if not stat.S_ISREG(before.st_mode) or before.st_size > MAX_JSON_CONFIG_BYTES:
+                return
+            data = json.loads(path.read_text(encoding="utf-8"))
+            env = data.get("env") if isinstance(data, dict) else None
+            current = env.get("AQG_ROOT") if isinstance(env, dict) else None
+        except (OSError, UnicodeError, json.JSONDecodeError):
+            return
+        if (
+            isinstance(current, str)
+            and Path(current).is_absolute()
+            and lex(Path(current)) == self.aqg
+        ):
+            self.aqg_alias_env_target = path
+            self.add_action(
+                "edit-json",
+                path,
+                "remove owned managed AQG_ROOT alias",
+            )
 
     def host_backup_paths(self) -> tuple[Path, ...]:
         roots = (
@@ -1444,6 +1903,79 @@ class Inventory:
             return None
         return process_file_refs_with(command, pid)
 
+    def process_command_has_explicit_ref(self, text: str, *, component: str) -> bool:
+        expanded = os.path.expanduser(text)
+        refs = self.de_refs if component == "de" else self.aqg_refs
+        for ref in refs:
+            ref_text = str(lex(ref))
+            if ref_text in expanded:
+                return True
+            if ref_text.startswith(str(self.home) + os.sep):
+                tilde = "~" + ref_text[len(str(self.home)) :]
+                if tilde in text:
+                    return True
+        return False
+
+    def managed_launcher_environment_host(
+        self, pid: str, command_line: str
+    ) -> str | None:
+        if self.scope == "aqg" or not re.fullmatch(r"\d+", pid):
+            return None
+        match = re.fullmatch(
+            r"(?P<executable>\S+) -m (?P<module>installer\.(?:launcher|shim))",
+            command_line,
+        )
+        if match is None:
+            return None
+        executable = Path(match.group("executable"))
+        if (
+            re.fullmatch(r"(?:python(?:[0-9][0-9.]*)?|Python)", executable.name)
+            is None
+            or not executable.exists()
+            or not os.access(executable, os.X_OK)
+        ):
+            return None
+        ps = trusted_system_tool("/bin/ps", "/usr/bin/ps")
+        if not ps:
+            return None
+        try:
+            result = subprocess.run(
+                [ps, "eww", "-p", pid, "-o", "command="],
+                text=True,
+                stdout=subprocess.PIPE,
+                stderr=subprocess.DEVNULL,
+                check=False,
+                timeout=2,
+            )
+        except (OSError, subprocess.TimeoutExpired):
+            return None
+        if result.returncode != 0:
+            return None
+        process_text = result.stdout.rstrip("\n")
+        if not process_text.startswith(command_line + " "):
+            return None
+        environment_text = process_text[len(command_line) :].lstrip()
+
+        def exact_environment_value(name: str, value: str) -> bool:
+            pattern = re.compile(
+                rf"(?:^| ){re.escape(name)}={re.escape(value)}"
+                r"(?= [A-Za-z_][A-Za-z0-9_]*=|$)"
+            )
+            return pattern.search(environment_text) is not None
+
+        host_match = re.search(
+            r"(?:^| )DE_MCP_CLIENT_HOST=([a-z0-9-]+)"
+            r"(?= [A-Za-z_][A-Za-z0-9_]*=|$)",
+            environment_text,
+        )
+        if (
+            not exact_environment_value("PYTHONPATH", str(self.de))
+            or host_match is None
+            or host_match.group(1) not in REGISTERED_DE_HOST_LABELS
+        ):
+            return None
+        return host_match.group(1)
+
     @staticmethod
     def looks_like_de_launcher(command_line: str) -> bool:
         normalized = command_line.lower()
@@ -1458,6 +1990,29 @@ class Inventory:
             or "stopper_launch_agent" in normalized
             or "decision-engine-stopper" in normalized
         )
+
+    @staticmethod
+    def is_verified_claude_launcher_supervisor(
+        wrapper: dict[str, str], processes: list[dict[str, str]]
+    ) -> bool:
+        if wrapper.get("host") != "Claude":
+            return False
+        children = [
+            process
+            for process in processes
+            if process.get("ppid") == wrapper.get("pid")
+            and process.get("proof") == "environment"
+            and process.get("environment_host") == "claude-desktop-3p"
+            and process_term_eligible(process)
+        ]
+        if len(children) != 1:
+            return False
+        child = children[0]
+        expected = (
+            "/Applications/Claude.app/Contents/Helpers/disclaimer "
+            f"--pgroup -- {child['command_line']}"
+        )
+        return wrapper.get("command_line") == expected
 
     @staticmethod
     def process_host_label(command_line: str) -> str:
@@ -1488,6 +2043,7 @@ class Inventory:
             return
         components = ("de",) if self.scope == "de" else ("aqg",) if self.scope == "aqg" else ("de", "aqg")
         rows: list[tuple[str, str, str]] = []
+        unverified_launchers: list[dict[str, str]] = []
         for raw_line in result.stdout.splitlines():
             line = raw_line.strip()
             match = re.match(r"^(\d+)\s+(\d+)\s+(.+)$", line)
@@ -1528,8 +2084,14 @@ class Inventory:
                 )
                 self.add_process_blocker(f"Qoder host must be stopped before plugin cleanup: pid={pid}")
                 continue
-            owned = any(self.text_has_ref(command_line, component=component) for component in components)
+            owned = any(
+                self.process_command_has_explicit_ref(
+                    command_line, component=component
+                )
+                for component in components
+            )
             proof = "command"
+            environment_host = None
             if not owned and self.looks_like_de_launcher(command_line):
                 file_refs = self.process_file_refs(pid)
                 owned = bool(
@@ -1542,7 +2104,15 @@ class Inventory:
                 )
                 proof = "files"
                 if not owned:
-                    self.processes.append(
+                    environment_host = self.managed_launcher_environment_host(
+                        pid, command_line
+                    )
+                    if environment_host is not None:
+                        owned = True
+                        proof = "environment"
+                        host = REGISTERED_DE_HOST_LABELS[environment_host]
+                if not owned:
+                    unverified_launchers.append(
                         {
                             "pid": pid,
                             "ppid": ppid,
@@ -1553,15 +2123,6 @@ class Inventory:
                             "term_eligible": "false",
                         }
                     )
-                    self.add_action(
-                        "process-blocker",
-                        Path(pid),
-                        "unverified-de-launcher",
-                        ppid=ppid,
-                        host=host,
-                        term_eligible=False,
-                    )
-                    self.add_process_blocker(f"live process ownership is unknown: pid={pid}")
                     continue
             if owned:
                 family = "stopper" if "stopper" in command_line.lower() else "mcp-launcher"
@@ -1574,6 +2135,8 @@ class Inventory:
                     "proof": proof,
                     "term_eligible": "false",
                 }
+                if environment_host is not None:
+                    process["environment_host"] = environment_host
                 if self.looks_like_de_launcher(command_line):
                     identity = read_process_identity(self, process)
                     if (
@@ -1596,6 +2159,26 @@ class Inventory:
                     term_eligible=term_eligible,
                 )
                 self.add_process_blocker(f"live {family} process must be stopped before uninstall: pid={pid}")
+        for process in unverified_launchers:
+            # Claude's desktop wrapper supervises the exact managed child. It
+            # is never a TERM target; after the child exits, a fresh inventory
+            # must prove that the wrapper exited before any mutation begins.
+            if self.is_verified_claude_launcher_supervisor(
+                process, self.processes
+            ):
+                continue
+            self.processes.append(process)
+            self.add_action(
+                "process-blocker",
+                Path(process["pid"]),
+                "unverified-de-launcher",
+                ppid=process["ppid"],
+                host=process["host"],
+                term_eligible=False,
+            )
+            self.add_process_blocker(
+                f"live process ownership is unknown: pid={process['pid']}"
+            )
 
     def aqg_hook_paths(self) -> tuple[Path, ...]:
         relative = (
@@ -1641,6 +2224,107 @@ class Inventory:
             if root is not None:
                 roots.add(root)
         return roots
+
+    @staticmethod
+    def managed_aqg_claude_hook_command(command: Any) -> bool:
+        if not isinstance(command, str) or "\n" in command or "\x00" in command:
+            return False
+        prefix = (
+            'if [ -z "${AQG_ROOT:-}" ]; then exit 0; fi; '
+            'CLAUDE_PROJECT_DIR="${CLAUDE_PROJECT_DIR:-}" bash '
+            '"$AQG_ROOT/agent-packs/claude-code/hooks/'
+        )
+        if not command.startswith(prefix):
+            return False
+        remainder = command[len(prefix) :]
+        marker = '"'
+        if marker not in remainder:
+            return False
+        script, suffix = remainder.split(marker, 1)
+        if script not in AQG_CLAUDE_HOOK_SCRIPTS:
+            return False
+        expected_suffix = (
+            ' "${CLAUDE_PROJECT_DIR:-}"'
+            if script in AQG_CLAUDE_PROJECT_DIR_HOOK_SCRIPTS
+            else ""
+        )
+        if script not in AQG_CLAUDE_BLOCKING_HOOK_SCRIPTS:
+            expected_suffix += " || true"
+        return suffix == expected_suffix
+
+    def orphaned_managed_aqg_hook_pointers(
+        self, payload: Any
+    ) -> tuple[tuple[str, ...], ...] | None:
+        if not isinstance(payload, dict) or lexists(self.aqg):
+            return None
+        env = payload.get("env")
+        aqg_root = env.get("AQG_ROOT") if isinstance(env, dict) else None
+        if not (
+            isinstance(aqg_root, str)
+            and Path(aqg_root).is_absolute()
+            and lex(Path(aqg_root)) == self.aqg
+        ):
+            return None
+        hooks = payload.get("hooks")
+        if not isinstance(hooks, dict):
+            return None
+
+        targets: list[tuple[str, ...]] = []
+        for event, blocks in hooks.items():
+            if not isinstance(event, str) or not isinstance(blocks, list):
+                if any(marker in value for value in flatten_strings(blocks) for marker in AQG_HOOK_MARKERS):
+                    return None
+                continue
+            for index, group in enumerate(blocks):
+                group_values = tuple(flatten_strings(group))
+                has_aqg_reference = any(
+                    marker in value
+                    for value in group_values
+                    for marker in AQG_HOOK_MARKERS
+                )
+                if not has_aqg_reference:
+                    continue
+                if (
+                    not isinstance(group, dict)
+                    or set(group) != {"matcher", "hooks"}
+                    or not isinstance(group.get("matcher"), str)
+                    or not isinstance(group.get("hooks"), list)
+                    or not group["hooks"]
+                ):
+                    return None
+                managed_hooks = []
+                for hook in group["hooks"]:
+                    owned = (
+                        isinstance(hook, dict)
+                        and set(hook) == {"type", "command"}
+                        and hook.get("type") == "command"
+                        and self.managed_aqg_claude_hook_command(hook.get("command"))
+                    )
+                    managed_hooks.append(owned)
+                # An official block contains only AQG-owned entries. Refuse to
+                # split a hand-merged block because its ownership is ambiguous.
+                if not all(managed_hooks):
+                    return None
+                targets.append(("hooks", event, str(index)))
+
+        if not targets:
+            return None
+
+        residual = dict(payload)
+        residual.pop("hooks", None)
+        residual_env = dict(env)
+        residual_env.pop("AQG_ROOT", None)
+        if residual_env:
+            residual["env"] = residual_env
+        else:
+            residual.pop("env", None)
+        if any(
+            marker in value
+            for value in flatten_strings(residual)
+            for marker in AQG_HOOK_MARKERS
+        ):
+            return None
+        return tuple(targets)
 
     @staticmethod
     def valid_aqg_uninstaller_root(root: Path) -> bool:
@@ -1711,13 +2395,25 @@ class Inventory:
                 self.blockers.append(f"cannot read AQG hook config {path}: {exc.__class__.__name__}")
                 continue
             if any(marker in text for marker in AQG_HOOK_MARKERS):
-                residue_found = True
                 try:
                     payload = json.loads(text)
                 except json.JSONDecodeError:
                     values = text.splitlines()
                 else:
+                    if path == self.home / CLAUDE_SETTINGS_RELATIVE:
+                        orphaned_targets = self.orphaned_managed_aqg_hook_pointers(payload)
+                        if orphaned_targets:
+                            self.orphaned_aqg_hook_targets = orphaned_targets
+                            count = len(orphaned_targets)
+                            suffix = "group" if count == 1 else "groups"
+                            self.add_action(
+                                "edit-json",
+                                path,
+                                f"remove {count} orphaned managed AQG hook {suffix}",
+                            )
+                            continue
                     values = flatten_strings(payload)
+                residue_found = True
                 for value in values:
                     candidates.update(self.aqg_roots_from_text(value))
 
@@ -1822,6 +2518,7 @@ class Inventory:
         self.inspect_qoder_plugins()
         self.inspect_qoder_runtime_caches()
         self.inspect_json()
+        self.inspect_managed_aqg_alias_env()
         self.inspect_codex()
         self.inspect_agents()
         self.inspect_skills()
@@ -1842,6 +2539,9 @@ def read_process_identity(inv: Inventory, process: dict[str, str]) -> dict[str, 
     command = trusted_system_tool("/bin/ps", "/usr/bin/ps")
     if not command:
         return None
+    environment = os.environ.copy()
+    environment["LC_ALL"] = "C"
+    environment["LANG"] = "C"
     try:
         result = subprocess.run(
             [
@@ -1855,6 +2555,7 @@ def read_process_identity(inv: Inventory, process: dict[str, str]) -> dict[str, 
             stdout=subprocess.PIPE,
             stderr=subprocess.STDOUT,
             check=False,
+            env=environment,
         )
     except OSError:
         return None
@@ -1910,7 +2611,10 @@ def revalidate_term_target(inv: Inventory, process: dict[str, str]) -> tuple[boo
         else ("de", "aqg")
     )
     if process.get("proof") == "command":
-        owned = any(inv.text_has_ref(command_line, component=item) for item in components)
+        owned = any(
+            inv.process_command_has_explicit_ref(command_line, component=item)
+            for item in components
+        )
     elif process.get("proof") == "files":
         lsof = trusted_system_tool("/usr/sbin/lsof", "/usr/bin/lsof")
         refs = process_file_refs_with(lsof, process["pid"]) if lsof else None
@@ -1921,6 +2625,14 @@ def revalidate_term_target(inv: Inventory, process: dict[str, str]) -> tuple[boo
                 for path in refs
                 for item in components
             )
+        )
+    elif process.get("proof") == "environment":
+        current_host = inv.managed_launcher_environment_host(
+            process["pid"], command_line
+        )
+        owned = bool(
+            current_host is not None
+            and current_host == process.get("environment_host")
         )
     else:
         owned = False
@@ -2199,7 +2911,41 @@ def atomic_write(path: Path, text: str) -> None:
             os.unlink(temporary)
 
 
-def edit_json(path: Path, pointers: tuple[tuple[str, ...], ...]) -> None:
+def edit_jsonc(path: Path, pointers: tuple[tuple[str, ...], ...]) -> None:
+    text = path.read_text(encoding="utf-8")
+    expected = parse_jsonc(text)
+    spans = jsonc_pointer_ranges(text)
+
+    selected: list[tuple[int, int]] = []
+    for pointer in pointers:
+        span = spans.get(pointer)
+        if span is None or not pointer_delete(expected, pointer):
+            raise RuntimeError(f"owned JSONC entry disappeared before edit: {path}")
+        selected.append(span)
+
+    merged: list[tuple[int, int]] = []
+    for start, end in sorted(selected):
+        if merged and start <= merged[-1][1]:
+            merged[-1] = (merged[-1][0], max(merged[-1][1], end))
+        else:
+            merged.append((start, end))
+    updated = text
+    for start, end in reversed(merged):
+        updated = updated[:start] + updated[end:]
+    if parse_jsonc(updated) != expected:
+        raise RuntimeError(f"JSONC edit changed unrelated configuration: {path}")
+    atomic_write(path, updated)
+
+
+def edit_json(
+    path: Path,
+    pointers: tuple[tuple[str, ...], ...],
+    *,
+    jsonc: bool = False,
+) -> None:
+    if jsonc:
+        edit_jsonc(path, pointers)
+        return
     data = json.loads(path.read_text(encoding="utf-8"))
     def deletion_order(pointer: tuple[str, ...]) -> tuple[int, int]:
         index = int(pointer[-1]) if pointer and pointer[-1].isdigit() else -1
@@ -2276,6 +3022,75 @@ def invoke_aqg_uninstaller(inv: Inventory) -> None:
         raise RuntimeError(f"AQG official user-scope uninstaller failed: exit {result.returncode}")
 
 
+def remove_managed_aqg_alias_env(inv: Inventory, manifest: Manifest) -> None:
+    path = inv.aqg_alias_env_target
+    if path is None:
+        return
+    if not lexists(path):
+        manifest.add(
+            {
+                "operation": "edit-json",
+                "source": str(path),
+                "status": "already-removed",
+            }
+        )
+        return
+    if path_has_symlink_component(path, inv.home) or path.is_symlink() or not path.is_file():
+        raise RuntimeError(f"managed AQG_ROOT config changed type before edit: {path}")
+    try:
+        data = json.loads(path.read_text(encoding="utf-8"))
+    except (OSError, UnicodeError, json.JSONDecodeError) as exc:
+        raise RuntimeError(
+            f"managed AQG_ROOT config cannot be revalidated: {path}: {exc.__class__.__name__}"
+        ) from exc
+    env = data.get("env") if isinstance(data, dict) else None
+    current = env.get("AQG_ROOT") if isinstance(env, dict) else None
+    if current is None:
+        manifest.add(
+            {
+                "operation": "edit-json",
+                "source": str(path),
+                "status": "already-removed",
+            }
+        )
+        return
+    if not (
+        isinstance(current, str)
+        and Path(current).is_absolute()
+        and lex(Path(current)) == inv.aqg
+    ):
+        manifest.add(
+            {
+                "operation": "edit-json",
+                "source": str(path),
+                "status": "preserved-changed",
+            }
+        )
+        return
+    edit_json(path, (("env", "AQG_ROOT"),))
+    manifest.add({"operation": "edit-json", "source": str(path), "destination": None})
+
+
+def remove_orphaned_managed_aqg_hooks(inv: Inventory, manifest: Manifest) -> None:
+    expected = inv.orphaned_aqg_hook_targets
+    if not expected:
+        return
+    path = inv.home / CLAUDE_SETTINGS_RELATIVE
+    if path_has_symlink_component(path, inv.home) or path.is_symlink() or not path.is_file():
+        raise RuntimeError(f"orphaned AQG hook config changed type before edit: {path}")
+    try:
+        data = json.loads(path.read_text(encoding="utf-8"))
+    except (OSError, UnicodeError, json.JSONDecodeError) as exc:
+        raise RuntimeError(
+            f"orphaned AQG hook config cannot be revalidated: {path}: {exc.__class__.__name__}"
+        ) from exc
+    current = inv.orphaned_managed_aqg_hook_pointers(data)
+    if current != expected:
+        raise RuntimeError(f"orphaned AQG hook ownership changed before edit: {path}")
+    edit_json(path, expected)
+    manifest.add({"operation": "edit-json", "source": str(path), "destination": None})
+
+
 def apply_inventory(inv: Inventory) -> Path:
     backup = backup_root(inv.home, inv.dp, inv.scope)
     manifest = Manifest(backup, inv.home, inv.scope)
@@ -2283,6 +3098,10 @@ def apply_inventory(inv: Inventory) -> Path:
     try:
         backup_paths: list[Path] = []
         backup_paths.extend(path for path, _ in inv.json_targets)
+        if inv.aqg_alias_env_target:
+            backup_paths.append(inv.aqg_alias_env_target)
+        if inv.orphaned_aqg_hook_targets:
+            backup_paths.append(inv.home / CLAUDE_SETTINGS_RELATIVE)
         backup_paths.extend(path for path, _ in inv.toml_ranges)
         backup_paths.extend(path for path, _digest in inv.aqg_skill_markers)
         if inv.agents_target:
@@ -2300,8 +3119,11 @@ def apply_inventory(inv: Inventory) -> Path:
 
         bootout_launchagent(inv)
         invoke_aqg_uninstaller(inv)
+        remove_orphaned_managed_aqg_hooks(inv, manifest)
+        remove_managed_aqg_alias_env(inv, manifest)
 
         json_targets = inv.json_targets
+        jsonc_targets = inv.jsonc_targets
         toml_ranges = inv.toml_ranges
         agents_target = inv.agents_target
         qoder_residue_paths = inv.qoder_residue_paths
@@ -2339,12 +3161,13 @@ def apply_inventory(inv: Inventory) -> Path:
                     + ", ".join(str(path) for path in sorted(new_residue_paths))
                 )
             json_targets = refreshed_de.json_targets
+            jsonc_targets = refreshed_de.jsonc_targets
             toml_ranges = refreshed_de.toml_ranges
             agents_target = refreshed_de.agents_target
             qoder_residue_paths = refreshed_de.qoder_residue_paths
 
         for path, pointers in json_targets:
-            edit_json(path, pointers)
+            edit_json(path, pointers, jsonc=path in jsonc_targets)
             manifest.add({"operation": "edit-json", "source": str(path), "destination": None})
         for path, ranges in toml_ranges:
             edit_toml(path, ranges)

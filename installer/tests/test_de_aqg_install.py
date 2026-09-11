@@ -51,10 +51,21 @@ def _checkout(root):
     root.mkdir(parents=True)
     _git(root, "init", "--quiet")
     _git(root, "remote", "add", "origin", AQG_REPO)
-    for name in REQUIRED_FILES:
+    for name in (*REQUIRED_FILES, "requirements.txt"):
         path = root / name
         path.parent.mkdir(parents=True, exist_ok=True)
         path.write_text("fixture\n", encoding="utf-8")
+    (root / "VERSION").write_text("fixture\n", encoding="utf-8")
+    updater = root / "scripts/aqg_update/run.py"
+    updater.parent.mkdir(parents=True)
+    updater.write_text(
+        "from types import SimpleNamespace\n"
+        "def check(*, root, remote, channel, apply):\n"
+        "    assert root.name == 'agent-quality-gates'\n"
+        "    assert channel == 'stable' and apply is True\n"
+        "    return SimpleNamespace(outcome='current', detail='offline fixture', pending=())\n",
+        encoding="utf-8",
+    )
     _git(root, "add", ".")
     _git(root, "-c", "user.name=Fixture", "-c", "user.email=fixture@example.test",
          "-c", "commit.gpgsign=false", "commit", "--quiet", "-m", "fixture")
@@ -68,6 +79,23 @@ def _managed_checkout(parent):
     target.parent.mkdir(parents=True, exist_ok=True)
     staging.rename(target)
     return target, commit
+
+
+def _managed_release_checkout(parent, release="0.14.14"):
+    staging = _checkout(parent / "staging")
+    (staging / "VERSION").write_text(release + "\n", encoding="utf-8")
+    _git(staging, "add", "VERSION")
+    _git(
+        staging,
+        "-c", "user.name=Fixture",
+        "-c", "user.email=fixture@example.test",
+        "-c", "commit.gpgsign=false",
+        "commit", "--quiet", "-m", "release identity",
+    )
+    target = parent / "versions" / release
+    target.parent.mkdir(parents=True, exist_ok=True)
+    staging.rename(target)
+    return target, _git(target, "rev-parse", "HEAD")
 
 
 def _link(root, target):
@@ -89,7 +117,7 @@ def verify_checkout(request, tmp_path):
     source = (ROOT / request.param).read_text(encoding="utf-8")
     # Load the real functions only: no network, activation, or host writes.
     functions = []
-    for name in ("fail", "clean_exec", "verify_aqg_checkout"):
+    for name in ("fail", "clean_exec", "verify_aqg_checkout", "update_managed_aqg"):
         match = re.search(rf"^{name}\(\) \{{\n.*?^\}}$", source, re.M | re.S)
         assert match is not None, f"missing installer function: {name}"
         functions.append(match.group())
@@ -250,8 +278,10 @@ def test_unmanaged_links_are_rejected(verify_checkout, tmp_path, target_name):
     result = verify_checkout(root)
 
     assert result.returncode == 2, result.stderr
-    if target_name == "versions" or target_name.startswith("versions/"):
-        expected = "not an AQG-managed versions/<commit> symlink"
+    if target_name in ("versions/latest", f"versions/{'a' * 39}", f"versions/{'g' * 40}"):
+        expected = "release-named target does not match VERSION/HEAD or the official retry naming rule"
+    elif target_name == "versions" or target_name.startswith("versions/"):
+        expected = "not an AQG-managed versions/<release-or-commit> symlink"
     else:
         expected = "symlink without a regular sibling versions directory"
     assert expected in result.stderr
@@ -278,7 +308,7 @@ def test_managed_path_cannot_escape_via_another_link(
     if linked_component == "versions":
         expected = "symlink without a regular sibling versions directory"
     else:
-        expected = "not an AQG-managed versions/<commit> symlink"
+        expected = "not an AQG-managed versions/<release-or-commit> symlink"
     assert expected in result.stderr
 
 
@@ -351,4 +381,4 @@ def test_managed_link_rejects_directory_name_that_does_not_match_head(
     result = verify_checkout(root)
 
     assert result.returncode == 2, result.stderr
-    assert "target name does not match its checked-out commit" in result.stderr
+    assert "commit-named target does not match its checked-out commit" in result.stderr

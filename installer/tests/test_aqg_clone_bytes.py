@@ -34,10 +34,10 @@ def test_aqg_clone_preserves_bytes_with_global_crlf_conversion(tmp_path, entry):
     git("commit", "-qm", "fixture")
     source = (REPO / entry).read_text(encoding="utf-8")
     if entry == "dp-install.ps1":
-        # This entrance clones DE first, then delegates AQG to install.sh.
-        # Execute its actual clone expression with only the process wrapper
-        # replaced, so global CRLF defaults exercise the shipped arguments.
-        start = source.index("$clone = Invoke-WithCleanEnvironment")
+        # Select the AQG clone inside Sync-AqgCheckout, not the earlier DE clone.
+        # Execute its actual expression with only the process wrapper replaced.
+        sync_start = source.index("function Sync-AqgCheckout")
+        start = source.index("$clone = Invoke-WithCleanEnvironment", sync_start)
         clone = source[start:source.index("if ($clone -ne 0)", start)]
         code = """
 function Invoke-WithCleanEnvironment {
@@ -46,8 +46,9 @@ function Invoke-WithCleanEnvironment {
     return $LASTEXITCODE
 }
 $GitPath = (Get-Command git.exe).Source
-$DecisionEngineRepository = $env:AQG_REPO
-$sourceRoot = $env:AQG_DEST
+$AqgRepository = $env:AQG_REPO
+$AqgRoot = $env:AQG_DEST
+$AqgRef = "main"
 """ + clone + "\nexit $clone\n"
     elif entry == "install.sh":
         start = source.index("install_aqg_body() {")
@@ -112,6 +113,10 @@ def test_aqg_update_pins_local_line_endings_before_git_operation(tmp_path, entry
         ["git", "-C", str(dest), "config", "--unset-all", "core.eol"],
         env=env, check=False, capture_output=True,
     )
+    # Repository-local EOL settings describe a provably clean legacy checkout.
+    # Entrypoint isolation deliberately removes GIT_CONFIG_GLOBAL overrides.
+    git(dest, "config", "core.autocrlf", "true")
+    git(dest, "config", "core.eol", "crlf")
 
     source = (REPO / entry).read_text(encoding="utf-8")
     if entry == "install.sh":

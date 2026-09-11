@@ -66,10 +66,19 @@ tty_print() {
 }
 
 clean_exec() {
+  (
+  # git -C does not override inherited repository/configuration redirection.
+  # Use a subshell so failures cannot alter the caller's environment.
+  local git_env_name
+  for git_env_name in "${!GIT_@}"; do
+    unset "$git_env_name" || exit 1
+  done
   env -u DE_ENDPOINT -u DE_ACTIVATION_SECRET -u PYTHONPATH \
     -u CLAUDE_DESKTOP_CONFIG -u CLAUDE_DESKTOP_3P_CONFIG -u WORKBUDDY_APP_ROOT \
     -u WORKBUDDY_CONFIG -u WORKBUDDY_SKILLS_DIR \
-    -u BASH_ENV -u ENV "$@"
+    -u BASH_ENV -u ENV \
+    AQG_BACKUP_DIR="${DEEPPATTERN_ROOT:-$HOME/.deeppattern}/aqg-backups" "$@"
+  )
 }
 
 confirm_dependency_install() {
@@ -603,8 +612,76 @@ managed_shim_has_root_ref() {
   return 1
 }
 
+managed_shim_has_root_env() {
+  local pid="$1" executable="$2" module="$3"
+  clean_exec "$PYTHON_BIN" - "$pid" "$executable" "$module" "$MANAGED_ROOT" <<'PY'
+import re
+import subprocess
+import sys
+
+pid, executable, module, managed_root = sys.argv[1:]
+try:
+    result = subprocess.run(
+        ["/bin/ps", "eww", "-p", pid, "-o", "command="],
+        text=True,
+        stdout=subprocess.PIPE,
+        stderr=subprocess.DEVNULL,
+        check=False,
+        timeout=2,
+    )
+except (OSError, subprocess.TimeoutExpired):
+    raise SystemExit(1)
+if result.returncode != 0:
+    raise SystemExit(1)
+
+prefix = f"{executable} -m {module}"
+process_text = result.stdout.rstrip("\n")
+if not process_text.startswith(prefix + " "):
+    raise SystemExit(1)
+environment_text = process_text[len(prefix) :].lstrip()
+
+def exact_environment_value(name: str, value: str) -> bool:
+    pattern = re.compile(
+        rf"(?:^| ){re.escape(name)}={re.escape(value)}"
+        r"(?= [A-Za-z_][A-Za-z0-9_]*=|$)"
+    )
+    return pattern.search(environment_text) is not None
+
+host_match = re.search(
+    r"(?:^| )DE_MCP_CLIENT_HOST=([a-z0-9-]+)"
+    r"(?= [A-Za-z_][A-Za-z0-9_]*=|$)",
+    environment_text,
+)
+registered_hosts = {
+    "claude-code",
+    "claude-desktop",
+    "claude-desktop-3p",
+    "codebuddy",
+    "codex",
+    "cursor",
+    "qoder",
+    "qoder-cn",
+    "qoder-ide",
+    "qoder-cn-ide",
+    "trae",
+    "trae-work",
+    "trae-cn",
+    "trae-work-cn",
+    "workbuddy",
+    "workbuddy-ai",
+}
+raise SystemExit(
+    0
+    if exact_environment_value("PYTHONPATH", managed_root)
+    and host_match is not None
+    and host_match.group(1) in registered_hosts
+    else 1
+)
+PY
+}
+
 verified_managed_shim_snapshot() {
-  local pid="$1" snapshot uid parent started command expected_uid executable executable_name
+  local pid="$1" snapshot uid parent started command expected_uid executable executable_name module
   snapshot="$(process_snapshot "$pid")" || return 1
   IFS=$'\t' read -r uid parent started command <<<"$snapshot"
   expected_uid="$(/usr/bin/id -u)"
@@ -618,7 +695,14 @@ verified_managed_shim_snapshot() {
   esac
   case "$command" in
     "$executable -m installer.launcher"*|"$executable -m installer.shim"*)
-      managed_shim_has_root_ref "$pid" || return 1
+      case "$command" in
+        "$executable -m installer.launcher"*) module="installer.launcher" ;;
+        *) module="installer.shim" ;;
+      esac
+      managed_shim_has_root_ref "$pid" \
+        || { [ "$command" = "$executable -m $module" ] \
+          && managed_shim_has_root_env "$pid" "$executable" "$module"; } \
+        || return 1
       printf '%s\n' "$snapshot"
       ;;
     "$executable -c "*"$MANAGED_ROOT --managed-root $MANAGED_ROOT")
@@ -856,14 +940,14 @@ AQG_LAYOUT=""
 AQG_MANAGED_TARGET=""
 
 verify_aqg_checkout() {
-  local actual_remote current_sha managed_target status_output versions_root
+  local actual_remote current_sha managed_name managed_target status_output versions_root
   AQG_LAYOUT="regular"
   AQG_MANAGED_TARGET=""
   if [ -L "$AQG_ROOT" ]; then
     versions_root="$(dirname "$AQG_ROOT")/versions"
     [ -d "$versions_root" ] && [ ! -L "$versions_root" ] \
       || fail "$AQG_ROOT is a symlink without a regular sibling versions directory; preserve it and stop"
-    managed_target="$(clean_exec "$PYTHON_BIN" - "$AQG_ROOT" "$versions_root" <<'PY'
+    managed_target="$(clean_exec "$PYTHON_BIN" -I -B - "$AQG_ROOT" "$versions_root" <<'PY'
 from pathlib import Path
 import re
 import sys
@@ -877,13 +961,14 @@ except OSError:
     raise SystemExit(1)
 if (
     target.parent != versions
-    or re.fullmatch(r"[0-9a-f]{40}", target.name) is None
     or not target.is_dir()
 ):
     raise SystemExit(1)
+if re.fullmatch(r"[0-9A-Za-z.+-]{1,40}", target.name) is None:
+    raise SystemExit(1)
 print(target)
 PY
-)" || fail "$AQG_ROOT is not an AQG-managed versions/<commit> symlink; preserve it and stop"
+)" || fail "$AQG_ROOT is not an AQG-managed versions/<release-or-commit> symlink; preserve it and stop"
     AQG_LAYOUT="managed"
     AQG_MANAGED_TARGET="$managed_target"
   elif [ ! -d "$AQG_ROOT" ]; then
@@ -909,15 +994,47 @@ PY
   current_sha="$(clean_exec "$GIT_BIN" -C "$AQG_ROOT" rev-parse --verify HEAD 2>/dev/null || true)"
   [[ "$current_sha" =~ ^[0-9a-f]{40}$ ]] \
     || fail "$AQG_ROOT does not resolve to a full Git commit; preserve it and stop"
-  if [ "$AQG_LAYOUT" = "managed" ] \
-      && [ "$AQG_MANAGED_TARGET" != "$(dirname "$AQG_MANAGED_TARGET")/$current_sha" ]; then
-    fail "$AQG_ROOT target name does not match its checked-out commit; preserve it and stop"
+  if [ "$AQG_LAYOUT" = "managed" ]; then
+    managed_name="${AQG_MANAGED_TARGET##*/}"
+    if [[ "$managed_name" =~ ^[0-9a-f]{40}$ ]]; then
+      [ "$managed_name" = "$current_sha" ] \
+        || fail "$AQG_ROOT commit-named target does not match its checked-out commit; preserve it and stop"
+    else
+      clean_exec "$PYTHON_BIN" -I -B - "$AQG_ROOT/VERSION" "$managed_name" "$current_sha" <<'PY' \
+        || fail "$AQG_ROOT release-named target does not match VERSION/HEAD or the official retry naming rule; preserve it and stop"
+from pathlib import Path
+import re
+import sys
+
+version = Path(sys.argv[1]).read_text(encoding="utf-8").strip()
+name, head = sys.argv[2:]
+def release(value):
+    return len(value) <= 40 and re.fullmatch(
+        r"[0-9]+\.[0-9]+\.[0-9]+(?:-[0-9A-Za-z]+(?:[.-][0-9A-Za-z]+)*)?"
+        r"(?:\+[0-9A-Za-z-]+(?:\.[0-9A-Za-z-]+)*)?", value
+    ) is not None
+
+# Mirror stage.version_name without invoking it (it inspects occupied paths).
+reissue = f"{version}-{head[:12]}"
+bases = {version if release(version) else head, reissue if release(reissue) else head}
+legacy = name == version and re.fullmatch(r"v?[0-9]+(?:\.[0-9]+){2}(?:[-+][0-9A-Za-z.-]+)?", version)
+matches = legacy or name in bases or any(
+    re.fullmatch(re.escape(base[:23]) + r"-[0-9a-f]{16}", name) for base in bases
+)
+raise SystemExit(0 if matches else 1)
+PY
+    fi
   fi
 }
 
 sync_aqg_checkout() {
-  local aqg_archive current_sha target_sha
+  local aqg_archive target_sha
   verify_aqg_checkout
+  if [ "$AQG_LAYOUT" = "managed" ]; then
+    update_managed_aqg
+    verify_aqg_checkout
+    return 0
+  fi
   tty_print "Synchronizing Agent Quality Gates from $AQG_REPO at $AQG_REF..."
   if [ "$AQG_LAYOUT" = "regular" ]; then
     clean_exec "$GIT_BIN" -C "$AQG_ROOT" config --local core.autocrlf false \
@@ -946,19 +1063,144 @@ sync_aqg_checkout() {
   target_sha="$(clean_exec "$GIT_BIN" -C "$AQG_ROOT" rev-parse --verify FETCH_HEAD 2>/dev/null || true)"
   [[ "$target_sha" =~ ^[0-9a-f]{40}$ ]] \
     || fail "the AQG product target did not resolve to a valid commit; the existing checkout was preserved"
-  if [ "$AQG_LAYOUT" = "managed" ]; then
-    current_sha="$(clean_exec "$GIT_BIN" -C "$AQG_ROOT" rev-parse --verify HEAD 2>/dev/null || true)"
-    [ "$current_sha" = "$target_sha" ] \
-      || fail "AQG managed install is at $current_sha but $AQG_REF is $target_sha; preserve the versioned layout and use AQG's transactional multi-host update flow"
-    tty_print "AQG managed checkout already matches $AQG_REF at $target_sha; preserving the versioned layout."
-    verify_aqg_checkout
-    return 0
-  fi
   clean_exec "$GIT_BIN" -C "$AQG_ROOT" checkout --detach "$target_sha" \
     || fail "could not switch the AQG checkout to the approved target; preserve it and stop"
   clean_exec "$GIT_BIN" -C "$AQG_ROOT" remote set-url origin "$AQG_REPO" \
     || fail "AQG was updated, but its origin could not be normalized to the product repository"
   verify_aqg_checkout
+}
+
+update_managed_aqg() {
+  local status=0
+  tty_print "Checking AQG signed stable through its transactional multi-host updater..."
+  verify_aqg_checkout
+  clean_exec env AQG_ROOT="$AQG_ROOT" "$PYTHON_BIN" -I -B - "$AQG_ROOT" "$AQG_REPO" <<'PY' || status=$?
+from pathlib import Path
+import sys
+
+root = Path(sys.argv[1]).absolute()
+sys.path.insert(0, str(root))
+from scripts.aqg_update.run import check
+
+result = check(root=root, remote=sys.argv[2], channel="stable", apply=True)
+print(f"AQG signed update: status={result.outcome}; {result.detail}")
+if result.pending:
+    print("AQG host approvals remain pending: " + ", ".join(result.pending))
+    raise SystemExit(4)
+if result.outcome in {"current", "applied"}:
+    raise SystemExit(0)
+if result.outcome in {"too-soon", "disabled"}:
+    print("AQG update check was skipped by updater policy; latest release is not confirmed.")
+    raise SystemExit(0)
+raise SystemExit(4 if result.outcome in {"pending", "busy", "deferred"} else 2)
+PY
+  case "$status" in
+    0) verify_aqg_checkout ;;
+    4) dependency_pending "AQG update needs attention; resolve the reported pending state and retry. No checkout reset was attempted." ;;
+    *) fail "AQG signed update did not complete; inspect the status above. No checkout reset was attempted." ;;
+  esac
+}
+
+aqg_backup_residue() {
+  clean_exec "$PYTHON_BIN" -I -B - "$DEEPPATTERN_ROOT" "$@" <<'PY'
+import os
+from pathlib import Path
+import stat
+import sys
+import tempfile
+
+dp, action = Path(sys.argv[1]), sys.argv[2]
+source = dp / "versions/aqg-backups"
+destination = dp / "aqg-backups"
+
+def directory(path):
+    info = path.lstat()
+    if not stat.S_ISDIR(info.st_mode) or info.st_uid != os.getuid() or info.st_mode & 0o022:
+        raise ValueError(f"not a private, owned regular directory: {path}")
+    return info
+
+def identity():
+    # Do not traverse backup contents. Rename preserves files and links intact.
+    parts = []
+    for path in (dp, source.parent, source):
+        info = directory(path)
+        parts.extend((info.st_dev, info.st_ino, info.st_mtime_ns))
+    return ":".join(map(str, parts))
+
+try:
+    if action == "inspect" and not os.path.lexists(source):
+        raise SystemExit(0)
+    frozen = identity()
+    if action == "inspect":
+        print(frozen)
+        raise SystemExit(0)
+    if action != "move" or len(sys.argv) != 4 or frozen != sys.argv[3]:
+        raise ValueError("backup directory identity changed after confirmation; nothing moved")
+    if os.path.lexists(destination):
+        directory(destination)
+    else:
+        destination.mkdir(mode=0o700)
+    directory(destination)
+    archive = Path(tempfile.mkdtemp(prefix="legacy-versions-", dir=destination))
+    target = archive / "aqg-backups"
+    try:
+        # Parent metadata may change when the archive base is created; freeze
+        # the source itself again immediately before the atomic rename.
+        info = directory(source)
+        expected = ":".join(map(str, (info.st_dev, info.st_ino, info.st_mtime_ns)))
+        if expected != ":".join(frozen.split(":")[-3:]):
+            raise ValueError("backup directory changed before move; nothing moved")
+        directory(dp)
+        directory(source.parent)
+        directory(destination)
+        os.rename(source, target)
+    except BaseException:
+        archive.rmdir()
+        raise
+    print(f"PRESERVE archived legacy AQG backups: {target}")
+except (OSError, ValueError) as exc:
+    print(f"AQG backup relocation refused: {exc}", file=sys.stderr)
+    raise SystemExit(2)
+PY
+}
+
+prepare_aqg_versions() {
+  local identity
+  identity="$(aqg_backup_residue inspect)" \
+    || fail "could not safely inspect legacy AQG backups; nothing was moved"
+  [ -n "$identity" ] || return 0
+  tty_print "AQG version migration is blocked by historical backups at $DEEPPATTERN_ROOT/versions/aqg-backups."
+  tty_print "Fully quit Agent hosts before moving these backups. Their contents will be preserved, not deleted or merged."
+  confirm_dependency_install "Move this directory into a new legacy-versions archive under $DEEPPATTERN_ROOT/aqg-backups and continue?" \
+    || dependency_pending "legacy AQG backups were preserved in versions; installation was paused before host configuration"
+  aqg_backup_residue move "$identity" \
+    || fail "legacy AQG backups could not be relocated safely; inspect the reason above and retry"
+}
+
+ensure_aqg_update_layout() {
+  verify_aqg_checkout
+  tty_print "Ensuring AQG uses its official managed-update version layout..."
+  clean_exec env AQG_ROOT="$AQG_ROOT" "$PYTHON_BIN" -I -B - "$AQG_ROOT" <<'PY' \
+    || fail "AQG managed-update layout was not established; resolve the migration reason above and retry"
+from pathlib import Path
+import sys
+
+root = Path(sys.argv[1]).absolute()
+sys.path.insert(0, str(root))
+from scripts.aqg_update.migrate import ensure_managed_layout
+
+result = ensure_managed_layout(root)
+print(f"AQG layout: {result.reason}")
+if not result.managed or not root.is_symlink():
+    raise SystemExit(2)
+PY
+  verify_aqg_checkout
+  [ "$AQG_LAYOUT" = "managed" ] \
+    || fail "AQG did not produce a verified managed versions directory"
+  tty_print "AQG managed entrance: $AQG_ROOT -> $AQG_MANAGED_TARGET"
+  if [[ "${AQG_MANAGED_TARGET##*/}" =~ ^[0-9a-f]{40}$ ]]; then
+    tty_print "AQG retained a legacy commit-named version; the official updater owns future version naming."
+  fi
 }
 
 run_aqg_clients() {
@@ -1080,15 +1322,15 @@ reconcile_codex_hooks_after_aqg_migration() {
   [ "$AQG_LAYOUT" = "managed" ] && [ -n "$AQG_MANAGED_TARGET" ] || return 1
   active_root="$AQG_MANAGED_TARGET"
 
-  tty_print "Rebinding Codex hooks to the active AQG managed version..."
+  tty_print "Rebinding Codex hooks to the stable AQG managed entrance..."
   clean_exec env \
     PATH="$PYTHON_DIR:$PATH" \
     AQG_BACKUP_DIR="$DEEPPATTERN_ROOT/aqg-backups" \
     "$PYTHON_BIN" "$active_root/scripts/install_aqg_codex_hooks.py" \
-    --apply --aqg-root "$active_root" || return 1
+    --apply --aqg-root "$AQG_ROOT" || return 1
   clean_exec env PATH="$PYTHON_DIR:$PATH" \
     "$PYTHON_BIN" "$active_root/scripts/install_aqg_codex_hooks.py" \
-    --verify --aqg-root "$active_root"
+    --verify --aqg-root "$AQG_ROOT"
 }
 
 install_aqg_dependencies() {
@@ -1101,6 +1343,8 @@ install_aqg_dependencies() {
     clean_exec "$PYTHON_BIN" -m pip install --user -r "$AQG_ROOT/requirements.txt"
   fi
 }
+
+prepare_aqg_versions
 
 if [ -e "$AQG_ROOT" ] || [ -L "$AQG_ROOT" ]; then
   sync_aqg_checkout
@@ -1151,17 +1395,19 @@ run_aqg_clients "dry-run" \
 tty_print "Applying AQG skills, rules, and only the lifecycle hooks supported by each detected host..."
 run_aqg_clients "apply" --apply \
   || fail "AQG multi-host configuration failed; Decision Engine was not installed"
+ensure_aqg_update_layout
+reconcile_codex_hooks_after_aqg_migration \
+  || fail "AQG migrated to its managed layout, but Codex hooks could not be rebound to the managed entrance; Decision Engine was not installed"
 converge_managed_claude_hooks \
   || fail "AQG-managed Claude hooks could not be converged safely; Decision Engine was not installed"
 tty_print "Verifying AQG multi-host configuration..."
 run_aqg_clients "verify" --verify \
   || fail "AQG multi-host verification failed; Decision Engine was not installed"
-reconcile_codex_hooks_after_aqg_migration \
-  || fail "AQG migrated to its managed layout, but Codex hooks could not be rebound to the active version; Decision Engine was not installed"
 if ! clean_exec env PATH="$PYTHON_DIR:$PATH" \
     "$PYTHON_BIN" "$AQG_ROOT/scripts/aqg_doctor.py"; then
   fail "AQG Doctor failed after multi-host configuration; Decision Engine was not installed"
 fi
+verify_aqg_checkout
 aqg_sha="$(clean_exec "$GIT_BIN" -C "$AQG_ROOT" rev-parse HEAD)"
 
 tty_print "Installing the signed Decision Engine stable release..."
