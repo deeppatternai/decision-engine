@@ -229,8 +229,6 @@ bootstrap_git_prerequisite() {
 }
 
 try_git "$(command -v git 2>/dev/null || true)" \
-  || try_git "/opt/homebrew/bin/git" \
-  || try_git "/usr/local/bin/git" \
   || bootstrap_git_prerequisite
 
 try_python() {
@@ -383,6 +381,33 @@ run_source_python() {
     de_exec "$PYTHON_BIN" "$@"
   )
 }
+
+trusted_git_from_source() {
+  run_source_python -c \
+    'from installer import updater
+print(updater._resolve_git_executable(minimum_version=updater._MINIMUM_GIT_VERSION))'
+}
+
+select_trusted_git_prerequisite() {
+  local selected=""
+  if selected="$(trusted_git_from_source 2>/dev/null)" && [ -n "$selected" ]; then
+    try_git "$selected" \
+      || fail "the trusted Git selector returned an unusable Git executable"
+    tty_print "Trusted Git prerequisite ready: $GIT_VERSION ($GIT_BIN)"
+    return 0
+  fi
+
+  bootstrap_git_prerequisite
+  if selected="$(trusted_git_from_source 2>/dev/null)" && [ -n "$selected" ]; then
+    try_git "$selected" \
+      || fail "the trusted Git selector returned an unusable Git executable after dependency setup"
+    tty_print "Trusted Git prerequisite ready: $GIT_VERSION ($GIT_BIN)"
+    return 0
+  fi
+  fail "Git 2.45 or newer is not available in a trusted system location accepted by the signed installer; install or repair system Git, then retry"
+}
+
+select_trusted_git_prerequisite
 
 managed_root_git_state_is_safe() {
   local status_output status_line

@@ -250,6 +250,45 @@ class ReleaseAcquisitionTests(unittest.TestCase):
                             root, expected_commit="1" * 40
                         )
 
+    def test_trust_store_loader_uses_legacy_local_git_reader_mode(self):
+        import tempfile
+        from pathlib import Path
+
+        with tempfile.TemporaryDirectory() as tmp:
+            root = Path(tmp)
+            path = root / release_acquisition.TRUST_STORE_RELATIVE_PATH
+            path.parent.mkdir(parents=True)
+            trust_store = {
+                "schema": 1,
+                "keys": [
+                    {
+                        "key_id": "local-key",
+                        "algorithm": release_contract.RSA_SHA256_ALGORITHM,
+                        "modulus_hex": "f" * 512,
+                        "exponent": 65537,
+                        "revoked": False,
+                    }
+                ],
+            }
+            payload = json.dumps(trust_store).encode("utf-8")
+            path.write_bytes(payload)
+            reader = mock.Mock()
+            reader.run.side_effect = [
+                (0, (b"1" * 40) + b"\n"),
+                (0, payload),
+            ]
+            with mock.patch.object(
+                release_acquisition.updater, "_GitReader", return_value=reader
+            ) as git_reader:
+                trusted = release_acquisition.load_trusted_release_keys(root)
+
+        self.assertEqual(tuple(trusted), ("local-key",))
+        git_reader.assert_called_once_with(
+            root,
+            deadline=None,
+            trust_store_only=True,
+        )
+
     def test_fetch_child_does_not_inherit_custom_tls_trust_anchors(self):
         process = mock.Mock()
         process.communicate.return_value = (b"{}", b"")

@@ -132,7 +132,9 @@ def _pin_windows_checkout_policy(repo: Path) -> None:
     same values, which self-heals an older checkout cloned before this pin."""
     if not _windows_checkout_policy_required():
         return
-    executable = updater._resolve_git_executable()
+    executable = updater._resolve_git_executable(
+        minimum_version=updater._MINIMUM_GIT_VERSION
+    )
     environment = updater._ambient_git_environment(executable)
     _git(executable, environment, repo, "config", "--local", "core.autocrlf", "false", timeout=30.0)
     _git(executable, environment, repo, "config", "--local", "core.symlinks", "false", timeout=30.0)
@@ -179,7 +181,9 @@ def _clone_staging(stage: Path, remote_urls: Sequence[Tuple[str, str]]) -> str:
     stage-path operands so a value that happens to start with ``-`` can
     never be parsed as a git flag (e.g. ``--upload-pack=<cmd>``).
     """
-    executable = updater._resolve_git_executable()
+    executable = updater._resolve_git_executable(
+        minimum_version=updater._MINIMUM_GIT_VERSION
+    )
     environment = updater._ambient_git_environment(executable)
     extra_git_config = _test_only_extra_git_config()
     last_error: Optional[Exception] = None
@@ -213,7 +217,9 @@ def _fetch_and_verify_tag(
     ``de_private_repo.py::_fetch_and_verify_tag``)."""
     if not _TAG_RE.fullmatch(manifest.tag):
         raise BootstrapError("signed release tag is invalid")
-    executable = updater._resolve_git_executable()
+    executable = updater._resolve_git_executable(
+        minimum_version=updater._MINIMUM_GIT_VERSION
+    )
     environment = updater._ambient_git_environment(executable)
     ref = "refs/tags/%s" % manifest.tag
     temporary = "refs/bootstrap-verified-%s" % manifest.tag
@@ -232,7 +238,9 @@ def _checkout_release(stage: Path, manifest: release_contract.ReleaseManifest) -
     ``de_private_repo.py::_checkout_release`` — ``activate_prepared_install``
     only compares resolved commit hashes, so a detached HEAD passes its
     checks exactly like an attached branch would)."""
-    executable = updater._resolve_git_executable()
+    executable = updater._resolve_git_executable(
+        minimum_version=updater._MINIMUM_GIT_VERSION
+    )
     environment = updater._ambient_git_environment(executable)
     _git(executable, environment, stage, "checkout", "--detach", manifest.tag, timeout=60.0)
     head = _git(executable, environment, stage, "rev-parse", "--verify", "HEAD^{commit}",

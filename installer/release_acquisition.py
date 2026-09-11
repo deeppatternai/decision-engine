@@ -540,7 +540,11 @@ def load_trusted_release_keys(
     except (OSError, UnicodeError, ValueError) as exc:
         raise ReleaseTrustUnavailable("release trust store is invalid") from exc
     try:
-        reader = updater._GitReader(Path(root), deadline=deadline)
+        reader = updater._GitReader(
+            Path(root),
+            deadline=deadline,
+            trust_store_only=True,
+        )
         commit = expected_commit
         if commit is None:
             _code, head_output = reader.run("head")

@@ -186,6 +186,55 @@ sync_aqg_checkout
     return verify
 
 
+def test_dp_install_trusted_git_selection_delegates_to_source_updater():
+    source = (ROOT / "dp-install.sh").read_text(encoding="utf-8")
+    match = re.search(r"^select_trusted_git_prerequisite\(\) \{\n.*?^\}$", source, re.M | re.S)
+    assert match is not None
+    body = match.group()
+
+    assert "trusted_git_from_source" in body
+    assert "bootstrap_git_prerequisite" in body
+    assert "/opt/homebrew/bin/git" not in body
+    assert "/usr/local/bin/git" not in body
+    assert "/opt/local/bin/git" not in body
+    assert "/snap/bin/git" not in body
+    assert "updater._resolve_git_executable(minimum_version=updater._MINIMUM_GIT_VERSION)" in source
+
+
+def test_dp_install_trusted_git_selection_uses_source_result(tmp_path):
+    bash = shutil.which("bash")
+    if bash is None:
+        pytest.skip("bash executable not found on PATH")
+    source = (ROOT / "dp-install.sh").read_text(encoding="utf-8")
+    match = re.search(r"^select_trusted_git_prerequisite\(\) \{\n.*?^\}$", source, re.M | re.S)
+    assert match is not None
+    trusted = tmp_path / "trusted-git"
+    script = "\n".join(
+        [
+            "set -euo pipefail",
+            match.group(),
+            "trusted_git_from_source() { printf '%s\\n' \"$TRUSTED_GIT\"; }",
+            "try_git() { GIT_BIN=\"$1\"; GIT_VERSION='git version 2.99.0'; printf 'try:%s\\n' \"$1\"; return 0; }",
+            "bootstrap_git_prerequisite() { printf 'bootstrap\\n'; return 0; }",
+            "tty_print() { printf 'tty:%s\\n' \"$*\"; }",
+            "fail() { printf 'fail:%s\\n' \"$*\"; exit 2; }",
+            "select_trusted_git_prerequisite",
+        ]
+    )
+
+    result = subprocess.run(
+        [bash, "--noprofile", "--norc", "-c", script],
+        env={**os.environ, "TRUSTED_GIT": str(trusted)},
+        capture_output=True,
+        text=True,
+        timeout=10,
+    )
+
+    assert result.returncode == 0, result.stdout + result.stderr
+    assert f"try:{trusted}" in result.stdout
+    assert "bootstrap" not in result.stdout
+
+
 def test_managed_version_with_tracked_changes_is_rejected(
     verify_checkout, tmp_path,
 ):

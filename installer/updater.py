@@ -439,7 +439,11 @@ def _windows_system_root() -> Path:
     return value
 
 
-def _git_environment(git_executable: Optional[str] = None) -> Dict[str, str]:
+def _git_environment(
+    git_executable: Optional[str] = None,
+    *,
+    deny_protocols: bool = False,
+) -> Dict[str, str]:
     allowed = {
         "LANG", "LC_ALL", "TEMP", "TMP", "TZ",
     }
@@ -467,6 +471,8 @@ def _git_environment(git_executable: Optional[str] = None) -> Dict[str, str]:
         "GIT_TERMINAL_PROMPT": "0",
         "PAGER": "",
     })
+    if deny_protocols:
+        environment["GIT_ALLOW_PROTOCOL"] = ""
     return environment
 
 
@@ -543,7 +549,29 @@ def _trusted_git_candidates() -> Tuple[Path, ...]:
     return tuple(dict.fromkeys(candidates))
 
 
-def _resolve_git_executables() -> Tuple[str, ...]:
+def _posix_git_path_is_trusted(resolved: Path) -> bool:
+    allowed_owners = {0}
+    current_uid = os.getuid() if hasattr(os, "getuid") else None
+    if current_uid is not None:
+        allowed_owners.add(current_uid)
+    for component in reversed((resolved, *resolved.parents)):
+        try:
+            component_info = os.lstat(component)
+        except OSError:
+            return False
+        mode = stat.S_IMODE(component_info.st_mode)
+        if stat.S_ISLNK(component_info.st_mode):
+            return False
+        if component_info.st_uid not in allowed_owners:
+            return False
+        if mode & 0o022:
+            return False
+    return True
+
+
+def _resolve_git_executables(
+    *, minimum_version: Optional[Tuple[int, int, int]] = None
+) -> Tuple[str, ...]:
     executables = []
     for candidate in _trusted_git_candidates():
         try:
@@ -580,39 +608,43 @@ def _resolve_git_executables() -> Tuple[str, ...]:
             if unsafe_component:
                 continue
         else:
-            allowed_owners = {0}
-            if hasattr(os, "getuid"):
-                allowed_owners.add(os.getuid())
-            trusted_path = True
-            for component in reversed((resolved, *resolved.parents)):
-                try:
-                    component_info = os.lstat(component)
-                except OSError:
-                    trusted_path = False
-                    break
-                if (
-                    stat.S_ISLNK(component_info.st_mode)
-                    or component_info.st_uid not in allowed_owners
-                    or stat.S_IMODE(component_info.st_mode) & 0o022
-                ):
-                    trusted_path = False
-                    break
-            if not trusted_path:
+            if not _posix_git_path_is_trusted(resolved):
                 continue
             if not os.access(resolved, os.X_OK):
                 continue
         value = str(resolved)
+        if minimum_version is not None:
+            try:
+                _code, version_output = _run_bounded_git(
+                    _git_arguments("version", Path.cwd(), git_executable=value),
+                    _git_environment(value),
+                    timeout_seconds=_GIT_OPERATION_TIMEOUTS["version"],
+                )
+                if _code != 0:
+                    raise UpdateInspectionError("Git version inspection failed")
+                _require_supported_git_version(
+                    version_output, minimum_version=minimum_version
+                )
+            except UpdateInspectionError:
+                continue
         if value not in executables:
             executables.append(value)
     if not executables:
+        if minimum_version is not None:
+            minimum = _format_git_version(minimum_version)
+            raise UpdateInspectionError(
+                "Git %s or newer is required in a trusted system location" % minimum
+            )
         raise UpdateInspectionError(
             "Git is not installed in a trusted system location"
         )
     return tuple(executables)
 
 
-def _resolve_git_executable() -> str:
-    return _resolve_git_executables()[0]
+def _resolve_git_executable(
+    *, minimum_version: Optional[Tuple[int, int, int]] = None
+) -> str:
+    return _resolve_git_executables(minimum_version=minimum_version)[0]
 
 
 def _git_executable_generation(
@@ -687,7 +719,12 @@ def _git_executable_generation(
 
 
 def _git_arguments(
-    operation: str, root: Path, *, git_executable: Optional[str] = None, **values: str
+    operation: str,
+    root: Path,
+    *,
+    git_executable: Optional[str] = None,
+    disable_lazy_fetch: bool = True,
+    **values: str,
 ) -> Tuple[str, ...]:
     template = _GIT_OPERATION_TEMPLATES.get(operation)
     if template is None:
@@ -711,12 +748,13 @@ def _git_arguments(
         suffix = template
     if operation == "version":
         return (git_executable or _resolve_git_executable(), *suffix)
+    lazy_fetch_args = ("--no-lazy-fetch",) if disable_lazy_fetch else ()
     worktree_override = () if operation == "top_level" else (
         "-c", "core.worktree=" + str(root),
     )
     return (
         git_executable or _resolve_git_executable(),
-        "--no-lazy-fetch",
+        *lazy_fetch_args,
         "--no-optional-locks",
         "--no-pager",
         "--no-replace-objects",
@@ -830,8 +868,15 @@ def _run_bounded_git(
 
 
 class _GitReader:
-    def __init__(self, root: Path, *, deadline: Optional[float] = None):
+    def __init__(
+        self,
+        root: Path,
+        *,
+        deadline: Optional[float] = None,
+        trust_store_only: bool = False,
+    ):
         self.root = Path(root)
+        self.trust_store_only = trust_store_only
         inspection_deadline = time.monotonic() + _INSPECTION_TIMEOUT_SECONDS
         self.deadline = (
             inspection_deadline
@@ -844,23 +889,43 @@ class _GitReader:
                 self.git_generation = _git_executable_generation(
                     executable, deadline=self.deadline
                 )
-                self.environment = _git_environment(executable)
+                self.environment = (
+                    _git_environment(executable, deny_protocols=True)
+                    if self.trust_store_only
+                    else _git_environment(executable)
+                )
                 _code, version_output = self.run("version")
-                _require_supported_git_version(version_output)
+                _require_supported_git_version(
+                    version_output,
+                    minimum_version=None if self.trust_store_only else _MINIMUM_GIT_VERSION,
+                )
             except UpdateInspectionError:
                 continue
             return
+        if self.trust_store_only:
+            raise UpdateInspectionError(
+                "Git is required in a trusted system location for release trust inspection"
+            )
         raise UpdateInspectionError(
             "Git 2.45 or newer is required in a trusted system location"
         )
 
     def run(self, operation: str, *, allowed: Iterable[int] = (0,), **values: str) -> Tuple[int, bytes]:
+        trust_store_only = getattr(self, "trust_store_only", False)
+        if trust_store_only and operation not in {"version", "head", "trust_store"}:
+            raise UpdateInspectionError(
+                "release trust inspection is limited to local trust store reads"
+            )
         if _git_executable_generation(
             self.git_executable, deadline=self.deadline
         ) != self.git_generation:
             raise UpdateInspectionError("trusted Git executable changed during inspection")
         argv = _git_arguments(
-            operation, self.root, git_executable=self.git_executable, **values
+            operation,
+            self.root,
+            git_executable=self.git_executable,
+            disable_lazy_fetch=not trust_store_only,
+            **values,
         )
         remaining = self.deadline - time.monotonic()
         if remaining <= 0:
@@ -887,7 +952,11 @@ class _GitReader:
         return returncode, output
 
 
-def _require_supported_git_version(output: bytes) -> Tuple[int, int, int]:
+def _require_supported_git_version(
+    output: bytes,
+    *,
+    minimum_version: Optional[Tuple[int, int, int]] = _MINIMUM_GIT_VERSION,
+) -> Tuple[int, int, int]:
     try:
         value = output.decode("ascii").strip()
     except UnicodeError as exc:
@@ -899,9 +968,19 @@ def _require_supported_git_version(output: bytes) -> Tuple[int, int, int]:
     if match is None:
         raise UpdateInspectionError("Git version output is invalid")
     version = tuple(int(item or 0) for item in match.groups()[:3])
-    if version < _MINIMUM_GIT_VERSION:
-        raise UpdateInspectionError("Git 2.45 or newer is required for safe update inspection")
+    if minimum_version is not None and version < minimum_version:
+        minimum = ".".join(str(part) for part in minimum_version[:2])
+        raise UpdateInspectionError(
+            "Git %s or newer is required for safe update inspection" % minimum
+        )
     return version
+
+
+def _format_git_version(version: Tuple[int, int, int]) -> str:
+    parts = tuple(version)
+    while len(parts) > 2 and parts[-1] == 0:
+        parts = parts[:-1]
+    return ".".join(str(part) for part in parts)
 
 
 def _single_commit(output: bytes, label: str) -> str:

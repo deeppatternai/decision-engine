@@ -1922,11 +1922,16 @@ class GitCommandPolicyTests(unittest.TestCase):
             "GIT_TERMINAL_PROMPT",
         }
         self.assertTrue({key for key in environment if key.startswith("GIT_")} <= allowed_git)
+        self.assertNotIn("GIT_ALLOW_PROTOCOL", environment)
         self.assertEqual(environment["GIT_CONFIG_NOSYSTEM"], "1")
         self.assertEqual(environment["GIT_OPTIONAL_LOCKS"], "0")
         self.assertEqual(environment["GIT_NO_LAZY_FETCH"], "1")
         self.assertEqual(environment["GIT_NO_REPLACE_OBJECTS"], "1")
         self.assertEqual(environment["GIT_TERMINAL_PROMPT"], "0")
+
+    def test_trust_store_git_environment_denies_all_transport_protocols(self):
+        environment = updater._git_environment(deny_protocols=True)
+        self.assertEqual(environment["GIT_ALLOW_PROTOCOL"], "")
 
     def test_ambient_git_environment_preserves_credential_resolution(self):
         # The exact inverse property from _git_environment above: this variant
@@ -1978,6 +1983,103 @@ class GitCommandPolicyTests(unittest.TestCase):
             candidates = updater._trusted_git_candidates()
         self.assertTrue(candidates)
         self.assertFalse(any("attacker" in str(path).casefold() for path in candidates))
+
+    def test_posix_git_path_accepts_root_owned_non_writable_system_git(self):
+        git = Path("/usr/bin/git")
+        stats = {
+            "/": mock.Mock(st_mode=stat.S_IFDIR | 0o755, st_uid=0),
+            "/usr": mock.Mock(st_mode=stat.S_IFDIR | 0o755, st_uid=0),
+            "/usr/bin": mock.Mock(st_mode=stat.S_IFDIR | 0o755, st_uid=0),
+            "/usr/bin/git": mock.Mock(st_mode=stat.S_IFREG | 0o755, st_uid=0),
+        }
+
+        def fake_lstat(path):
+            return stats[Path(path).as_posix()]
+
+        with (
+            mock.patch.object(updater.os, "getuid", return_value=501, create=True),
+            mock.patch.object(updater.os, "lstat", side_effect=fake_lstat),
+        ):
+            self.assertTrue(updater._posix_git_path_is_trusted(git))
+
+    def test_posix_git_path_rejects_user_owned_group_writable_homebrew_prefix(self):
+        user_uid = 501
+        git = Path("/opt/homebrew/bin/git")
+        stats = {
+            "/": mock.Mock(st_mode=stat.S_IFDIR | 0o755, st_uid=0),
+            "/opt": mock.Mock(st_mode=stat.S_IFDIR | 0o755, st_uid=0),
+            "/opt/homebrew": mock.Mock(st_mode=stat.S_IFDIR | 0o775, st_uid=user_uid),
+            "/opt/homebrew/bin": mock.Mock(st_mode=stat.S_IFDIR | 0o775, st_uid=user_uid),
+            "/opt/homebrew/bin/git": mock.Mock(st_mode=stat.S_IFREG | 0o755, st_uid=user_uid),
+        }
+
+        def fake_lstat(path):
+            return stats[Path(path).as_posix()]
+
+        with (
+            mock.patch.object(updater.os, "getuid", return_value=user_uid, create=True),
+            mock.patch.object(updater.os, "lstat", side_effect=fake_lstat),
+        ):
+            self.assertFalse(updater._posix_git_path_is_trusted(git))
+
+    def test_posix_git_path_rejects_world_writable_component(self):
+        user_uid = 501
+        git = Path("/opt/homebrew/bin/git")
+        stats = {
+            "/": mock.Mock(st_mode=stat.S_IFDIR | 0o755, st_uid=0),
+            "/opt": mock.Mock(st_mode=stat.S_IFDIR | 0o755, st_uid=0),
+            "/opt/homebrew": mock.Mock(st_mode=stat.S_IFDIR | 0o777, st_uid=user_uid),
+            "/opt/homebrew/bin": mock.Mock(st_mode=stat.S_IFDIR | 0o775, st_uid=user_uid),
+            "/opt/homebrew/bin/git": mock.Mock(st_mode=stat.S_IFREG | 0o755, st_uid=user_uid),
+        }
+
+        def fake_lstat(path):
+            return stats[Path(path).as_posix()]
+
+        with (
+            mock.patch.object(updater.os, "getuid", return_value=user_uid, create=True),
+            mock.patch.object(updater.os, "lstat", side_effect=fake_lstat),
+        ):
+            self.assertFalse(updater._posix_git_path_is_trusted(git))
+
+    def test_posix_git_path_rejects_root_owned_group_writable_component(self):
+        user_uid = 501
+        git = Path("/usr/local/bin/git")
+        stats = {
+            "/": mock.Mock(st_mode=stat.S_IFDIR | 0o755, st_uid=0),
+            "/usr": mock.Mock(st_mode=stat.S_IFDIR | 0o755, st_uid=0),
+            "/usr/local": mock.Mock(st_mode=stat.S_IFDIR | 0o775, st_uid=0),
+            "/usr/local/bin": mock.Mock(st_mode=stat.S_IFDIR | 0o775, st_uid=user_uid),
+            "/usr/local/bin/git": mock.Mock(st_mode=stat.S_IFREG | 0o755, st_uid=user_uid),
+        }
+
+        def fake_lstat(path):
+            return stats[Path(path).as_posix()]
+
+        with (
+            mock.patch.object(updater.os, "getuid", return_value=user_uid, create=True),
+            mock.patch.object(updater.os, "lstat", side_effect=fake_lstat),
+        ):
+            self.assertFalse(updater._posix_git_path_is_trusted(git))
+
+    def test_posix_git_path_rejects_root_owned_group_writable_component_as_root(self):
+        git = Path("/usr/local/bin/git")
+        stats = {
+            "/": mock.Mock(st_mode=stat.S_IFDIR | 0o755, st_uid=0),
+            "/usr": mock.Mock(st_mode=stat.S_IFDIR | 0o755, st_uid=0),
+            "/usr/local": mock.Mock(st_mode=stat.S_IFDIR | 0o775, st_uid=0),
+            "/usr/local/bin": mock.Mock(st_mode=stat.S_IFDIR | 0o775, st_uid=0),
+            "/usr/local/bin/git": mock.Mock(st_mode=stat.S_IFREG | 0o755, st_uid=0),
+        }
+
+        def fake_lstat(path):
+            return stats[Path(path).as_posix()]
+
+        with (
+            mock.patch.object(updater.os, "getuid", return_value=0, create=True),
+            mock.patch.object(updater.os, "lstat", side_effect=fake_lstat),
+        ):
+            self.assertFalse(updater._posix_git_path_is_trusted(git))
 
     def test_git_executable_must_resolve_to_an_absolute_file(self):
         with mock.patch.object(
@@ -2059,6 +2161,61 @@ class GitCommandPolicyTests(unittest.TestCase):
             with self.assertRaisesRegex(updater.UpdateInspectionError, "not installed"):
                 updater._resolve_git_executable()
 
+    def test_git_executable_minimum_filter_skips_older_trusted_candidate(self):
+        with tempfile.TemporaryDirectory() as folder:
+            base = Path(folder)
+            name = "git.exe" if os.name == "nt" else "git"
+            first = base / "first" / "Git" / "bin" / name
+            second = base / "second" / "Git" / "bin" / name
+            for candidate in (first, second):
+                candidate.parent.mkdir(parents=True)
+                candidate.write_bytes(b"git")
+                candidate.chmod(0o755)
+
+            def fake_run(argv, _environment, **_kwargs):
+                if argv[0] == str(first.resolve()):
+                    return 0, b"git version 2.39.5 (Apple Git-154)\n"
+                if argv[0] == str(second.resolve()):
+                    return 0, b"git version 2.45.4\n"
+                raise AssertionError("unexpected argv: %r" % (argv,))
+
+            with (
+                mock.patch.object(
+                    updater,
+                    "_trusted_git_candidates",
+                    return_value=(first, second),
+                ),
+                mock.patch.object(updater, "_run_bounded_git", side_effect=fake_run),
+            ):
+                selected = updater._resolve_git_executable(
+                    minimum_version=updater._MINIMUM_GIT_VERSION
+                )
+
+        self.assertEqual(selected, str(second.resolve()))
+
+    def test_git_executable_minimum_filter_reports_actionable_version_floor(self):
+        with tempfile.TemporaryDirectory() as folder:
+            name = "git.exe" if os.name == "nt" else "git"
+            first = Path(folder) / "first" / "Git" / "bin" / name
+            first.parent.mkdir(parents=True)
+            first.write_bytes(b"git")
+            first.chmod(0o755)
+
+            with (
+                mock.patch.object(
+                    updater, "_trusted_git_candidates", return_value=(first,)
+                ),
+                mock.patch.object(
+                    updater,
+                    "_run_bounded_git",
+                    return_value=(0, b"git version 2.39.5 (Apple Git-154)\n"),
+                ),
+            ):
+                with self.assertRaisesRegex(updater.UpdateInspectionError, "2.45 or newer"):
+                    updater._resolve_git_executable(
+                        minimum_version=updater._MINIMUM_GIT_VERSION
+                    )
+
     def test_missing_local_autocrlf_is_explicitly_unset(self):
         reader = mock.Mock()
         reader.run.return_value = (1, b"")
@@ -2123,6 +2280,51 @@ class GitCommandPolicyTests(unittest.TestCase):
                     reader = updater._GitReader(Path.cwd())
         self.assertEqual(reader.git_executable, "supported-git")
         self.assertEqual(run.call_count, 2)
+
+    def test_trust_store_reader_allows_any_parseable_git_without_lazy_fetch_flag(self):
+        calls = []
+
+        def run_git(argv, _environment, **_kwargs):
+            calls.append(tuple(argv))
+            if argv[-1] == "--version":
+                return 0, b"git version 1.8.0\n"
+            if argv[-1] == "HEAD^{commit}":
+                return 0, (b"1" * 40) + b"\n"
+            raise AssertionError("unexpected git argv: %r" % (argv,))
+
+        with (
+            mock.patch.object(updater, "_resolve_git_executables", return_value=("system-git",)),
+            mock.patch.object(updater, "_git_executable_generation", return_value=("stable",)),
+            mock.patch.object(updater, "_git_environment", return_value={}) as environment,
+            mock.patch.object(updater, "_run_bounded_git", side_effect=run_git),
+        ):
+            reader = updater._GitReader(
+                Path.cwd(),
+                trust_store_only=True,
+            )
+            reader.run("head")
+
+        self.assertEqual(reader.git_executable, "system-git")
+        environment.assert_called_once_with("system-git", deny_protocols=True)
+        self.assertNotIn("--no-lazy-fetch", calls[-1])
+
+    def test_trust_store_reader_refuses_non_trust_store_operations(self):
+        with (
+            mock.patch.object(updater, "_resolve_git_executables", return_value=("system-git",)),
+            mock.patch.object(updater, "_git_executable_generation", return_value=("stable",)),
+            mock.patch.object(updater, "_git_environment", return_value={}),
+            mock.patch.object(
+                updater,
+                "_run_bounded_git",
+                return_value=(0, b"git version 2.39.5\n"),
+            ),
+        ):
+            reader = updater._GitReader(
+                Path.cwd(),
+                trust_store_only=True,
+            )
+            with self.assertRaisesRegex(updater.UpdateInspectionError, "release trust inspection"):
+                reader.run("target", tag="v1.2.3")
 
     def test_git_standard_error_never_enters_machine_output(self):
         code, output = updater._run_bounded_git(
