@@ -16,7 +16,10 @@ Headless (stdlib only; no window / pywebview backend). Run from the repo root:
 
 from __future__ import annotations
 
+import json
+import tempfile
 import unittest
+from pathlib import Path
 from types import SimpleNamespace
 from unittest import mock
 
@@ -105,6 +108,15 @@ class ClaimAppIdentity(unittest.TestCase):
 
 
 class DockIdentity(unittest.TestCase):
+    def test_the_popup_process_claims_dock_name_before_window_registration(self):
+        with mock.patch("client.tk_icon.apply_dock_app_name", return_value=True) as app_name:
+            native_shell._claim_dock_app_name("Decision Engine - \u56fe\u89e3")
+        app_name.assert_called_once_with("Decision Engine - \u56fe\u89e3")
+
+    def test_a_raising_early_dock_name_never_escapes(self):
+        with mock.patch("client.tk_icon.apply_dock_app_name", side_effect=OSError("no app")):
+            native_shell._claim_dock_app_name("Decision Engine - \u56fe\u89e3")
+
     def test_the_localized_title_reaches_macos_dock_identity(self):
         with mock.patch("client.tk_icon.apply_dock_app_name", return_value=True) as app_name, \
                 mock.patch("client.tk_icon.apply_dock_icon", return_value=True) as icon:
@@ -116,6 +128,30 @@ class DockIdentity(unittest.TestCase):
         with mock.patch("client.tk_icon.apply_dock_app_name", side_effect=OSError("no app")), \
                 mock.patch("client.tk_icon.apply_dock_icon", return_value=True):
             native_shell._install_dock_icon("Decision Engine - \u56fe\u89e3")
+
+
+class PopupReadyMarker(unittest.TestCase):
+    def test_loaded_dom_probe_writes_ready_marker(self):
+        win = SimpleNamespace(evaluate_js=mock.Mock(return_value=True))
+        with tempfile.TemporaryDirectory() as root:
+            ready = Path(root) / "ready.json"
+            native_shell._mark_popup_ready(win, str(ready))
+            payload = json.loads(ready.read_text(encoding="utf-8"))
+
+        self.assertEqual(payload, {"ok": True, "state": "ready"})
+
+    def test_failed_dom_probe_writes_child_diagnostic(self):
+        win = SimpleNamespace(evaluate_js=mock.Mock(side_effect=RuntimeError("boom")))
+        with tempfile.TemporaryDirectory() as root:
+            ready = Path(root) / "ready.json"
+            native_shell._mark_popup_ready(win, str(ready))
+            diagnostic = json.loads(
+                (Path(root) / "ready-diagnostic.json").read_text(encoding="utf-8")
+            )
+
+        self.assertFalse(ready.exists())
+        self.assertEqual(diagnostic["reason"], "dom-probe-failed")
+        self.assertEqual(diagnostic["detail"], "RuntimeError")
 
 
 if __name__ == "__main__":

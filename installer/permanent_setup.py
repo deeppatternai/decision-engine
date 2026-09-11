@@ -534,20 +534,21 @@ def _claim_app_identity() -> None:
         return
 
 
-def _apply_window_icon(root) -> None:
-    """Best-effort: give Tk setup windows the product icon instead of Tk's default feather.
+def _apply_window_icon(root, app_title: str = "") -> None:
+    """Best-effort: give Tk setup windows the product OS identity instead of Python's.
 
     ``apply_window_icon`` covers the Tk fallback form and establishes an application-wide
     default inherited by the status ``messagebox`` child. The import is guarded because the
     installer is its own package with no other dependency on ``client`` — if the body is not
     importable from here, the dialogs keep the feather rather than failing setup over decoration.
 
-    Also where the macOS Dock tile is claimed: its call must come AFTER Tk has created its own
-    ``NSApplication`` subclass, which is the opposite of the AUMID's ordering rule and the reason
-    it is not in ``_claim_app_identity`` beside it. See ``client.tk_icon.apply_dock_icon``."""
+    Also where the macOS Dock tile/title is claimed: these calls must come AFTER Tk has created
+    its own ``NSApplication`` subclass, which is the opposite of the AUMID's ordering rule and the
+    reason it is not in ``_claim_app_identity`` beside it. See ``client.tk_icon.apply_dock_icon``."""
     try:
-        from client.tk_icon import apply_dock_icon, apply_window_icon
+        from client.tk_icon import apply_dock_app_name, apply_dock_icon, apply_window_icon
 
+        apply_dock_app_name(app_title)
         apply_window_icon(root)
         apply_dock_icon()
     except Exception:  # aqg: top-level boundary — the icon is never worth a failed installation
@@ -704,21 +705,30 @@ class _CredentialFormApi:
         return result
 
 
-def _apply_webview_icon(window) -> None:
-    """Give the setup window the product icon once its native handle exists.
+def _apply_webview_icon(window, app_title: str = "") -> None:
+    """Give the setup window the product OS identity once its native handle exists.
 
     The Tk dialogs get theirs from ``_apply_window_icon``; this one is pywebview, whose Windows
     backend is a WinForms host with no ``icon`` argument — that parameter exists only on the GTK
     and Qt backends — so the icon has to be stamped onto the window handle with WM_SETICON. Without
     it the first thing a new device sees is a window and a taskbar button branded as Python.
 
+    macOS has the title sibling of the same defect: Dock hover reads the process/app name, not the
+    pywebview window title, so pass the localized setup title through ``apply_dock_app_name``.
+
     On ``loaded`` because the handle does not exist until the window is realised, and idempotent
     because that event fires once per navigation."""
     if getattr(window, "_de_icon_set", False):
         return
     try:
-        from client.tk_icon import apply_dock_icon, apply_taskbar_icon, native_window_handle
+        from client.tk_icon import (
+            apply_dock_app_name,
+            apply_dock_icon,
+            apply_taskbar_icon,
+            native_window_handle,
+        )
 
+        apply_dock_app_name(app_title)
         hwnd = native_window_handle(window)
         window._de_icon_set = bool(hwnd) and apply_taskbar_icon(hwnd)
         apply_dock_icon()      # macOS: no handle involved, and a no-op everywhere else
@@ -774,7 +784,7 @@ def _prompt_credentials_webview(
         if window is None:
             raise RuntimeError("webview returned no window")
         try:
-            window.events.loaded += lambda *_a: _apply_webview_icon(window)
+            window.events.loaded += lambda *_a: _apply_webview_icon(window, strings["window_title"])
         except Exception:  # aqg: top-level boundary — backend event support is optional
             pass
         try:
@@ -853,7 +863,7 @@ def _prompt_credentials_tk(
         root.title(strings["window_title"])
         root.configure(background="#F4F6FA")
         root.resizable(False, False)
-        _apply_window_icon(root)
+        _apply_window_icon(root, strings["window_title"])
 
         style = widgets.Style(root)
         if "clam" in style.theme_names():
@@ -1212,7 +1222,7 @@ def _show_gui_message(title: str, message: str, *, error: bool = False) -> None:
     except tk.TclError:
         return
     root.withdraw()
-    _apply_window_icon(root)
+    _apply_window_icon(root, title)
     try:
         if error:
             messagebox.showerror(title, message, parent=root)

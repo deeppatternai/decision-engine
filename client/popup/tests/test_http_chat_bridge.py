@@ -111,6 +111,14 @@ class SessionBridgeHandoffTests(unittest.TestCase):
                 return_value=[sys.executable, "-m", "client.popup.native_shell"],
             ) as build,
             mock.patch.object(session.subprocess, "Popen", return_value=process) as popen,
+            mock.patch.object(
+                session,
+                "_wait_for_popup_ready",
+                side_effect=lambda _process, _workdir, popup_id: {
+                    "status": "open",
+                    "popup_id": popup_id,
+                },
+            ),
         ):
             result = session.spawn(
                 "<html><body>artifact</body></html>",
@@ -444,6 +452,14 @@ class SessionBridgeHandoffTests(unittest.TestCase):
                 ),
                 mock.patch.object(session.subprocess, "Popen", return_value=process),
                 mock.patch.object(session, "_early_native_shell_returncode", return_value=None),
+                mock.patch.object(
+                    session,
+                    "_wait_for_popup_ready",
+                    side_effect=lambda _process, _workdir, popup_id: {
+                        "status": "open",
+                        "popup_id": popup_id,
+                    },
+                ),
             ):
                 result = session.spawn("<html><body>private</body></html>", "GE")
 
@@ -676,6 +692,14 @@ class SessionBridgeHandoffTests(unittest.TestCase):
                 ),
                 mock.patch.object(session.subprocess, "Popen", return_value=process),
                 mock.patch.object(session, "_early_native_shell_returncode", return_value=None),
+                mock.patch.object(
+                    session,
+                    "_wait_for_popup_ready",
+                    side_effect=lambda _process, _workdir, popup_id: {
+                        "status": "open",
+                        "popup_id": popup_id,
+                    },
+                ),
             ):
                 result = session.spawn(
                     "<html><body>private</body></html>",
@@ -856,6 +880,61 @@ class SessionBridgeHandoffTests(unittest.TestCase):
                 "returncode": 23,
             },
         )
+
+    def test_spawn_waits_for_loaded_dom_ready_marker_before_reporting_open(self):
+        process = _Process(None)
+        marker_written = threading.Event()
+
+        def delayed_ready(*_args, **_kwargs):
+            popup_dir = _popup_test_root(root) / "pop_ready"
+
+            def write_ready():
+                time.sleep(0.05)
+                (popup_dir / "ready.json").write_text(
+                    json.dumps({"ok": True, "state": "ready"}), encoding="utf-8"
+                )
+                marker_written.set()
+
+            threading.Thread(target=write_ready, daemon=True).start()
+            return process
+
+        with tempfile.TemporaryDirectory() as root:
+            popup_root = _popup_test_root(root)
+            with (
+                mock.patch.object(session.backend, "ensure_webview", return_value=True),
+                mock.patch.object(session, "_POPUP_ROOT", popup_root),
+                mock.patch.object(
+                    session, "_validate_windows_private_mutation_acl", return_value=True
+                ),
+                mock.patch.object(session, "_new_popup_id", return_value="pop_ready"),
+                mock.patch.object(session.subprocess, "Popen", side_effect=delayed_ready),
+                mock.patch.object(session, "_POPUP_READY_TIMEOUT_S", 1.0),
+                mock.patch.object(session, "_POPUP_READY_POLL_S", 0.005),
+            ):
+                started = time.monotonic()
+                result = session.spawn("<html><body>artifact</body></html>", "GE")
+                elapsed = time.monotonic() - started
+
+            self.assertTrue(marker_written.is_set())
+            self.assertGreaterEqual(elapsed, 0.04)
+
+        self.assertEqual(result, {"status": "open", "popup_id": "pop_ready"})
+
+    def test_ready_timeout_logs_diagnostic_terminates_child_and_removes_workdir(self):
+        process = _Process(None)
+        with tempfile.TemporaryDirectory() as root:
+            popup_root = _popup_test_root(root)
+            workdir = popup_root / "pop_white"
+            workdir.mkdir(parents=True, mode=0o700)
+            result = session._wait_for_popup_ready(
+                process, workdir, "pop_white", timeout_s=0.0
+            )
+            log_path = popup_root / "popup-ready.log"
+            self.assertTrue(log_path.is_file())
+            self.assertFalse(workdir.exists())
+
+        self.assertEqual(result, {"status": "failed", "reason": "popup-not-ready"})
+        process.terminate.assert_called_once()
 
     def test_nonserializable_chat_context_removes_private_workdir(self):
         with tempfile.TemporaryDirectory() as root:
@@ -1135,6 +1214,14 @@ class SessionBridgeHandoffTests(unittest.TestCase):
                     return_value=[sentinel, "-m", "client.popup.native_shell"],
                 ) as build,
                 mock.patch.object(session.subprocess, "Popen", return_value=process),
+                mock.patch.object(
+                    session,
+                    "_wait_for_popup_ready",
+                    side_effect=lambda _process, _workdir, popup_id: {
+                        "status": "open",
+                        "popup_id": popup_id,
+                    },
+                ),
             ):
                 result = session.spawn(
                     "<html><body>artifact</body></html>",

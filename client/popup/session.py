@@ -59,6 +59,8 @@ _CHAT_BRIDGE_HANDOFF_TIMEOUT_S = 3.0
 # lifecycle events.
 _NATIVE_SHELL_EXIT_GRACE_S = 0.25
 _NATIVE_SHELL_EXIT_POLL_S = 0.005
+_POPUP_READY_TIMEOUT_S = 20.0
+_POPUP_READY_POLL_S = 0.05
 _CHAT_BRIDGE_FIELDS = frozenset(
     {"schema_version", "kind", "route", "endpoint", "device_token", "run_id"}
 )
@@ -536,6 +538,78 @@ def _native_shell_exit_response(
     }
 
 
+def _read_json_file(path: Path) -> Optional[Dict[str, Any]]:
+    try:
+        loaded = json.loads(path.read_text(encoding="utf-8"))
+    except (OSError, ValueError):
+        return None
+    return loaded if isinstance(loaded, dict) else None
+
+
+def _append_ready_diagnostic(
+    popup_root: Path,
+    popup_id: str,
+    *,
+    reason: str,
+    detail: str = "",
+    returncode: Optional[int] = None,
+) -> None:
+    """Append a privacy-safe startup diagnostic under the private popup root."""
+    try:
+        payload: Dict[str, Any] = {
+            "ts": round(time.time(), 3),
+            "popup_id": popup_id,
+            "reason": reason,
+        }
+        if detail:
+            payload["detail"] = detail[:200]
+        if returncode is not None:
+            payload["returncode"] = returncode
+        with open(popup_root / "popup-ready.log", "a", encoding="utf-8") as handle:
+            handle.write(json.dumps(payload, ensure_ascii=False, sort_keys=True) + "\n")
+    except Exception:  # aqg: top-level boundary — diagnostics must never block popup launch
+        pass
+
+
+def _wait_for_popup_ready(
+    process: subprocess.Popen,
+    workdir: Path,
+    popup_id: str,
+    *,
+    timeout_s: float = _POPUP_READY_TIMEOUT_S,
+) -> Dict[str, Any]:
+    """Wait for the child to prove pywebview loaded and the DOM is reachable."""
+    ready_path = workdir / "ready.json"
+    diagnostic_path = workdir / "ready-diagnostic.json"
+    deadline = time.monotonic() + max(0.0, timeout_s)
+    while True:
+        ready = _read_json_file(ready_path)
+        if ready is not None and ready.get("ok") is True:
+            return {"status": "open", "popup_id": popup_id}
+        terminal = _read_result(workdir / "result.json")
+        if terminal is not None and terminal.get("outcome") in {"committed", "dismissed"}:
+            return {"status": "open", "popup_id": popup_id}
+        returncode = process.poll()
+        if returncode is not None:
+            return _native_shell_exit_response(workdir, popup_id, returncode)
+        remaining = deadline - time.monotonic()
+        if remaining <= 0:
+            child_diagnostic = _read_json_file(diagnostic_path) or {}
+            reason = str(child_diagnostic.get("reason") or "ready-timeout")
+            detail = str(child_diagnostic.get("detail") or "")
+            _append_ready_diagnostic(
+                workdir.parent,
+                popup_id,
+                reason=reason,
+                detail=detail,
+                returncode=process.poll(),
+            )
+            _terminate_spawned_process(process)
+            _remove_private_workdir(workdir)
+            return {"status": "failed", "reason": "popup-not-ready"}
+        time.sleep(min(_POPUP_READY_POLL_S, remaining))
+
+
 def _handoff_chat_bridge(
     process: subprocess.Popen,
     bridge_bytes: bytes,
@@ -728,6 +802,7 @@ def spawn(html_body: str, title: str, *, python: Optional[str] = None,
         "on_close_dismiss": True,
         "api_profile": api_profile,
         "bridge_state_stdin": cursor_bridge_bytes is not None,
+        "ready_path": str(workdir / "ready.json"),
     }
     if chat_bridge_bytes is not None:
         # Frozen integration seam owned by launcher.py's work package.  Do not synthesize argv here.
@@ -803,7 +878,7 @@ def spawn(html_body: str, title: str, *, python: Optional[str] = None,
     except OSError:
         _remove_private_workdir(workdir)   # no orphan workdir on a launch failure
         return {"status": "failed", "reason": "launch-failed"}
-    return {"status": "open", "popup_id": popup_id}
+    return _wait_for_popup_ready(process, workdir, popup_id)
 
 
 def _read_result(result_path: Path) -> Optional[Dict[str, Any]]:

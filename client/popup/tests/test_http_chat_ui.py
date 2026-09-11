@@ -8,9 +8,13 @@ never reaches an HTML-parsing sink.
 from __future__ import annotations
 
 import json
+import plistlib
 import subprocess
 import sys
+import tempfile
 import unittest
+from pathlib import Path
+from unittest import mock
 
 from client.popup import launcher
 
@@ -268,6 +272,52 @@ class HttpChatShellCommandTestCase(unittest.TestCase):
             "GE chat",
             "result.json",
         ))
+
+    def test_ready_path_flag_is_explicit(self):
+        command = launcher.build_shell_command(
+            sys.executable,
+            "popup.html",
+            "GE chat",
+            "result.json",
+            ready_path="ready.json",
+        )
+
+        self.assertEqual(command[-2:], ["--ready-path", "ready.json"])
+
+    def test_macos_popup_shell_command_uses_real_app_bundle_identity(self):
+        with tempfile.TemporaryDirectory() as root:
+            python_dir = Path(root) / "Python 3.12"
+            python_dir.mkdir()
+            python = python_dir / "python3"
+            python.write_bytes(b"synthetic python")
+            app_root = Path(root) / "Decision Engine Popup.app"
+            with (
+                mock.patch.object(launcher.sys, "platform", "darwin"),
+                mock.patch.object(launcher, "_mac_popup_app_path", return_value=app_root),
+            ):
+                command = launcher.build_shell_command(
+                    str(python),
+                    "popup.html",
+                    "Decision Engine - \u56fe\u89e3",
+                    "result.json",
+                )
+
+            executable = app_root / "Contents" / "MacOS" / "Decision Engine Popup"
+            info = plistlib.loads(
+                (app_root / "Contents" / "Info.plist").read_bytes()
+            )
+            wrapper = executable.read_text(encoding="utf-8")
+
+        self.assertEqual(command[0], str(executable))
+        self.assertTrue(wrapper.startswith("#!/bin/sh\n"))
+        self.assertIn("exec '", wrapper)
+        self.assertIn(str(python), wrapper)
+        self.assertIn(' "$@"', wrapper)
+        self.assertEqual(info["CFBundleName"], "Decision Engine Popup")
+        self.assertEqual(
+            info["CFBundleIdentifier"], "com.deeppattern.decisionengine.popup"
+        )
+        self.assertEqual(info["CFBundleIconFile"], "AppIcon")
 
 
 class HttpChatPageContractTestCase(unittest.TestCase):

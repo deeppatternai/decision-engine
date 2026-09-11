@@ -256,6 +256,14 @@ class CursorApiProfileTestCase(unittest.TestCase):
                 mock.patch.object(
                     session.subprocess, "Popen", return_value=process
                 ) as popen,
+                mock.patch.object(
+                    session,
+                    "_wait_for_popup_ready",
+                    side_effect=lambda _process, _workdir, popup_id: {
+                        "status": "open",
+                        "popup_id": popup_id,
+                    },
+                ),
             ):
                 result = session.spawn(
                     "<html><body>trusted board</body></html>",
@@ -431,6 +439,14 @@ class CursorApiProfileTestCase(unittest.TestCase):
                 mock.patch.object(session, "_new_popup_id", return_value="pop_a2"),
                 mock.patch.object(session.subprocess, "Popen", return_value=process),
                 mock.patch.object(session, "_NATIVE_SHELL_EXIT_GRACE_S", 0.0),
+                mock.patch.object(
+                    session,
+                    "_wait_for_popup_ready",
+                    side_effect=lambda _process, _workdir, popup_id: {
+                        "status": "open",
+                        "popup_id": popup_id,
+                    },
+                ),
             ):
                 started = time.monotonic()
                 try:

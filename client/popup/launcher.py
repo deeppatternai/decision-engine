@@ -30,8 +30,9 @@ import html
 import json
 import math
 import os
+import plistlib
 import re
-import shutil
+import shlex
 import subprocess
 import sys
 import tempfile
@@ -2147,6 +2148,85 @@ def render_activation_html(spec: PopupSpec) -> str:
     }
 
 
+_MAC_POPUP_APP_NAME = "Decision Engine Popup"
+_MAC_POPUP_BUNDLE_ID = "com.deeppattern.decisionengine.popup"
+
+
+def _deeppattern_state_root() -> Path:
+    config = os.getenv("DE_CONFIG_PATH")
+    if config:
+        return Path(config).expanduser().parent
+    return Path.home() / ".deeppattern"
+
+
+def _mac_popup_app_path() -> Path:
+    override = os.getenv("DE_POPUP_APP")
+    if override:
+        return Path(override).expanduser()
+    return _deeppattern_state_root() / "app" / f"{_MAC_POPUP_APP_NAME}.app"
+
+
+def _mac_popup_executable_path(app_path: Optional[Path] = None) -> Path:
+    root = app_path or _mac_popup_app_path()
+    return root / "Contents" / "MacOS" / _MAC_POPUP_APP_NAME
+
+
+def _write_macos_popup_wrapper(source: Path, target: Path) -> None:
+    """Write a tiny app-bundle executable without relocating the Python binary."""
+    script = (
+        "#!/bin/sh\n"
+        f"exec {shlex.quote(str(source))} \"$@\"\n"
+    )
+    tmp = target.with_suffix(target.suffix + ".tmp")
+    tmp.write_text(script, encoding="utf-8", newline="\n")
+    tmp.chmod(0o755)
+    os.replace(tmp, target)
+
+
+def _ensure_macos_popup_app(python: str) -> Optional[Path]:
+    """Create the real macOS app bundle that owns popup Dock identity."""
+    if sys.platform != "darwin":
+        return None
+    try:
+        source = Path(python).expanduser()
+        if not source.is_file():
+            return None
+        if any(char in str(source) for char in ("\n", "\r")):
+            return None
+        app_path = _mac_popup_app_path()
+        contents = app_path / "Contents"
+        macos_dir = contents / "MacOS"
+        resources = contents / "Resources"
+        macos_dir.mkdir(parents=True, exist_ok=True)
+        resources.mkdir(parents=True, exist_ok=True)
+        info = {
+            "CFBundleDevelopmentRegion": "en",
+            "CFBundleDisplayName": _MAC_POPUP_APP_NAME,
+            "CFBundleExecutable": _MAC_POPUP_APP_NAME,
+            "CFBundleIconFile": "AppIcon",
+            "CFBundleIdentifier": _MAC_POPUP_BUNDLE_ID,
+            "CFBundleInfoDictionaryVersion": "6.0",
+            "CFBundleName": _MAC_POPUP_APP_NAME,
+            "CFBundlePackageType": "APPL",
+            "CFBundleShortVersionString": "1.0",
+            "CFBundleVersion": "1",
+            "LSMinimumSystemVersion": "10.15",
+            "NSHighResolutionCapable": True,
+        }
+        with open(contents / "Info.plist", "wb") as handle:
+            plistlib.dump(info, handle, sort_keys=True)
+        icon = Path(__file__).resolve().parents[2] / "desktop" / "icons" / "AppIcon.icns"
+        if icon.is_file():
+            import shutil
+
+            shutil.copy2(icon, resources / "AppIcon.icns")
+        executable = _mac_popup_executable_path(app_path)
+        _write_macos_popup_wrapper(source, executable)
+        return executable
+    except OSError:
+        return None
+
+
 def _popup_python(python: str) -> str:
     """The console-less interpreter for the native popup shell.
 
@@ -2173,7 +2253,8 @@ def build_shell_command(python: str, html_path: str, title: str, result_path: st
                         on_close_dismiss: bool = False,
                         api_profile: str = "legacy",
                         bridge_state_stdin: bool = False,
-                        chat_bridge_stdin: bool = False) -> List[str]:
+                        chat_bridge_stdin: bool = False,
+                        ready_path: Optional[str] = None) -> List[str]:
     """The argv that launches the native shell child in ``python``'s venv.
 
     ``chat_context_path`` (GE follow-up chat) appends ``--context <path>`` so the popup wires a
@@ -2181,6 +2262,7 @@ def build_shell_command(python: str, html_path: str, title: str, result_path: st
     importing the shell, so an embedded Python ``.pth`` cannot silently route it to another checkout.
     ``chat_bridge_stdin`` appends only the non-sensitive ``--chat-bridge-stdin`` switch; the actual
     server bootstrap envelope is delivered through the child pipe by ``session.spawn``.
+    ``ready_path`` appends the child-to-parent loaded+DOM-ready marker path used by detached spawn.
     ``on_close_dismiss`` (the detached ``session.spawn`` poll path) appends ``--on-close-dismiss`` so a
     bare OS-chrome close records a terminal ``dismissed``; the blocking ``open_popup`` path leaves it
     off, so its OS-close still maps to ``closed`` (unchanged)."""
@@ -2190,6 +2272,9 @@ def build_shell_command(python: str, html_path: str, title: str, result_path: st
         f"sys.path.insert(0,{source_root!r});"
         f"runpy.run_module({NATIVE_SHELL_MODULE!r},run_name='__main__',alter_sys=True)"
     )
+    executable = _ensure_macos_popup_app(python)
+    if executable is not None:
+        python = str(executable)
     cmd = [
         python,
         "-c",
@@ -2211,6 +2296,8 @@ def build_shell_command(python: str, html_path: str, title: str, result_path: st
         cmd += ["--bridge-state-stdin"]
     if chat_bridge_stdin:
         cmd += ["--chat-bridge-stdin"]
+    if ready_path:
+        cmd += ["--ready-path", ready_path]
     return cmd
 
 

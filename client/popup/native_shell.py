@@ -362,9 +362,9 @@ _WINDOWS_DRAG_JS = r"""
 """
 
 
-def write_result(result_path: str, payload: Dict[str, Any]) -> None:
-    """Atomically write the popup result so the launcher never sees a partial file."""
-    path = Path(result_path)
+def _write_json_atomic(path_value: str, payload: Dict[str, Any]) -> None:
+    """Atomically write a small JSON handoff file so readers never see a partial file."""
+    path = Path(path_value)
     path.parent.mkdir(parents=True, exist_ok=True)
     tmp = path.with_suffix(path.suffix + ".%d.tmp" % os.getpid())
     with open(tmp, "w", encoding="utf-8") as handle:
@@ -372,6 +372,11 @@ def write_result(result_path: str, payload: Dict[str, Any]) -> None:
         handle.flush()
         os.fsync(handle.fileno())
     os.replace(tmp, path)
+
+
+def write_result(result_path: str, payload: Dict[str, Any]) -> None:
+    """Atomically write the popup result so the launcher never sees a partial file."""
+    _write_json_atomic(result_path, payload)
 
 
 # The only geChat functions the shell ever calls. `fn` is interpolated raw into executable JS, so it is
@@ -2067,6 +2072,7 @@ def configure_cursor_webview2_window(
     all_context: Any = None,
     deny_state: Any = None,
     response_factory=None,
+    ready_path: Optional[str] = None,
 ) -> Optional[str]:
     """Harden an inert owned bootstrap before navigating to trusted content."""
     outcome = {"target": None}
@@ -2112,6 +2118,7 @@ def configure_cursor_webview2_window(
                 if timer is not None:
                     timer.cancel()
                 api._core._cursor_document_ready.set()
+                _mark_popup_ready(win, ready_path)
 
             retained = install_cursor_webview2_policy(
                 core,
@@ -3988,14 +3995,32 @@ def _claim_app_identity() -> None:
     """Tell Windows who this process is, BEFORE the first window — see
     ``client.tk_icon.claim_app_identity``.
 
-    The macOS equivalent is the Dock tile, but its ordering rule is the opposite: it must be set
-    once an NSApplication exists, so it runs from ``_install_dock_icon`` on ``loaded`` instead."""
+    macOS splits the equivalent in two: process name is claimed before ``create_window`` so Dock
+    never snapshots ``Python``, while the tile image waits until ``loaded`` when NSApplication
+    exists."""
     try:
         from client.tk_icon import claim_app_identity
 
         claim_app_identity()
     except Exception as exc:  # aqg: top-level boundary — an icon never blocks a window
         print("native_shell: app identity skipped (%s)" % exc, file=sys.stderr)
+
+
+def _claim_dock_app_name(title: str) -> None:
+    """macOS: claim the Dock-visible process name before the app registers with Dock.
+
+    Unlike the Dock icon, changing NSProcessInfo's process name does not need an NSApplication and
+    should happen before ``create_window`` so Dock never snapshots the interpreter's ``Python`` name.
+    It is repeated after ``loaded`` by ``_install_dock_icon`` as a harmless fallback for older
+    backends, but this early call is the one that matters for the taskbar/Dock hover title.
+    """
+    try:
+        from client.tk_icon import apply_dock_app_name
+
+        if not apply_dock_app_name(title):
+            print("native_shell: dock app name skipped", file=sys.stderr)
+    except Exception as exc:  # aqg: top-level boundary — a title never blocks a window
+        print("native_shell: dock app name skipped (%s)" % exc, file=sys.stderr)
 
 
 def _install_dock_icon(title: str) -> None:
@@ -4005,15 +4030,52 @@ def _install_dock_icon(title: str) -> None:
     refuses to instantiate the NSApplication itself — doing so is what aborts a Tk that starts
     afterwards, and the same restraint costs nothing here since pywebview has long since made one
     by the time a page loads."""
+    _claim_dock_app_name(title)
     try:
-        from client.tk_icon import apply_dock_app_name, apply_dock_icon
+        from client.tk_icon import apply_dock_icon
 
-        if not apply_dock_app_name(title):
-            print("native_shell: dock app name skipped", file=sys.stderr)
         if not apply_dock_icon():
             print("native_shell: dock icon skipped (no application or no icns)", file=sys.stderr)
     except Exception as exc:  # aqg: top-level boundary — an icon never blocks a window
         print("native_shell: dock identity skipped (%s)" % exc, file=sys.stderr)
+
+
+def _write_ready_diagnostic(ready_path: Optional[str], reason: str, detail: str = "") -> None:
+    """Best-effort child-side startup diagnostic beside the ready marker."""
+    if not ready_path:
+        return
+    try:
+        diagnostic_path = str(Path(ready_path).with_name("ready-diagnostic.json"))
+        payload = {"ok": False, "reason": reason}
+        if detail:
+            payload["detail"] = detail[:200]
+        _write_json_atomic(diagnostic_path, payload)
+    except Exception as exc:  # aqg: top-level boundary — diagnostics must never break the popup
+        print("native_shell: ready diagnostic skipped (%s)" % exc, file=sys.stderr)
+
+
+def _mark_popup_ready(win: Any, ready_path: Optional[str]) -> None:
+    """Loaded hook: prove the page DOM is reachable, then let the parent report ``open``."""
+    if not ready_path:
+        return
+    path = Path(ready_path)
+    if path.exists():
+        return
+    probe = (
+        "(function(){"
+        "if(!document||document.readyState!=='complete'||!document.body)return false;"
+        "if(document.getElementById('close-btn'))return true;"
+        "if(document.querySelector('.artifact'))return true;"
+        "return document.body.children&&document.body.children.length>0;"
+        "})()"
+    )
+    try:
+        if win.evaluate_js(probe) is True:
+            _write_json_atomic(str(path), {"ok": True, "state": "ready"})
+        else:
+            _write_ready_diagnostic(ready_path, "dom-not-ready")
+    except Exception as exc:  # aqg: top-level boundary — startup readiness is reported by parent
+        _write_ready_diagnostic(ready_path, "dom-probe-failed", type(exc).__name__)
 
 
 def _windows_hwnd(win) -> int:
@@ -4176,7 +4238,8 @@ def open_window(html_path: str, title: str, result_path: str,
                 forbidden_token: Optional[str] = None,
                 chat: Any = None,
                 chat_route: Optional[str] = None,
-                chat_error_code: Optional[str] = None) -> None:
+                chat_error_code: Optional[str] = None,
+                ready_path: Optional[str] = None) -> None:
     """Open the native pywebview window and block until it closes.
 
     ``webview`` is imported lazily so this module stays importable (and self-checkable) on a machine
@@ -4253,6 +4316,8 @@ def open_window(html_path: str, title: str, result_path: str,
     # Before create_window: Windows reads the AppUserModelID when a window registers with the shell,
     # so a later claim leaves the already-registered button showing Python's icon. This is a
     # separate process from the stop panel and inherits nothing from it — it must claim its own.
+    if _IS_MAC:
+        _claim_dock_app_name(title)
     _claim_app_identity()
     win = webview.create_window(**kw)
     core_api._win = win
@@ -4268,6 +4333,8 @@ def open_window(html_path: str, title: str, result_path: str,
         win.events.loaded += lambda *a: _win_after_show(win)       # re-show the detached frameless popup
         win.events.loaded += lambda *a: _install_windows_chrome(win)
         win.events.loaded += lambda *a: _install_windows_taskbar_icon(win)   # …and stop being Python
+    if ready_path and not cursor_profile:
+        win.events.loaded += lambda *a: _mark_popup_ready(win, ready_path)
     if cursor_profile:
         cursor_policy_started = threading.Event()
 
@@ -4280,6 +4347,7 @@ def open_window(html_path: str, title: str, result_path: str,
                 html_path,
                 bootstrap_path,
                 api,
+                ready_path=ready_path,
             )
             if target_url is None:
                 api.close()
@@ -4360,6 +4428,11 @@ def main(argv: Optional[list[str]] = None) -> int:
         "--chat-bridge-stdin",
         action="store_true",
         help="read one bounded GE server-chat envelope from this child's owned stdin pipe",
+    )
+    parser.add_argument(
+        "--ready-path",
+        default=None,
+        help="write a readiness marker after pywebview loaded and DOM probing succeeds",
     )
     parser.add_argument("--self-check", action="store_true", help="headless commit→result plumbing check; no window")
     args = parser.parse_args(argv)
@@ -4455,7 +4528,8 @@ def main(argv: Optional[list[str]] = None) -> int:
                 context=context, on_close_dismiss=args.on_close_dismiss,
                 api_profile=args.api_profile, initial_state=initial_state,
                 forbidden_token=forbidden_token, chat=server_chat,
-                chat_route=chat_route, chat_error_code=chat_error_code)
+                chat_route=chat_route, chat_error_code=chat_error_code,
+                ready_path=args.ready_path)
     return 0
 
 

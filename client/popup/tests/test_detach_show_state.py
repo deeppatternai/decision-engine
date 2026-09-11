@@ -684,6 +684,7 @@ class MacStatusItemLifecycle(unittest.TestCase):
              mock.patch.object(native_shell, "_IS_WINDOWS", False), \
              mock.patch.object(native_shell, "_mac_visible_frame", return_value=None), \
              mock.patch.object(native_shell, "_claim_app_identity", side_effect=lambda: calls.append("claim_identity")), \
+             mock.patch.object(native_shell, "_claim_dock_app_name", side_effect=lambda _title: calls.append("claim_dock_name")), \
              mock.patch.object(native_shell, "_install_dock_icon", side_effect=lambda _title: calls.append("dock_icon")), \
              mock.patch.object(native_shell, "_mac_after_show", side_effect=lambda: calls.append("mac_after_show")), \
              mock.patch.object(native_shell, "_install_dock_reopen", side_effect=lambda _win: calls.append("dock_reopen")), \
@@ -694,6 +695,7 @@ class MacStatusItemLifecycle(unittest.TestCase):
                 native_shell.open_window("popup.html", "Popup", "result.json")
 
         self.assertIn("apply_status", calls)
+        self.assertLess(calls.index("claim_dock_name"), calls.index("create_window"))
         self.assertLess(calls.index("create_window"), calls.index("apply_status"))
         self.assertLess(calls.index("webview.start"), calls.index("apply_status"))
         self.assertLess(calls.index("apply_status"), calls.index("wire_status"))

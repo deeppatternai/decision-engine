@@ -822,6 +822,55 @@ class PermanentSetupTestCase(unittest.TestCase):
         self.assertIn(zh["secret_label"], header_titles)
         self.assertNotIn("Activation key", header_titles)
 
+    def test_tk_form_claims_the_localized_product_title(self):
+        zh = i18n.permanent_setup("zh-CN")
+        tk_module, widgets, _root = _credential_tk_double(
+            ["https://owner.example", "owner_invite_value"], action=zh["activate"]
+        )
+
+        with mock.patch.object(permanent_setup, "_apply_window_icon") as apply_icon:
+            result = permanent_setup._prompt_credentials_tk(tk_module, widgets, strings=zh)
+
+        self.assertEqual(result, ("https://owner.example", "owner_invite_value"))
+        apply_icon.assert_called_once_with(_root, zh["window_title"])
+
+    def test_tk_message_claims_the_message_title(self):
+        class FakeTclError(Exception):
+            pass
+
+        root = mock.MagicMock()
+        shown = []
+        fake_messagebox = SimpleNamespace(
+            showinfo=lambda title, message, parent=None: shown.append(("info", title, message, parent)),
+            showerror=lambda title, message, parent=None: shown.append(("error", title, message, parent)),
+        )
+        fake_tk = SimpleNamespace(
+            TclError=FakeTclError,
+            Tk=mock.Mock(return_value=root),
+            messagebox=fake_messagebox,
+        )
+
+        with mock.patch.object(permanent_setup, "_gui_session_blocked", return_value=None), \
+                mock.patch.object(permanent_setup, "_tk_creation_blocked", return_value=None), \
+                mock.patch.dict(sys.modules, {"tkinter": fake_tk, "tkinter.messagebox": fake_messagebox}), \
+                mock.patch.object(permanent_setup, "_apply_window_icon") as apply_icon:
+            permanent_setup._show_gui_message("Decision Engine 配置失败", "message", error=True)
+
+        apply_icon.assert_called_once_with(root, "Decision Engine 配置失败")
+        self.assertEqual(shown, [("error", "Decision Engine 配置失败", "message", root)])
+
+    def test_tk_identity_helper_applies_the_product_title(self):
+        root = mock.MagicMock()
+
+        with mock.patch("client.tk_icon.apply_dock_app_name", return_value=True) as app_name, \
+                mock.patch("client.tk_icon.apply_window_icon", return_value=True) as window_icon, \
+                mock.patch("client.tk_icon.apply_dock_icon", return_value=True) as dock_icon:
+            permanent_setup._apply_window_icon(root, "Decision Engine 永久配置")
+
+        app_name.assert_called_once_with("Decision Engine 永久配置")
+        window_icon.assert_called_once_with(root)
+        dock_icon.assert_called_once_with()
+
     def test_the_setup_window_claims_the_product_icon(self):
         """The first window a new device ever sees. pywebview's Windows backend is a WinForms host
         with no `icon` argument, so without WM_SETICON the activation dialog and its taskbar button
@@ -846,6 +895,20 @@ class PermanentSetupTestCase(unittest.TestCase):
                 mock.patch("client.tk_icon.apply_dock_icon", return_value=False):
             permanent_setup._apply_webview_icon(window)
         self.assertEqual(applied, [0xBEEF])
+
+    def test_the_setup_window_claims_the_product_title(self):
+        """macOS Dock hover text reads the process/app name, not the pywebview window title."""
+
+        class FakeWindow:
+            native = type("Form", (), {"Handle": 0})()
+
+        with mock.patch("client.tk_icon.apply_taskbar_icon") as apply_taskbar, \
+                mock.patch("client.tk_icon.apply_dock_icon", return_value=False), \
+                mock.patch("client.tk_icon.apply_dock_app_name", return_value=True) as app_name:
+            permanent_setup._apply_webview_icon(window=FakeWindow(), app_title="Decision Engine 永久配置")
+
+        apply_taskbar.assert_not_called()
+        app_name.assert_called_once_with("Decision Engine 永久配置")
 
     def test_the_dialog_registers_the_icon_on_loaded(self):
         """The handler has to be attached to the window, not just exist. pywebview only realises
@@ -879,6 +942,44 @@ class PermanentSetupTestCase(unittest.TestCase):
         with self.assertRaises(RuntimeError):
             permanent_setup._prompt_credentials_webview(FakeWebview)
         self.assertEqual(len(registered), 1, "no loaded handler was attached to the setup window")
+
+    def test_the_dialog_loaded_handler_uses_the_localized_product_title(self):
+        registered = []
+        window = None
+
+        class FakeEvents:
+            def __init__(self):
+                self.loaded = self
+
+            def __iadd__(self, handler):
+                registered.append(handler)
+                return self
+
+        class FakeWindow:
+            def __init__(self):
+                self.events = FakeEvents()
+
+            def destroy(self):
+                pass
+
+        class FakeWebview:
+            @staticmethod
+            def create_window(**_kwargs):
+                nonlocal window
+                window = FakeWindow()
+                return window
+
+            @staticmethod
+            def start(**_kwargs):
+                raise RuntimeError("stop after wiring")
+
+        zh = i18n.permanent_setup("zh-CN")
+        with mock.patch.object(permanent_setup, "_apply_webview_icon") as apply_icon:
+            with self.assertRaises(RuntimeError):
+                permanent_setup._prompt_credentials_webview(FakeWebview, strings=zh)
+            registered[0]()
+
+        apply_icon.assert_called_once_with(window, zh["window_title"])
 
     def test_the_setup_window_is_closed_by_the_watcher_not_the_form(self):
         """End to end over the backend seam: the form submits from pywebview's own bridge thread,
