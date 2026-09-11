@@ -66,6 +66,16 @@ CLAUDE_CODE = AgentHostSpec(
         {"anthropic", "claude", "claude code", "claude desktop"}
     ),
     detection="file-or-sibling-dir",
+    # Claude Code starts MCP servers from the open project directory and does
+    # not apply `cwd` (observed: Claude Code 2.1.221 on macOS, 2026-09), so
+    # `python -m installer.launcher` would resolve the `installer` package
+    # from that project first. A decision-engine source checkout shadows the
+    # managed install and the launcher refuses to serve. The cwd-independent
+    # bootstrap binds the import to the managed root through argv instead, the
+    # same contract Cursor ships. Claude Desktop keeps the `cwd` shape: its
+    # servers were observed launching from `/`, which holds no `installer`
+    # package to shadow the managed root.
+    json_include_cwd=False,
     skills_path=_claude_skills_path,
     skills_global_path=_claude_skills_path,
     skill_delivery_mode="managed-copy",

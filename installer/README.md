@@ -74,7 +74,7 @@ an owner-issued device activation key.
 
 | Host | Installer ID | User MCP config | Managed Skills | Launch/render contract |
 |---|---|---|---|---|
-| Claude Code | `claude-code` | `~/.claude.json` | `~/.claude/skills/` | direct Python; JSON includes `cwd`; includes `type` |
+| Claude Code | `claude-code` | `~/.claude.json` | `~/.claude/skills/` | direct Python; JSON omits `cwd`; includes `type` |
 | Claude Desktop | `claude-desktop` | Windows: `%APPDATA%/Claude/claude_desktop_config.json`<br>macOS: `~/Library/Application Support/Claude/claude_desktop_config.json`<br>Linux: `~/.config/Claude/claude_desktop_config.json` | none | direct Python; JSON includes `cwd`; includes `type` |
 | Claude third-party provider profile | `claude-desktop-3p` | `~/Library/Application Support/Claude-3p/claude_desktop_config.json` | none | direct Python; JSON includes `cwd`; includes `type` |
 | Tencent CodeBuddy Agent CLI | `codebuddy` | `~/.codebuddy/mcp.json` | `~/.codebuddy/skills/` | direct Python; JSON omits `cwd`; omits `type`; CodeBuddy Studio is not installation evidence |
@@ -257,17 +257,29 @@ A bare call with no prepared managed install and no `--dev-root` prints an
 error naming both remedies rather than guessing.
 
 For example, Claude Code emits the following shape (paths resolved for your
-machine). Do not copy this shape into Qoder or another host; let
-`installer.mcp_config` render the selected contract:
+machine). Claude Code launches MCP servers from the open project directory and
+does not apply `cwd`, so the entry binds the import to the managed root through
+argv instead of relying on the working directory. Do not copy this shape into
+Qoder or another host; let `installer.mcp_config` render the selected contract:
 
 ```jsonc
 // Claude Code MCP server entry
 {
   "mcpServers": {
     "decision-engine": {
+      "type": "stdio",
       "command": "/abs/path/to/python3",
-      "args": ["-m", "installer.launcher"],
-      "cwd": "/home/user/.deeppattern/decision-engine"
+      "args": [
+        "-c",
+        "import sys; root = sys.argv.pop(1); sys.path[0] = root; from installer.launcher import main; raise SystemExit(main(sys.argv[1:]))",
+        "/home/user/.deeppattern/decision-engine",
+        "--managed-root",
+        "/home/user/.deeppattern/decision-engine"
+      ],
+      "env": {
+        "PYTHONPATH": "/home/user/.deeppattern/decision-engine",
+        "DE_MCP_CLIENT_HOST": "claude"
+      }
     }
   }
 }

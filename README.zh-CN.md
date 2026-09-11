@@ -159,43 +159,17 @@ AQG 是本地、无需账户的工程纪律工具包。安装其中任一个，�
 
 ### 支持的 AI 工具（按系列汇总）
 
-下列产品均支持 MCP、原生窗口、弹窗追问和 Stop Panel。先按系列找产品，再展开详情查看
-安装器 ID、Skills 支持以及平台和版本要求。
+下列产品均支持 MCP、原生窗口、弹窗追问和 Stop Panel。这里按系列汇总产品；安装流程会
+自动探测当前宿主并配置其支持的 MCP 和 Skills。
 
 | 系列 | 支持的产品 | 需要注意的区别 |
 |---|---|---|
 | Claude | Claude Code、Claude Desktop、Claude 第三方提供商配置 | Claude Code 另支持 Skills；第三方提供商配置仅 macOS，使用独立 MCP 配置。 |
 | Codex | Codex | 支持 Skills。 |
 | Cursor | Cursor | 支持 Skills。 |
-| 腾讯 | CodeBuddy Agent CLI、WorkBuddy Desktop、WorkBuddy AI Desktop | CodeBuddy 仅支持独立 Agent CLI，不支持 CodeBuddy Studio；各产品的平台要求见详情。 |
+| 腾讯 | CodeBuddy Agent CLI、WorkBuddy Desktop、WorkBuddy AI Desktop | CodeBuddy 仅支持独立 Agent CLI，不支持 CodeBuddy Studio。 |
 | 阿里 Qoder | Qoder Desktop、Qoder CN Desktop、Qoder IDE、Qoder CN IDE | 区分 Desktop／IDE 和普通版／CN 版；IDE 使用独立 MCP 身份，共享对应版本的 Skills 与审计 hook。 |
-| TRAE | TRAE Desktop、TRAE CN Desktop、TRAE Work、TRAE Work CN | Desktop 与 Work、普通版与 CN 版分别列出；平台和版本要求见详情。 |
-
-<details>
-<summary>展开查看全部 16 个产品的安装器 ID、平台和版本要求</summary>
-
-| 系列 | 宿主 | 安装器 ID | 当前本地宿主范围 |
-|---|---|---|---|
-| Claude | Claude Code | `claude-code` | MCP、Skills、原生窗口、弹窗右侧追问、Stop Panel |
-| Claude | Claude Desktop | `claude-desktop` | MCP、原生窗口、弹窗右侧追问、Stop Panel |
-| Claude | Claude 第三方提供商配置 | `claude-desktop-3p` | 仅 macOS 的独立 MCP 配置、原生窗口、弹窗右侧追问、Stop Panel |
-| Codex | Codex | `codex` | MCP、Skills、原生窗口、弹窗右侧追问、Stop Panel |
-| Cursor | Cursor | `cursor` | MCP、Skills、原生窗口、弹窗右侧追问、Stop Panel |
-| 腾讯 | 腾讯 CodeBuddy Agent CLI | `codebuddy` | 仅支持独立 Agent CLI；CodeBuddy Studio 是另一个未支持产品；MCP、Skills、原生窗口、弹窗右侧追问、Stop Panel |
-| 腾讯 | 腾讯 WorkBuddy Desktop | `workbuddy` | Windows and macOS Desktop；MCP、Skills、原生窗口、弹窗右侧追问、Stop Panel |
-| 腾讯 | 腾讯 WorkBuddy AI Desktop | `workbuddy-ai` | macOS WorkBuddy AI.app 5.5.2+；MCP、Skills、原生窗口、弹窗右侧追问、Stop Panel |
-| 阿里 Qoder | 阿里 Qoder Desktop | `qoder` | Windows Desktop 1.106.3+；macOS Qoder.app 0.1.3+；MCP、Skills、原生窗口、弹窗右侧追问、Stop Panel |
-| 阿里 Qoder | 阿里 Qoder CN Desktop | `qoder-cn` | macOS Qoder CN.app 0.1.4；MCP、Skills、原生窗口、弹窗右侧追问、Stop Panel |
-| 阿里 Qoder | 阿里 Qoder IDE | `qoder-ide` | macOS Qoder IDE.app 1.106.3+；独立 MCP 身份、共享 Qoder Skills 与审计 hook、原生窗口、弹窗右侧追问、Stop Panel |
-| 阿里 Qoder | 阿里 Qoder CN IDE | `qoder-cn-ide` | macOS Qoder CN IDE.app 1.106.3+；独立 MCP 身份、共享 Qoder CN Skills 与审计 hook、原生窗口、弹窗右侧追问、Stop Panel |
-| TRAE | TRAE Desktop | `trae` | macOS Trae.app 3.5.81；MCP、Skills、原生窗口、弹窗右侧追问、Stop Panel |
-| TRAE | TRAE CN Desktop | `trae-cn` | Windows Trae Code CN 3.3.98+；macOS Trae CN.app 3.3.95；MCP、Skills、原生窗口、弹窗右侧追问、Stop Panel |
-| TRAE | TRAE Work | `trae-work` | Windows and macOS Desktop 0.1.48+；MCP、Skills、原生窗口、弹窗右侧追问、Stop Panel |
-| TRAE | TRAE Work CN | `trae-work-cn` | Windows and macOS Desktop 0.1.48+；MCP、Skills、原生窗口、弹窗右侧追问、Stop Panel |
-
-</details>
-
-图解窗口中的追问默认由 DE 服务端处理，无需在本机额外启动 AI 程序。
+| TRAE | TRAE Desktop、TRAE CN Desktop、TRAE Work、TRAE Work CN | Desktop 与 Work、普通版与 CN 版分别处理。 |
 
 ### 审计深度
 
@@ -226,124 +200,53 @@ AQG 是本地、无需账户的工程纪律工具包。安装其中任一个，�
 
 ## 安装
 
-### 环境要求
+目前提供两种正式安装方式，均会安装 Decision Engine 与 Agent Quality Gates、接入检测到的
+AI 宿主并运行安装后检查。请选择其中一种，不需要手工修改 MCP 配置。
 
-客户端主要使用 Python 标准库，同时声明了 `certifi` 包依赖。安装、MCP 运行和下面的
-检查应使用同一个 Python 环境。如果所选系统 Python 标记为 `EXTERNALLY-MANAGED`，
-安装器会要求改用可写的虚拟环境。原生弹窗还需要 pywebview 和可用的系统图形后端。
+### 方式一：让 AI Agent 协助安装（推荐）
 
-| 依赖 | 用于 | 如何安装 |
-|---|---|---|
-| **Python 3.12+** | 一切 | 安装指南会复用满足最低版本且通过检查的本地版本；安装器会在安装前检查版本、SSL、venv、pip 和 Tk 支持 |
-| **certifi >=2024.0.0** | HTTPS 验证所用的 CA 证书 | 在 `pyproject.toml` 中声明；应将包依赖安装到 MCP 使用的 Python 环境中 |
-| **pywebview** | 画板 / 图解的原生弹窗，以及默认的配置窗口 | 配置阶段会尝试在 MCP 的 Python 环境中准备；首次打开图形窗口时，若缺少这个包，也会尝试补装。安装失败或系统图形后端不可用时，按报错提示修复。 |
-| **LibreOffice** | *可选* —— 准备 Office 文件转换环境；标注已生成的页面图片无需它 | `python3 -m installer.office` 仅检测或帮助安装 LibreOffice，不转换或导入文件。macOS 可尝试 Homebrew 安装；Linux 提供安装命令；当前模块没有 Windows 专用安装流程。 |
+打开与你使用语言对应的完整安装指南：
 
-随时跑 `python3 -m installer.doctor` 检查你的环境（skills 是否 link、Python、弹窗
-后端、LibreOffice）—— 见[检查你的环境](#检查你的环境)。
+- [中文 AI 安装指南](AI_SETUP.zh-CN.md)
+- [English AI setup guide](AI_SETUP.md)
 
-### 安装 Decision Engine + AQG，再完成激活（推荐）
+把整份指南交给能够操作本机终端的 AI Agent，然后告诉它：“请按这份文档安装 Decision Engine。”
+Agent 会检查环境、取得可信安装源码、安装并验证 AQG 和 Decision Engine、配置 MCP 与 Skills，
+并在条件具备时完成设备激活。
 
-这里的**设备激活密钥**（`activation secret`，也常被叫作“安装密钥”）由 DE 服务管理员发放，
-用于在安装后为这台设备申请访问凭据。它不是模型厂商的 API Key。激活成功后，客户端保存设备
-凭据，正常使用时不需要反复输入激活密钥。
+设备激活密钥由 DE 服务管理员发放。不要把真实 endpoint、激活密钥、设备 token 或 Git 凭据
+粘贴到聊天中；AI 安装指南包含完整的凭据保护和失败处理要求。
 
-Decision Engine 客户端安装文件随本仓分发。先克隆本仓，再从本地源码目录安装。不要把设备激活
-密钥填进命令或环境变量赋值；安装完成后，在永久配置窗口的隐藏输入框中填写：
+### 方式二：运行一键安装器
 
-```bash
-git clone https://github.com/deeppatternai/decision-engine.git
-cd decision-engine
-./install.sh
-( cd "$HOME/.deeppattern/decision-engine" && python3 -m installer.permanent_setup )
-```
+只从官方可信来源下载与你的平台对应的安装器，然后在本机终端运行。安装器会检查所需依赖、
+安装 AQG 和 Decision Engine、配置支持的宿主，并打开掩码激活窗口。
 
-这份 clone 只是用来*跑* `install.sh` 的 —— `install.sh` 自己会独立地在固定路径
-`~/.deeppattern/decision-engine` 重新 clone 并校验一份真正会被自动更新管理的副本，跟你这次 clone
-到哪没关系。掩码永久配置会激活这份安装副本并写入宿主 MCP。AQG（从它自己的公开仓克隆）会并排落在
-`~/.deeppattern/agent-quality-gates`，两者的 skill 都路由进你的 agent skill 目录
-（`~/.claude/skills/` 和 `~/.codex/skills/`）。探测到桌面宿主时，同一组受管 Skills 还会按
-注册宿主路由到 `~/.cursor/skills/`、`~/.trae/skills/`、`~/.trae-cn/skills/`、
-`~/.workbuddy/skills/`、`~/.workbuddy-ai/skills/`、`~/.codebuddy/skills/`、
-`~/.qoder/skills/` 或 `~/.qoder-cn/skills/`。`install de`（默认）会把两个都装上。
-若想从 AQG 一侧起步、并在同一步加上 DE，用 `WITH_DE=1 ./install.sh aqg`（见下）。永久配置只保存
-endpoint 和服务端签发的每设备凭据，绝不保存 owner 发放的 activation secret。
+#### macOS
 
-> **在开发本仓库，或者你在固定路径上已经有一份不是刚 clone 出来的 checkout？**
-> 改用 `DE_DEV_MODE=1 ./install.sh` —— 这会让 agent 直接指向你正在跑的这份 checkout
-> （不做签名校验、不自动更新），改代码立刻生效。
-
-### 只装 Decision Engine（无需写代码）
-
-Decision Engine 本身就能独立使用。如果你用 AI 来做决策、汇总选项、给方案把关或修改
-文档 —— 而且你并不写代码 —— 那你要的就是 DE，不需要那套工程纪律工具包。设 `WITH_AQG=0`：
+下载 [dp-install.sh](dp-install.sh)，然后在交互式 Terminal 中运行：
 
 ```bash
-git clone https://github.com/deeppatternai/decision-engine.git
-cd decision-engine
-WITH_AQG=0 ./install.sh
-( cd "$HOME/.deeppattern/decision-engine" && python3 -m installer.permanent_setup )
+bash ./dp-install.sh
 ```
 
-（跟上面一样，这份 clone 只是用来跑 `install.sh`；真正的副本会独立落在
-`~/.deeppattern/decision-engine`。）这只装 Decision Engine、完全跳过 AQG —— 不从 AQG 仓克隆任何东西，也不加任何工程 gate。
-你依然拿到全套引擎 skill（评审、市场调研、预测、可视化讲解、看板）。之后改主意了？
-去掉 `WITH_AQG=0` 重跑一次（或 `./install.sh aqg`）即可加上 AQG。
+该脚本不接受命令行参数。
 
-### 只装 AQG（本地，无需账户 —— 不推荐单独安装）
+#### 原生 Windows
 
-```bash
-./install.sh aqg
+下载 [dp-install.ps1](dp-install.ps1)，然后在 64 位 Windows PowerShell 中运行：
+
+```powershell
+powershell.exe -NoProfile -ExecutionPolicy Bypass -File .\dp-install.ps1
 ```
 
-克隆 [`deeppatternai/agent-quality-gates`](https://github.com/deeppatternai/agent-quality-gates)
-并运行它的安装器。无需 endpoint 或账户。
-
-> ⚠️ **不推荐单独安装。** AQG 的若干纪律 gate —— commit 前的外部评审、多维评审、
-> 以及 phase-transition 审计检查点 —— 在其关键一步会交棒给 Decision Engine 的审计引擎。
-> 没有 DE 时，这些 gate 只能发出一个建议，跑不了真正的跨厂商审核 —— 于是你拿到了脚手架，
-> 却拿不到第二意见。请把 DE 和 AQG 一起装（上面的 `de` 路径，或下面的 `WITH_DE=1`）以获得
-> 完整体验。
-
-若想从 AQG 一侧同时装上 Decision Engine，设置 `WITH_DE=1`，然后仍通过同一个掩码窗口激活：
-
-```bash
-WITH_DE=1 ./install.sh aqg
-( cd "$HOME/.deeppattern/decision-engine" && python3 -m installer.permanent_setup )
-```
-
-> ⚠️ **AQG 仓必须从你的机器可达** —— 要么它是公开的，要么你的 `git` 已对它鉴权。
-> `de` 和 `aqg` 两条路径都从 AQG 自己的公开仓克隆它，所以那次克隆若失败，AQG 就装不上。
-> 若你从别处安装 AQG，可用 `AQG_REPO=<git-url> ./install.sh aqg` 覆盖来源。
-
-### 从 bundle 手动 / 离线安装
-
-上层的 `./install.sh` 会替你调用这一步。若要直接用
-[`installer/`](installer/) 里的 Python 安装器针对一个 bundle 根目录（例如本仓，或
-检出在别处的一个 bundle）驱动：
-
-```bash
-python3 -m installer.install de \
-  --bundle-root ./bundle
-```
-
-这个底层原语只铺设 body，不会建立 `installer.permanent_setup` 所要求的签名受管安装身份。交互式激活
-应使用上面的普通受管安装路径。历史/预配置自动化和显式 MCP 修复细节见
-[`installer/README.md`](installer/README.md)；不得把 activation secret 放进 argv。
+两种方式都用于首次安装。若固定安装目录已经存在或安装曾经中断，请保留现有文件，按照安装器
+报告的恢复提示处理，不要手工覆盖或删除安装目录。
 
 ## 激活并使用
 
-Decision Engine 按设备绑定。把 shim 向你的 agent 注册一次：
-
-```bash
-python3 -m installer.mcp_config    # 打印可直接粘贴的 MCP server 条目
-```
-
-安装后让 Agent 主动运行永久配置：
-
-```bash
-( cd "$HOME/.deeppattern/decision-engine" && python3 -m installer.permanent_setup )
-```
+Decision Engine 按设备绑定。上面的两种正式安装方式都会注册 MCP、配置 Skills、运行 Doctor，
+并在安装流程中处理永久配置；无需手工修改宿主配置或另外执行底层安装命令。
 
 macOS 上的永久配置会打开掩码 pywebview 桌面窗口；只有 pywebview 在原生注册前不可用时才回退 Tk。
 Windows 默认采用相同路径，但 WorkBuddy 会直接打开受支持的掩码 Tk 表单。用户只输入一次 owner
@@ -374,25 +277,16 @@ python3 -m installer.doctor --json   # 机器可读
 它检查：Python 是否 3.12+、skills 是否已 link 进你的 agent、原生弹窗后端（pywebview）
 能否开窗、LibreOffice 是否可用于 Office 转换（没有则 WARN —— 它可选、按需安装）、以及
 本设备是否已激活。全部 PASS 或 WARN 时退出 `0`，真正坏了才退出 `1`。它**绝不**打印你的
-endpoint 或激活码 —— 只报是否已设置。umbrella `./install.sh` 会在安装结尾替你跑一遍。
+endpoint 或激活码 —— 只报是否已设置。两种正式安装方式都会在安装结尾替你运行检查。
 
 ## 安装副本与更新
 
-MCP 条目运行 `installer.launcher`。在发布迁移的过渡期，它仍指向当前确实可运行的源码/旧副本；
-只有签名受管激活已经发布 launcher 协议后，才切到固定的
-`~/.deeppattern/decision-engine` checkout。旧安装所使用的源码 clone 目前不能删除；迁移完成后，
-受管产品副本才与任何开发工作区彼此独立。
+正式安装会把签名受管副本放在固定路径 `~/.deeppattern/decision-engine`。MCP 条目通过
+`installer.launcher` 运行该副本，并在启动前按有界的 GitHub→Gitee 策略检查和应用已签名的
+`stable` 更新；用户无需保留最初下载的一键安装器。
 
-在发布迁移的过渡期，旧的复制式安装没有受管控制面；launcher 会继续运行旧副本，但不会联网
-或修改 Git。此类安装仍通过任意源码 clone 拉取后重跑安装器更新：
-
-```bash
-git pull
-./install.sh
-```
-
-重跑是幂等的，并保留已有设备激活。正式 `stable`、生产公钥、Gitee 镜像和一次性签名迁移
-bootstrap 发布后，已迁移安装会在 MCP 启动前按有界的 GitHub→Gitee 策略更新。
+旧版安装、迁移失败或恢复场景不要通过手工覆盖安装目录处理；请保留现有文件，并按照 Doctor 或
+安装器给出的恢复提示操作。
 `python3 -m installer.doctor` 会分别显示 installed、target、running 和 last result，避免把
 “已下载”误报成“当前已经运行”。
 

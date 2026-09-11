@@ -7,6 +7,7 @@ from __future__ import annotations
 import io
 import json
 import os
+import subprocess
 import sys
 import traceback
 import unittest
@@ -48,12 +49,98 @@ class WriteJsonClientTestCase(unittest.TestCase):
         return mcp_config.render_entry()["mcpServers"]["decision-engine"]
 
     def test_entry_has_pythonpath_for_cwd_independent_import(self):
-        # Objection #4: a client that ignores cwd (verified: Claude Desktop) must still import
-        # `-m installer.launcher` — PYTHONPATH == the managed root carries the import.
+        # Objection #4: the default (claude-code) entry omits `cwd`, so
+        # PYTHONPATH == the managed root must carry the import, and the
+        # cwd-independent bootstrap's root argv must name that same root.
         e = self._entry()
         self.assertEqual(e["type"], "stdio")
         self.assertEqual(e["env"]["PYTHONPATH"], str(mcp_config.registration_root()))
-        self.assertEqual(e["env"]["PYTHONPATH"], e["cwd"])
+        self.assertEqual(e["env"]["PYTHONPATH"], e["args"][2])
+
+    def test_claude_code_entry_omits_cwd_and_uses_cwd_independent_bootstrap(self):
+        # Claude Code launches MCP servers from the open project directory and
+        # does not honor `cwd`, so `python -m installer.launcher` resolves the
+        # `installer` package from whatever checkout is open. Inside a
+        # decision-engine source checkout that shadows the managed install and
+        # the launcher refuses to serve. Same contract Cursor already ships.
+        e = self._entry()
+        root = str(mcp_config.registration_root())
+        self.assertNotIn("cwd", e)
+        self.assertEqual(e["type"], "stdio")
+        self.assertEqual(
+            e["args"],
+            ["-c", mcp_config._CWD_INDEPENDENT_BOOTSTRAP, root, "--managed-root", root],
+        )
+        self.assertEqual(e["env"]["PYTHONPATH"], root)
+        self.assertEqual(e["env"][mcp_config.CLIENT_HOST_ENV], "claude")
+
+    def test_rendered_claude_code_argv_ignores_shadowing_cwd(self):
+        # Regression for the failure this contract fixes: Claude Code runs the
+        # server with cwd = the open project. A project carrying its own
+        # `installer/` package must not be the one the launcher is imported
+        # from. Spawns the rendered argv verbatim so the bootstrap payload
+        # itself is exercised, not re-derived from the constant.
+        bound = self.tmp / "installer"
+        bound.mkdir()
+        (bound / "__init__.py").write_text("", encoding="utf-8")
+        (bound / "launcher.py").write_text(
+            "def main(arguments):\n"
+            "    print(__file__, *arguments)\n"
+            "    return 23\n",
+            encoding="utf-8",
+        )
+        open_project = self.tmp / "open-project"
+        decoy = open_project / "installer"
+        decoy.mkdir(parents=True)
+        (decoy / "__init__.py").write_text("", encoding="utf-8")
+        (decoy / "launcher.py").write_text(
+            "def main(arguments):\n    return 41\n", encoding="utf-8"
+        )
+
+        entry = self._entry()
+        environment = dict(os.environ)
+        environment.update(entry["env"])
+        completed = subprocess.run(
+            [entry["command"], *entry["args"]],
+            cwd=str(open_project),
+            env=environment,
+            stdout=subprocess.PIPE,
+            stderr=subprocess.PIPE,
+            text=True,
+            timeout=60,
+            check=False,
+        )
+
+        self.assertEqual(completed.returncode, 23, completed.stderr)
+        loaded, *arguments = completed.stdout.split()
+        self.assertEqual(Path(loaded).resolve(), (bound / "launcher.py").resolve())
+        self.assertEqual(arguments, ["--managed-root", str(self.tmp)])
+
+    def test_write_replaces_legacy_cwd_pinned_claude_code_entry(self):
+        root = str(mcp_config.registration_root())
+        legacy = {
+            "type": "stdio",
+            "command": sys.executable,
+            "args": ["-m", "installer.launcher"],
+            "cwd": root,
+            "env": {"PYTHONPATH": root, mcp_config.CLIENT_HOST_ENV: "claude"},
+        }
+        other = {"command": "other-server", "args": ["--flag"]}
+        self.cc.write_text(
+            json.dumps({"mcpServers": {"decision-engine": legacy, "other": other}}),
+            encoding="utf-8",
+        )
+        self.assertEqual(mcp_config.entry_status("claude-code"), "stale")
+
+        result = mcp_config.write_entry("claude-code")
+
+        self.assertEqual(result["action"], "updated")
+        self.assertIsNotNone(result["backup"])
+        data = json.loads(self.cc.read_text(encoding="utf-8"))
+        self.assertEqual(data["mcpServers"]["decision-engine"], self._entry())
+        self.assertNotIn("cwd", data["mcpServers"]["decision-engine"])
+        self.assertEqual(data["mcpServers"]["other"], other)
+        self.assertEqual(mcp_config.entry_status("claude-code"), "ready")
 
     def test_write_creates_fresh_config(self):
         result = mcp_config.write_entry("claude-code")
@@ -90,7 +177,9 @@ class WriteJsonClientTestCase(unittest.TestCase):
             result = mcp_config.write_entry("claude-code", allow_unactivated=True)
         self.assertEqual(result["action"], "added")
         entry = json.loads(self.cc.read_text())["mcpServers"]["decision-engine"]
-        self.assertEqual(entry["cwd"], str(self.tmp))
+        self.assertNotIn("cwd", entry)
+        self.assertEqual(entry["args"][2:], [str(self.tmp), "--managed-root", str(self.tmp)])
+        self.assertEqual(entry["env"]["PYTHONPATH"], str(self.tmp))
         self.assertNotIn("DE_ENDPOINT", json.dumps(entry))
 
     def test_write_is_idempotent(self):

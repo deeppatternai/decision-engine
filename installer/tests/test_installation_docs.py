@@ -20,18 +20,12 @@ from installer.config import ShellError
 
 
 ROOT = Path(__file__).resolve().parents[2]
-INSTALLATION_DOCS = (
-    ROOT / "README.md",
-    ROOT / "README.zh-CN.md",
-    ROOT / "AI_SETUP.md",
-    ROOT / "AI_SETUP.zh-CN.md",
-    ROOT / "installer" / "README.md",
-)
 SETUP_DOCS = (
     ROOT / "AI_SETUP.md",
     ROOT / "AI_SETUP.zh-CN.md",
 )
 ROOT_READMES = (ROOT / "README.md", ROOT / "README.zh-CN.md")
+HOST_MATRIX_DOCS = SETUP_DOCS + (ROOT / "installer" / "README.md",)
 
 
 def _doc_path(value: Path, actual_home: Path) -> str:
@@ -116,8 +110,8 @@ class InstallationDocsTestCase(unittest.TestCase):
             with self.subTest(client=client):
                 self.assertIn(client, hints[0])
 
-    def test_every_installation_document_names_every_registered_host(self):
-        for path in INSTALLATION_DOCS:
+    def test_detailed_installation_docs_name_every_registered_host(self):
+        for path in HOST_MATRIX_DOCS:
             body = path.read_text(encoding="utf-8")
             for client in CLIENTS:
                 with self.subTest(path=path.name, client=client):
@@ -125,7 +119,7 @@ class InstallationDocsTestCase(unittest.TestCase):
 
     def test_setup_and_installer_tables_use_registered_paths(self):
         expected = _windows_contract_paths()
-        for path in SETUP_DOCS + (ROOT / "installer" / "README.md",):
+        for path in HOST_MATRIX_DOCS:
             body = path.read_text(encoding="utf-8")
             for client, contract in expected.items():
                 row = _table_row(body, client)
@@ -138,7 +132,7 @@ class InstallationDocsTestCase(unittest.TestCase):
 
     def test_claude_desktop_table_lists_every_platform_path(self):
         expected = _claude_desktop_config_paths()
-        for path in SETUP_DOCS + (ROOT / "installer" / "README.md",):
+        for path in HOST_MATRIX_DOCS:
             row = _table_row(path.read_text(encoding="utf-8"), "claude-desktop")
             with self.subTest(path=path.name):
                 for value in expected:
@@ -146,7 +140,7 @@ class InstallationDocsTestCase(unittest.TestCase):
 
     def test_setup_tables_list_macos_paths_for_desktop_hosts(self):
         expected = _darwin_contract_paths()
-        for path in SETUP_DOCS + (ROOT / "installer" / "README.md",):
+        for path in HOST_MATRIX_DOCS:
             body = path.read_text(encoding="utf-8")
             for client in (
                 "qoder",
@@ -161,35 +155,26 @@ class InstallationDocsTestCase(unittest.TestCase):
                 with self.subTest(path=path.name, client=client):
                     self.assertIn(expected[client], _table_row(body, client))
 
-    def test_root_readme_capabilities_match_registered_specs(self):
+    def test_root_readmes_present_only_the_two_supported_install_methods(self):
         english = ROOT_READMES[0].read_text(encoding="utf-8")
         chinese = ROOT_READMES[1].read_text(encoding="utf-8")
-        for client, spec in CLIENT_SPECS.items():
-            en_row = _table_row(english, client)
-            zh_row = _table_row(chinese, client)
-            with self.subTest(client=client):
-                self.assertEqual("Skills" in en_row, spec.skill_delivery_mode != "none")
-                self.assertEqual("Skills" in zh_row, spec.skill_delivery_mode != "none")
-                # Per the internal decision log entry 2026-08-31, user-facing popup follow-up is the
-                # server route (hub HTTP, no local Agent), available to ANY host that can render
-                # a GE popup — i.e. gated by local_display_tools, NOT by popup_followup (which now
-                # only gates the internal legacy local-Agent route and is not a documented capability).
-                self.assertEqual("popup follow-up" in en_row, spec.local_display_tools)
-                self.assertEqual("弹窗右侧追问" in zh_row, spec.local_display_tools)
-                self.assertEqual("native windows" in en_row, spec.local_display_tools)
-                self.assertEqual("原生窗口" in zh_row, spec.local_display_tools)
-                self.assertEqual("Stop Panel" in en_row, spec.audit_stop_panel)
-                self.assertEqual("Stop Panel" in zh_row, spec.audit_stop_panel)
-
-    def test_root_readmes_route_registered_skill_paths(self):
-        expected = _windows_contract_paths()
-        for path in ROOT_READMES:
-            body = path.read_text(encoding="utf-8")
-            for client, contract in expected.items():
-                if contract["skills"] is None:
-                    continue
-                with self.subTest(path=path.name, client=client):
-                    self.assertIn(contract["skills"], body)
+        for body in (english, chinese):
+            self.assertIn("AI_SETUP.md", body)
+            self.assertIn("AI_SETUP.zh-CN.md", body)
+            self.assertIn("dp-install.sh", body)
+            self.assertIn("dp-install.ps1", body)
+            self.assertNotIn("WITH_AQG", body)
+            self.assertNotIn("WITH_DE", body)
+            self.assertNotIn("DE_DEV_MODE", body)
+            self.assertNotIn("python3 -m installer.permanent_setup", body)
+            self.assertNotIn(
+                "git clone https://github.com/deeppatternai/decision-engine.git",
+                body,
+            )
+            self.assertNotIn("Linux", body)
+            self.assertNotIn("WSL", body)
+        self.assertNotIn("Expand all 16 products", english)
+        self.assertNotIn("展开查看全部 16 个产品", chinese)
 
     def test_installer_launch_rows_match_host_specs(self):
         body = (ROOT / "installer" / "README.md").read_text(encoding="utf-8")
@@ -217,13 +202,13 @@ class InstallationDocsTestCase(unittest.TestCase):
             "trae-work-cn": trae_work_cn._MINIMUM_VERSION,
             "workbuddy-ai": workbuddy_ai._MINIMUM_VERSION,
         }
-        for path in ROOT_READMES + SETUP_DOCS:
+        for path in SETUP_DOCS:
             body = path.read_text(encoding="utf-8")
             for client, version in floors.items():
                 with self.subTest(path=path.name, client=client):
                     self.assertIn(".".join(map(str, version)) + "+", _table_row(body, client))
 
-        for path in ROOT_READMES + SETUP_DOCS:
+        for path in SETUP_DOCS:
             row = _table_row(path.read_text(encoding="utf-8"), "qoder")
             self.assertIn("Windows Desktop 1.106.3+", row)
             self.assertIn("macOS Qoder.app 0.1.3+", row)
@@ -249,7 +234,7 @@ class InstallationDocsTestCase(unittest.TestCase):
                 with mock.patch.object(sys, "platform", "linux"):
                     with self.assertRaises(ShellError):
                         spec.config_write_guard_probe()
-            for path in ROOT_READMES + SETUP_DOCS:
+            for path in SETUP_DOCS:
                 with self.subTest(client=client, path=path.name):
                     row = _table_row(path.read_text(encoding="utf-8"), client)
                     if client == "qoder":
@@ -363,8 +348,6 @@ class InstallationDocsTestCase(unittest.TestCase):
     def test_setup_guides_reuse_any_verified_python_at_or_above_floor(self):
         english = " ".join((ROOT / "AI_SETUP.md").read_text(encoding="utf-8").split())
         chinese = " ".join((ROOT / "AI_SETUP.zh-CN.md").read_text(encoding="utf-8").split())
-        readme = (ROOT / "README.md").read_text(encoding="utf-8")
-        readme_zh = (ROOT / "README.zh-CN.md").read_text(encoding="utf-8")
         self.assertIn("Reuse any existing Python", english)
         self.assertIn(">=3.12 that passes those probes", english)
         self.assertIn("a newer version is valid and must not trigger installation or downgrade", english)
@@ -373,9 +356,7 @@ class InstallationDocsTestCase(unittest.TestCase):
         self.assertIn("不得因此要求安装或", chinese)
         self.assertIn("This applies to native Windows and macOS/Linux", english)
         self.assertIn("本要求同时适用于原生 Windows 和 macOS/Linux", chinese)
-        self.assertIn("reuses any verified local version", readme)
-        self.assertIn("复用满足最低版本且通过检查的本地版本", readme_zh)
-        for body in (english, chinese, readme, readme_zh):
+        for body in (english, chinese):
             self.assertNotIn("3.13", body)
             self.assertNotIn("3.14", body)
             self.assertNotIn("3.15", body)
@@ -394,7 +375,15 @@ class InstallationDocsTestCase(unittest.TestCase):
         self.assertIn("“是”或“否”", chinese)
 
     def test_public_install_examples_do_not_put_activation_secret_in_argv_or_shell(self):
-        for path in ROOT_READMES + (ROOT / "installer" / "README.md", ROOT / "install.sh"):
+        for path in ROOT_READMES:
+            body = path.read_text(encoding="utf-8")
+            with self.subTest(path=path.name):
+                self.assertNotIn("DE_ACTIVATION_SECRET=<", body)
+                self.assertNotRegex(body, r"--api-key\s+<")
+                self.assertIn("dp-install.sh", body)
+                self.assertIn("dp-install.ps1", body)
+
+        for path in (ROOT / "installer" / "README.md", ROOT / "install.sh"):
             body = path.read_text(encoding="utf-8")
             with self.subTest(path=path.name):
                 self.assertNotIn("DE_ACTIVATION_SECRET=<", body)

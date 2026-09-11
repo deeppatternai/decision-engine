@@ -1816,6 +1816,11 @@ if [ "$activated_repair_mode" -eq 1 ]; then
   tty_print "Restart the configured host applications before using repaired MCP and skill routes."
 else
   activation_status=0
+  if ! run_managed_python -c \
+      'from installer import gui_setup; import sys; gui_setup.prepare_gui_environment(sys.executable)' \
+      </dev/null; then
+    tty_print "Warning: optional activation UI preparation failed; continuing with the existing activation fallback."
+  fi
   run_selected_permanent_setup || activation_status=$?
 
   case "$activation_status" in

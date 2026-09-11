@@ -198,44 +198,17 @@ forecasts, graphics, boards, and popup follow-up require device activation
 ### Supported AI tools, grouped by family
 
 All products below support MCP, native windows, popup follow-up, and Stop Panel.
-Find your product by family, then expand the details for installer IDs, Skills
-support, and platform and version requirements.
+This table summarizes them by family; installation detects the current host and
+configures the MCP and Skills it supports.
 
 | Family | Supported products | Differences to note |
 |---|---|---|
 | Claude | Claude Code, Claude Desktop, Claude third-party provider profile | Claude Code also supports Skills; the third-party profile is an independent macOS MCP location. |
 | Codex | Codex | Supports Skills. |
 | Cursor | Cursor | Supports Skills. |
-| Tencent | CodeBuddy Agent CLI, WorkBuddy Desktop, WorkBuddy AI Desktop | CodeBuddy support is limited to the standalone Agent CLI, not CodeBuddy Studio; see details for platform requirements. |
+| Tencent | CodeBuddy Agent CLI, WorkBuddy Desktop, WorkBuddy AI Desktop | CodeBuddy support is limited to the standalone Agent CLI, not CodeBuddy Studio. |
 | Alibaba Qoder | Qoder Desktop, Qoder CN Desktop, Qoder IDE, Qoder CN IDE | Desktop/IDE and standard/CN variants are distinct; IDE variants have separate MCP identities and share Skills and audit hooks with the corresponding Qoder variant. |
-| TRAE | TRAE Desktop, TRAE CN Desktop, TRAE Work, TRAE Work CN | Desktop/Work and standard/CN variants are listed separately; see details for platform and version requirements. |
-
-<details>
-<summary>Expand all 16 products: installer IDs, platforms, and version requirements</summary>
-
-| Family | Host | Installer ID | Current local-host scope |
-|---|---|---|---|
-| Claude | Claude Code | `claude-code` | MCP, Skills, native windows, popup follow-up, Stop Panel |
-| Claude | Claude Desktop | `claude-desktop` | MCP, native windows, popup follow-up, Stop Panel |
-| Claude | Claude third-party provider profile | `claude-desktop-3p` | macOS-only independent MCP profile, native windows, popup follow-up, Stop Panel |
-| Codex | Codex | `codex` | MCP, Skills, native windows, popup follow-up, Stop Panel |
-| Cursor | Cursor | `cursor` | MCP, Skills, native windows, popup follow-up, Stop Panel |
-| Tencent | Tencent CodeBuddy Agent CLI | `codebuddy` | Independent Agent CLI only; CodeBuddy Studio is a separate unsupported product; MCP, Skills, native windows, popup follow-up, Stop Panel |
-| Tencent | Tencent WorkBuddy Desktop | `workbuddy` | Windows and macOS Desktop; MCP, Skills, native windows, popup follow-up, Stop Panel |
-| Tencent | Tencent WorkBuddy AI Desktop | `workbuddy-ai` | macOS WorkBuddy AI.app 5.5.2+; MCP, Skills, native windows, popup follow-up, Stop Panel |
-| Alibaba Qoder | Alibaba Qoder Desktop | `qoder` | Windows Desktop 1.106.3+; macOS Qoder.app 0.1.3+; MCP, Skills, native windows, popup follow-up, Stop Panel |
-| Alibaba Qoder | Alibaba Qoder CN Desktop | `qoder-cn` | macOS Qoder CN.app 0.1.4; MCP, Skills, native windows, popup follow-up, Stop Panel |
-| Alibaba Qoder | Alibaba Qoder IDE | `qoder-ide` | macOS Qoder IDE.app 1.106.3+; independent MCP identity, shared Qoder Skills and audit hook, native windows, popup follow-up, Stop Panel |
-| Alibaba Qoder | Alibaba Qoder CN IDE | `qoder-cn-ide` | macOS Qoder CN IDE.app 1.106.3+; independent MCP identity, shared Qoder CN Skills and audit hook, native windows, popup follow-up, Stop Panel |
-| TRAE | TRAE Desktop | `trae` | macOS Trae.app 3.5.81; MCP, Skills, native windows, popup follow-up, Stop Panel |
-| TRAE | TRAE CN Desktop | `trae-cn` | Windows Trae Code CN 3.3.98+; macOS Trae CN.app 3.3.95; MCP, Skills, native windows, popup follow-up, Stop Panel |
-| TRAE | TRAE Work | `trae-work` | Windows and macOS Desktop 0.1.48+; MCP, Skills, native windows, popup follow-up, Stop Panel |
-| TRAE | TRAE Work CN | `trae-work-cn` | Windows and macOS Desktop 0.1.48+; MCP, Skills, native windows, popup follow-up, Stop Panel |
-
-</details>
-
-Follow-up questions in the diagram window are handled by DE's server by default,
-without starting an additional AI program on your computer.
+| TRAE | TRAE Desktop, TRAE CN Desktop, TRAE Work, TRAE Work CN | Desktop/Work and standard/CN variants are handled separately. |
 
 ### Audit depth
 
@@ -276,146 +249,64 @@ current AI tool.
 
 ## Install
 
-### Requirements
+There are two supported installation methods. Both install Decision Engine and
+Agent Quality Gates, connect detected AI hosts, and run post-install checks.
+Choose either method; do not edit MCP configuration by hand.
 
-The client mainly uses Python's standard library, with `certifi` declared as a
-package dependency. Use the same Python environment for installation, MCP, and
-the checks below. If the selected system Python is marked `EXTERNALLY-MANAGED`,
-the installer requires a writable virtual environment. Native popups also need
-pywebview and a working platform GUI backend.
+### Option 1: ask an AI agent to install it (recommended)
 
-| Dependency | Needed for | How it's installed |
-|---|---|---|
-| **Python 3.12+** | everything | the setup guide reuses any verified local version at or above the minimum; the installer checks version, SSL, venv, pip, and Tk before installation |
-| **certifi >=2024.0.0** | CA certificates for HTTPS verification | declared in `pyproject.toml`; install the package dependencies in the Python environment used by MCP |
-| **pywebview** | native board / graphic-explanation popups and the default setup window | setup attempts to prepare it in the MCP Python environment; first visual use also attempts installation if the package is missing. If installation or the native GUI backend fails, follow the reported repair instructions. |
-| **LibreOffice** | *optional* — preparing an Office conversion environment; annotating existing page images does not require it | `python3 -m installer.office` only detects or helps install LibreOffice; it does not convert or import files. It can attempt Homebrew installation on macOS and print installation commands on Linux; the module has no Windows-specific installation flow. |
+Open the complete guide for your preferred language:
 
-Run `python3 -m installer.doctor` any time to check your setup (skills linked,
-Python OK, popup backend ready, LibreOffice present) — see [Check your setup](#check-your-setup).
+- [English AI setup guide](AI_SETUP.md)
+- [中文 AI 安装指南](AI_SETUP.zh-CN.md)
 
-### Install Decision Engine + AQG, then activate (recommended)
+Give the entire guide to an AI agent that can operate your local terminal, then
+say: "Install Decision Engine according to this guide." The agent checks the
+machine, obtains trusted installer source, installs and verifies AQG and Decision
+Engine, configures MCP and Skills, and activates the device when the required
+owner values are available.
 
-The **device activation secret** (sometimes called an installation key) is issued
-by the DE service administrator. It lets the installed client obtain credentials
-for this device; it is not a model provider's API key. After activation, the client
-saves the device credentials, so normal use does not require entering the secret
-again.
+The DE service administrator issues the device activation key. Never paste a
+real endpoint, activation key, device token, or Git credential into chat. The AI
+setup guide contains the complete credential-handling and failure rules.
 
-The Decision Engine client bundle ships in this repo. Clone it, then install
-from your local checkout. Do not put the activation secret in a command or
-environment assignment; enter it in the masked permanent-setup window after
-the core install:
+### Option 2: run the one-click installer
 
-```bash
-git clone https://github.com/deeppatternai/decision-engine.git
-cd decision-engine
-./install.sh
-( cd "$HOME/.deeppattern/decision-engine" && python3 -m installer.permanent_setup )
-```
+Download the installer for your platform only from the official trusted source,
+then run it in a local terminal. The installer checks required dependencies,
+installs AQG and Decision Engine, configures supported hosts, and opens the
+masked activation window.
 
-This clone is just something to *run* `install.sh` from — `./install.sh` then
-independently clones and signature-verifies the real, auto-updating copy at the
-fixed path `~/.deeppattern/decision-engine`, regardless of where you cloned to.
-The masked setup step activates that installed copy and writes host MCP entries.
-AQG (from its own public repo) lands alongside it at
-`~/.deeppattern/agent-quality-gates`, both routed into your agent skills
-directories (`~/.claude/skills/` and `~/.codex/skills/`). Detected desktop hosts
-receive the same managed Skills at `~/.cursor/skills/`, `~/.trae/skills/`,
-`~/.trae-cn/skills/`, `~/.workbuddy/skills/`, `~/.workbuddy-ai/skills/`,
-`~/.codebuddy/skills/`, `~/.qoder/skills/`, or `~/.qoder-cn/skills/`, according
-to the registered host. `install de` (the
-default) lays down both. To start from AQG instead and add DE in the same step,
-use `WITH_DE=1 ./install.sh aqg` (see below). Permanent setup stores the endpoint
-and server-issued per-device credentials; it never stores the owner-issued
-activation secret.
+#### macOS
 
-> **Developing this repo, or already have a clone at that exact path that isn't
-> a fresh `git clone`?** Set `DE_DEV_MODE=1 ./install.sh` instead — this wires
-> your agent straight at the checkout you're running from (no signature
-> verification, no auto-update), so local edits take effect immediately.
-
-### Decision Engine only (no coding required)
-
-Decision Engine stands on its own. If you use AI to make decisions, pull together
-options, sanity-check a plan, or edit a document — and you don't write code — you
-want DE without the engineering-discipline toolkit. Set `WITH_AQG=0`:
+Download [dp-install.sh](dp-install.sh), then run it in an interactive Terminal:
 
 ```bash
-git clone https://github.com/deeppatternai/decision-engine.git
-cd decision-engine
-WITH_AQG=0 ./install.sh
-( cd "$HOME/.deeppattern/decision-engine" && python3 -m installer.permanent_setup )
+bash ./dp-install.sh
 ```
 
-(Same as above — this clone just runs `install.sh`; the real copy lands
-independently at `~/.deeppattern/decision-engine`.) This installs Decision
-Engine alone and skips AQG entirely — nothing to clone from
-the AQG repo, no engineering gates added. You still get the full set of engine
-skills (review, market research, forecasting, visual explanation, boards). Change
-your mind later? Re-run without `WITH_AQG=0` (or `./install.sh aqg`) to add AQG.
+The script does not accept command-line arguments.
 
-### AQG only (local, no account — not recommended on its own)
+#### Native Windows
 
-```bash
-./install.sh aqg
+Download [dp-install.ps1](dp-install.ps1), then run it in 64-bit Windows
+PowerShell:
+
+```powershell
+powershell.exe -NoProfile -ExecutionPolicy Bypass -File .\dp-install.ps1
 ```
 
-Clones [`deeppatternai/agent-quality-gates`](https://github.com/deeppatternai/agent-quality-gates)
-and runs its installer. No endpoint or account needed.
-
-> ⚠️ **Not recommended on its own.** Several of AQG's discipline gates — the
-> pre-commit external review, multi-dimension review, and the phase-transition
-> audit checkpoints — hand off to Decision Engine's audit engine at their key
-> step. Without DE, those gates can only emit a recommendation; they can't run
-> the actual cross-vendor review, so you get the scaffolding without the second
-> opinion. Install DE alongside AQG — the `de` path above, or `WITH_DE=1` below —
-> for the complete experience.
-
-To also install Decision Engine from the AQG side, set `WITH_DE=1`, then activate
-through the same masked window:
-
-```bash
-WITH_DE=1 ./install.sh aqg
-( cd "$HOME/.deeppattern/decision-engine" && python3 -m installer.permanent_setup )
-```
-
-> ⚠️ **The AQG repo must be reachable from your machine** — either it's public,
-> or your `git` is authenticated to it. Both the `de` and `aqg` paths clone AQG
-> from its own public repo, so if that clone fails, AQG can't install.
-> Override the source with `AQG_REPO=<git-url> ./install.sh aqg` if you install
-> AQG from a different location.
-
-### Manual / offline install from a bundle
-
-The umbrella `./install.sh` calls this for you. To drive the Python installer
-in [`installer/`](installer/) directly against a bundle root (e.g. this repo, or
-a bundle checked out elsewhere):
-
-```bash
-python3 -m installer.install de \
-  --bundle-root ./bundle
-```
-
-This lower-level primitive lays down a body but does not establish the signed
-managed-install identity required by `installer.permanent_setup`. Use the normal
-managed path above for interactive activation. See
-[`installer/README.md`](installer/README.md) for legacy/pre-provisioned automation
-and explicit MCP repair details; never place an activation secret in argv.
+Both methods are for first-time installation. If the fixed installation directory
+already exists or an earlier installation was interrupted, preserve the existing
+files and follow the recovery instructions reported by the installer; do not
+manually overwrite or delete the installation directory.
 
 ## Activate & use
 
-Decision Engine binds per device. Register the shim with your agent once:
-
-```bash
-python3 -m installer.mcp_config    # print the ready-to-paste MCP server entry
-```
-
-Ask your Agent to run permanent setup after installation:
-
-```bash
-( cd "$HOME/.deeppattern/decision-engine" && python3 -m installer.permanent_setup )
-```
+Decision Engine binds per device. Both supported installation methods register
+MCP, configure Skills, run Doctor, and handle permanent setup as part of the
+installation flow. Do not edit host configuration or run lower-level installer
+commands by hand.
 
 On macOS, permanent setup opens a masked pywebview desktop window and uses Tk
 only as a fallback when pywebview is unavailable before native registration.
@@ -455,33 +346,22 @@ popup backend (pywebview) can open a window, LibreOffice is available for Office
 conversion (a WARN if not — it's optional and installed on demand), and whether
 this device is activated. It exits `0` when everything is PASS or WARN, `1` when
 something is genuinely broken. It never prints your endpoint or activation
-secret — only whether they are set. The umbrella `./install.sh` runs it for you
+secret — only whether they are set. Both supported installation methods run it
 at the end of an install.
 
 ## Installed copy and updates
 
-The MCP entry runs `installer.launcher`. During the rollout transition it stays
-on the currently runnable source/legacy copy; it switches to the fixed
-`~/.deeppattern/decision-engine` checkout only after signed managed activation
-has published the launcher protocol. Do not delete the source clone used by a
-legacy install yet. After migration, the managed product copy and any developer
-checkout are independent.
+A supported installation places the signed managed copy at the fixed path
+`~/.deeppattern/decision-engine`. The MCP entry runs that copy through
+`installer.launcher`, which checks and applies signed `stable` updates before
+startup under the bounded GitHub→Gitee policy. Users do not need to keep the
+originally downloaded one-click installer.
 
-During the rollout transition, a legacy copied install has no managed control
-plane and the launcher serves it without network or Git mutation. Update that
-legacy copy by pulling any source clone and re-running the installer:
-
-```bash
-git pull
-./install.sh
-```
-
-Re-running is idempotent and preserves device activation. Once the signed stable
-channel, production public key, Gitee mirror and one-time migration bootstrap
-are published, migrated installs update before MCP startup under a bounded
-GitHub→Gitee policy. `python3 -m installer.doctor` reports installed, target,
-running and last-result state, so a fetched version is not mistaken for the
-version actually serving.
+Do not handle legacy installations, failed migrations, or recovery by manually
+overwriting the installation directory. Preserve existing files and follow the
+recovery instructions reported by Doctor or the installer. `python3 -m
+installer.doctor` reports installed, target, running, and last-result state, so
+a fetched version is not mistaken for the version actually serving.
 
 ## Verify the shell is clean
 

@@ -41,12 +41,23 @@ class McpConfigTestCase(unittest.TestCase):
         servers = entry["mcpServers"]
         self.assertIn("decision-engine", servers)
         de = servers["decision-engine"]
-        # Uses the current interpreter and launches the updater gate as a module, with the
-        # explicit --dev-root flag installer.launcher already implements (no marker/network/
-        # updater/lease at all).
+        # Uses the current interpreter and launches the updater gate through the
+        # cwd-independent bootstrap (Claude Code does not apply `cwd`), with the
+        # explicit --dev-root flag installer.launcher already implements (no
+        # marker/network/updater/lease at all).
         self.assertEqual(de["command"], sys.executable)
-        self.assertEqual(de["args"], ["-m", "installer.launcher", "--dev-root", str(dev_root)])
-        self.assertEqual(de["cwd"], str(dev_root))
+        self.assertEqual(
+            de["args"],
+            [
+                "-c",
+                mcp_config._CWD_INDEPENDENT_BOOTSTRAP,
+                str(dev_root),
+                "--dev-root",
+                str(dev_root),
+            ],
+        )
+        self.assertNotIn("cwd", de)
+        self.assertEqual(de["env"]["PYTHONPATH"], str(dev_root))
         self.assertEqual(
             de["env"][mcp_config.CLIENT_HOST_ENV], "claude"
         )
@@ -75,7 +86,9 @@ class McpConfigTestCase(unittest.TestCase):
                 ),
             ):
                 entry = mcp_config.render_entry()
-        self.assertEqual(entry["mcpServers"]["decision-engine"]["cwd"], str(root))
+        de = entry["mcpServers"]["decision-engine"]
+        self.assertEqual(de["args"][2:], [str(root), "--managed-root", str(root)])
+        self.assertEqual(de["env"]["PYTHONPATH"], str(root))
 
     def test_explicit_pre_activation_entry_accepts_only_a_complete_fixed_managed_root(self):
         with tempfile.TemporaryDirectory() as tmp:
@@ -97,9 +110,9 @@ class McpConfigTestCase(unittest.TestCase):
             ):
                 entry = mcp_config.render_entry(allow_unactivated=True)
 
-        self.assertEqual(
-            entry["mcpServers"]["decision-engine"]["cwd"], str(root)
-        )
+        de = entry["mcpServers"]["decision-engine"]
+        self.assertEqual(de["args"][2:], [str(root), "--managed-root", str(root)])
+        self.assertEqual(de["env"]["PYTHONPATH"], str(root))
 
     def test_pre_activation_entry_does_not_weaken_default_root_gate(self):
         with tempfile.TemporaryDirectory() as tmp:
@@ -134,13 +147,17 @@ class McpConfigTestCase(unittest.TestCase):
     def test_explicit_developer_root_is_launchable(self):
         entry = mcp_config.render_entry(cwd=mcp_config.shell_root())
         de = entry["mcpServers"]["decision-engine"]
-        self.assertTrue((Path(de["cwd"]) / "installer" / "launcher.py").is_file())
+        bound_root = Path(de["args"][2])
+        self.assertTrue((bound_root / "installer" / "launcher.py").is_file())
+        self.assertEqual(de["env"]["PYTHONPATH"], str(bound_root))
 
     def test_custom_name_and_overrides(self):
         entry = mcp_config.render_entry("de", python="/usr/bin/python3", cwd=Path("/opt/shell"))
         de = entry["mcpServers"]["de"]
         self.assertEqual(de["command"], "/usr/bin/python3")
-        self.assertEqual(de["cwd"], str(Path("/opt/shell")))
+        self.assertEqual(de["args"][2], str(Path("/opt/shell")))
+        self.assertEqual(de["env"]["PYTHONPATH"], str(Path("/opt/shell")))
+        self.assertNotIn("cwd", de)
         self.assertNotIn("decision-engine", entry["mcpServers"])
 
     def test_render_is_valid_json(self):
@@ -2659,7 +2676,29 @@ assert mcp_config.CLIENT_SPECS == registry.CLIENT_SPECS
             )
 
     def test_legacy_mcp_renderer_bytes_are_locked_during_registry_migration(self):
-        expected_json = """{
+        expected_json = {
+            # Claude Code does not apply `cwd`, so its entry binds the managed
+            # root through the cwd-independent bootstrap argv instead.
+            "claude-code": """{
+  "mcpServers": {
+    "decision-engine": {
+      "args": [
+        "-c",
+        "import sys; root = sys.argv.pop(1); sys.path[0] = root; from installer.launcher import main; raise SystemExit(main(sys.argv[1:]))",
+        "managed-root",
+        "--managed-root",
+        "managed-root"
+      ],
+      "command": "python-bin",
+      "env": {
+        "DE_MCP_CLIENT_HOST": "claude",
+        "PYTHONPATH": "managed-root"
+      },
+      "type": "stdio"
+    }
+  }
+}""",
+            "claude-desktop": """{
   "mcpServers": {
     "decision-engine": {
       "args": [
@@ -2675,8 +2714,9 @@ assert mcp_config.CLIENT_SPECS == registry.CLIENT_SPECS
       "type": "stdio"
     }
   }
-}"""
-        for client in ("claude-code", "claude-desktop"):
+}""",
+        }
+        for client, expected in expected_json.items():
             with self.subTest(client=client):
                 self.assertEqual(
                     json.dumps(
@@ -2688,7 +2728,7 @@ assert mcp_config.CLIENT_SPECS == registry.CLIENT_SPECS
                         indent=2,
                         sort_keys=True,
                     ),
-                    expected_json,
+                    expected,
                 )
         self.assertEqual(
             mcp_config.render_codex_toml(
