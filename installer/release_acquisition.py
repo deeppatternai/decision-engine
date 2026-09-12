@@ -609,6 +609,7 @@ def fetch_release_objects(root: Path, acquired: AcquiredRelease, *, deadline: fl
     ):
         raise ReleaseAcquisitionError("authorized release source is invalid")
     reader = updater._GitReader(Path(root), deadline=deadline)
+    updater._require_safe_local_config(reader)
     remotes = updater._read_remotes(reader)
     identity = managed_install.validate_managed_identity(Path(root), remotes)
     if identity.remotes.get(acquired.source.name) != dict(managed_install.OFFICIAL_REMOTE_URLS)[acquired.source.name]:
@@ -623,7 +624,6 @@ def fetch_release_objects(root: Path, acquired: AcquiredRelease, *, deadline: fl
         environment = updater._ambient_git_environment(reader.git_executable)
     argv = (
         reader.git_executable,
-        "--no-lazy-fetch",
         "--no-optional-locks",
         "--no-pager",
         "--no-replace-objects",

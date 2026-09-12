@@ -288,7 +288,7 @@ function Find-Git {
         }
         $major = [int]$Matches[1]
         $minor = [int]$Matches[2]
-        if ($major -gt 2 -or ($major -eq 2 -and $minor -ge 45)) {
+        if ($major -gt 2 -or ($major -eq 2 -and $minor -ge 36)) {
             return $verified
         }
     }
@@ -322,11 +322,11 @@ function Resolve-Git {
     if (-not [string]::IsNullOrWhiteSpace($git)) {
         return $git
     }
-    Write-Host "Git for Windows 2.45 or newer is missing."
-    Install-WinGetPackage -PackageId "Git.Git" -DisplayName "Git for Windows 2.45 or newer"
+    Write-Host "Git for Windows 2.36 or newer is missing."
+    Install-WinGetPackage -PackageId "Git.Git" -DisplayName "Git for Windows 2.36 or newer"
     $git = Find-Git
     if ([string]::IsNullOrWhiteSpace($git)) {
-        Stop-Install "WinGet finished, but Git for Windows 2.45 or newer could not be verified. Open a new PowerShell window and retry."
+        Stop-Install "WinGet finished, but Git for Windows 2.36 or newer could not be verified. Open a new PowerShell window and retry."
     }
     Write-Host ("Git prerequisite ready: {0}" -f $git)
     return $git

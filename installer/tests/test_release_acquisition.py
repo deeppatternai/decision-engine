@@ -94,7 +94,10 @@ class ReleaseAcquisitionTests(unittest.TestCase):
         reader = mock.Mock()
         reader.git_executable = "/trusted/git"
         reader.environment = {"transport": "hardened"}
-        reader.run.return_value = (0, (self.manifest.commit + "\n").encode("ascii"))
+        commit_output = (0, (self.manifest.commit + "\n").encode("ascii"))
+        reader.run.side_effect = lambda operation, **_values: (
+            (0, b"") if operation == "unsafe_config" else commit_output
+        )
         identity = mock.Mock()
         identity.canonical_root = Path("/managed/root")
         identity.remotes = dict(managed_install.OFFICIAL_REMOTE_URLS)
@@ -149,6 +152,32 @@ class ReleaseAcquisitionTests(unittest.TestCase):
 
     def test_anonymous_release_keeps_exact_tag_fetch_hardened(self):
         self._assert_tag_fetch_transport(uses_git_credentials=False)
+
+    def test_tag_fetch_refuses_promisor_config_before_any_fetch(self):
+        acquired = release_acquisition.AcquiredRelease(
+            release_acquisition.GITHUB_SOURCE,
+            self.manifest,
+            self.signature,
+            uses_git_credentials=False,
+        )
+        reader = mock.Mock()
+        reader.run.return_value = (0, b"extensions.partialclone\x00")
+        with (
+            mock.patch.object(
+                release_acquisition.updater, "_GitReader", return_value=reader
+            ),
+            mock.patch.object(
+                release_acquisition.updater, "_run_bounded_git"
+            ) as run,
+        ):
+            with self.assertRaisesRegex(
+                release_acquisition.updater.UpdateInspectionError,
+                "execution-capable",
+            ):
+                release_acquisition.fetch_release_objects(
+                    Path("/managed/root"), acquired, deadline=1e18
+                )
+        run.assert_not_called()
 
     def test_tag_fetch_rejects_non_boolean_credential_provenance(self):
         acquired = release_acquisition.AcquiredRelease(

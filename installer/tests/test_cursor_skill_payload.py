@@ -378,9 +378,31 @@ class CursorSkillPayloadTests(unittest.TestCase):
             self._prepare()
         self.assertFalse((self.state / "staging" / str(uuid.UUID(int=1))).exists())
 
+    def test_git_inventory_refuses_promisor_config_before_reading_head(self):
+        reader = mock.Mock()
+        reader.run.return_value = (0, b"remote.origin.promisor\x00")
+        with (
+            mock.patch.object(
+                cursor_skill_payload.updater,
+                "_GitReader",
+                return_value=reader,
+            ),
+            self.assertRaisesRegex(
+                cursor_skill_payload.CursorSkillPayloadError,
+                "could not be verified",
+            ),
+        ):
+            cursor_skill_payload._verified_source_inventory(
+                self.root,
+                self.verified,
+            )
+        reader.run.assert_called_once_with("unsafe_config")
+
     def test_git_inventory_refuses_head_other_than_verified_commit(self):
         reader = mock.Mock()
-        reader.run.return_value = (0, b"8" * 40 + b"\n")
+        reader.run.side_effect = lambda operation, **_values: (
+            (0, b"") if operation == "unsafe_config" else (0, b"8" * 40 + b"\n")
+        )
         with (
             mock.patch.object(
                 cursor_skill_payload.updater,
@@ -396,7 +418,10 @@ class CursorSkillPayloadTests(unittest.TestCase):
                 self.root,
                 self.verified,
             )
-        reader.run.assert_called_once_with("head")
+        self.assertEqual(
+            reader.run.call_args_list,
+            [mock.call("unsafe_config"), mock.call("head")],
+        )
 
     def test_real_git_inventory_and_blob_reader_prepare_current_commit(self):
         repo = Path(__file__).resolve().parents[2]

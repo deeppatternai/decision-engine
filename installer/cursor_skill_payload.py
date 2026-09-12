@@ -293,6 +293,7 @@ def _verified_source_inventory(
 
     try:
         reader = updater._GitReader(managed_root)
+        updater._require_safe_local_config(reader)
         _code, head_output = reader.run("head")
         if updater._single_commit(head_output, "Cursor skill source HEAD") != verified.manifest.commit:
             raise CursorSkillPayloadError(
@@ -345,7 +346,6 @@ def _read_verified_blob(reader: object, object_id: str) -> bytes:
         raise CursorSkillPayloadError("trusted Git changed during skill preparation")
     argv = (
         reader.git_executable,
-        "--no-lazy-fetch",
         "--no-optional-locks",
         "--no-pager",
         "--no-replace-objects",

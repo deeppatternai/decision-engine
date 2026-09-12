@@ -21,7 +21,7 @@
 必须具备：
 
 - Python 3.12 或更高版本；
-- Git 2.45 或更高版本；
+- Git 2.36 或更高版本；
 - 至少一个下表中的注册目标客户端；
 - 当前私仓阶段，用户自己的 GitHub 账号需要拥有仓库读取权限，并且普通 Git 认证已经可用。
 
@@ -118,7 +118,7 @@ env -u DE_ENDPOINT -u DE_ACTIVATION_SECRET python3 -c "import webview; print('py
   ```
 
   原生 Windows PowerShell 使用第 5 步所示的等价 `$PythonPath` 变量。
-- Git 必须为 2.45+。Git 版本过低时，停止并让用户先升级。
+- Git 必须为 2.36+。Git 版本过低时，停止并让用户先升级。
 - `tkinter` 用于第 5 步的掩码配置窗口。缺少时不得改用聊天或命令行收集 secret。即使以后才提供
   owner 值，Python/Tk 就绪仍是本安装流程的前置条件。
 - `pywebview` 用于画板、图解、漫画等可视化窗口。缺少包不代表安装失败：安装阶段会在 MCP 使用的

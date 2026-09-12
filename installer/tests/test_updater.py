@@ -6,6 +6,7 @@ import hashlib
 import inspect
 import json
 import os
+import re
 import shutil
 import socket
 import stat
@@ -377,6 +378,9 @@ class UpdateInspectionTests(unittest.TestCase):
             ("core.askPass", "hostile-command"),
             ("core.ExcludesFile", str(self.root / "global-ignore")),
             ("extensions.worktreeConfig", "true"),
+            ("extensions.partialClone", "origin"),
+            ("remote.origin.promisor", "true"),
+            ("remote.origin.partialCloneFilter", "blob:none"),
             ("uploadpack.packObjectsHook", "hostile-command"),
             ("protocol.file.allow", "always"),
             ("alias.hostile", "!hostile-command"),
@@ -1857,14 +1861,34 @@ class GitCommandPolicyTests(unittest.TestCase):
             "version": ("--version",),
         })
 
-    def test_every_git_command_disables_lazy_fetch_and_optional_writes(self):
+    def test_git_floor_literals_match_python_constant(self):
+        # dp-install.sh / dp-install.ps1 gate on their own literals before the
+        # Python constant is reachable; a bump must touch all three together.
+        repo = Path(__file__).resolve().parents[2]
+        major, minor, _patch = updater._MINIMUM_GIT_VERSION
+        self.assertEqual(major, 2)
+        shell = (repo / "dp-install.sh").read_text(encoding="utf-8")
+        match = re.search(r"BASH_REMATCH\[2\] < ([0-9]+)", shell)
+        self.assertIsNotNone(match)
+        self.assertEqual(int(match.group(1)), minor)
+        powershell = (repo / "dp-install.ps1").read_text(encoding="utf-8")
+        match = re.search(r"\$minor -ge ([0-9]+)", powershell)
+        self.assertIsNotNone(match)
+        self.assertEqual(int(match.group(1)), minor)
+        for text in (shell, powershell):
+            mentioned = re.findall(r"Git (?:for Windows )?2\.([0-9]+) or newer", text)
+            self.assertTrue(mentioned)
+            self.assertEqual({int(item) for item in mentioned}, {minor})
+
+    def test_every_git_command_disables_optional_writes_without_2_45_only_flags(self):
         argv = updater._git_arguments(
             "target",
             Path("C:/managed-root"),
             git_executable="C:/Program Files/Git/cmd/git.exe",
             tag="v1.2.3",
         )
-        self.assertIn("--no-lazy-fetch", argv)
+        # --no-lazy-fetch exists only on git >= 2.45; the floor is 2.36.
+        self.assertNotIn("--no-lazy-fetch", argv)
         self.assertIn("--no-optional-locks", argv)
         self.assertIn("--no-replace-objects", argv)
         self.assertIn("--no-pager", argv)
@@ -2154,8 +2178,18 @@ class GitCommandPolicyTests(unittest.TestCase):
             ),
             (2, 51, 2),
         )
-        with self.assertRaisesRegex(updater.UpdateInspectionError, "2.45 or newer"):
-            updater._require_supported_git_version(b"git version 2.44.4\n")
+        self.assertEqual(
+            updater._require_supported_git_version(
+                b"git version 2.39.5 (Apple Git-154)\n"
+            ),
+            (2, 39, 5),
+        )
+        self.assertEqual(
+            updater._require_supported_git_version(b"git version 2.36.0\n"),
+            updater._MINIMUM_GIT_VERSION,
+        )
+        with self.assertRaisesRegex(updater.UpdateInspectionError, "2.36 or newer"):
+            updater._require_supported_git_version(b"git version 2.35.1\n")
 
         with mock.patch.object(updater, "_trusted_git_candidates", return_value=()):
             with self.assertRaisesRegex(updater.UpdateInspectionError, "not installed"):
@@ -2174,9 +2208,9 @@ class GitCommandPolicyTests(unittest.TestCase):
 
             def fake_run(argv, _environment, **_kwargs):
                 if argv[0] == str(first.resolve()):
-                    return 0, b"git version 2.39.5 (Apple Git-154)\n"
+                    return 0, b"git version 2.35.1\n"
                 if argv[0] == str(second.resolve()):
-                    return 0, b"git version 2.45.4\n"
+                    return 0, b"git version 2.39.5 (Apple Git-154)\n"
                 raise AssertionError("unexpected argv: %r" % (argv,))
 
             with (
@@ -2208,10 +2242,10 @@ class GitCommandPolicyTests(unittest.TestCase):
                 mock.patch.object(
                     updater,
                     "_run_bounded_git",
-                    return_value=(0, b"git version 2.39.5 (Apple Git-154)\n"),
+                    return_value=(0, b"git version 2.35.1\n"),
                 ),
             ):
-                with self.assertRaisesRegex(updater.UpdateInspectionError, "2.45 or newer"):
+                with self.assertRaisesRegex(updater.UpdateInspectionError, "2.36 or newer"):
                     updater._resolve_git_executable(
                         minimum_version=updater._MINIMUM_GIT_VERSION
                     )
@@ -2252,10 +2286,10 @@ class GitCommandPolicyTests(unittest.TestCase):
                 with mock.patch.object(
                     updater,
                     "_run_bounded_git",
-                    return_value=(0, b"git version 2.44.4\n"),
+                    return_value=(0, b"git version 2.35.1\n"),
                 ) as run:
                     with self.assertRaisesRegex(
-                        updater.UpdateInspectionError, "2.45 or newer"
+                        updater.UpdateInspectionError, "2.36 or newer"
                     ):
                         updater._GitReader(Path.cwd())
         self.assertEqual(run.call_count, 1)
@@ -2263,7 +2297,7 @@ class GitCommandPolicyTests(unittest.TestCase):
 
     def test_supported_trusted_git_candidate_is_used_after_an_older_one(self):
         def version_for(argv, _environment, **_kwargs):
-            version = b"2.44.4" if argv[0] == "old-git" else b"2.51.2"
+            version = b"2.35.1" if argv[0] == "old-git" else b"2.39.5"
             return 0, b"git version " + version + b"\n"
 
         with mock.patch.object(

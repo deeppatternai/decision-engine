@@ -54,7 +54,7 @@ _MAX_TRACKED_TOTAL_BYTES = 256 * 1024 * 1024
 _MAX_GIT_EXECUTABLE_BYTES = 128 * 1024 * 1024
 _TRACKED_HASH_TIMEOUT_SECONDS = 15
 _TREE_OPERATION_TIMEOUT_SECONDS = 20
-_MINIMUM_GIT_VERSION = (2, 45, 0)
+_MINIMUM_GIT_VERSION = (2, 36, 0)
 _COMMIT_RE = re.compile(r"[0-9a-f]{40}\Z")
 _DIGEST_RE = re.compile(r"[0-9a-f]{64}\Z")
 _VERSION_RE = re.compile(r"(?:0|[1-9][0-9]*)\.(?:0|[1-9][0-9]*)\.(?:0|[1-9][0-9]*)\Z")
@@ -64,7 +64,8 @@ _UNSAFE_LOCAL_CONFIG_PATTERN = (
     r"askpass|attributesfile|editor|excludesfile|fsmonitor|gitproxy|hookspath|pager|sshcommand|worktree)|"
     r"diff\.(external|.*\.(command|textconv))|difftool\..*\.cmd|gpg(\..*)?\.program|"
     r"interactive\.difffilter|merge\..*\.driver|mergetool\..*\.cmd|protocol\..*\.allow|"
-    r"extensions\.worktreeconfig|receivepack\.packobjectshook|remote\..*\.(uploadpack|receivepack)|"
+    r"extensions\.(worktreeconfig|partialclone)|receivepack\.packobjectshook|"
+    r"remote\..*\.(uploadpack|receivepack|promisor|partialclonefilter)|"
     r"sequence\.editor|trace2\..*|uploadpack\.packobjectshook|submodule\..*\.update|"
     r"url\..*\.(insteadof|pushinsteadof))$"
 )
@@ -723,7 +724,6 @@ def _git_arguments(
     root: Path,
     *,
     git_executable: Optional[str] = None,
-    disable_lazy_fetch: bool = True,
     **values: str,
 ) -> Tuple[str, ...]:
     template = _GIT_OPERATION_TEMPLATES.get(operation)
@@ -748,13 +748,11 @@ def _git_arguments(
         suffix = template
     if operation == "version":
         return (git_executable or _resolve_git_executable(), *suffix)
-    lazy_fetch_args = ("--no-lazy-fetch",) if disable_lazy_fetch else ()
     worktree_override = () if operation == "top_level" else (
         "-c", "core.worktree=" + str(root),
     )
     return (
         git_executable or _resolve_git_executable(),
-        *lazy_fetch_args,
         "--no-optional-locks",
         "--no-pager",
         "--no-replace-objects",
@@ -907,7 +905,8 @@ class _GitReader:
                 "Git is required in a trusted system location for release trust inspection"
             )
         raise UpdateInspectionError(
-            "Git 2.45 or newer is required in a trusted system location"
+            "Git %s or newer is required in a trusted system location"
+            % _format_git_version(_MINIMUM_GIT_VERSION)
         )
 
     def run(self, operation: str, *, allowed: Iterable[int] = (0,), **values: str) -> Tuple[int, bytes]:
@@ -924,7 +923,6 @@ class _GitReader:
             operation,
             self.root,
             git_executable=self.git_executable,
-            disable_lazy_fetch=not trust_store_only,
             **values,
         )
         remaining = self.deadline - time.monotonic()
@@ -1016,6 +1014,21 @@ def _read_local_config_names(output: bytes) -> Tuple[str, ...]:
             raise UpdateInspectionError("checkout Git config contains an invalid name")
         names.append(normalized)
     return tuple(names)
+
+
+def _require_safe_local_config(reader: _GitReader) -> bytes:
+    """Refuse a checkout whose local config can run commands or lazy-fetch.
+
+    Promisor / partial-clone keys are rejected here because git below 2.45
+    has no ``--no-lazy-fetch`` / ``GIT_NO_LAZY_FETCH``: a tampered
+    ``.git/config`` could otherwise make a missing object trigger a fetch
+    from an attacker-chosen remote during an otherwise read-only call.
+    """
+    _code, config_output = reader.run("unsafe_config")
+    config_names = _read_local_config_names(config_output)
+    if any(_UNSAFE_LOCAL_CONFIG_RE.fullmatch(name) for name in config_names):
+        raise UpdateInspectionError("checkout Git config contains execution-capable settings")
+    return config_output
 
 
 def _read_remotes(reader: _GitReader) -> Dict[str, str]:
@@ -2011,10 +2024,8 @@ def inspect_update(
     """
     requested_root = Path(root)
     reader = _GitReader(requested_root)
-    _config_code, config_output = reader.run("unsafe_config")
+    config_output = _require_safe_local_config(reader)
     config_names = _read_local_config_names(config_output)
-    if any(_UNSAFE_LOCAL_CONFIG_RE.fullmatch(name) for name in config_names):
-        raise UpdateInspectionError("checkout Git config contains execution-capable settings")
     autocrlf = _read_autocrlf(reader)
     eol = _read_eol(reader)
     symlinks = _read_symlinks(reader)

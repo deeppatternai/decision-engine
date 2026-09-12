@@ -187,7 +187,7 @@ try_git() {
   if [[ ! "$version" =~ git[[:space:]]version[[:space:]]([0-9]+)\.([0-9]+) ]]; then
     return 1
   fi
-  if (( BASH_REMATCH[1] < 2 || (BASH_REMATCH[1] == 2 && BASH_REMATCH[2] < 45) )); then
+  if (( BASH_REMATCH[1] < 2 || (BASH_REMATCH[1] == 2 && BASH_REMATCH[2] < 36) )); then
     return 1
   fi
   GIT_BIN="$candidate"
@@ -198,16 +198,16 @@ try_git() {
 bootstrap_git_with_homebrew() {
   local git_prefix candidate
   find_homebrew \
-    || fail "Homebrew is not installed. Install it from https://brew.sh, then rerun this installer to install Git 2.45 or newer."
-  tty_print "Git 2.45 or newer is missing, but Homebrew is available."
+    || fail "Homebrew is not installed. Install it from https://brew.sh, then rerun this installer to install Git 2.36 or newer."
+  tty_print "Git 2.36 or newer is missing, but Homebrew is available."
   confirm_dependency_install "Install or upgrade Git with Homebrew now?" \
-    || fail "Git installation was declined; install Git 2.45 or newer, then retry"
+    || fail "Git installation was declined; install Git 2.36 or newer, then retry"
   clean_exec "$HOMEBREW_BIN" install git \
     || fail "Homebrew could not install Git; correct the reported Homebrew error, then retry"
   git_prefix="$(clean_exec "$HOMEBREW_BIN" --prefix git 2>/dev/null || true)"
   candidate="$git_prefix/bin/git"
   try_git "$candidate" \
-    || fail "Homebrew finished, but $candidate is not a usable Git 2.45 or newer"
+    || fail "Homebrew finished, but $candidate is not a usable Git 2.36 or newer"
   tty_print "Git prerequisite ready: $GIT_VERSION ($GIT_BIN)"
 }
 
@@ -220,12 +220,12 @@ bootstrap_git_prerequisite() {
       && ! clean_exec "$XCODE_SELECT_BIN" -p >/dev/null 2>&1; then
     tty_print "Git is missing and Apple Command Line Tools are not installed."
     confirm_dependency_install "Open Apple's Command Line Tools installer now?" \
-      || fail "Git setup was declined; install Apple Command Line Tools and Git 2.45 or newer, then retry"
+      || fail "Git setup was declined; install Apple Command Line Tools and Git 2.36 or newer, then retry"
     clean_exec "$XCODE_SELECT_BIN" --install \
       || fail "Apple's Command Line Tools installer could not be opened; install it manually, then retry"
     dependency_pending "Command Line Tools installation was requested. Complete the Apple installer, then rerun this command."
   fi
-  fail "Git 2.45 or newer is required. Install Homebrew from https://brew.sh and run 'brew install git', then retry."
+  fail "Git 2.36 or newer is required. Install Homebrew from https://brew.sh and run 'brew install git', then retry."
 }
 
 try_git "$(command -v git 2>/dev/null || true)" \
@@ -404,7 +404,7 @@ select_trusted_git_prerequisite() {
     tty_print "Trusted Git prerequisite ready: $GIT_VERSION ($GIT_BIN)"
     return 0
   fi
-  fail "Git 2.45 or newer is not available in a trusted system location accepted by the signed installer; install or repair system Git, then retry"
+  fail "Git 2.36 or newer is not available in a trusted system location accepted by the signed installer; install or repair system Git, then retry"
 }
 
 select_trusted_git_prerequisite

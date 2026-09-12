@@ -24,7 +24,7 @@ English | [简体中文](AI_SETUP.zh-CN.md)
 Required:
 
 - Python 3.12 or later;
-- Git 2.45 or later;
+- Git 2.36 or later;
 - at least one target client from the registered-host table below;
 - while the repository is private, the user's GitHub account must have repository read access and
   ordinary Git authentication must already work.
@@ -143,7 +143,7 @@ env -u DE_ENDPOINT -u DE_ACTIVATION_SECRET python3 -c "import webview; print('py
   ```
 
   Native Windows PowerShell uses the equivalent `$PythonPath` variable shown in step 5.
-- Git must be 2.45+. If Git is too old, stop and ask the user to upgrade it.
+- Git must be 2.36+. If Git is too old, stop and ask the user to upgrade it.
 - `tkinter` provides step 5's masked setup window. If it is unavailable, do not collect secrets by
   another route. Python/Tk readiness is a prerequisite for this installation flow, even when owner
   values will be supplied later.

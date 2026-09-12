@@ -1394,7 +1394,6 @@ def _mutation_arguments(root: Path, commit: str, executable: str) -> Tuple[str, 
         raise GitMutationError("Git reset commit is invalid")
     return (
         executable,
-        "--no-lazy-fetch",
         "--no-pager",
         "--no-replace-objects",
         "-c", "gc.auto=0",
