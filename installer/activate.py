@@ -159,18 +159,68 @@ def activate_with_recovery_guard(
         return summary
 
 
-def _https_context() -> Optional[ssl.SSLContext]:
-    """Mirror the shim's CA resolution (SSL_CERT_FILE / REQUESTS_CA_BUNDLE / certifi)."""
+def _https_context() -> ssl.SSLContext:
+    """Mirror the shim's CA resolution: explicit override, else the platform store, with certifi
+    ONLY as a last-resort rescue when the platform ships no usable store.
+
+    Kept byte-for-byte equivalent to `shim._https_context`; see that docstring for why certifi is
+    a fallback rather than a supplement (it must never re-trust a root the OS distrusts) and why
+    the three copies are duplicated on purpose.
+    """
     import os
 
     ca_file = os.getenv("SSL_CERT_FILE") or os.getenv("REQUESTS_CA_BUNDLE")
-    if ca_file:
-        return ssl.create_default_context(cafile=ca_file)
+    ca_dir = os.getenv("SSL_CERT_DIR")
+    if ca_file or ca_dir:
+        # An explicit override is authoritative AND exclusive — folding the OS store in on
+        # top of a user-pinned CA would widen trust behind their back. SSL_CERT_DIR belongs
+        # here with SSL_CERT_FILE: OpenSSL honors it when building the default context, so
+        # leaving it out would let a pinned directory be judged by the platform probe below.
+        # Consuming all three here means that probe runs ONLY when no override is set, where
+        # it and OpenSSL's loader read the same compiled-in defaults and cannot disagree.
+        return ssl.create_default_context(cafile=ca_file or None, capath=ca_dir or None)
+    context = ssl.create_default_context()
+    # Does the platform's own store actually hold anchors? Windows enumerates it eagerly, so
+    # get_ca_certs() is truthful there. POSIX loads default paths lazily (get_ca_certs() is
+    # empty even with a full /etc/ssl), so inspect the paths OpenSSL would use — but inspect
+    # their CONTENT, not merely their existence: libssl creates /etc/ssl/certs, ca-certificates
+    # fills it, so on a stripped image (alpine without ca-certificates, distroless) the
+    # directory exists and is empty. Scoring that "usable" would skip the rescue and leave TLS
+    # failing closed on exactly the host the rescue exists for.
+    if sys.platform == "win32":
+        platform_store_usable = bool(context.get_ca_certs())
+    else:
+        # get_default_verify_paths() already returns None unless the file/dir exists, and it
+        # shadows SSL_CERT_FILE / SSL_CERT_DIR — both consumed above — so this sees only the
+        # compiled-in defaults.
+        paths = ssl.get_default_verify_paths()
+        try:
+            platform_store_usable = bool(
+                (paths.cafile and os.path.getsize(paths.cafile) > 0)
+                or (paths.capath and os.listdir(paths.capath))
+            )
+        except OSError:
+            # Unreadable default path — treat as unusable and let the rescue supply anchors.
+            # Safe in this direction only because the rescue below builds a FRESH certifi-only
+            # context, so a wrong guess here cannot union certifi onto a populated store.
+            platform_store_usable = False
+    if platform_store_usable:
+        # The OS store governs alone — an OS/enterprise CA distrust is honored, not re-widened.
+        return context
     try:
         import certifi  # type: ignore
-    except ImportError:
-        return None
-    return ssl.create_default_context(cafile=certifi.where())
+
+        # No usable OS store: certifi is the ONLY anchor source. Build a fresh certifi-only
+        # context rather than loading certifi INTO `context` — create_default_context(cafile=...)
+        # skips load_default_certs entirely, so this is structurally incapable of layering
+        # certifi on top of a platform store, whatever the probe above concluded.
+        return ssl.create_default_context(cafile=certifi.where())
+    except Exception:  # aqg: top-level boundary — the rescue is best-effort. If certifi is
+        # absent/unreadable we fall back to `context`, which on a store-less host has no
+        # anchors, so TLS fails CLOSED (CERTIFICATE_VERIFY_FAILED), never open; verify_mode /
+        # check_hostname keep their secure defaults. Surface it so this is attributable.
+        print("de-activate: certifi trust-store rescue unavailable; TLS may fail closed", file=sys.stderr)
+    return context
 
 
 def _opener(context: Optional[ssl.SSLContext]):
