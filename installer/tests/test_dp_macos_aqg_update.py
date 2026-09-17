@@ -182,12 +182,15 @@ with Path({str(self.log)!r}).open('a') as stream:
         (backup / 'saved.json').write_bytes(b'{"original":true}\n')
         return backup
 
-    def test_legacy_backups_are_archived_after_consent(self):
+    def test_legacy_backups_are_archived_without_a_prompt(self):
         backup = self.backup_residue()
         canonical = self.root.parent / 'aqg-backups'
         canonical.mkdir()
         (canonical / 'existing').write_text('keep')
-        result = self.run_function('prepare_aqg_versions', extra='confirm_dependency_install() { return 0; }')
+        result = self.run_function(
+            'prepare_aqg_versions',
+            extra='confirm_dependency_install() { exit 90; }',
+        )
         self.assertEqual(result.returncode, 0, result.stdout + result.stderr)
         self.assertFalse(backup.exists())
         copies = list(canonical.glob('legacy-versions-*/aqg-backups/saved.json'))
@@ -195,12 +198,13 @@ with Path({str(self.log)!r}).open('a') as stream:
         self.assertEqual(copies[0].read_bytes(), b'{"original":true}\n')
         self.assertEqual((canonical / 'existing').read_text(), 'keep')
 
-    def test_declining_backup_relocation_preserves_everything(self):
+    def test_legacy_backup_archive_explains_automatic_preservation(self):
         backup = self.backup_residue()
-        result = self.run_function('prepare_aqg_versions', extra='confirm_dependency_install() { return 1; }')
-        self.assertEqual(result.returncode, 4, result.stdout + result.stderr)
-        self.assertTrue((backup / 'saved.json').is_file())
-        self.assertFalse((self.root.parent / 'aqg-backups').exists())
+        result = self.run_function('prepare_aqg_versions')
+        self.assertEqual(result.returncode, 0, result.stdout + result.stderr)
+        self.assertFalse(backup.exists())
+        self.assertIn('Automatically archiving them', result.stdout)
+        self.assertIn('contents are preserved, not deleted or merged', result.stdout)
 
     def test_symlink_backup_residue_is_not_moved(self):
         versions = self.root.parent / 'versions'
@@ -210,12 +214,18 @@ with Path({str(self.log)!r}).open('a') as stream:
         self.assertEqual(result.returncode, 2, result.stdout + result.stderr)
         self.assertTrue((versions / 'aqg-backups').is_symlink())
 
-    def test_replaced_backup_after_prompt_is_not_moved(self):
+    def test_replaced_backup_after_inspection_is_not_moved(self):
         backup = self.backup_residue()
-        result = self.run_function('prepare_aqg_versions', extra='''
-confirm_dependency_install() {
-  mv "$DEEPPATTERN_ROOT/versions/aqg-backups" "$DEEPPATTERN_ROOT/versions/original"
-  mkdir "$DEEPPATTERN_ROOT/versions/aqg-backups"
+        original = shell_function(self.source, 'aqg_backup_residue').replace(
+            'aqg_backup_residue() {', 'original_aqg_backup_residue() {', 1
+        )
+        result = self.run_function('prepare_aqg_versions', extra=original + '''
+aqg_backup_residue() {
+  if [ "$1" = move ]; then
+    mv "$DEEPPATTERN_ROOT/versions/aqg-backups" "$DEEPPATTERN_ROOT/versions/original"
+    mkdir "$DEEPPATTERN_ROOT/versions/aqg-backups"
+  fi
+  original_aqg_backup_residue "$@"
 }
 ''')
         self.assertEqual(result.returncode, 2, result.stdout + result.stderr)

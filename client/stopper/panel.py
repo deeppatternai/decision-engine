@@ -6,14 +6,17 @@ Design parity with `desktop/macos/DecisionEngineStopper.swift`:
     live elapsed. Per-voice model names / counts are deliberately NOT shown (privacy; matches
     the Swift panel and the voice-redaction model).
   * Data comes from `client.runner`: the active-runs registry on disk (seeded by the shim at
-    submit) plus a 1 Hz poll of the hub `/v1/audits/<id>` for status / profile / started_at.
+    submit) plus a client-paced poll of the hub `/v1/audits/<id>` for status / profile /
+    started_at. That is the DETAIL view on purpose — the lighter `/status` route the CLI wait
+    loop uses carries no `auditors`, so this panel could not draw a per-voice or `partial`
+    state from it. The tradeoff is real and accepted: `poll_after_ms` rides on `/status` only,
+    so the interval here is ours (`POLL_INTERVAL_MS` + backoff), and the `poll_after_ms` read
+    in `_poll` is forward compatibility for a detail view that grows it — not a live pace.
   * Stop button cancels queued audits via the hub (`POST /v1/audits/<id>/cancel`).
-
-Parity is about what the panel SHOWS, not how it behaves as a window. Deliberate divergence: this
-panel is NOT always-on-top, while the Swift one is `.floating` (Owner, 2026-07-17). A floating
-utility window is the macOS convention for a menu-bar accessory; on Windows this is a taskbar app,
-and pinning it over everything meant an audit sat over your work for its whole run. Do not "restore
-parity" by re-adding -topmost.
+  * ALWAYS-ON-TOP, like the Swift panel's `.floating` level (Owner, 2026-09-16). This reverses the
+    2026-07-17 decision to leave the tk panel unpinned — that made a running audit easy to lose
+    behind the window you were working in. Minimise (native title bar) is the way out; it still
+    works, and a minimised panel stays minimised.
 
 BEFORE TOUCHING ANY TIMING CODE, read README.md next to this file: a finished run's duration comes
 from the hub's timestamps, never from this machine's clock. That one rule has already been broken
@@ -470,6 +473,24 @@ def _display_scale(widget: Any, tk: Any) -> float:
     return min(max(dpi / 96.0, 1.0), 4.0)
 
 
+def apply_always_on_top(root: Any, tk: Any) -> bool:
+    """Float the panel above other windows, like the Swift panel's `.floating` level.
+
+    Tk's own `-topmost` window attribute is the platform-native way to do this (Windows maps it to
+    `WS_EX_TOPMOST`), so there is no re-assert timer and no ctypes: the style holds for the window's
+    life. Applied on every platform that runs this panel, not just Windows — gating it would leave
+    Linux as the one surface that does not float.
+
+    Fails OPEN: a Tk build that rejects the attribute returns False and the panel opens as an
+    ordinary window. Raising here would reach `main`'s handler and show the customer nothing at all.
+    """
+    try:
+        root.attributes("-topmost", True)
+    except (AttributeError, TypeError, tk.TclError):
+        return False
+    return True
+
+
 class _DarkScrollbar:
     """Canvas-backed vertical scrollbar so Windows themes cannot paint a white trough."""
 
@@ -775,6 +796,12 @@ class StopPanelApp:
         # A cancel transition bumps this generation so older in-flight GETs cannot regress state.
         self._state_epochs: Dict[str, int] = {}
         self._not_found_polls: Dict[str, int] = {}   # run_id → consecutive hub 404s (reap streak)
+        # Poll pacing, per run. The tick below stays at 1 Hz because it also draws the live
+        # elapsed clock; these gate the REQUEST so a hub suggestion, or a failing hub, can slow
+        # it down without freezing the display.
+        self._next_poll_at: Dict[str, float] = {}    # run_id → earliest next request time
+        self._poll_failures: Dict[str, int] = {}     # run_id → consecutive failed polls (backoff)
+        self._auth_failures: Dict[str, int] = {}     # run_id → consecutive 401/403 (stop streak)
         self._retired: set = set()   # run_ids shown to completion + pruned — never re-seed from disk
         self._lock = threading.Lock()
         self._no_runs_since: Optional[float] = None
@@ -798,12 +825,11 @@ class StopPanelApp:
         tk_icon.apply_dock_icon()
         self.root.configure(bg=BG)
         self.root.minsize(320, 96)
-        # Deliberately NOT always-on-top (Owner, 2026-07-17). It used to set -topmost to float like
-        # the macOS Swift panel; on Windows that made an audit panel sit over whatever you were
-        # working in for the whole run, with no way to push it back. A new panel still comes up in
-        # front — it just stops winning every raise after that, so the title bar's minimise means
-        # what it says. The Swift panel keeps .floating: that is a menu-bar-anchored accessory on a
-        # platform where a floating utility window is the convention, not a taskbar app.
+        # Always-on-top, matching the Swift panel's .floating level (Owner, 2026-09-16 — this
+        # REVERSES the 2026-07-17 decision to leave the tk panel unpinned). An audit you cannot see
+        # is an audit you forget you are waiting on; the panel is small, and the native title bar's
+        # minimise still takes it away for the rest of the run.
+        apply_always_on_top(self.root, tk)
         viewport = tk.Frame(self.root, bg=BG)
         viewport.pack(fill="both", expand=True, padx=12, pady=12)
         viewport.grid_rowconfigure(0, weight=1)
@@ -934,13 +960,19 @@ class StopPanelApp:
         nothing prunes it and it shows "排队中" forever.
         After NOT_FOUND_FORGET_THRESHOLD consecutive gone-replies (grace for the brief post-submit
         window) it is retired like a finished run. Any OTHER failure (network down / hub unreachable
-        — a transport AuditError with no status_code, or a 401/5xx) leaves state as-is and is
-        retried next tick."""
+        — a transport AuditError with no status_code, or a 401/429/5xx) leaves state as-is and is
+        retried later, each consecutive failure waiting longer (`_defer_poll`); a run answering
+        401/403 that many times in a row leaves the normal cadence for one slow probe per
+        POLL_AUTH_PROBE_INTERVAL_S, so its row goes stale but still heals if the token is fixed."""
         if expected_epoch is None:
             with self._lock:
                 expected_epoch = self._state_epochs.get(run_id, 0)
         try:
-            view = runner.request_json("GET", "/v1/audits/%s" % run_id)
+            # The DETAIL view, deliberately not the lighter status route: `overall_status`
+            # derives the displayed state from `auditors[]` (including `partial`, which the
+            # run-level status cannot express) and `_debug_auditor_details` renders per-voice
+            # lines from it. The status route carries neither, nor `debug_authorized`.
+            view = runner.request_json("GET", runner.audit_detail_path(run_id))
         except runner.AuditError as exc:
             status_code = getattr(exc, "status_code", None)
             is_synchronous_workflow = (
@@ -950,36 +982,89 @@ class StopPanelApp:
                 and getattr(exc, "error_code", None) == _SYNCHRONOUS_WORKFLOW_ERROR_CODE
             )
             if status_code in _GONE_STATUS_CODES or is_synchronous_workflow:
-                self._on_run_vanished(run_id)
+                self._on_run_vanished(run_id)   # reaping wins over backoff: the run is gone
             else:
-                with self._lock:
-                    self._polling.discard(run_id)
+                is_auth = status_code in runner.POLL_AUTH_STATUS_CODES
+                self._defer_poll(
+                    run_id,
+                    auth_failure=is_auth,
+                    # Auth gets the streak budget below; any OTHER definitive 4xx is the hub's
+                    # final answer on this request and drops to the probe rate at once.
+                    transient=is_auth or runner.poll_failure_is_transient(status_code),
+                )
             return
-        except Exception:
-            with self._lock:
-                self._polling.discard(run_id)
+        except Exception:  # aqg: top-level boundary — no client-side defect may stop the panel
+            self._defer_poll(run_id)
             return
         with self._lock:
-            if run_id in self._retired or self._state_epochs.get(run_id, 0) != expected_epoch:
-                self._polling.discard(run_id)
-                return
-            self._not_found_polls.pop(run_id, None)   # a live view resets the reap streak
-            existing = self.runs.get(run_id, {})
-            if isinstance(view, dict):
-                self._server_verified.add(run_id)
-                merged = merge_poll_view(
-                    existing, view, run_id, time.time(),
-                    preserve_cancelling=run_id in self._cancel_inflight,
+            # `finally`, not a tail statement: anything raising in here — a hostile payload field,
+            # a merge defect — would otherwise leave run_id in `_polling` forever and that run
+            # would never be polled again for the life of the process.
+            try:
+                if run_id in self._retired or self._state_epochs.get(run_id, 0) != expected_epoch:
+                    return
+                self._not_found_polls.pop(run_id, None)   # a live view resets the reap streak
+                self._poll_failures.pop(run_id, None)     # …and the backoff and auth streaks
+                self._auth_failures.pop(run_id, None)
+                self._next_poll_at[run_id] = time.monotonic() + runner.poll_delay_s(
+                    view.get("poll_after_ms") if isinstance(view, dict) else None
                 )
-                self.runs[run_id] = merged
-                if str(merged.get("status") or "") in TERMINAL_STATUSES:
-                    self._cancel_inflight.discard(run_id)
-                if merged.get("status") != existing.get("status"):
-                    try:
-                        runner.save_active_run(merged, existing_only=True)
-                    except Exception:  # aqg: top-level boundary — registry persistence is best-effort UI state
-                        pass
+                existing = self.runs.get(run_id, {})
+                if isinstance(view, dict):
+                    self._server_verified.add(run_id)
+                    merged = merge_poll_view(
+                        existing, view, run_id, time.time(),
+                        preserve_cancelling=run_id in self._cancel_inflight,
+                    )
+                    self.runs[run_id] = merged
+                    if str(merged.get("status") or "") in TERMINAL_STATUSES:
+                        self._cancel_inflight.discard(run_id)
+                    if merged.get("status") != existing.get("status"):
+                        try:
+                            runner.save_active_run(merged, existing_only=True)
+                        except Exception:  # aqg: top-level boundary — registry persistence is best-effort UI state
+                            pass
+            finally:
+                self._polling.discard(run_id)
+
+    def _defer_poll(
+        self, run_id: str, *, auth_failure: bool = False, transient: bool = True
+    ) -> None:
+        """Release the in-flight flag and push the next poll for `run_id` further out.
+
+        Each consecutive failure waits longer (under a fixed ceiling), so a hub that is down or
+        rate-limiting is not asked once per second per run. A run answering 401/403
+        POLL_AUTH_FAILURE_LIMIT times IN A ROW — any other answer, success or not, resets that
+        streak — drops to one probe per POLL_AUTH_PROBE_INTERVAL_S instead of stopping dead:
+        a revoked token cannot be repaired by asking again at 1 Hz, but a token the user fixes
+        on disk IS picked up by the next request, so the row heals itself rather than needing a
+        panel restart. Meanwhile the row just goes stale — reaping it would claim the run is
+        gone, which a 401 does not say."""
+        with self._lock:
             self._polling.discard(run_id)
+            # A worker that started before the run was retired or pruned must not re-create the
+            # bookkeeping `_forget_poll_state` just dropped: nothing would ever forget it again.
+            if run_id in self._retired or run_id not in self.runs:
+                return
+            if auth_failure:
+                self._auth_failures[run_id] = self._auth_failures.get(run_id, 0) + 1
+            else:
+                self._auth_failures.pop(run_id, None)   # "consecutive" means consecutive
+            failures = self._poll_failures.get(run_id, 0) + 1
+            self._poll_failures[run_id] = failures
+            exhausted = self._auth_failures.get(run_id, 0) >= runner.POLL_AUTH_FAILURE_LIMIT
+            if exhausted or not transient:
+                delay = runner.POLL_AUTH_PROBE_INTERVAL_S
+            else:
+                delay = runner.poll_backoff_delay_s(failures)
+            self._next_poll_at[run_id] = time.monotonic() + delay
+
+    def _forget_poll_state(self, run_id: str) -> None:
+        """Drop a retired run's poll bookkeeping. Caller holds `self._lock`."""
+        self._next_poll_at.pop(run_id, None)
+        self._poll_failures.pop(run_id, None)
+        self._auth_failures.pop(run_id, None)
+        self._not_found_polls.pop(run_id, None)
 
     def _on_run_vanished(self, run_id: str) -> None:
         """Count a hub 404 for run_id; once the streak reaches the grace threshold, retire the run
@@ -991,7 +1076,7 @@ class StopPanelApp:
             self._not_found_polls[run_id] = count
             if count < NOT_FOUND_FORGET_THRESHOLD:
                 return
-            self._not_found_polls.pop(run_id, None)
+            self._forget_poll_state(run_id)
             self.runs.pop(run_id, None)
             self._cancel_inflight.discard(run_id)
             self._server_verified.discard(run_id)
@@ -1005,6 +1090,7 @@ class StopPanelApp:
             for run_id in list(self.runs):
                 hidden_after = self.runs[run_id].get("hidden_after")
                 if isinstance(hidden_after, (int, float)) and hidden_after <= now:
+                    self._forget_poll_state(run_id)
                     self.runs.pop(run_id, None)
                     self._cancel_inflight.discard(run_id)
                     self._server_verified.discard(run_id)
@@ -1123,11 +1209,21 @@ class StopPanelApp:
     # -- loop --------------------------------------------------------------------------------
     def _tick(self) -> None:
         now = time.time()
+        # Poll scheduling is an INTERVAL, so it reads the monotonic clock: an NTP correction, a
+        # VM resume or a user changing the system clock backwards would otherwise silently
+        # suspend every poll for the size of the jump while the 1 Hz repaint kept running.
+        # Wall-clock `now` stays for the display/staleness values, which are wall-clock facts.
+        scheduled = time.monotonic()
         self._merge_disk()
         with self._lock:
+            # This tick also drives the live elapsed clock, so it keeps running at 1 Hz; the
+            # REQUEST is what the per-run gate paces. A run is asked again only once its
+            # scheduled time has arrived — including a run that exhausted its auth budget and is
+            # now down to one probe a minute, which is how a repaired token gets noticed.
             to_poll = [run_id for run_id, run in self.runs.items()
                        if _entry_is_active(run_id, run) and should_hub_poll(run)
-                       and run_id not in self._polling]
+                       and run_id not in self._polling
+                       and self._next_poll_at.get(run_id, 0.0) <= scheduled]
             self._polling.update(to_poll)
             poll_epochs = {run_id: self._state_epochs.get(run_id, 0) for run_id in to_poll}
         for run_id in to_poll:

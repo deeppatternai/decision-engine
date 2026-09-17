@@ -201,6 +201,40 @@ def test_dp_install_trusted_git_selection_delegates_to_source_updater():
     assert "updater._resolve_git_executable(minimum_version=updater._MINIMUM_GIT_VERSION)" in source
 
 
+def test_dp_install_git_bootstrap_prefers_installed_capabilities_before_clt_install():
+    source = (ROOT / "dp-install.sh").read_text(encoding="utf-8")
+    match = re.search(r"^bootstrap_git_prerequisite\(\) \{\n.*?^\}$", source, re.M | re.S)
+    assert match is not None
+    body = match.group()
+
+    apple_git = body.index('try_git "/usr/bin/git"')
+    homebrew_fallback = body.index("if find_homebrew; then")
+    clt_install = body.index('clean_exec "$XCODE_SELECT_BIN" --install')
+    assert apple_git < homebrew_fallback < clt_install
+    assert "if bootstrap_git_with_homebrew; then" in body
+    assert "Command Line Tools installation was requested" in body
+    assert "Trying the existing Homebrew installation before requesting Apple Command Line Tools" in body
+    assert "brew.sh" not in body
+    assert "install Homebrew" not in body
+
+
+def test_dp_install_clt_request_explicitly_presents_an_apple_ui():
+    source = (ROOT / "dp-install.sh").read_text(encoding="utf-8")
+    function = re.search(
+        r"^present_clt_install_ui\(\) \{\n.*?^\}$", source, re.M | re.S
+    )
+    assert function is not None
+    body = function.group()
+
+    assert '"$CLT_INSTALLER_APP/Contents/Info.plist"' in body
+    assert '"$CLT_INSTALLER_BUNDLE_ID"' in body
+    assert 'clean_exec /usr/bin/open "$CLT_INSTALLER_APP"' in body
+    assert 'clean_exec /usr/bin/open "$SOFTWARE_UPDATE_URL"' in body
+    request = re.search(r"^bootstrap_git_prerequisite\(\) \{\n.*?^\}$", source, re.M | re.S)
+    assert request is not None
+    assert "present_clt_install_ui" in request.group()
+
+
 def test_dp_install_trusted_git_selection_uses_source_result(tmp_path):
     bash = shutil.which("bash")
     if bash is None:

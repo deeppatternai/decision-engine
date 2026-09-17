@@ -1590,13 +1590,16 @@ _GE_CHROME_JS = """
     if (e.key !== 'Escape') return;
     if (imagePreview && !imagePreview.hidden) return;
     if (regionMode) { exitRegion(); return; }          // Esc disarms region-select first
-    // close() is the ONLY terminal action for a fire-and-forget popup, so a stray Esc would destroy the
-    // artifact + a half-typed follow-up. Esc is a routine keystroke inside a text field (clear it / dismiss
-    // an IME candidate list) — ignore it while composing or focused in an editable control.
+    // Esc MINIMIZES, it never closes (Owner, 2026-09-16). close() is the ONLY terminal action for a
+    // fire-and-forget popup — there is no reopening it — so binding it to a single keystroke meant one
+    // stray Esc destroyed the artifact plus any half-typed follow-up. hide() only puts the window away
+    // (real minimize on Windows/Linux, orderOut + Dock recall on macOS); the header ✕ stays the one way
+    // to destroy. Esc is still a routine keystroke inside a text field (clear it / dismiss an IME
+    // candidate list), so don't even minimize while composing or focused in an editable control.
     if (e.isComposing) return;
     var t = e.target;
     if (t && t.closest && t.closest('input, textarea, [contenteditable]')) return;
-    geClose();
+    geHide();
   });
 
   // ---- header controls must NOT drag the window: pywebview's drag-region walks up from the mousedown

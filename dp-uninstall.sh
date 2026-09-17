@@ -26,7 +26,7 @@ if [[ -z "${python_bin}" || ! -x "${python_bin}" ]]; then
   exit 2
 fi
 
-exec "${python_bin}" - "$@" 3<&0 <<'PY'
+exec "${python_bin}" - "$@" <<'PY'
 from __future__ import annotations
 
 import argparse
@@ -51,8 +51,12 @@ EXIT_OK = 0
 EXIT_USAGE = 2
 EXIT_BLOCKED = 3
 EXIT_UNSUPPORTED = 4
-PROMPT_INPUT_FD = 3
+EXIT_PENDING = 5
 MAX_JSON_CONFIG_BYTES = 8 * 1024 * 1024
+MAX_UNINSTALL_BACKUPS = 5
+UNINSTALL_BACKUP_NAME = re.compile(
+    r"^(?P<stamp>\d{8}-\d{6})(?:-(?P<suffix>\d+))?-dp-uninstall-(?P<scope>de|aqg|both)$"
+)
 ZED_SETTINGS_RELATIVE = Path(".config/zed/settings.json")
 CLAUDE_SETTINGS_RELATIVE = Path(".claude/settings.json")
 
@@ -375,8 +379,10 @@ PROCESS_HOST_MARKERS = (
     (("codebuddy studio.app", "codebuddy.app", "/codebuddy"), "CodeBuddy"),
     (("cursor.app", "/cursor/"), "Cursor"),
     (("claude.app", "/claude/", "claude-code"), "Claude"),
+    (("chatgpt.app/contents/resources/codex",), "Codex (ChatGPT.app)"),
     (("codex.app", "/codex/"), "Codex"),
 )
+APP_PATH_PATTERN = re.compile(r"(?P<path>/[^\n\"]*?\.app)(?:/|\s|$)", re.IGNORECASE)
 REGISTERED_DE_HOST_LABELS = {
     "claude-code": "Claude Code",
     "claude-desktop": "Claude Desktop",
@@ -525,6 +531,8 @@ class Inventory:
         self.host_backups: list[Path] = []
         self.de_aux: list[Path] = []
         self.aqg_aux: list[Path] = []
+        self.aqg_version_residue: list[Path] = []
+        self.empty_managed_dirs: list[Path] = []
         self.runtime_roots: list[Path] = []
         self.launchagent: Path | None = None
         self.launchagent_loaded = False
@@ -680,7 +688,7 @@ class Inventory:
 
     def inspect_root(self, root: Path, component: str) -> None:
         if not lexists(root):
-            self.notes.append(f"preserve absent {root}")
+            self.notes.append(f"absent {root}")
             return
         if component == "aqg" and root == self.aqg and root.is_symlink():
             target = self.proven_managed_aqg_target(root)
@@ -728,6 +736,9 @@ class Inventory:
         if not target.is_absolute():
             target = root.parent / target
         target = lex(target)
+        return self.proven_aqg_version_target(target)
+
+    def proven_aqg_version_target(self, target: Path) -> Path | None:
         versions = self.dp / "versions"
         commit_name = re.fullmatch(r"[0-9a-f]{40}", target.name) is not None
         if target.parent != versions or re.fullmatch(r"[0-9A-Za-z.+-]{1,40}", target.name) is None:
@@ -823,11 +834,119 @@ class Inventory:
             return None
         return target
 
+    def aqg_versions_backup_owned(self, path: Path) -> bool:
+        return (
+            path == self.dp / "versions" / "aqg-backups"
+            and path.is_dir()
+            and not path.is_symlink()
+            and path_has_symlink_component(path, self.home) is None
+            and (not hasattr(os, "getuid") or path.stat().st_uid == os.getuid())
+        )
+
+    def refresh_aqg_version_residue_after_uninstall(self, manifest: "Manifest") -> None:
+        if self.scope not in ("aqg", "both"):
+            return
+        path = self.dp / "versions" / "aqg-backups"
+        if not lexists(path) or path in self.aqg_version_residue:
+            return
+        if not self.aqg_versions_backup_owned(path):
+            raise RuntimeError(
+                f"AQG uninstaller created an unprovable versions backup path: {path}"
+            )
+        self.aqg_version_residue.append(path)
+        manifest.add(
+            {
+                "operation": "discover-post-aqg-uninstall-residue",
+                "source": str(path),
+            }
+        )
+
+    def inspect_managed_state_cleanup(self) -> None:
+        if self.scope in ("aqg", "both"):
+            state = self.dp / "aqg-state"
+            if lexists(state):
+                if state.is_symlink() or path_has_symlink_component(state, self.home):
+                    self.blockers.append(f"AQG state ownership is unknown through symlink: {state}")
+                elif not state.is_dir():
+                    self.blockers.append(f"AQG state path is not a directory: {state}")
+                elif hasattr(os, "getuid") and state.stat().st_uid != os.getuid():
+                    self.blockers.append(f"AQG state directory owner is unexpected: {state}")
+                else:
+                    self.aqg_aux.append(state)
+                    self.add_action("quarantine-aux", state, "AQG managed state")
+
+            versions = self.dp / "versions"
+            if lexists(versions):
+                if versions.is_symlink() or path_has_symlink_component(versions, self.home):
+                    self.blockers.append(f"AQG versions ownership is unknown through symlink: {versions}")
+                elif not versions.is_dir():
+                    self.blockers.append(f"AQG versions path is not a directory: {versions}")
+                elif hasattr(os, "getuid") and versions.stat().st_uid != os.getuid():
+                    self.blockers.append(f"AQG versions directory owner is unexpected: {versions}")
+                else:
+                    for child in sorted(versions.iterdir()):
+                        if child == self.aqg_managed_target:
+                            continue
+                        owned_backup_dir = self.aqg_versions_backup_owned(child)
+                        if not owned_backup_dir and self.proven_aqg_version_target(child) is None:
+                            self.blockers.append(
+                                f"AQG versions contains unproven content that must be preserved: {child}"
+                            )
+                            continue
+                        self.aqg_version_residue.append(child)
+                        self.add_action(
+                            "quarantine-aqg-version",
+                            child,
+                            "unreferenced AQG managed version or backup residue",
+                        )
+
+        planned_children = set(self.de_aux) | set(self.aqg_aux) | set(self.aqg_version_residue)
+        if self.aqg_managed_target is not None:
+            planned_children.add(self.aqg_managed_target)
+        directories: list[Path] = []
+        if self.scope in ("de", "both"):
+            directories.extend((self.dp / "installations", self.dp / "popup-sessions"))
+        if self.scope in ("aqg", "both"):
+            directories.append(self.dp / "versions")
+        for directory in directories:
+            if not lexists(directory):
+                continue
+            if directory.is_symlink() or path_has_symlink_component(directory, self.home):
+                self.blockers.append(f"managed state directory is unsafe through symlink: {directory}")
+                continue
+            if not directory.is_dir():
+                self.blockers.append(f"managed state path is not a directory: {directory}")
+                continue
+            children = set(directory.iterdir())
+            if children and not children.issubset(planned_children):
+                self.notes.append(f"preserve non-empty managed state directory {directory}")
+                continue
+            self.empty_managed_dirs.append(directory)
+            self.add_action("remove-empty-dir", directory, "remove after managed contents are quarantined")
+
+    def inspect_backup_retention(self) -> None:
+        if os.environ.get("DE_AQG_BACKUP_ROOT"):
+            return
+        try:
+            roots = managed_uninstall_backups(self.home, self.dp)
+        except RuntimeError as exc:
+            self.blockers.append(str(exc))
+            return
+        creates_backup = any(item["kind"] != "backup-retention" for item in self.actions)
+        if len(roots) + int(creates_backup) > MAX_UNINSTALL_BACKUPS:
+            self.add_action(
+                "backup-retention",
+                self.dp / "uninstall-backups",
+                f"retain latest {MAX_UNINSTALL_BACKUPS} managed backups after successful uninstall",
+            )
+
     def inspect_aux(self) -> None:
         if self.scope in ("de", "both"):
             candidates = [
                 self.dp / ".install.lock",
                 self.dp / "de-python",
+                self.dp / "runtimes",
+                self.dp / "runtime-backups",
                 self.dp / "installations" / "decision-engine.json",
                 self.dp / "installations" / "decision-engine.identity.lock",
             ]
@@ -2022,6 +2141,59 @@ class Inventory:
                 return label
         return "Unknown Agent"
 
+    @staticmethod
+    def process_executable(command_line: str) -> str:
+        try:
+            tokens = shlex.split(command_line, posix=True)
+        except ValueError:
+            tokens = command_line.split()
+        if not tokens:
+            return "unknown"
+        executable = tokens[0]
+        return executable if len(executable) <= 240 else executable[:237] + "..."
+
+    @staticmethod
+    def process_app_path(command_line: str) -> str | None:
+        match = APP_PATH_PATTERN.search(command_line)
+        if match is None:
+            return None
+        value = match.group("path")
+        return value if len(value) <= 240 else value[:237] + "..."
+
+    @classmethod
+    def process_context(
+        cls,
+        pid: str,
+        ppid: str,
+        command_line: str,
+        commands_by_pid: dict[str, str],
+        parents_by_pid: dict[str, str],
+    ) -> dict[str, str]:
+        context = {
+            "executable": cls.process_executable(command_line),
+        }
+        app_path = cls.process_app_path(command_line)
+        if app_path is not None:
+            context["app_path"] = app_path
+            context["app_name"] = Path(app_path).name
+        ancestor = ppid
+        visited: set[str] = set()
+        while ancestor and ancestor not in visited:
+            visited.add(ancestor)
+            parent_command = commands_by_pid.get(ancestor)
+            if parent_command is None:
+                break
+            if "parent_executable" not in context:
+                context["parent_executable"] = cls.process_executable(parent_command)
+                context["parent_pid"] = ancestor
+            parent_app_path = cls.process_app_path(parent_command)
+            if parent_app_path is not None:
+                context["parent_app_path"] = parent_app_path
+                context["parent_app_name"] = Path(parent_app_path).name
+                break
+            ancestor = parents_by_pid.get(ancestor, "")
+        return context
+
     def inspect_processes(self) -> None:
         command = self.process_command()
         if not command:
@@ -2053,6 +2225,9 @@ class Inventory:
         commands_by_pid = {pid: command_line for pid, _ppid, command_line in rows}
         parents_by_pid = {pid: ppid for pid, ppid, _command_line in rows}
         for pid, ppid, command_line in rows:
+            context = self.process_context(
+                pid, ppid, command_line, commands_by_pid, parents_by_pid
+            )
             host = self.process_host_label(command_line)
             ancestor = ppid
             visited: set[str] = set()
@@ -2072,6 +2247,7 @@ class Inventory:
                         "command_line": command_line,
                         "proof": "host-marker",
                         "term_eligible": "false",
+                        **context,
                     }
                 )
                 self.add_action(
@@ -2121,6 +2297,7 @@ class Inventory:
                             "command_line": command_line,
                             "proof": "unknown",
                             "term_eligible": "false",
+                            **context,
                         }
                     )
                     continue
@@ -2134,6 +2311,7 @@ class Inventory:
                     "command_line": command_line,
                     "proof": proof,
                     "term_eligible": "false",
+                    **context,
                 }
                 if environment_host is not None:
                     process["environment_host"] = environment_host
@@ -2514,6 +2692,7 @@ class Inventory:
         if self.scope in ("aqg", "both"):
             self.inspect_root(self.aqg, "aqg")
         self.inspect_aux()
+        self.inspect_managed_state_cleanup()
         self.inspect_aqg_uninstaller()
         self.inspect_qoder_plugins()
         self.inspect_qoder_runtime_caches()
@@ -2528,6 +2707,7 @@ class Inventory:
         for protected in self.protected:
             if lexists(protected):
                 self.notes.append(f"preserve protected source/worktree {protected}")
+        self.inspect_backup_retention()
         return self
 
 
@@ -2641,6 +2821,102 @@ def revalidate_term_target(inv: Inventory, process: dict[str, str]) -> tuple[boo
     return True, ""
 
 
+def process_host_family(host: str) -> str | None:
+    for prefix, family in (
+        ("Claude", "Claude"),
+        ("Codex", "Codex"),
+        ("Cursor", "Cursor"),
+        ("Qoder", "Qoder"),
+        ("TRAE", "TRAE"),
+        ("WorkBuddy", "WorkBuddy"),
+        ("CodeBuddy", "CodeBuddy"),
+    ):
+        if host.startswith(prefix):
+            return family
+    return None
+
+
+def effective_process_host(
+    process: dict[str, str], processes: list[dict[str, str]]
+) -> str:
+    by_pid = {item["pid"]: item for item in processes}
+    ancestor = process.get("ppid", "")
+    visited: set[str] = set()
+    inherited = ""
+    while ancestor and ancestor not in visited:
+        visited.add(ancestor)
+        parent = by_pid.get(ancestor)
+        if parent is None:
+            break
+        parent_host = parent.get("host", "Unknown Agent")
+        if parent_host != "Unknown Agent":
+            inherited = parent_host
+        ancestor = parent.get("ppid", "")
+    return inherited or process.get("host", "Unknown Agent")
+
+
+def grouped_processes(inv: Inventory) -> dict[str, dict[str, int]]:
+    grouped: dict[str, dict[str, int]] = {}
+    for process in inv.processes:
+        host = effective_process_host(process, inv.processes)
+        counts = grouped.setdefault(host, {})
+        family = process.get("family", "unknown")
+        counts[family] = counts.get(family, 0) + 1
+    return grouped
+
+
+def print_process_summary(inv: Inventory, heading: str) -> None:
+    print(heading)
+    labels = {
+        "mcp-launcher": "active MCP session",
+        "stopper": "Deep Pattern helper",
+        "qoder-plugin-host": "active plugin host",
+        "unverified-de-launcher": "unverified launcher",
+    }
+    grouped = grouped_processes(inv)
+    for host, counts in sorted(grouped.items()):
+        if host == "Unknown Agent":
+            print("  Unknown Agent (host could not be identified):")
+        else:
+            print(f"  {host}:")
+        for family, count in sorted(counts.items()):
+            label = labels.get(family, "runtime process")
+            suffix = "" if count == 1 else "s"
+            print(f"    {count} {label}{suffix}")
+        if host == "Unknown Agent":
+            for process in inv.processes:
+                if effective_process_host(process, inv.processes) != host:
+                    continue
+                print(
+                    f"    PID={process.get('pid', '?')} "
+                    f"PPID={process.get('ppid', '?')} "
+                    f"executable={process.get('executable', 'unknown')}"
+                )
+                app_name = process.get("app_name") or process.get("parent_app_name")
+                app_path = process.get("app_path") or process.get("parent_app_path")
+                if app_name:
+                    print(f"    application={app_name}")
+                if app_path:
+                    print(f"    application-path={app_path}")
+                parent_pid = process.get("parent_pid")
+                parent_executable = process.get("parent_executable")
+                if parent_pid and parent_executable:
+                    print(
+                        f"    parent={parent_executable} (PID={parent_pid})"
+                    )
+            print(
+                "    Please quit the application identified above. If no application "
+                "is shown, close recently used Agent applications and rerun."
+            )
+
+
+def process_only_inventory(inv: Inventory) -> Inventory:
+    refreshed = Inventory(inv.home, inv.scope)
+    refreshed.qoder_residue_paths = list(inv.qoder_residue_paths)
+    refreshed.inspect_processes()
+    return refreshed
+
+
 def prompt_tty(message: str) -> str | None:
     try:
         with open("/dev/tty", "r", encoding="utf-8", buffering=1) as tty_in:
@@ -2650,79 +2926,82 @@ def prompt_tty(message: str) -> str | None:
                     tty_out.flush()
             except OSError:
                 print(message, end="", file=sys.stderr, flush=True)
-            response = tty_in.readline()
+            return tty_in.readline().strip().lower()
     except OSError:
-        try:
-            if not os.isatty(PROMPT_INPUT_FD):
-                raise OSError("inherited input is not interactive")
-            print(message, end="", file=sys.stderr, flush=True)
-            with os.fdopen(
-                os.dup(PROMPT_INPUT_FD),
-                "r",
-                encoding="utf-8",
-                buffering=1,
-            ) as tty_in:
-                response = tty_in.readline()
-        except (OSError, ValueError):
-            print(
-                "BLOCKED: interactive process confirmation requires a terminal; "
-                "quit all Agent hosts and rerun the command in a terminal.",
-                file=sys.stderr,
-            )
-            return None
-    return response.strip().lower()
-
-
-def offer_term_for_managed_processes(inv: Inventory) -> bool:
-    eligible = [process for process in inv.processes if process_term_eligible(process)]
-    if not eligible:
         print(
-            "No remaining process is eligible for TERM. Fully quit the listed Agent hosts; "
-            "unknown and host-owned processes remain blocked."
+            "UNINSTALL_PENDING: interactive confirmation requires a terminal; "
+            "no process was terminated and no files or settings were changed.",
+            file=sys.stderr,
         )
-        return False
-    pids = ", ".join(process["pid"] for process in eligible)
-    answer = prompt_tty(
-        f"Send TERM to the verified managed DE/AQG process(es) pid={pids}? [y/N] "
-    )
-    if answer not in ("y", "yes"):
-        print("TERM was not sent; uninstall remains blocked.")
-        return False
-    for process in eligible:
+        return None
+
+
+def terminate_verified_processes(
+    inv: Inventory, candidates: list[dict[str, str]]
+) -> bool:
+    candidates.sort(key=lambda item: item.get("family") != "stopper")
+    for process in candidates:
         valid, reason = revalidate_term_target(inv, process)
         if not valid:
-            print(f"BLOCKED PROCESS pid={process['pid']} TERM refused: {reason}")
+            print(
+                f"UNINSTALL_PENDING: helper pid={process['pid']} was not terminated: {reason}"
+            )
+            return False
+    for process in candidates:
+        valid, reason = revalidate_term_target(inv, process)
+        if not valid:
+            print(
+                f"UNINSTALL_PENDING: helper pid={process['pid']} changed before TERM: {reason}"
+            )
             return False
         try:
             os.kill(int(process["pid"]), signal.SIGTERM)
         except (OSError, ValueError) as exc:
             print(
-                f"BLOCKED PROCESS pid={process['pid']} TERM failed: {exc.__class__.__name__}"
+                f"UNINSTALL_PENDING: helper pid={process['pid']} TERM failed: "
+                f"{exc.__class__.__name__}"
             )
             return False
-        print(f"TERM sent to verified managed process pid={process['pid']}")
+        print(
+            f"TERM sent to verified Deep Pattern process "
+            f"(pid={process['pid']}, family={process.get('family', 'runtime')})."
+        )
     return True
 
 
-def resolve_process_blockers(inv: Inventory) -> Inventory:
-    hosts = sorted({process.get("host", "Unknown Agent") for process in inv.processes})
-    print("Active DE/AQG runtime processes were detected.")
-    print("Completely quit these Agent hosts before uninstall: " + ", ".join(hosts))
-    response = prompt_tty(
-        "After quitting them, press Enter to recheck immediately (or type N to cancel): "
-    )
-    if response is None or response in ("n", "no", "q", "quit"):
-        print("Process cleanup was cancelled; uninstall remains blocked.")
-        return inv
-    refreshed = Inventory(inv.home, inv.scope).collect()
-    if not refreshed.processes:
-        print("All blocking Agent processes exited normally.")
-        return refreshed
-    if not refreshed.has_only_process_blockers():
-        return refreshed
-    if not offer_term_for_managed_processes(refreshed):
-        return refreshed
-    return Inventory(inv.home, inv.scope).collect()
+def resolve_process_blockers(inv: Inventory) -> tuple[Inventory, bool]:
+    current = process_only_inventory(inv)
+    if not current.processes:
+        refreshed = Inventory(inv.home, inv.scope).collect()
+        return refreshed, bool(refreshed.processes)
+
+    eligible = [
+        process for process in current.processes if process_term_eligible(process)
+    ]
+    if eligible:
+        print(
+            "The listed DE/AQG MCP sessions are verified as managed child processes. "
+            "The Agent applications themselves will not be closed."
+        )
+        answer = prompt_tty(
+            f"Terminate {len(eligible)} verified Deep Pattern process(es) now? [Y/N] "
+        )
+        if answer not in ("y", "yes"):
+            print(
+                "UNINSTALL_PENDING: process termination was declined; no files or "
+                "settings were changed."
+            )
+            return current, True
+        if terminate_verified_processes(current, eligible):
+            time.sleep(1)
+            refreshed = Inventory(inv.home, inv.scope).collect()
+            if not refreshed.processes:
+                print("All blocking Agent sessions have exited.")
+                return refreshed, False
+            return refreshed, True
+        return Inventory(inv.home, inv.scope).collect(), True
+
+    return current, True
 
 
 def print_inventory(
@@ -2738,34 +3017,80 @@ def print_inventory(
         path = item["path"]
         detail = f" ({item['detail']})" if item.get("detail") else ""
         if kind == "process-blocker":
-            print(
-                f"BLOCKED PROCESS pid={path} ppid={item.get('ppid', '?')} "
-                f"host={item.get('host', 'Unknown Agent')} family={item['detail']}"
-            )
+            if not process_resolution_pending:
+                print(
+                    f"BLOCKED PROCESS pid={path} ppid={item.get('ppid', '?')} "
+                    f"host={item.get('host', 'Unknown Agent')} family={item['detail']}"
+                )
         elif kind == "aqg-official-uninstall":
             print(f"RUN {path}{detail}")
+        elif kind == "backup-retention":
+            print(f"PRUNE {path}{detail}")
         else:
             print(f"REMOVE {path}{detail}")
     for note in inv.notes:
-        print(f"PRESERVE {note.removeprefix('preserve ')}")
+        if note.startswith("absent "):
+            print(f"ABSENT {note.removeprefix('absent ')}")
+        else:
+            print(f"PRESERVE {note.removeprefix('preserve ')}")
+    if process_resolution_pending:
+        print_process_summary(inv, "ACTIVE AGENT SESSIONS:")
     for blocker in inv.blockers:
-        print(f"BLOCKED {blocker}")
-    if not inv.actions:
+        if not (process_resolution_pending and blocker in inv.process_blockers):
+            print(f"BLOCKED {blocker}")
+    if not any(item["kind"] != "backup-retention" for item in inv.actions):
         print("NO IN-SCOPE INSTALLATION FOUND")
     if inv.blockers and process_resolution_pending:
-        print("ACTION REQUIRED: close the listed Agent hosts; guided process cleanup follows.")
+        print("ACTION REQUIRED: fully quit the listed Agent hosts, then rerun this uninstaller.")
     elif inv.blockers:
         print("STOP: ownership or runtime state is not fully provable; no mutation is allowed.")
     elif not apply:
         print("DRY-RUN only: add --apply after reviewing this plan.")
 
 
-def backup_root(home: Path, dp: Path, scope: str) -> Path:
+def backup_base(dp: Path) -> Path:
     configured = os.environ.get("DE_AQG_BACKUP_ROOT")
-    if configured:
-        base = lex(Path(configured))
-    else:
-        base = dp / "uninstall-backups"
+    return lex(Path(configured)) if configured else dp / "uninstall-backups"
+
+
+def managed_uninstall_backups(home: Path, dp: Path) -> list[Path]:
+    base = backup_base(dp)
+    if not lexists(base):
+        return []
+    if base.is_symlink() or path_has_symlink_component(base, home) or not base.is_dir():
+        raise RuntimeError(f"uninstall backup root is not a safe directory: {base}")
+    if hasattr(os, "getuid") and base.stat().st_uid != os.getuid():
+        raise RuntimeError(f"uninstall backup root owner is unexpected: {base}")
+    roots: list[tuple[str, int, str, Path]] = []
+    for child in base.iterdir():
+        match = UNINSTALL_BACKUP_NAME.fullmatch(child.name)
+        if match is None or child.is_symlink() or not child.is_dir():
+            continue
+        if hasattr(os, "getuid") and child.stat().st_uid != os.getuid():
+            continue
+        manifest = child / "manifest.json"
+        if manifest.is_symlink() or not manifest.is_file():
+            continue
+        try:
+            data = json.loads(manifest.read_text(encoding="utf-8"))
+        except (OSError, UnicodeError, json.JSONDecodeError):
+            continue
+        entries = data.get("entries")
+        if (
+            data.get("schema") != 1
+            or data.get("home") != str(home)
+            or data.get("scope") != match.group("scope")
+            or not isinstance(entries, list)
+        ):
+            continue
+        roots.append(
+            (match.group("stamp"), int(match.group("suffix") or 0), child.name, child)
+        )
+    return [item[3] for item in sorted(roots)]
+
+
+def backup_root(home: Path, dp: Path, scope: str) -> Path:
+    base = backup_base(dp)
     base.mkdir(parents=True, exist_ok=True)
     stamp = time.strftime("%Y%m%d-%H%M%S")
     candidate = base / f"{stamp}-dp-uninstall-{scope}"
@@ -2779,6 +3104,30 @@ def backup_root(home: Path, dp: Path, scope: str) -> Path:
     (candidate / "quarantine").mkdir(mode=0o700)
     (candidate / "manifest.json").touch(mode=0o600)
     return candidate
+
+
+def prune_uninstall_backups(
+    home: Path,
+    dp: Path,
+    current: Path | None = None,
+    manifest: "Manifest | None" = None,
+) -> int:
+    if os.environ.get("DE_AQG_BACKUP_ROOT"):
+        return 0
+    roots = managed_uninstall_backups(home, dp)
+    if current is not None and current not in roots:
+        raise RuntimeError(f"current uninstall backup cannot be revalidated: {current}")
+    obsolete = roots[:-MAX_UNINSTALL_BACKUPS]
+    for path in obsolete:
+        shutil.rmtree(path)
+        if manifest is not None:
+            manifest.add({"operation": "purge-old-uninstall-backup", "source": str(path)})
+    if obsolete:
+        print(
+            f"PRUNED {len(obsolete)} old uninstall backup(s); "
+            f"retained latest {MAX_UNINSTALL_BACKUPS}"
+        )
+    return len(obsolete)
 
 
 class Manifest:
@@ -3119,6 +3468,7 @@ def apply_inventory(inv: Inventory) -> Path:
 
         bootout_launchagent(inv)
         invoke_aqg_uninstaller(inv)
+        inv.refresh_aqg_version_residue_after_uninstall(manifest)
         remove_orphaned_managed_aqg_hooks(inv, manifest)
         remove_managed_aqg_alias_env(inv, manifest)
 
@@ -3275,6 +3625,14 @@ def apply_inventory(inv: Inventory) -> Path:
             shutil.move(str(path), str(destination))
             manifest.record_tree_moved(path, destination)
 
+        for source in inv.aqg_version_residue:
+            if not lexists(source):
+                continue
+            destination = backup / "quarantine" / "managed-versions" / source.name
+            destination.parent.mkdir(parents=True, exist_ok=True)
+            shutil.move(str(source), str(destination))
+            manifest.record_tree_moved(source, destination)
+
         roots: list[Path] = []
         if inv.scope in ("de", "both"):
             roots.append(inv.de)
@@ -3321,8 +3679,27 @@ def apply_inventory(inv: Inventory) -> Path:
                 target, target_destination
             )
 
-        manifest.add({"operation": "apply-complete", "source": None, "destination": str(backup)})
+        for directory in inv.empty_managed_dirs:
+            if not lexists(directory):
+                manifest.add(
+                    {"operation": "remove-empty-managed-dir", "source": str(directory), "status": "already-removed"}
+                )
+                continue
+            if directory.is_symlink() or not directory.is_dir() or any(directory.iterdir()):
+                raise RuntimeError(f"managed state directory did not become safely empty: {directory}")
+            directory.rmdir()
+            manifest.add({"operation": "remove-empty-managed-dir", "source": str(directory)})
+
         verify_after_apply(inv)
+        pruned = prune_uninstall_backups(inv.home, inv.dp, backup, manifest)
+        manifest.add(
+            {
+                "operation": "apply-complete",
+                "source": None,
+                "destination": str(backup),
+                "pruned_backups": pruned,
+            }
+        )
         return backup
     except Exception as exc:
         manifest.add({"operation": "apply-failed", "error": str(exc)})
@@ -3332,7 +3709,7 @@ def apply_inventory(inv: Inventory) -> Path:
 def verify_after_apply(inv: Inventory) -> None:
     time.sleep(0.2)
     check = Inventory(inv.home, inv.scope).collect()
-    remaining = list(check.actions)
+    remaining = [item for item in check.actions if item["kind"] != "backup-retention"]
     if check.blockers:
         raise RuntimeError("post-uninstall verification blocked: " + "; ".join(check.blockers))
     if remaining:
@@ -3375,12 +3752,33 @@ def main(argv: list[str]) -> int:
         process_resolution_pending=process_resolution_pending,
     )
     if process_resolution_pending:
-        inventory = resolve_process_blockers(inventory)
+        try:
+            inventory, uninstall_pending = resolve_process_blockers(inventory)
+        except KeyboardInterrupt:
+            print("\nUNINSTALL_PENDING: process check interrupted; no files or settings were changed.")
+            return EXIT_PENDING
+        if uninstall_pending:
+            print(
+                "UNINSTALL_PENDING: fully quit every listed Agent host and rerun the "
+                "uninstaller. No files or settings were changed."
+            )
+            return EXIT_PENDING
         print("Rechecked uninstall plan after process cleanup:")
         print_inventory(inventory, apply=args.apply)
     if inventory.blockers:
         return EXIT_BLOCKED
     if not args.apply:
+        return EXIT_OK
+    cleanup_actions = [
+        item for item in inventory.actions if item["kind"] != "backup-retention"
+    ]
+    if not cleanup_actions:
+        try:
+            prune_uninstall_backups(home, inventory.dp)
+        except Exception as exc:
+            print(f"ERROR: uninstall backup retention failed: {exc}", file=sys.stderr)
+            return EXIT_BLOCKED
+        print("PASS: uninstall verified; no in-scope installation found")
         return EXIT_OK
     try:
         backup = apply_inventory(inventory)
@@ -3388,6 +3786,10 @@ def main(argv: list[str]) -> int:
         print(f"ERROR: uninstall stopped without a clean verification: {exc}", file=sys.stderr)
         return EXIT_BLOCKED
     print(f"PASS: uninstall verified; quarantine={backup}")
+    print(
+        "Restart affected Agent applications before using Deep Pattern again "
+        "so they reload the updated MCP configuration."
+    )
     return EXIT_OK
 
 

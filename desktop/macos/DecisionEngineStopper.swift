@@ -102,6 +102,21 @@ final class DecisionEngineStopper: NSObject, NSApplicationDelegate {
     private let notFoundForgetThreshold = 3
     private let scrollMaxScreenFraction: CGFloat = 0.618
     private var notFoundPolls: [String: Int] = [:]   // run_id → consecutive hub gone-replies
+    // Status-poll pacing, per run — mirrors client/runner.py's POLL_* constants and
+    // client/stopper/panel.py's `_next_poll_at` / `_poll_failures` / `_auth_failures`. The 1 Hz
+    // timer also draws the live elapsed clock so it keeps its cadence; these gate the REQUEST,
+    // so a hub suggestion (or a failing hub) can slow it without freezing the display.
+    private let pollBaseInterval: TimeInterval = 1.0
+    private let pollMinInterval: TimeInterval = 0.25   // absolute floor, below the base only
+    private let pollMaxInterval: TimeInterval = 10.0   // ceiling on a SERVER suggestion
+    private let pollBackoffCeiling: TimeInterval = 30.0
+    private let pollJitterFraction: Double = 0.2
+    private let pollAuthStatusCodes: Set<Int> = [401, 403]
+    private let pollAuthFailureLimit = 3   // consecutive 401/403 before dropping to the probe rate
+    private let pollAuthProbeInterval: TimeInterval = 60.0   // …and then one probe this often
+    private var nextPollAllowedAt: [String: TimeInterval] = [:]
+    private var pollFailures: [String: Int] = [:]
+    private var authFailures: [String: Int] = [:]
     private var autoShownRunIDs: Set<String> = []
     private var hiddenByUser = false
     private var noAuditItemsSince: TimeInterval?
@@ -200,12 +215,77 @@ final class DecisionEngineStopper: NSObject, NSApplicationDelegate {
     @objc private func refresh() {
         mergeRunsFromDisk()
         pruneExpiredRuns()
+        // Scheduling is an INTERVAL, so it reads the monotonic clock: an NTP correction, a lid-open
+        // resume or a user changing the system clock backwards must not suspend every poll for the
+        // size of the jump while the 1 Hz repaint keeps running. Mirrors panel.py's `time.monotonic`.
+        let now = ProcessInfo.processInfo.systemUptime
         for run in visibleRuns() where isActive(run) {
-            if let runID = run["run_id"] as? String, !runID.isEmpty {
+            // A run is asked again only once its scheduled time has arrived — including a run that
+            // spent its auth budget and is now down to one probe a minute, which is how a repaired
+            // token gets noticed; the surrounding 1 Hz refresh (and its clock) is untouched.
+            if let runID = run["run_id"] as? String, !runID.isEmpty,
+               (nextPollAllowedAt[runID] ?? 0) <= now {
                 poll(runID: runID)
             }
         }
         render()
+    }
+
+    /// Seconds to wait before the next status poll. The hub may slow this client down and may never
+    /// speed it up: `poll_after_ms` is honoured only above the base interval and below
+    /// `pollMaxInterval`, and the ceiling bounds the JITTERED value. Mirrors `runner.poll_delay_s`.
+    private func pollDelay(pollAfterMS: Any?) -> TimeInterval {
+        let floor = max(pollMinInterval, pollBaseInterval)
+        guard let value = pollAfterMS, !(value is Bool), let number = value as? NSNumber,
+              number.doubleValue.isFinite, number.doubleValue >= 0 else {
+            return floor * (1.0 + pollJitterFraction * Double.random(in: 0...1))
+        }
+        let delay = max(floor, min(pollMaxInterval, number.doubleValue / 1000.0))
+        let jittered = delay * (1.0 + pollJitterFraction * Double.random(in: 0...1))
+        return delay > pollMaxInterval ? jittered : min(pollMaxInterval, jittered)
+    }
+
+    /// Seconds to wait after `failures` consecutive failed polls. Mirrors
+    /// `runner.poll_backoff_delay_s`: doubling under a fixed ceiling that bounds the jittered value.
+    private func pollBackoffDelay(failures: Int) -> TimeInterval {
+        let exponent = min(max(failures, 1) - 1, 16)
+        let ceiling = max(pollBackoffCeiling, pollBaseInterval)
+        let delay = min(ceiling, pollBaseInterval * pow(2.0, Double(exponent)))
+        return min(ceiling, delay * (1.0 + pollJitterFraction * Double.random(in: 0...1)))
+    }
+
+    /// Release the in-flight flag and push this run's next poll further out. A run answering
+    /// 401/403 `pollAuthFailureLimit` times IN A ROW — any other answer resets that streak — drops
+    /// to one probe per `pollAuthProbeInterval` rather than stopping dead, so a token the user
+    /// repairs on disk is noticed without restarting the panel; the row meanwhile goes stale rather
+    /// than being reaped, because a 401 does not say the run is gone. Mirrors panel.py's
+    /// `_defer_poll`.
+    private func deferPoll(runID: String, authFailure: Bool, transient: Bool = true) {
+        pollingRunIDs.remove(runID)
+        lastPollStartedAt.removeValue(forKey: runID)
+        // A reply that lands after the run was retired or pruned must not re-create the
+        // bookkeeping `forgetPollState` just dropped: nothing would ever forget it again.
+        guard runsByID[runID] != nil else { return }
+        if authFailure {
+            authFailures[runID] = (authFailures[runID] ?? 0) + 1
+        } else {
+            authFailures.removeValue(forKey: runID)   // "consecutive" means consecutive
+        }
+        let failures = (pollFailures[runID] ?? 0) + 1
+        pollFailures[runID] = failures
+        let exhausted = (authFailures[runID] ?? 0) >= pollAuthFailureLimit
+        let delay = (exhausted || !transient)
+            ? pollAuthProbeInterval
+            : pollBackoffDelay(failures: failures)
+        nextPollAllowedAt[runID] = ProcessInfo.processInfo.systemUptime + delay
+    }
+
+    /// Drop a retired run's poll bookkeeping. Mirrors panel.py's `_forget_poll_state`.
+    private func forgetPollState(runID: String) {
+        nextPollAllowedAt.removeValue(forKey: runID)
+        pollFailures.removeValue(forKey: runID)
+        authFailures.removeValue(forKey: runID)
+        notFoundPolls.removeValue(forKey: runID)
     }
 
     private func mergeRunsFromDisk() {
@@ -278,7 +358,7 @@ final class DecisionEngineStopper: NSObject, NSApplicationDelegate {
         let count = (notFoundPolls[runID] ?? 0) + 1
         notFoundPolls[runID] = count
         guard count >= notFoundForgetThreshold else { return }
-        notFoundPolls.removeValue(forKey: runID)
+        forgetPollState(runID: runID)
         cancelRequestsInFlight.remove(runID)
         serverVerifiedRunIDs.remove(runID)
         stateGenerations.removeValue(forKey: runID)
@@ -292,6 +372,7 @@ final class DecisionEngineStopper: NSObject, NSApplicationDelegate {
         var reapedAny = false
         for (runID, run) in runsByID {
             if let hiddenAfter = run["hidden_after"] as? Double, hiddenAfter <= now {
+                forgetPollState(runID: runID)
                 runsByID.removeValue(forKey: runID)
                 cancelRequestsInFlight.remove(runID)
                 serverVerifiedRunIDs.remove(runID)
@@ -542,6 +623,11 @@ final class DecisionEngineStopper: NSObject, NSApplicationDelegate {
             }
             pollingRunIDs.remove(runID)
         }
+        // The DETAIL view, deliberately not the lighter "/status" route the CLI wait loop uses:
+        // overallStatus derives the displayed state from the individual voices (including
+        // `partial`, which the run-level status cannot express) and the debug rows render
+        // per-voice lines. The status route carries neither, nor `debug_authorized`.
+        // Mirrors runner.audit_detail_path / panel._poll.
         guard let config = readJSON(path: configPath),
               let serverURL = config["server_endpoint"] as? String,
               let token = config["access_token"] as? String,
@@ -570,11 +656,27 @@ final class DecisionEngineStopper: NSObject, NSApplicationDelegate {
                 }
                 return
             }
+            // Any other error reply (401/403 auth, 429 rate limit, 5xx, …) is not "gone": keep the
+            // row, but back the next request off instead of asking again one second later.
+            if let http = response as? HTTPURLResponse, http.statusCode >= 400 {
+                DispatchQueue.main.async {
+                    let isAuth = self.pollAuthStatusCodes.contains(http.statusCode)
+                    self.deferPoll(
+                        runID: runID,
+                        authFailure: isAuth,
+                        // Auth gets the streak budget; any OTHER definitive 4xx is the hub's final
+                        // answer on this request and drops to the probe rate at once. Mirrors
+                        // `runner.poll_failure_is_transient`.
+                        transient: isAuth || http.statusCode == 429 || http.statusCode >= 500
+                    )
+                    self.render()
+                }
+                return
+            }
             guard let data = data,
                   let payload = (try? JSONSerialization.jsonObject(with: data)) as? [String: Any] else {
                 DispatchQueue.main.async {
-                    self.pollingRunIDs.remove(runID)
-                    self.lastPollStartedAt.removeValue(forKey: runID)
+                    self.deferPoll(runID: runID, authFailure: false)
                     self.render()
                 }
                 return
@@ -586,6 +688,10 @@ final class DecisionEngineStopper: NSObject, NSApplicationDelegate {
                     return
                 }
                 self.notFoundPolls.removeValue(forKey: runID)   // a live view resets the reap streak
+                self.pollFailures.removeValue(forKey: runID)    // …and the backoff and auth streaks
+                self.authFailures.removeValue(forKey: runID)
+                self.nextPollAllowedAt[runID] = ProcessInfo.processInfo.systemUptime
+                    + self.pollDelay(pollAfterMS: payload["poll_after_ms"])
                 self.serverVerifiedRunIDs.insert(runID)
                 var updated = self.runsByID[runID] ?? [:]
                 var status = payload["status"] as? String ?? (updated["status"] as? String) ?? "unknown"

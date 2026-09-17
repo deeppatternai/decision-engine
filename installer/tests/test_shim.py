@@ -3400,6 +3400,9 @@ class HostedCompletionRegistryTestCase(unittest.TestCase):
         app._server_verified = set()
         app._state_epochs = {}
         app._not_found_polls = {}
+        app._next_poll_at = {}
+        app._poll_failures = {}
+        app._auth_failures = {}
         app._lock = threading.Lock()
         app._merge_disk()
         return app

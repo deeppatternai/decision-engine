@@ -10,6 +10,7 @@ import json
 import math
 import os
 import platform
+import random
 import socket
 import ssl
 import stat
@@ -49,6 +50,144 @@ TERMINAL_STATUSES = {"completed", "partial", "failed", "cancelled"}
 FINISHED_LINGER_S = 30.0
 ACTIVE_RUNS_SCHEMA_VERSION = 1
 LOCAL_TERMINAL_TOMBSTONE_TTL_S = 24 * 60 * 60.0
+
+# --- status-poll pacing -------------------------------------------------------
+# Shared by every client that waits for a run to finish: the CLI `--wait` loop and the
+# Stop Panel tick. Same clamp-then-jitter shape the GE-chat client already ships
+# (client/popup/http_chat.py::_poll_delay); kept here because this is the module both
+# audit pollers already import.
+POLL_BASE_INTERVAL_S = 1.0
+POLL_MIN_INTERVAL_S = 0.25  # absolute floor, used when the caller's own base is below it
+POLL_MAX_INTERVAL_S = 10.0  # ceiling on a SERVER suggestion, so a bad value cannot freeze a row
+POLL_BACKOFF_CEILING_S = 30.0
+POLL_JITTER_FRACTION = 0.2  # spreads many clients that started together
+POLL_AUTH_STATUS_CODES = frozenset({401, 403})
+POLL_AUTH_FAILURE_LIMIT = 3  # consecutive 401/403 before a poller stops asking at the normal rate
+# …and then asks again only this rarely. A stopped poller must not be an ABSORBING state: a token
+# repaired on disk is picked up by the next request (request_json re-reads the config each call),
+# so a half-open probe is the difference between "recovers by itself" and "restart the panel".
+POLL_AUTH_PROBE_INTERVAL_S = 60.0
+POLL_WAIT_MAX_CONSECUTIVE_FAILURES = 8
+
+
+def audit_status_path(run_id: str) -> str:
+    """Path for a poll that only needs `status` (and an optional `poll_after_ms`).
+
+    The hub answers this with exactly:
+        cancel_requested, completed_at, created_at, poll_after_ms,
+        result_available, run_id, started_at, status, updated_at
+
+    NOTE what is NOT in that list: `auditors`, `debug_authorized`, `title`, `profile`, `error`.
+    A caller that renders per-voice state, the run title or the audit tier MUST use
+    `audit_detail_path` instead — this route would silently blank those fields.
+    `poll_after_ms` is carried HERE and not by the detail view, so this is also the only
+    route on which the hub can pace a caller at all.
+    """
+    return "/v1/audits/%s/status" % run_id
+
+
+def audit_detail_path(run_id: str) -> str:
+    """Path for the full run view: `auditors`, `title`, `profile`, `error`, `debug_authorized`.
+
+    The stop panel polls THIS, not `audit_status_path`, because `overall_status` derives the
+    displayed state from the individual voices — `partial` (some voices failed, some succeeded)
+    cannot be expressed by the run-level `status` the lighter route returns.
+    """
+    return "/v1/audits/%s" % run_id
+
+
+def poll_failure_is_transient(status_code: Optional[int]) -> bool:
+    """True when repeating a failed status poll could plausibly get a different answer.
+
+    A transport error (no status code), a 429 and any 5xx are about the hub or the link.
+    Every other 4xx is the hub's verdict on THIS request — bad token, unknown run, wrong id
+    class — and asking again at 1 Hz forever only burns the user's quota.
+    """
+    if status_code is None:
+        return True
+    return status_code == 429 or 500 <= int(status_code) < 600
+
+
+def _jitter_unit(rng: Any = None) -> float:
+    """A float in [0, 1] from an untrusted/injected RNG; 0.5 when it misbehaves."""
+    source = rng if rng is not None else random.random
+    try:
+        value = source.random() if hasattr(source, "random") else source()
+    except Exception:  # noqa: BLE001  # aqg: top-level boundary — RNG injection cannot break polling
+        return 0.5
+    if isinstance(value, bool) or not isinstance(value, (int, float)):
+        return 0.5
+    if not math.isfinite(value) or not 0.0 <= value <= 1.0:
+        return 0.5
+    return float(value)
+
+
+def _usable_seconds(value: Any) -> Optional[float]:
+    """A finite, non-negative float from a server payload or a CLI flag, else None."""
+    if isinstance(value, bool) or not isinstance(value, (int, float)):
+        return None
+    try:
+        # A JSON body is free to carry an int of any width, and `float()` RAISES OverflowError on
+        # one too large for a double — before `math.isfinite` ever gets to reject it. Unguarded,
+        # a hub answering `poll_after_ms: 10**400` throws inside the panel's locked success block
+        # and strands the run in `_polling` forever: a remotely triggerable poll lockout.
+        number = float(value)
+    except (OverflowError, ValueError):
+        return None
+    if not math.isfinite(number) or number < 0:
+        return None
+    return number
+
+
+def poll_delay_s(
+    poll_after_ms: Any = None,
+    *,
+    base_s: float = POLL_BASE_INTERVAL_S,
+    rng: Any = None,
+) -> float:
+    """Seconds to wait before the next status poll.
+
+    The hub may slow this client down; it may never speed it up. `poll_after_ms` is honoured
+    only above the caller's own base interval and below POLL_MAX_INTERVAL_S — so a hub
+    answering `poll_after_ms: 250` cannot raise a 1 Hz poller to 4 Hz, and cannot override
+    `--poll-s 60` either, while a bad large value still cannot freeze a row.
+    `base_s` itself is only floored, never capped: a user asking for a *slower* poll is being
+    polite, not hostile.
+    """
+    floor = _usable_seconds(base_s)
+    if floor is None:
+        floor = POLL_BASE_INTERVAL_S
+    floor = max(POLL_MIN_INTERVAL_S, floor)
+    suggested = _usable_seconds(poll_after_ms)
+    if suggested is None:
+        return floor * (1.0 + POLL_JITTER_FRACTION * _jitter_unit(rng))
+    delay = max(floor, min(POLL_MAX_INTERVAL_S, suggested / 1000.0))
+    jittered = delay * (1.0 + POLL_JITTER_FRACTION * _jitter_unit(rng))
+    # Cap the JITTERED value, not just the clamped one, so POLL_MAX_INTERVAL_S is the ceiling
+    # it claims to be. The caller's own slower base is exempt — it is not the hub talking.
+    return jittered if delay > POLL_MAX_INTERVAL_S else min(POLL_MAX_INTERVAL_S, jittered)
+
+
+def poll_backoff_delay_s(
+    failures: Any,
+    *,
+    base_s: float = POLL_BASE_INTERVAL_S,
+    rng: Any = None,
+) -> float:
+    """Seconds to wait after `failures` consecutive failed status polls (1-based)."""
+    if isinstance(failures, bool) or not isinstance(failures, int) or failures < 1:
+        count = 1
+    else:
+        count = failures
+    base = _usable_seconds(base_s)
+    if base is None:
+        base = POLL_BASE_INTERVAL_S
+    base = max(POLL_MIN_INTERVAL_S, base)
+    # A caller whose own base is already slower than the ceiling must not be SPED UP by failing.
+    ceiling = max(POLL_BACKOFF_CEILING_S, base)
+    delay = min(ceiling, base * (2 ** min(count - 1, 16)))
+    # Ceiling applies to the value actually slept, jitter included.
+    return min(ceiling, delay * (1.0 + POLL_JITTER_FRACTION * _jitter_unit(rng)))
 
 
 def normalize_ui_locale(value: Any = None) -> str:
@@ -755,6 +894,51 @@ def _save_active_run_locked(
 def save_active_run(run: Dict[str, Any], *, existing_only: bool = False) -> None:
     with active_runs_lock():
         _save_active_run_locked(run, existing_only=existing_only)
+
+
+def save_active_run_status(run_id: str, view: Dict[str, Any]) -> None:
+    """Persist a poll of `audit_status_path` WITHOUT thinning the row the panel reads.
+
+    `active_run_payload` is a whitelist with hard defaults and `_save_active_run_locked`
+    REPLACES the entry, so handing it a status view directly would blank `title`, `caller`,
+    `profile`, `mode`, `auditors` and `ui_locale` — every field the stop panel renders — for
+    as long as the wait loop ran. Only the timing fields the lighter route actually carries
+    are merged onto the existing row, mirroring `sync_hosted_run_completion`.
+
+    Nothing is created here. A run this client never submitted has no display metadata to
+    preserve, and a run already reaped or past its terminal linger must not be resurrected by a
+    poll. The pre-check below is not enough on its own: `_save_active_run_locked` prunes AGAIN
+    on a fresh clock reading, so a row alive at the first reading and expired at the second is
+    dropped by the inner prune and then written straight back by the unconditional assignment.
+    `existing_only=True` is what actually closes that, and it is the only thing that does.
+
+    Two fields the status route DOES carry are deliberately not merged. `updated_at` is stamped
+    unconditionally by `active_run_payload`, so merging the hub's copy would be overwritten in
+    the same call. `cancel_requested` and `result_available` are not in that whitelist at all.
+    `started_at` / `completed_at` are numeric epoch seconds on the wire (verified against a live
+    hub), which is what the finite-number guard below is written for.
+
+    One consequence worth naming: `auditors` now holds whatever the submit response carried for
+    the length of the wait, instead of being refreshed each second by a full detail read. Only
+    the panel's hub-poll-failure fallback renders from the row, and `sync_hosted_run_completion`
+    refreshes the voices on the terminal read, so the staleness is bounded to a wait whose panel
+    poll is ALSO failing — the case where the row is already the older of the two sources.
+    """
+    with active_runs_lock():
+        registry = prune_active_runs(load_active_runs_registry())
+        current = registry.get("runs", {}).get(run_id)
+        if not isinstance(current, dict):
+            return
+        merged = dict(current)
+        status = view.get("status")
+        if isinstance(status, str) and status:
+            merged["status"] = status
+        for field in ("started_at", "completed_at"):
+            value = view.get(field)
+            if type(value) in (int, float) and math.isfinite(value):
+                merged[field] = value
+        merged["run_id"] = run_id
+        _save_active_run_locked(merged, registry, existing_only=True)
 
 
 def sync_hosted_run_completion(run_id: str, view: Dict[str, Any]) -> None:
@@ -1806,17 +1990,36 @@ def cmd_cancel(args: argparse.Namespace) -> int:
 
 def wait_and_print_result(run_id: str, poll_s: float, *, json_output: bool = False) -> int:
     last_status = ""
+    failures = 0
     while True:
-        run = request_json("GET", "/v1/audits/%s" % run_id)
+        try:
+            run = request_json("GET", audit_status_path(run_id))
+        except AuditError as exc:
+            status_code = getattr(exc, "status_code", None)
+            if not poll_failure_is_transient(status_code):
+                raise  # the hub's verdict on this request; repeating it changes nothing
+            failures += 1
+            if failures > POLL_WAIT_MAX_CONSECUTIVE_FAILURES:
+                raise  # bounded: a hub that stays down must end the wait, not outlive it
+            print(
+                "status: poll failed (%s), retrying %d/%d"
+                % (exc, failures, POLL_WAIT_MAX_CONSECUTIVE_FAILURES),
+                file=sys.stderr,
+            )
+            time.sleep(poll_backoff_delay_s(failures, base_s=poll_s))
+            continue
+        failures = 0
         status = run.get("status")
+        # MERGE, never replace: this loop polls the lighter status route, which carries no
+        # title, profile or auditors. Writing it straight through would blank the row the stop
+        # panel is rendering for the whole wait.
+        save_active_run_status(run_id, run)
         if status in TERMINAL_STATUSES:
-            save_active_run(run)
             break
-        save_active_run(run)
         if status != last_status:
             print("status: %s" % status, file=sys.stderr)
             last_status = status
-        time.sleep(poll_s)
+        time.sleep(poll_delay_s(run.get("poll_after_ms"), base_s=poll_s))
     clear_active_run(run_id)
     result = request_json("GET", "/v1/audits/%s/result" % run_id)
     if json_output:

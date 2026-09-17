@@ -3884,9 +3884,14 @@ def _mac_after_show(*_args) -> None:
     """`loaded` handler: activate the app + make the window key on the NEXT main-loop tick, so the popup
     opens FOCUSED. The focus step is DEFERRED via the main queue because AppKit window-ordering INSIDE this
     KVO callback crashes (the A-repo spike lesson); running it after the callback returns is safe. (We no
-    longer force Accessory/no-Dock here — the popup is a normal Dock app now; see _apply_mac_chrome.)"""
+    longer force Accessory/no-Dock here — the popup is a normal Dock app now; see _apply_mac_chrome.)
+
+    Front, not pinned: nothing here touches the window LEVEL. The window is created without `on_top`
+    (Owner, 2026-09-16), so it sits at the ordinary level and a later raise by another app wins — the
+    old code had to drop on_top's NSStatusWindowLevel (25) back to floating (3) just to stop pinning
+    the popup over the system IME candidate window. With no on_top there is nothing to drop."""
     try:
-        from AppKit import NSApp, NSFloatingWindowLevel
+        from AppKit import NSApp
         from Foundation import NSOperationQueue
 
         def _focus() -> None:
@@ -3895,9 +3900,6 @@ def _mac_after_show(*_args) -> None:
                 w = _content_nswindow()
                 if w is not None:
                     w.makeKeyAndOrderFront_(None)
-                    # on_top sets NSStatusWindowLevel (25), which occludes the system IME candidate window
-                    # → drop to NSFloatingWindowLevel (3): still floats (no-Dock preserved) but below the IME.
-                    w.setLevel_(NSFloatingWindowLevel)
             except Exception:  # aqg: top-level boundary — focus is a nicety, never crash
                 pass
         NSOperationQueue.mainQueue().addOperationWithBlock_(_focus)
@@ -4146,14 +4148,18 @@ def _windows_window_maximized(win) -> Optional[bool]:
 
 
 def _show_and_focus(win) -> None:
-    """Bring the popup window back: show it, activate the app, make it key + FRONT at floating level."""
-    from AppKit import NSApp, NSFloatingWindowLevel
+    """Bring the popup window back: show it, activate the app, make it key + FRONT — at the ORDINARY level.
+
+    No `setLevel_` here (Owner, 2026-09-16). The call this replaces re-applied the floating level after
+    `show()`, because `show()` could reset the window to `on_top`'s NSStatusWindowLevel; the window is no
+    longer created with `on_top`, so there is no raised level to come back and no pin to restore.
+    """
+    from AppKit import NSApp
     win.show()                                   # hidden → bring it back to the front, FOCUSED
     NSApp.activateIgnoringOtherApps_(True)
     w = _content_nswindow()
     if w is not None:
         w.makeKeyAndOrderFront_(None)
-        w.setLevel_(NSFloatingWindowLevel)       # re-apply (show can reset to on_top's level)
 
 
 def _toggle_window(win) -> None:
@@ -4308,9 +4314,14 @@ def open_window(html_path: str, title: str, result_path: str,
     )
     vf = _mac_visible_frame() if _IS_MAC else None
     if vf:
-        # no-Dock Accessory windows must be FLOATING (on_top) to stay visible + clickable; size to the
-        # screen's visible frame so the popup opens filling the usable area (below the menu bar / above the Dock).
-        kw.update(on_top=True, x=vf[0], y=vf[1], width=vf[2], height=vf[3])
+        # Size to the screen's visible frame so the popup opens filling the usable area (below the
+        # menu bar / above the Dock). NOT on_top (Owner, 2026-09-16): a content popup you are reading
+        # from — diagram / comic / infographic / discussion board — must not pin itself over the work
+        # it describes. It still opens focused and in front (_mac_after_show); it just stops winning
+        # every raise after that. The float originally came with no-Dock Accessory policy, which this
+        # shell no longer forces (see _apply_mac_chrome), and the Dock icon + menu-bar item are the
+        # documented ways to bring a buried popup back.
+        kw.update(x=vf[0], y=vf[1], width=vf[2], height=vf[3])
     else:
         kw.update(width=900, height=640)   # non-mac / NSScreen unavailable — keep the prior default size
     # Before create_window: Windows reads the AppUserModelID when a window registers with the shell,

@@ -7,8 +7,9 @@
 #   curl -fsSL <trusted-install-url> | bash
 #
 # It deliberately accepts no arguments. The Decision Engine repository supplies
-# the signed stable release installer; this wrapper only bootstraps that
-# installer, then opens the existing masked activation dialog.
+# the signed stable release installer; this wrapper prepares a private Python
+# runtime when needed, bootstraps that installer, then opens the existing masked
+# activation dialog.
 #
 set -euo pipefail
 
@@ -21,12 +22,23 @@ AQG_ROOT="$HOME/.deeppattern/agent-quality-gates"
 DEEPPATTERN_ROOT="$HOME/.deeppattern"
 MANAGED_PYTHON_ROOT="$DEEPPATTERN_ROOT/de-python"
 MANAGED_PYTHON_BIN="$MANAGED_PYTHON_ROOT/bin/python3"
+PRIVATE_RUNTIME_ROOT="$DEEPPATTERN_ROOT/runtimes"
+PRIVATE_RUNTIME_BACKUP_ROOT="$DEEPPATTERN_ROOT/runtime-backups"
+PRIVATE_PYTHON_VERSION="3.13.15"
+PRIVATE_PYTHON_BUILD="20260901"
+PRIVATE_PYTHON_RELEASE="20260901"
+PRIVATE_PYTHON_BASE_URL="https://github.com/astral-sh/python-build-standalone/releases/download/$PRIVATE_PYTHON_RELEASE"
+PRIVATE_RUNTIME_MARKER_NAME=".deeppattern-python-runtime"
+MANAGED_PYTHON_MARKER_NAME=".deeppattern-python-environment"
 CLAUDE_3P_ROOT="$HOME/Library/Application Support/Claude-3p"
 CLAUDE_3P_CONFIG="$CLAUDE_3P_ROOT/claude_desktop_config.json"
 WORKBUDDY_STANDARD_APP="/Applications/WorkBuddy.app"
 WORKBUDDY_AI_APP="/Applications/WorkBuddy AI.app"
 WORKBUDDY_AI_ROOT="$HOME/.workbuddy-ai"
 XCODE_SELECT_BIN="/usr/bin/xcode-select"
+CLT_INSTALLER_APP="/System/Library/CoreServices/Install Command Line Developer Tools.app"
+CLT_INSTALLER_BUNDLE_ID="com.apple.dt.CommandLineTools.installondemand"
+SOFTWARE_UPDATE_URL="x-apple.systempreferences:com.apple.Software-Update-Settings.extension"
 EXIT_USAGE=2
 EXIT_BLOCKED=3
 EXIT_PARTIAL=4
@@ -83,7 +95,7 @@ clean_exec() {
 
 confirm_dependency_install() {
   local prompt="$1" answer=""
-  printf '%s [y/N] ' "$prompt" >/dev/tty
+  printf '%s [Y/N] ' "$prompt" >/dev/tty
   if ! IFS= read -r answer </dev/tty; then
     return 1
   fi
@@ -197,41 +209,80 @@ try_git() {
 
 bootstrap_git_with_homebrew() {
   local git_prefix candidate
-  find_homebrew \
-    || fail "Homebrew is not installed. Install it from https://brew.sh, then rerun this installer to install Git 2.36 or newer."
+  find_homebrew || return 1
   tty_print "Git 2.36 or newer is missing, but Homebrew is available."
   confirm_dependency_install "Install or upgrade Git with Homebrew now?" \
-    || fail "Git installation was declined; install Git 2.36 or newer, then retry"
-  clean_exec "$HOMEBREW_BIN" install git \
-    || fail "Homebrew could not install Git; correct the reported Homebrew error, then retry"
+    || { tty_print "Homebrew Git installation was declined; trying the Apple prerequisite path."; return 1; }
+  if ! clean_exec "$HOMEBREW_BIN" install git; then
+    tty_print "Homebrew could not install Git; trying the Apple prerequisite path."
+    return 1
+  fi
   git_prefix="$(clean_exec "$HOMEBREW_BIN" --prefix git 2>/dev/null || true)"
   candidate="$git_prefix/bin/git"
-  try_git "$candidate" \
-    || fail "Homebrew finished, but $candidate is not a usable Git 2.36 or newer"
+  if ! try_git "$candidate"; then
+    tty_print "Homebrew finished, but $candidate is not a usable Git 2.36 or newer; trying the Apple prerequisite path."
+    return 1
+  fi
   tty_print "Git prerequisite ready: $GIT_VERSION ($GIT_BIN)"
 }
 
-bootstrap_git_prerequisite() {
-  if find_homebrew; then
-    bootstrap_git_with_homebrew
+present_clt_install_ui() {
+  local info_plist="$CLT_INSTALLER_APP/Contents/Info.plist" bundle_id=""
+  if [ -d "$CLT_INSTALLER_APP" ] && [ ! -L "$CLT_INSTALLER_APP" ] \
+      && [ -f "$info_plist" ] && [ ! -L "$info_plist" ]; then
+    bundle_id="$(
+      /usr/bin/plutil -extract CFBundleIdentifier raw -o - "$info_plist" \
+        2>/dev/null || true
+    )"
+    if [ "$bundle_id" = "$CLT_INSTALLER_BUNDLE_ID" ] \
+        && clean_exec /usr/bin/open "$CLT_INSTALLER_APP"; then
+      tty_print "Requested the Apple Command Line Tools installer window."
+      return 0
+    fi
+  fi
+  if clean_exec /usr/bin/open "$SOFTWARE_UPDATE_URL"; then
+    tty_print "The dedicated installer window was unavailable; opened System Settings > Software Update instead."
     return 0
   fi
+  tty_print "macOS accepted the Command Line Tools request but did not present an installation window."
+  tty_print "Open System Settings > General > Software Update manually, complete the Command Line Tools installation, then rerun this command."
+  return 1
+}
+
+bootstrap_git_prerequisite() {
+  local clt_ready=0
   if [ -x "$XCODE_SELECT_BIN" ] \
-      && ! clean_exec "$XCODE_SELECT_BIN" -p >/dev/null 2>&1; then
-    tty_print "Git is missing and Apple Command Line Tools are not installed."
+      && clean_exec "$XCODE_SELECT_BIN" -p >/dev/null 2>&1; then
+    clt_ready=1
+    if try_git "/usr/bin/git"; then
+      tty_print "Apple Command Line Tools Git prerequisite ready: $GIT_VERSION ($GIT_BIN)"
+      return 0
+    fi
+  fi
+  if find_homebrew; then
+    tty_print "Trying the existing Homebrew installation before requesting Apple Command Line Tools."
+    if bootstrap_git_with_homebrew; then
+      return 0
+    fi
+  fi
+  if [ "$clt_ready" -eq 0 ] && [ -x "$XCODE_SELECT_BIN" ]; then
+    tty_print "Git 2.36 or newer is missing and Apple Command Line Tools are not installed."
+    tty_print "Apple's installer will open. After it finishes, rerun this command."
+    tty_print "Older macOS releases may also require a macOS or Command Line Tools update."
     confirm_dependency_install "Open Apple's Command Line Tools installer now?" \
       || fail "Git setup was declined; install Apple Command Line Tools and Git 2.36 or newer, then retry"
     clean_exec "$XCODE_SELECT_BIN" --install \
       || fail "Apple's Command Line Tools installer could not be opened; install it manually, then retry"
-    dependency_pending "Command Line Tools installation was requested. Complete the Apple installer, then rerun this command."
+    present_clt_install_ui || true
+    dependency_pending "Command Line Tools installation was requested. Complete the Apple installer or Software Update flow, then rerun this command."
   fi
-  fail "Git 2.36 or newer is required. Install Homebrew from https://brew.sh and run 'brew install git', then retry."
+  fail "Git 2.36 or newer is required. Update or repair Apple Command Line Tools, or make a trusted Git 2.36 or newer installation available, then retry."
 }
 
 try_git "$(command -v git 2>/dev/null || true)" \
   || bootstrap_git_prerequisite
 
-try_python() {
+python_candidate_usable() {
   local candidate="$1"
   [ -n "$candidate" ] || return 1
   [ -x "$candidate" ] || return 1
@@ -240,6 +291,11 @@ try_python() {
     </dev/null >/dev/null 2>&1 || return 1
   clean_exec "$candidate" -c 'import ssl, venv, tkinter' </dev/null >/dev/null 2>&1 || return 1
   clean_exec "$candidate" -m pip --version </dev/null >/dev/null 2>&1 || return 1
+}
+
+try_python() {
+  local candidate="$1"
+  python_candidate_usable "$candidate" || return 1
   PYTHON_BIN="$candidate"
   return 0
 }
@@ -260,38 +316,231 @@ bootstrap_python_with_homebrew() {
   tty_print "Python prerequisite ready: $PYTHON_BIN"
 }
 
-python_is_externally_managed() {
-  local candidate="$1"
-  clean_exec "$candidate" -c \
-    'import os, sys, sysconfig; raise SystemExit(0 if sys.prefix == sys.base_prefix and os.path.exists(os.path.join(sysconfig.get_path("stdlib"), "EXTERNALLY-MANAGED")) else 1)' \
-    </dev/null >/dev/null 2>&1
-}
-
-ensure_install_python_is_writable() {
-  local base_python="$PYTHON_BIN"
-  local partial_python_root=""
-
-  python_is_externally_managed "$base_python" || return 0
-
-  tty_print "Selected Python is externally managed (PEP 668); preparing a private Deep Pattern environment..."
-  if [ -e "$MANAGED_PYTHON_ROOT" ] || [ -L "$MANAGED_PYTHON_ROOT" ]; then
-    [ -d "$MANAGED_PYTHON_ROOT" ] && [ ! -L "$MANAGED_PYTHON_ROOT" ] \
-      || blocked "$MANAGED_PYTHON_ROOT is not a regular managed Python directory; preserve it and stop"
-    try_python "$MANAGED_PYTHON_BIN" \
-      || blocked "$MANAGED_PYTHON_ROOT exists but is not a usable Python 3.12+ environment; preserve it and stop"
-    tty_print "Reusing the private Deep Pattern Python environment at $MANAGED_PYTHON_ROOT."
+ensure_private_directory() {
+  local path="$1" description="$2"
+  if [ -e "$path" ] || [ -L "$path" ]; then
+    [ -d "$path" ] && [ ! -L "$path" ] \
+      || blocked "$path is not a regular $description directory; preserve it and stop"
     return 0
   fi
+  clean_exec /bin/mkdir -m 700 "$path" \
+    || fail "could not create the private $description directory at $path"
+}
 
-  if [ -e "$DEEPPATTERN_ROOT" ] || [ -L "$DEEPPATTERN_ROOT" ]; then
-    [ -d "$DEEPPATTERN_ROOT" ] && [ ! -L "$DEEPPATTERN_ROOT" ] \
-      || blocked "$DEEPPATTERN_ROOT is not a regular directory; preserve it and stop"
-  else
-    clean_exec mkdir -m 700 "$DEEPPATTERN_ROOT" \
-      || fail "could not create the private Deep Pattern directory"
+ensure_deeppattern_runtime_directories() {
+  ensure_private_directory "$DEEPPATTERN_ROOT" "Deep Pattern"
+  ensure_private_directory "$PRIVATE_RUNTIME_ROOT" "Deep Pattern runtime"
+}
+
+select_private_runtime_spec() {
+  local machine_arch translated="0"
+  machine_arch="$(/usr/bin/uname -m)"
+  if [ -x /usr/sbin/sysctl ]; then
+    translated="$(/usr/sbin/sysctl -in sysctl.proc_translated 2>/dev/null || true)"
+  fi
+  if [ "$translated" = "1" ]; then
+    machine_arch="arm64"
   fi
 
-  clean_exec mkdir -m 700 "$MANAGED_PYTHON_ROOT" \
+  case "$machine_arch" in
+    arm64|aarch64)
+      PRIVATE_RUNTIME_ARCH="aarch64"
+      PRIVATE_RUNTIME_SHA256="b9054a9d3d54f4cb5573d44907fddb29874b08909bde73f29f2868cf872223ee"
+      PRIVATE_RUNTIME_ASSET_SIZE="25293188"
+      ;;
+    x86_64|amd64)
+      PRIVATE_RUNTIME_ARCH="x86_64"
+      PRIVATE_RUNTIME_SHA256="49f0d97f506b855eed60b74a8ac138595c5b39799a6aa5e0d7ca8abe1019a4d4"
+      PRIVATE_RUNTIME_ASSET_SIZE="25037769"
+      ;;
+    *)
+      fail "unsupported Mac architecture for the private Python runtime: $machine_arch"
+      ;;
+  esac
+
+  PRIVATE_RUNTIME_ID="cpython-$PRIVATE_PYTHON_VERSION+$PRIVATE_PYTHON_BUILD-$PRIVATE_RUNTIME_ARCH-apple-darwin"
+  PRIVATE_RUNTIME_ASSET="$PRIVATE_RUNTIME_ID-install_only.tar.gz"
+  PRIVATE_RUNTIME_URL="$PRIVATE_PYTHON_BASE_URL/${PRIVATE_RUNTIME_ASSET/+/%2B}"
+  PRIVATE_RUNTIME_DIR="$PRIVATE_RUNTIME_ROOT/$PRIVATE_RUNTIME_ID"
+  PRIVATE_RUNTIME_BIN="$PRIVATE_RUNTIME_DIR/python/bin/python3"
+  PRIVATE_RUNTIME_MARKER="$PRIVATE_RUNTIME_DIR/$PRIVATE_RUNTIME_MARKER_NAME"
+}
+
+runtime_marker_matches() {
+  [ -f "$PRIVATE_RUNTIME_MARKER" ] && [ ! -L "$PRIVATE_RUNTIME_MARKER" ] \
+    && /usr/bin/grep -Fxq "schema=1" "$PRIVATE_RUNTIME_MARKER" \
+    && /usr/bin/grep -Fxq "runtime_id=$PRIVATE_RUNTIME_ID" "$PRIVATE_RUNTIME_MARKER" \
+    && /usr/bin/grep -Fxq "sha256=$PRIVATE_RUNTIME_SHA256" "$PRIVATE_RUNTIME_MARKER"
+}
+
+private_runtime_is_usable() {
+  [ -d "$PRIVATE_RUNTIME_DIR" ] && [ ! -L "$PRIVATE_RUNTIME_DIR" ] \
+    && runtime_marker_matches \
+    && python_candidate_usable "$PRIVATE_RUNTIME_BIN"
+}
+
+next_runtime_backup_path() {
+  local label="$1" stamp candidate suffix=0
+  ensure_private_directory "$PRIVATE_RUNTIME_BACKUP_ROOT" "Deep Pattern runtime backup"
+  stamp="$(/bin/date '+%Y%m%d-%H%M%S')"
+  candidate="$PRIVATE_RUNTIME_BACKUP_ROOT/$stamp-$label"
+  while [ -e "$candidate" ] || [ -L "$candidate" ]; do
+    suffix=$((suffix + 1))
+    candidate="$PRIVATE_RUNTIME_BACKUP_ROOT/$stamp-$suffix-$label"
+  done
+  printf '%s\n' "$candidate"
+}
+
+quarantine_runtime_path() {
+  local source="$1" label="$2" destination
+  [ -e "$source" ] || [ -L "$source" ] || return 0
+  [ -d "$source" ] && [ ! -L "$source" ] \
+    || blocked "$source is not a regular Deep Pattern runtime directory; preserve it and stop"
+  destination="$(next_runtime_backup_path "$label")" \
+    || fail "could not allocate a private runtime backup path"
+  clean_exec /bin/mv "$source" "$destination" \
+    || fail "could not preserve $source at $destination"
+  tty_print "Preserved the previous runtime state at $destination."
+}
+
+download_private_python_runtime() {
+  local stage archive extract listing actual_size actual_sha member unsafe=0
+
+  ensure_deeppattern_runtime_directories
+  select_private_runtime_spec
+  if [ -e "$PRIVATE_RUNTIME_DIR" ] || [ -L "$PRIVATE_RUNTIME_DIR" ]; then
+    if private_runtime_is_usable; then
+      PRIVATE_BASE_PYTHON="$PRIVATE_RUNTIME_BIN"
+      tty_print "Reusing Deep Pattern private Python $PRIVATE_PYTHON_VERSION at $PRIVATE_RUNTIME_DIR."
+      return 0
+    fi
+    confirm_dependency_install "The Deep Pattern private Python runtime is incomplete or invalid. Preserve it and download a verified replacement?" \
+      || return 1
+    quarantine_runtime_path "$PRIVATE_RUNTIME_DIR" "private-python-runtime"
+  else
+    tty_print "Deep Pattern requires its verified private Python $PRIVATE_PYTHON_VERSION runtime."
+    tty_print "Downloading about 25 MB into $PRIVATE_RUNTIME_ROOT without changing system Python."
+  fi
+
+  [ -x /usr/bin/curl ] || {
+    tty_print "The system curl executable is unavailable; private Python cannot be downloaded."
+    return 1
+  }
+  [ -x /usr/bin/openssl ] || {
+    tty_print "The system OpenSSL executable is unavailable; the Python download cannot be verified."
+    return 1
+  }
+  [ -x /usr/bin/tar ] || {
+    tty_print "The system tar executable is unavailable; private Python cannot be unpacked."
+    return 1
+  }
+
+  stage="$(clean_exec /usr/bin/mktemp -d "$PRIVATE_RUNTIME_ROOT/.python-runtime-stage.XXXXXX")" \
+    || fail "could not create a private Python staging directory"
+  archive="$stage/$PRIVATE_RUNTIME_ASSET"
+  extract="$stage/extract"
+  listing="$stage/archive-members.txt"
+  clean_exec /bin/mkdir -m 700 "$extract" \
+    || { clean_exec /bin/rm -rf "$stage"; fail "could not prepare private Python extraction"; }
+
+  tty_print "Downloading Deep Pattern private Python $PRIVATE_PYTHON_VERSION for $PRIVATE_RUNTIME_ARCH..."
+  if ! clean_exec /usr/bin/curl --fail --location --show-error --progress-bar \
+      --proto '=https' --tlsv1.2 --connect-timeout 20 --retry 2 \
+      --output "$archive" "$PRIVATE_RUNTIME_URL"; then
+    clean_exec /bin/rm -rf "$stage"
+    tty_print "Private Python download failed; no existing runtime was overwritten."
+    return 1
+  fi
+
+  actual_size="$(/usr/bin/stat -f '%z' "$archive" 2>/dev/null || true)"
+  actual_sha="$(/usr/bin/openssl dgst -sha256 "$archive" 2>/dev/null | /usr/bin/awk '{print $NF}')"
+  if [ "$actual_size" != "$PRIVATE_RUNTIME_ASSET_SIZE" ] \
+      || [ "$actual_sha" != "$PRIVATE_RUNTIME_SHA256" ]; then
+    clean_exec /bin/rm -rf "$stage"
+    tty_print "Private Python download failed its fixed size or SHA-256 check; nothing was installed."
+    return 1
+  fi
+
+  if ! clean_exec /usr/bin/tar -tzf "$archive" >"$listing"; then
+    clean_exec /bin/rm -rf "$stage"
+    tty_print "Private Python archive could not be inspected; nothing was installed."
+    return 1
+  fi
+  while IFS= read -r member; do
+    [ -n "$member" ] || continue
+    case "$member" in
+      python|python/|python/*) ;;
+      *) unsafe=1; break ;;
+    esac
+    case "/$member/" in
+      *"/../"*) unsafe=1; break ;;
+    esac
+  done <"$listing"
+  if [ "$unsafe" -ne 0 ] || [ ! -s "$listing" ]; then
+    clean_exec /bin/rm -rf "$stage"
+    tty_print "Private Python archive has an unexpected path layout; nothing was installed."
+    return 1
+  fi
+  if ! clean_exec /usr/bin/tar -xzf "$archive" -C "$extract"; then
+    clean_exec /bin/rm -rf "$stage"
+    tty_print "Private Python archive extraction failed; nothing was installed."
+    return 1
+  fi
+  if [ ! -d "$extract/python" ] || [ -L "$extract/python" ] \
+      || [ -n "$(/usr/bin/find "$extract" -mindepth 1 -maxdepth 1 ! -name python -print -quit)" ] \
+      || ! python_candidate_usable "$extract/python/bin/python3"; then
+    clean_exec /bin/rm -rf "$stage"
+    tty_print "The verified private Python archive does not provide ssl, venv, tkinter, and pip on this Mac."
+    return 1
+  fi
+
+  clean_exec /bin/mkdir -m 700 "$stage/runtime" \
+    || { clean_exec /bin/rm -rf "$stage"; fail "could not prepare the private Python runtime"; }
+  clean_exec /bin/mv "$extract/python" "$stage/runtime/python" \
+    || { clean_exec /bin/rm -rf "$stage"; fail "could not stage the private Python runtime"; }
+  printf '%s\n' \
+    "schema=1" \
+    "runtime_id=$PRIVATE_RUNTIME_ID" \
+    "python_version=$PRIVATE_PYTHON_VERSION" \
+    "architecture=$PRIVATE_RUNTIME_ARCH" \
+    "source=$PRIVATE_RUNTIME_URL" \
+    "sha256=$PRIVATE_RUNTIME_SHA256" \
+    >"$stage/runtime/$PRIVATE_RUNTIME_MARKER_NAME" \
+    || { clean_exec /bin/rm -rf "$stage"; fail "could not record private Python ownership"; }
+  /bin/chmod 600 "$stage/runtime/$PRIVATE_RUNTIME_MARKER_NAME" \
+    || { clean_exec /bin/rm -rf "$stage"; fail "could not protect private Python ownership metadata"; }
+  if [ -e "$PRIVATE_RUNTIME_DIR" ] || [ -L "$PRIVATE_RUNTIME_DIR" ]; then
+    clean_exec /bin/rm -rf "$stage"
+    blocked "$PRIVATE_RUNTIME_DIR appeared during download; preserve it and retry"
+  fi
+  clean_exec /bin/mv "$stage/runtime" "$PRIVATE_RUNTIME_DIR" \
+    || { clean_exec /bin/rm -rf "$stage"; fail "could not activate the private Python runtime"; }
+  clean_exec /bin/rm -rf "$stage"
+  private_runtime_is_usable \
+    || blocked "$PRIVATE_RUNTIME_DIR was installed but failed final verification; preserve it and stop"
+  PRIVATE_BASE_PYTHON="$PRIVATE_RUNTIME_BIN"
+  tty_print "Deep Pattern private Python runtime ready at $PRIVATE_RUNTIME_DIR."
+}
+
+select_fallback_python() {
+  PYTHON_BIN=""
+  try_python "${DE_PYTHON:-}" \
+    || try_python "$(command -v python3 2>/dev/null || true)" \
+    || try_python "$(command -v python 2>/dev/null || true)" \
+    || try_python "/opt/homebrew/bin/python3" \
+    || try_python "/usr/local/bin/python3" \
+    || try_python "/opt/anaconda3/bin/python" \
+    || try_python "/opt/anaconda3/bin/python3" \
+    || bootstrap_python_with_homebrew
+  PRIVATE_BASE_PYTHON="$PYTHON_BIN"
+  tty_print "Using $PRIVATE_BASE_PYTHON only to prepare the private Deep Pattern environment."
+}
+
+create_managed_python_environment() {
+  local base_python="$1" partial_python_root=""
+
+  ensure_private_directory "$DEEPPATTERN_ROOT" "Deep Pattern"
+  clean_exec /bin/mkdir -m 700 "$MANAGED_PYTHON_ROOT" \
     || blocked "$MANAGED_PYTHON_ROOT appeared while preparing Python; preserve it and retry"
   partial_python_root="$MANAGED_PYTHON_ROOT"
   cleanup_partial_python() {
@@ -310,6 +559,13 @@ ensure_install_python_is_writable() {
   fi
   try_python "$MANAGED_PYTHON_BIN" \
     || fail "the private Deep Pattern Python environment is incomplete"
+  printf '%s\n' \
+    "schema=1" \
+    "base_python=$base_python" \
+    >"$MANAGED_PYTHON_ROOT/$MANAGED_PYTHON_MARKER_NAME" \
+    || fail "could not record the private Deep Pattern Python environment"
+  /bin/chmod 600 "$MANAGED_PYTHON_ROOT/$MANAGED_PYTHON_MARKER_NAME" \
+    || fail "could not protect the private Deep Pattern Python metadata"
 
   partial_python_root=""
   trap - EXIT HUP INT TERM
@@ -317,16 +573,28 @@ ensure_install_python_is_writable() {
 }
 
 PYTHON_BIN=""
-try_python "${DE_PYTHON:-}" \
-  || try_python "$MANAGED_PYTHON_BIN" \
-  || try_python "$(command -v python3 2>/dev/null || true)" \
-  || try_python "$(command -v python 2>/dev/null || true)" \
-  || try_python "/opt/homebrew/bin/python3" \
-  || try_python "/usr/local/bin/python3" \
-  || try_python "/opt/anaconda3/bin/python" \
-  || try_python "/opt/anaconda3/bin/python3" \
-  || bootstrap_python_with_homebrew
-ensure_install_python_is_writable
+if try_python "$MANAGED_PYTHON_BIN"; then
+  tty_print "Reusing the private Deep Pattern Python environment at $MANAGED_PYTHON_ROOT."
+else
+  if [ -e "$MANAGED_PYTHON_ROOT" ] || [ -L "$MANAGED_PYTHON_ROOT" ]; then
+    [ -d "$MANAGED_PYTHON_ROOT" ] && [ ! -L "$MANAGED_PYTHON_ROOT" ] \
+      || blocked "$MANAGED_PYTHON_ROOT is not a regular managed Python directory; preserve it and stop"
+    confirm_dependency_install "The private Deep Pattern Python environment is unusable. Preserve it and rebuild it?" \
+      || blocked "$MANAGED_PYTHON_ROOT was preserved; repair was declined"
+    quarantine_runtime_path "$MANAGED_PYTHON_ROOT" "de-python"
+  fi
+  PRIVATE_BASE_PYTHON=""
+  if [ -n "${DE_PYTHON:-}" ]; then
+    python_candidate_usable "$DE_PYTHON" \
+      || fail "DE_PYTHON does not provide Python 3.12+ with ssl, venv, tkinter, and pip"
+    PRIVATE_BASE_PYTHON="$DE_PYTHON"
+    tty_print "Using the explicitly selected DE_PYTHON only to prepare the private Deep Pattern environment."
+  elif ! download_private_python_runtime; then
+    tty_print "A verified private Python runtime could not be used. An existing compatible Python or optional Homebrew fallback will be checked."
+    select_fallback_python
+  fi
+  create_managed_python_environment "$PRIVATE_BASE_PYTHON"
+fi
 PYTHON_DIR="$(dirname "$PYTHON_BIN")"
 
 managed_root_was_present=0
@@ -515,28 +783,30 @@ try:
         root, timeout_seconds=wait_budget
     ) as startup_gate:
         recovery = launcher._finalize_journal(root)
-        if recovery is not None and recovery.status in {
+        if recovery is not None and recovery.status == "deferred_active_session":
+            result = recovery
+        elif recovery is not None and recovery.status in {
             "repair_required",
             "retry_pending",
-            "deferred_active_session",
             "skipped_locked",
         }:
             raise ShellError(f"managed update recovery returned {recovery.status}")
-        if getattr(startup_gate, "waited", False):
-            raise ShellError("another managed update attempt completed; retry to verify the current signed stable release")
-        if not launcher._updates_enabled(root):
-            raise ShellError("managed update protocol is not ready")
-        state = updater._read_update_state(root)
-        if launcher._head_commit(root) != state.last_release_commit:
-            raise ShellError("managed HEAD differs from the protected release state")
-        trusted_keys = load_trusted_release_keys(
-            root,
-            deadline=deadline,
-            expected_commit=state.last_release_commit,
-        )
-        if not trusted_keys:
-            raise ShellError("managed release trust store contains no active key")
-        result = launcher._attempt_update(root, trusted_keys, deadline=deadline)
+        else:
+            if getattr(startup_gate, "waited", False):
+                raise ShellError("another managed update attempt completed; retry to verify the current signed stable release")
+            if not launcher._updates_enabled(root):
+                raise ShellError("managed update protocol is not ready")
+            state = updater._read_update_state(root)
+            if launcher._head_commit(root) != state.last_release_commit:
+                raise ShellError("managed HEAD differs from the protected release state")
+            trusted_keys = load_trusted_release_keys(
+                root,
+                deadline=deadline,
+                expected_commit=state.last_release_commit,
+            )
+            if not trusted_keys:
+                raise ShellError("managed release trust store contains no active key")
+            result = launcher._attempt_update(root, trusted_keys, deadline=deadline)
 except (
     ShellError,
     OSError,
@@ -547,11 +817,12 @@ except (
     raise SystemExit(1)
 
 accepted_statuses = {"up_to_date", "candidate_ready", "updated"}
+deferred_statuses = {"deferred_active_session"}
 blocker_pids = ",".join(
     str(blocker.pid) for blocker in result.blockers if blocker.pid is not None
 )
 print(f"{result.status}\t{blocker_pids}")
-if result.status not in accepted_statuses:
+if result.status not in accepted_statuses | deferred_statuses:
     details = [f"status={result.status}"]
     if result.error_code:
         details.append(f"error_code={result.error_code}")
@@ -597,174 +868,13 @@ process_field() {
   esac
 }
 
-process_is_alive() {
-  local pid="$1"
-  [[ "$pid" =~ ^[0-9]+$ ]] && [ "$pid" -gt 1 ] \
-    && kill -0 "$pid" 2>/dev/null
-}
-
-process_snapshot() {
-  local pid="$1" raw uid parent weekday month day clock year command
-  [[ "$pid" =~ ^[0-9]+$ ]] && [ "$pid" -gt 1 ] || return 1
-  raw="$(
-    LC_ALL=C /bin/ps -p "$pid" \
-      -o uid= -o ppid= -o lstart= -o command= 2>/dev/null
-  )" || return 1
-  read -r uid parent weekday month day clock year command <<<"$raw"
-  [[ "$uid" =~ ^[0-9]+$ ]] || return 1
-  [[ "$parent" =~ ^[0-9]+$ ]] || return 1
-  [ -n "$weekday" ] && [ -n "$month" ] && [ -n "$day" ] \
-    && [ -n "$clock" ] && [ -n "$year" ] && [ -n "$command" ] || return 1
-  printf '%s\t%s\t%s %s %s %s %s\t%s\n' \
-    "$uid" "$parent" "$weekday" "$month" "$day" "$clock" "$year" "$command"
-}
-
-managed_shim_has_root_ref() {
-  local pid="$1" refs line path
-  [ -x /usr/sbin/lsof ] || return 1
-  refs="$(
-    /usr/sbin/lsof -a -n -P -p "$pid" -d cwd,txt,mem -Fn 2>/dev/null
-  )" || return 1
-  while IFS= read -r line; do
-    case "$line" in
-      n*) path="${line#n}" ;;
-      *) continue ;;
-    esac
-    case "$path" in
-      "$MANAGED_ROOT"|"$MANAGED_ROOT"/*) return 0 ;;
-    esac
-  done <<<"$refs"
-  return 1
-}
-
-managed_shim_has_root_env() {
-  local pid="$1" executable="$2" module="$3"
-  clean_exec "$PYTHON_BIN" - "$pid" "$executable" "$module" "$MANAGED_ROOT" <<'PY'
-import re
-import subprocess
-import sys
-
-pid, executable, module, managed_root = sys.argv[1:]
-try:
-    result = subprocess.run(
-        ["/bin/ps", "eww", "-p", pid, "-o", "command="],
-        text=True,
-        stdout=subprocess.PIPE,
-        stderr=subprocess.DEVNULL,
-        check=False,
-        timeout=2,
-    )
-except (OSError, subprocess.TimeoutExpired):
-    raise SystemExit(1)
-if result.returncode != 0:
-    raise SystemExit(1)
-
-prefix = f"{executable} -m {module}"
-process_text = result.stdout.rstrip("\n")
-if not process_text.startswith(prefix + " "):
-    raise SystemExit(1)
-environment_text = process_text[len(prefix) :].lstrip()
-
-def exact_environment_value(name: str, value: str) -> bool:
-    pattern = re.compile(
-        rf"(?:^| ){re.escape(name)}={re.escape(value)}"
-        r"(?= [A-Za-z_][A-Za-z0-9_]*=|$)"
-    )
-    return pattern.search(environment_text) is not None
-
-host_match = re.search(
-    r"(?:^| )DE_MCP_CLIENT_HOST=([a-z0-9-]+)"
-    r"(?= [A-Za-z_][A-Za-z0-9_]*=|$)",
-    environment_text,
-)
-registered_hosts = {
-    "claude-code",
-    "claude-desktop",
-    "claude-desktop-3p",
-    "codebuddy",
-    "codex",
-    "cursor",
-    "qoder",
-    "qoder-cn",
-    "qoder-ide",
-    "qoder-cn-ide",
-    "trae",
-    "trae-work",
-    "trae-cn",
-    "trae-work-cn",
-    "workbuddy",
-    "workbuddy-ai",
-}
-raise SystemExit(
-    0
-    if exact_environment_value("PYTHONPATH", managed_root)
-    and host_match is not None
-    and host_match.group(1) in registered_hosts
-    else 1
-)
-PY
-}
-
-verified_managed_shim_snapshot() {
-  local pid="$1" snapshot uid parent started command expected_uid executable executable_name module
-  snapshot="$(process_snapshot "$pid")" || return 1
-  IFS=$'\t' read -r uid parent started command <<<"$snapshot"
-  expected_uid="$(/usr/bin/id -u)"
-  [ "$uid" = "$expected_uid" ] || return 1
-  executable="${command%% *}"
-  executable_name="${executable##*/}"
-  [ -x "$executable" ] || return 1
-  case "$executable_name" in
-    python|python[0-9]*|Python) ;;
-    *) return 1 ;;
-  esac
-  case "$command" in
-    "$executable -m installer.launcher"*|"$executable -m installer.shim"*)
-      case "$command" in
-        "$executable -m installer.launcher"*) module="installer.launcher" ;;
-        *) module="installer.shim" ;;
-      esac
-      managed_shim_has_root_ref "$pid" \
-        || { [ "$command" = "$executable -m $module" ] \
-          && managed_shim_has_root_env "$pid" "$executable" "$module"; } \
-        || return 1
-      printf '%s\n' "$snapshot"
-      ;;
-    "$executable -c "*"$MANAGED_ROOT --managed-root $MANAGED_ROOT")
-      printf '%s\n' "$snapshot"
-      ;;
-    "$executable $MANAGED_ROOT/installer/mcp_bootstrap.py $MANAGED_ROOT --managed-root $MANAGED_ROOT")
-      printf '%s\n' "$snapshot"
-      ;;
-    *) return 1 ;;
-  esac
-}
-
-freeze_managed_shim_for_term() {
-  local pid="$1" identity_dir="$2" snapshot
-  [[ "$pid" =~ ^[0-9]+$ ]] && [ "$pid" -gt 1 ] || return 1
-  [ -d "$identity_dir" ] && [ ! -L "$identity_dir" ] || return 1
-  snapshot="$(verified_managed_shim_snapshot "$pid")" || return 1
-  ( umask 077; printf '%s\n' "$snapshot" >"$identity_dir/$pid" )
-}
-
-terminate_frozen_managed_shim() {
-  local pid="$1" identity_dir="$2" identity_file frozen current
-  [[ "$pid" =~ ^[0-9]+$ ]] && [ "$pid" -gt 1 ] || return 1
-  identity_file="$identity_dir/$pid"
-  [ -f "$identity_file" ] && [ ! -L "$identity_file" ] || return 1
-  frozen="$(<"$identity_file")"
-  current="$(verified_managed_shim_snapshot "$pid")" || return 1
-  [ "$current" = "$frozen" ] || return 1
-  kill -TERM "$pid"
-}
-
 likely_host_for_pid() {
   local current="$1" command parent depth=0
   while [[ "$current" =~ ^[0-9]+$ ]] && [ "$current" -gt 1 ] \
       && [ "$depth" -lt 8 ]; do
     command="$(process_field "$current" command || true)"
     case "$command" in
+      *"/ChatGPT.app/Contents/Resources/codex"*) printf 'Codex (ChatGPT.app)\n'; return 0 ;;
       *"/Codex.app/"*) printf 'Codex\n'; return 0 ;;
       *"/Claude.app/"*|*"/Claude Desktop.app/"*) printf 'Claude Desktop\n'; return 0 ;;
       *"/Cursor.app/"*) printf 'Cursor\n'; return 0 ;;
@@ -785,98 +895,38 @@ likely_host_for_pid() {
   printf 'unknown Agent host\n'
 }
 
-show_active_shim_sessions() {
+describe_active_shim_sessions() {
   local values="$1" pid label parent
-  tty_print "Decision Engine is still in use by the following active MCP session(s):"
   while IFS= read -r pid; do
     [ -n "$pid" ] || continue
     label="$(likely_host_for_pid "$pid")"
     parent="$(process_field "$pid" ppid || true)"
     [[ "$parent" =~ ^[0-9]+$ ]] || parent="unknown"
-    tty_print "  PID=$pid likely-host=$label parent-pid=$parent"
+    printf '  PID=%s likely-host=%s parent-pid=%s\n' "$pid" "$label" "$parent"
   done <<<"$(printf '%s' "$values" | /usr/bin/tr ',' '\n')"
 }
 
-blocker_pids_are_clear() {
-  local values="$1" pid
-  while IFS= read -r pid; do
-    [ -n "$pid" ] || continue
-    process_is_alive "$pid" && return 1
-  done <<<"$(printf '%s' "$values" | /usr/bin/tr ',' '\n')"
-  return 0
-}
-
-remediate_active_shim_sessions() {
-  local values="$1" answer="" pid managed_pids="" identity_dir
-  show_active_shim_sessions "$values"
-  tty_print "Completely quit the listed Agent host applications; closing only their windows is not sufficient."
-  printf 'After quitting them, press Enter to recheck immediately (or type N to stop): ' >/dev/tty
-  IFS= read -r answer </dev/tty || return 1
-  case "$answer" in n|N|no|NO|q|Q|quit|QUIT) return 1 ;; esac
-  blocker_pids_are_clear "$values" && return 0
-
-  identity_dir="$tmp_root/active-shim-identities"
-  mkdir -m 700 "$identity_dir" || return 1
-
-  while IFS= read -r pid; do
-    [ -n "$pid" ] || continue
-    if freeze_managed_shim_for_term "$pid" "$identity_dir"; then
-      managed_pids="$(append_client_line "$managed_pids" "$pid")"
-    fi
-  done <<<"$(printf '%s' "$values" | /usr/bin/tr ',' '\n')"
-
-  [ -n "$managed_pids" ] || {
-    tty_print "The remaining process identity is not safe to terminate automatically. Quit the Agent host and rerun the installer."
-    return 1
-  }
-  tty_print "The remaining process(es) are same-user managed DE MCP launchers:"
-  printf '%s\n' "$managed_pids" >/dev/tty
-  tty_print "TERM will target only these DE MCP launcher processes, not the Agent applications."
-  confirm_dependency_install "Terminate these verified managed DE sessions with TERM and retry?" \
-    || return 1
-  while IFS= read -r pid; do
-    [ -n "$pid" ] || continue
-    if ! terminate_frozen_managed_shim "$pid" "$identity_dir"; then
-      tty_print "TERM refused for PID=$pid because its identity changed or could not be proven."
-      return 1
-    fi
-    tty_print "TERM sent to verified managed DE session PID=$pid."
-  done <<<"$managed_pids"
-  return 0
-}
-
-run_managed_update_with_retry() {
-  local attempt raw result_status
+run_managed_update_once() {
+  local raw result_status=0
   managed_update_status=""
   managed_update_blocker_pids=""
-  for attempt in 1 2; do
+  if raw="$(update_existing_managed_root)"; then
     result_status=0
-    if raw="$(update_existing_managed_root)"; then
-      result_status=0
-    else
-      result_status=$?
-    fi
-    parse_managed_update_result "$raw" || {
-      managed_update_status="unknown"
-      managed_update_blocker_pids=""
-      return "$result_status"
-    }
-    [ "$result_status" -eq 0 ] && return 0
-    if [ "$attempt" -eq 1 ] \
-        && [ "$managed_update_status" = "deferred_active_session" ] \
-        && [ -n "$managed_update_blocker_pids" ]; then
-      remediate_active_shim_sessions "$managed_update_blocker_pids" \
-        || return "$result_status"
-      tty_print "Retrying the signed stable update once..."
-      continue
-    fi
-    return "$result_status"
-  done
-  return 1
+  else
+    result_status=$?
+  fi
+  parse_managed_update_result "$raw" || {
+    managed_update_status="unknown"
+    managed_update_blocker_pids=""
+    return 1
+  }
+  return "$result_status"
 }
 
 resume_managed_root=0
 activated_repair_mode=0
+de_update_deferred=0
+deferred_update_sessions=""
 if [ "$managed_root_was_present" -eq 1 ]; then
   if ! validate_complete_managed_root; then
     blocked \
@@ -892,9 +942,9 @@ if [ "$managed_root_was_present" -eq 1 ]; then
   fi
   if [ "$existing_activation_state" = "activated" ]; then
     activated_repair_mode=1
-    tty_print "Found a complete signed and activated Decision Engine install; entering signed stable update and host repair mode without reopening activation."
+    tty_print "Found a complete signed and activated Decision Engine install; checking the signed stable update and repairing host configuration without reopening activation."
   else
-    tty_print "Found a complete signed Decision Engine stable install with activation pending; entering signed stable update before resuming setup."
+    tty_print "Found a complete signed Decision Engine stable install with activation pending; checking the signed stable update before resuming setup. Active MCP sessions will defer the update without blocking activation."
   fi
   resume_managed_root=1
 fi
@@ -903,16 +953,27 @@ if [ "$resume_managed_root" -eq 1 ]; then
   activation_state_before_update="$existing_activation_state"
   config_digest_before_update="$(managed_config_digest)" \
     || blocked "could not fingerprint the Decision Engine configuration before update"
-  tty_print "Checking and applying the newest signed Decision Engine stable release before continuing..."
+  tty_print "Checking for and applying the newest signed Decision Engine stable release..."
   managed_update_status=""
   managed_update_blocker_pids=""
-  if ! run_managed_update_with_retry; then
-    if validate_complete_managed_root \
+  if ! run_managed_update_once; then
+    if [ "$managed_update_status" = "deferred_active_session" ] \
+        && [ -n "$managed_update_blocker_pids" ] \
+        && validate_complete_managed_root \
         && [ "$(managed_activation_state)" = "$activation_state_before_update" ] \
         && [ "$(managed_config_digest)" = "$config_digest_before_update" ]; then
-      fail "signed stable update status ${managed_update_status:-unknown}; the existing release and activation state were verified and preserved. The guided close-and-retry flow did not clear every active session"
+      de_update_deferred=1
+      deferred_update_sessions="$(
+        describe_active_shim_sessions "$managed_update_blocker_pids"
+      )"
+      tty_print "Active MCP sessions are using the current verified Decision Engine release. The signed update is deferred; setup will continue without stopping Agent applications."
+    elif validate_complete_managed_root \
+        && [ "$(managed_activation_state)" = "$activation_state_before_update" ] \
+        && [ "$(managed_config_digest)" = "$config_digest_before_update" ]; then
+      fail "signed stable update status ${managed_update_status:-unknown}; the existing release and activation state were verified and preserved"
+    else
+      blocked "signed stable update did not complete and the previous release could not be re-verified; preserve the managed root and use the owner-guided recovery flow"
     fi
-    blocked "signed stable update did not complete and the previous release could not be re-verified; preserve the managed root and use the owner-guided recovery flow"
   fi
   validate_complete_managed_root \
     || blocked "signed stable update returned $managed_update_status, but the managed release no longer validates"
@@ -920,11 +981,17 @@ if [ "$resume_managed_root" -eq 1 ]; then
     || blocked "signed stable update returned $managed_update_status, but the activation state changed"
   [ "$(managed_config_digest)" = "$config_digest_before_update" ] \
     || blocked "signed stable update returned $managed_update_status, but the protected activation configuration changed"
-  tty_print "Decision Engine signed stable update status: $managed_update_status"
+  if [ "$de_update_deferred" -eq 0 ]; then
+    tty_print "Decision Engine signed stable update status: $managed_update_status"
+  fi
 fi
 
+catalog_root="$source_root"
+if [ "$de_update_deferred" -eq 1 ]; then
+  catalog_root="$MANAGED_ROOT"
+fi
 if ! source_detected_clients="$(
-  cd "$source_root"
+  cd "$catalog_root"
   de_exec "$PYTHON_BIN" -c \
     'from installer import mcp_config; print("\n".join(mcp_config.detect_clients()))' \
     | tr -d '\r'
@@ -1194,10 +1261,8 @@ prepare_aqg_versions() {
   identity="$(aqg_backup_residue inspect)" \
     || fail "could not safely inspect legacy AQG backups; nothing was moved"
   [ -n "$identity" ] || return 0
-  tty_print "AQG version migration is blocked by historical backups at $DEEPPATTERN_ROOT/versions/aqg-backups."
-  tty_print "Fully quit Agent hosts before moving these backups. Their contents will be preserved, not deleted or merged."
-  confirm_dependency_install "Move this directory into a new legacy-versions archive under $DEEPPATTERN_ROOT/aqg-backups and continue?" \
-    || dependency_pending "legacy AQG backups were preserved in versions; installation was paused before host configuration"
+  tty_print "Historical AQG backups were found at $DEEPPATTERN_ROOT/versions/aqg-backups."
+  tty_print "Automatically archiving them under $DEEPPATTERN_ROOT/aqg-backups; contents are preserved, not deleted or merged."
   aqg_backup_residue move "$identity" \
     || fail "legacy AQG backups could not be relocated safely; inspect the reason above and retry"
 }
@@ -1557,13 +1622,10 @@ print(result.get("status", "unknown"))' \
 # it must refuse before any host write, and it protects a product-owned file
 # rather than a Decision Engine one.
 claude_3p_profile_detected=0
-if [ -d "$CLAUDE_3P_ROOT" ] || [ -e "$CLAUDE_3P_CONFIG" ] \
-    || [ -L "$CLAUDE_3P_CONFIG" ]; then
-  if [ -e "$CLAUDE_3P_CONFIG" ] || [ -L "$CLAUDE_3P_CONFIG" ]; then
-    if [ -L "$CLAUDE_3P_CONFIG" ] || [ ! -f "$CLAUDE_3P_CONFIG" ]; then
-      blocked \
-        "$CLAUDE_3P_CONFIG is not a regular configuration file; preserve it and repair the Claude third-party profile before continuing"
-    fi
+if [ -e "$CLAUDE_3P_CONFIG" ] || [ -L "$CLAUDE_3P_CONFIG" ]; then
+  if [ -L "$CLAUDE_3P_CONFIG" ] || [ ! -f "$CLAUDE_3P_CONFIG" ]; then
+    blocked \
+      "$CLAUDE_3P_CONFIG is not a regular configuration file; preserve it and repair the Claude third-party profile before continuing"
   fi
   claude_3p_profile_detected=1
 fi
@@ -1573,6 +1635,13 @@ detect_managed_clients() {
     'from installer import mcp_config; print("\n".join(mcp_config.detect_clients()))' \
     | tr -d '\r'
 }
+
+if [ "$claude_3p_profile_detected" -eq 1 ]; then
+  run_managed_python -c \
+    'from installer import mcp_config; raise SystemExit(0 if "claude-desktop-3p" in mcp_config.CLIENTS else 1)' \
+    </dev/null >/dev/null 2>&1 \
+    || blocked "Decision Engine $managed_version does not support the configured Claude third-party profile"
+fi
 
 normalize_managed_clients_for_variant() {
   local clients="$1" normalized="" client
@@ -1903,6 +1972,23 @@ if [ "$workbuddy_variant" = "ai" ]; then
   fi
 fi
 
+deferred_activation_state=""
+if [ "$de_update_deferred" -eq 1 ]; then
+  deferred_activation_state="$(managed_activation_state)" \
+    || blocked "could not verify the final activation state after deferring the signed update"
+  tty_print "Decision Engine deferred update report:"
+  if [ "$deferred_activation_state" = "activated" ]; then
+    tty_print "Activation: complete"
+  else
+    tty_print "Activation: pending"
+  fi
+  tty_print "DE update: deferred because Agent MCP sessions are active"
+  tty_print "Active MCP sessions recorded when this update was deferred:"
+  printf '%s\n' "$deferred_update_sessions" >/dev/tty
+  tty_print "Fully quit every listed Agent application before reopening any of them."
+  tty_print "The first new MCP session will retry the pending signed update."
+fi
+
 printf '%s: source=%s\n' "$PROGRAM_NAME" "$source_sha"
 printf '%s: decision-engine-version=%s\n' "$PROGRAM_NAME" "$managed_version"
 printf '%s: decision-engine=%s\n' "$PROGRAM_NAME" "$managed_sha"
@@ -1914,6 +2000,17 @@ if [ -n "$catalog_missing_clients" ] \
     || [ "$capability_report_incomplete" -ne 0 ] \
     || [ "$manual_host_action_pending" -ne 0 ]; then
   printf '%s: PARTIAL: supported components were installed, but one or more detected hosts are unsupported, unconfigured, unverifiable, or awaiting in-app approval.\n' \
+    "$PROGRAM_NAME" >&2
+  exit "$EXIT_PARTIAL"
+fi
+
+if [ "$de_update_deferred" -eq 1 ]; then
+  if [ "$deferred_activation_state" = "activated" ]; then
+    printf '%s: SUCCESS_WITH_RESTART_REQUIRED: device activation and host configuration are complete; the current verified DE release was preserved and its signed update remains pending.\n' \
+      "$PROGRAM_NAME"
+    exit 0
+  fi
+  printf '%s: PARTIAL: device activation and the signed DE update remain pending; the current verified release and host configuration were preserved.\n' \
     "$PROGRAM_NAME" >&2
   exit "$EXIT_PARTIAL"
 fi

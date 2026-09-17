@@ -267,7 +267,7 @@ class ManagedShimIdentityTests(unittest.TestCase):
         inventory.process_blockers = ["process a", "process b"]
         self.assertTrue(inventory.has_only_process_blockers())
 
-    def test_apply_with_only_process_blockers_enters_guided_resolution(self) -> None:
+    def test_apply_with_only_process_blockers_returns_pending_without_mutation(self) -> None:
         inventory = self._inventory()
         inventory.processes = [
             {
@@ -290,7 +290,7 @@ class ManagedShimIdentityTests(unittest.TestCase):
 
         def resolver(candidate):
             calls.append("resolve")
-            return candidate
+            return candidate, True
 
         def unexpected_apply(_candidate):
             self.fail("apply_inventory must not run while a process blocker remains")
@@ -311,12 +311,172 @@ class ManagedShimIdentityTests(unittest.TestCase):
         finally:
             self.module.update(originals)
 
-        self.assertEqual(result, self.module["EXIT_BLOCKED"])
+        self.assertEqual(result, self.module["EXIT_PENDING"])
         self.assertEqual(calls, ["resolve"])
         self.assertIn(
-            "ACTION REQUIRED: close the listed Agent hosts; guided process cleanup follows.",
+            "UNINSTALL_PENDING: fully quit every listed Agent host and rerun the uninstaller.",
             output.getvalue(),
         )
+
+    def test_declining_verified_process_termination_returns_pending(self) -> None:
+        current = self._inventory()
+        current.processes = [
+            {
+                "pid": "102",
+                "family": "mcp-launcher",
+                "term_eligible": "true",
+            }
+        ]
+        original_process_only = self.module["process_only_inventory"]
+        original_prompt = self.module["prompt_tty"]
+        original_terminate = self.module["terminate_verified_processes"]
+        self.module["process_only_inventory"] = lambda _inventory: current
+        self.module["prompt_tty"] = lambda _message: "n"
+        self.module["terminate_verified_processes"] = lambda *_args: self.fail(
+            "declining termination must not send TERM"
+        )
+        output = io.StringIO()
+        try:
+            with contextlib.redirect_stdout(output):
+                refreshed, pending = self.module["resolve_process_blockers"](
+                    self._inventory()
+                )
+        finally:
+            self.module["process_only_inventory"] = original_process_only
+            self.module["prompt_tty"] = original_prompt
+            self.module["terminate_verified_processes"] = original_terminate
+
+        self.assertIs(refreshed, current)
+        self.assertTrue(pending)
+        self.assertIn("process termination was declined", output.getvalue())
+
+    def test_accepting_termination_passes_only_eligible_processes(self) -> None:
+        current = self._inventory()
+        eligible = {
+            "pid": "102",
+            "family": "mcp-launcher",
+            "term_eligible": "true",
+        }
+        ineligible = {
+            "pid": "103",
+            "family": "unverified-de-launcher",
+            "term_eligible": "false",
+        }
+        current.processes = [eligible, ineligible]
+        refreshed = self._inventory()
+        refreshed.processes = []
+        captured: list[dict[str, str]] = []
+
+        class RefreshedInventory:
+            def __init__(self, _home: Path, _scope: str) -> None:
+                pass
+
+            def collect(self):
+                return refreshed
+
+        original_process_only = self.module["process_only_inventory"]
+        original_prompt = self.module["prompt_tty"]
+        original_terminate = self.module["terminate_verified_processes"]
+        original_inventory = self.module["Inventory"]
+        original_sleep = self.module["time"].sleep
+        initial = self._inventory()
+        self.module["process_only_inventory"] = lambda _inventory: current
+        self.module["prompt_tty"] = lambda message: (
+            self.assertIn("[Y/N]", message) or "y"
+        )
+        self.module["terminate_verified_processes"] = lambda _inventory, items: (
+            captured.extend(items) or True
+        )
+        self.module["Inventory"] = RefreshedInventory
+        self.module["time"].sleep = lambda _seconds: None
+        try:
+            result, pending = self.module["resolve_process_blockers"](
+                initial
+            )
+        finally:
+            self.module["process_only_inventory"] = original_process_only
+            self.module["prompt_tty"] = original_prompt
+            self.module["terminate_verified_processes"] = original_terminate
+            self.module["Inventory"] = original_inventory
+            self.module["time"].sleep = original_sleep
+
+        self.assertIs(result, refreshed)
+        self.assertFalse(pending)
+        self.assertEqual(captured, [eligible])
+
+    def test_chatgpt_codex_parent_is_reported_as_known_host(self) -> None:
+        inventory = self._inventory()
+        inventory.processes = [
+            {
+                "pid": "9778",
+                "ppid": "8981",
+                "family": "mcp-launcher",
+                "host": "Codex (ChatGPT.app)",
+                "executable": str(self.home / ".deeppattern/de-python/bin/python3"),
+                "app_name": "ChatGPT.app",
+                "app_path": "/Applications/ChatGPT.app",
+                "parent_pid": "8981",
+                "parent_executable": "/Applications/ChatGPT.app/Contents/Resources/codex",
+            }
+        ]
+        output = io.StringIO()
+        with contextlib.redirect_stdout(output):
+            self.module["print_process_summary"](
+                inventory, "ACTIVE AGENT SESSIONS:"
+            )
+
+        rendered = output.getvalue()
+        self.assertIn("Codex (ChatGPT.app):", rendered)
+        self.assertNotIn("Unknown Agent (host could not be identified)", rendered)
+
+    def test_chatgpt_codex_executable_maps_to_codex_host(self) -> None:
+        label = self.module["Inventory"].process_host_label(
+            "/Applications/ChatGPT.app/Contents/Resources/codex"
+        )
+        self.assertEqual(label, "Codex (ChatGPT.app)")
+
+    def test_term_target_is_revalidated_immediately_before_signal(self) -> None:
+        candidates = [
+            {
+                "pid": "102",
+                "family": "mcp-launcher",
+                "term_eligible": "true",
+            }
+        ]
+        validations = iter(((True, ""), (False, "identity changed")))
+        original_revalidate = self.module["revalidate_term_target"]
+        original_kill = self.module["os"].kill
+        self.module["revalidate_term_target"] = lambda *_args: next(validations)
+        self.module["os"].kill = lambda *_args: self.fail(
+            "TERM must not be sent after the second identity check fails"
+        )
+        output = io.StringIO()
+        try:
+            with contextlib.redirect_stdout(output):
+                result = self.module["terminate_verified_processes"](
+                    self._inventory(), candidates
+                )
+        finally:
+            self.module["revalidate_term_target"] = original_revalidate
+            self.module["os"].kill = original_kill
+
+        self.assertFalse(result)
+        self.assertIn("changed before TERM: identity changed", output.getvalue())
+
+    def test_absent_paths_are_not_reported_as_preserved(self) -> None:
+        inventory = self._inventory()
+        inventory.notes = [
+            f"absent {inventory.de}",
+            f"preserve protected source/worktree {inventory.dp / 'decision-engine-root'}",
+        ]
+        output = io.StringIO()
+        with contextlib.redirect_stdout(output):
+            self.module["print_inventory"](inventory, apply=True)
+
+        rendered = output.getvalue()
+        self.assertIn(f"ABSENT {inventory.de}", rendered)
+        self.assertNotIn(f"PRESERVE absent {inventory.de}", rendered)
+        self.assertIn("PRESERVE protected source/worktree", rendered)
 
     def test_rejects_launcher_with_wrong_managed_root(self) -> None:
         process = self._spawn(

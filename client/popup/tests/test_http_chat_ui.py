@@ -124,13 +124,17 @@ const ids = [
   'ge-chat-scroll', 'ge-composer', 'composer-input', 'composer-send', 'ge-imgchips',
   'ge-chat-status', 'ge-chat-status-text', 'ge-retry', 'ge-input-error', 'region-btn',
   'ge-i18n', 'ge-welcome', 'ge-image-preview', 'ge-image-preview-image',
-  'ge-image-preview-close'
+  'ge-image-preview-close',
+  // The frameless header's own controls: ✕ destroys the popup, — minimizes it. Present so a test can
+  // prove Escape's move from close to minimize did not disturb either explicit button.
+  'close-btn', 'hide-btn'
 ];
+const BUTTON_IDS = new Set(['ge-image-preview-close', 'close-btn', 'hide-btn']);
 const nodes = {};
 ids.forEach((id) => {
   const tag = id === 'composer-input' ? 'textarea'
     : id === 'ge-image-preview-image' ? 'img'
-      : id === 'ge-image-preview-close' ? 'button' : 'div';
+      : BUTTON_IDS.has(id) ? 'button' : 'div';
   nodes[id] = new FakeNode(tag, id);
 });
 nodes['composer-input'].disabled = true;
@@ -167,7 +171,10 @@ const api = {
   chat_ready() { calls.push(['chat_ready']); return {ok: true, state: 'capability_checking'}; },
   ask() { calls.push(['ask'].concat(Array.from(arguments))); return {ok: true}; },
   retry_chat() { calls.push(['retry_chat'].concat(Array.from(arguments))); return {ok: true, status: 'recovering'}; },
-  close() { calls.push(['close']); return {ok: true}; }
+  close() { calls.push(['close']); return {ok: true}; },
+  // The real bridge aliases hide() onto minimize(): a real OS minimize on Windows, orderOut + Dock
+  // recall on macOS. Recorded separately from close so a test can tell "went away" from "destroyed".
+  hide() { calls.push(['hide']); return {ok: true}; }
 };
 const window = {
   document,
@@ -2324,7 +2331,7 @@ class HttpChatPageContractTestCase(unittest.TestCase):
         self.assertTrue(result["inputFocused"])
         self.assertFalse(result["detachedOpenerFocused"])
 
-    def test_full_page_escape_closes_preview_then_popup_without_cross_script_error(self):
+    def test_full_page_escape_closes_preview_then_minimizes_without_cross_script_error(self):
         result = _run_js(r"""
           window.geChat.bootstrap({ok: true, backend: 'server', state: 'ready',
             conversation: {status: 'active', turn_count: 0, max_turns: 40, expires_at: 1},
@@ -2341,13 +2348,53 @@ class HttpChatPageContractTestCase(unittest.TestCase):
           try { document.dispatchEvent({type: 'keydown', key: 'Escape'}); }
           catch (error) { secondError = String(error && error.message ? error.message : error); }
           finish({firstError, secondError, hiddenAfterFirstEscape,
-            closeCalls: calls.filter((call) => call[0] === 'close').length});
+            closeCalls: calls.filter((call) => call[0] === 'close').length,
+            hideCalls: calls.filter((call) => call[0] === 'hide').length});
         """, include_chrome=True)
 
         self.assertIsNone(result["firstError"])
         self.assertTrue(result["hiddenAfterFirstEscape"])
         self.assertIsNone(result["secondError"])
+        # The preview overlay eats the first Escape; the second reaches the window — and MINIMIZES it.
+        self.assertEqual(result["hideCalls"], 1)
+        self.assertEqual(result["closeCalls"], 0)
+
+    def test_escape_minimizes_the_popup_and_never_destroys_the_artifact(self):
+        result = _run_js(r"""
+          document.dispatchEvent({type: 'keydown', key: 'Escape'});
+          finish({hideCalls: calls.filter((call) => call[0] === 'hide').length,
+            closeCalls: calls.filter((call) => call[0] === 'close').length});
+        """, include_chrome=True)
+
+        self.assertEqual(result["hideCalls"], 1)
+        self.assertEqual(result["closeCalls"], 0)
+
+    def test_escape_while_typing_or_composing_neither_minimizes_nor_closes(self):
+        result = _run_js(r"""
+          const editable = {closest(selector) { return selector.indexOf('textarea') >= 0 ? this : null; }};
+          document.dispatchEvent({type: 'keydown', key: 'Escape', target: editable});
+          const afterEditable = calls.length;
+          document.dispatchEvent({type: 'keydown', key: 'Escape', isComposing: true});
+          finish({afterEditable, afterComposing: calls.length,
+            hideCalls: calls.filter((call) => call[0] === 'hide').length,
+            closeCalls: calls.filter((call) => call[0] === 'close').length});
+        """, include_chrome=True)
+
+        # Escape is a routine keystroke in a text field / IME candidate list — the window must not move.
+        self.assertEqual(result["hideCalls"], 0)
+        self.assertEqual(result["closeCalls"], 0)
+
+    def test_the_header_close_button_still_destroys_the_popup(self):
+        result = _run_js(r"""
+          nodes['close-btn'].click();
+          nodes['hide-btn'].click();
+          finish({closeCalls: calls.filter((call) => call[0] === 'close').length,
+            hideCalls: calls.filter((call) => call[0] === 'hide').length});
+        """, include_chrome=True)
+
+        # Esc losing its close duty must not take the explicit ✕ with it.
         self.assertEqual(result["closeCalls"], 1)
+        self.assertEqual(result["hideCalls"], 1)
 
     def test_sent_message_reuses_clickable_image_thumbnails(self):
         result = _run_js(r"""

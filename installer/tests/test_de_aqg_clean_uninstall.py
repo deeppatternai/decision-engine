@@ -27,7 +27,11 @@ class PublicInstallEntryPointTests(unittest.TestCase):
     def test_public_entrypoints_have_only_reviewed_disclosure_findings(self):
         repo_root = Path(__file__).resolve().parents[2]
         expected = {
-            "dp-install.sh": [("ipv6:::dec", 1273)],
+            "dp-install.sh": [
+                ("secret:bearer-hex-token", 348),
+                ("secret:bearer-hex-token", 353),
+                ("ipv6:::dec", 1363),
+            ],
             "dp-install.ps1": [
                 ("ipv6:::e", line)
                 for line in (

@@ -333,6 +333,49 @@ class MacOSStopperSourceContractTests(unittest.TestCase):
         self.assertLess(guard_at, verify_at)
         self.assertIn('updated["status"] as? String) == "cancelling"', poll_body)
 
+    def test_native_poll_pacing_matches_the_python_panel(self):
+        """The native panel must pace its status polls the same way client/runner.py does.
+
+        Compile-unverified on this lane (no macOS toolchain); the release workflow
+        .github/workflows/macos-stopper-binaries.yml is what actually builds it.
+        """
+        from client import runner
+
+        # Same numbers as the Python side — a divergence here is a real behavior split.
+        self.assertIn("pollMinInterval: TimeInterval = %s" % runner.POLL_MIN_INTERVAL_S, _SOURCE)
+        self.assertIn("pollMaxInterval: TimeInterval = %s" % runner.POLL_MAX_INTERVAL_S, _SOURCE)
+        self.assertIn(
+            "pollBackoffCeiling: TimeInterval = %s" % runner.POLL_BACKOFF_CEILING_S, _SOURCE
+        )
+        self.assertIn("pollJitterFraction: Double = %s" % runner.POLL_JITTER_FRACTION, _SOURCE)
+        self.assertIn("pollAuthFailureLimit = %d" % runner.POLL_AUTH_FAILURE_LIMIT, _SOURCE)
+        self.assertIn(
+            "pollAuthProbeInterval: TimeInterval = %s" % runner.POLL_AUTH_PROBE_INTERVAL_S, _SOURCE
+        )
+        self.assertIn("pollAuthStatusCodes: Set<Int> = [401, 403]", _SOURCE)
+
+        # The refresh loop gates the REQUEST, not the timer: the 1 Hz tick draws the elapsed clock.
+        self.assertIn("withTimeInterval: 1.0, repeats: true", _SOURCE)
+        refresh_body = _SOURCE.split("@objc private func refresh", 1)[1].split(
+            "private func pollDelay", 1
+        )[0]
+        self.assertIn("(nextPollAllowedAt[runID] ?? 0) <= now", refresh_body)
+        # The gate is the SCHEDULE alone. Excluding an auth-exhausted run here instead would make
+        # the stop absorbing: only a successful poll clears the streak, and none would ever run.
+        self.assertNotIn("authFailures[runID]", refresh_body)
+        # …and the schedule is a monotonic interval, not a wall-clock instant a user can rewind.
+        self.assertIn("ProcessInfo.processInfo.systemUptime", refresh_body)
+
+        # A live view reschedules from the hub's suggestion; a failure backs off; "gone" still reaps.
+        poll_body = _SOURCE.split("private func poll(runID", 1)[1].split(
+            "private func render", 1
+        )[0]
+        self.assertIn('self.pollDelay(pollAfterMS: payload["poll_after_ms"])', poll_body)
+        self.assertIn("self.deferPoll(runID: runID", poll_body)
+        gone_at = poll_body.index("self.handleRunVanished(runID: runID)")
+        defer_at = poll_body.index("self.deferPoll(runID: runID")
+        self.assertLess(gone_at, defer_at, "a gone reply must reap rather than back off")
+
 
 
 class SwiftDebugAuditorDisplayTests(unittest.TestCase):

@@ -701,5 +701,82 @@ class MacStatusItemLifecycle(unittest.TestCase):
         self.assertLess(calls.index("apply_status"), calls.index("wire_status"))
 
 
+class PopupWindowLevelTests(unittest.TestCase):
+    """The content popup — 图解 / 漫解 / 信息图 / 讨论板 / 白板 are all THIS one window — is not
+    pinned above the caller (Owner, 2026-09-16). It still opens focused and in front; it just stops
+    winning every raise after that. The audit stop panel is the opposite case and lives in
+    client/stopper/panel.py.
+    """
+
+    class _StopAfterCreate(Exception):
+        pass
+
+    @staticmethod
+    def _fake_appkit_window():
+        return SimpleNamespace(
+            makeKeyAndOrderFront_=mock.Mock(),
+            setLevel_=mock.Mock(),
+        )
+
+    @staticmethod
+    def _fake_frameworks(ns_app):
+        """AppKit without a floating-level constant: importing one is itself the regression."""
+        app_kit = SimpleNamespace(NSApp=ns_app)
+        inline_queue = SimpleNamespace(
+            mainQueue=lambda: SimpleNamespace(
+                addOperationWithBlock_=lambda callback: callback(),
+            ),
+        )
+        return {"AppKit": app_kit, "Foundation": SimpleNamespace(NSOperationQueue=inline_queue)}
+
+    def test_window_is_created_without_on_top_and_keeps_the_visible_frame(self):
+        created = {}
+
+        class _FakeWebview:
+            @staticmethod
+            def create_window(**kwargs):
+                created.update(kwargs)
+                raise PopupWindowLevelTests._StopAfterCreate()
+
+        with mock.patch.dict(sys.modules, {"webview": _FakeWebview}), \
+             mock.patch.object(native_shell, "_IS_MAC", True), \
+             mock.patch.object(native_shell, "_IS_WINDOWS", False), \
+             mock.patch.object(native_shell, "_mac_visible_frame", return_value=(0, 25, 1440, 875)), \
+             mock.patch.object(native_shell, "_claim_app_identity"), \
+             mock.patch.object(native_shell, "_claim_dock_app_name"):
+            with self.assertRaises(PopupWindowLevelTests._StopAfterCreate):
+                native_shell.open_window("popup.html", "Popup", "result.json")
+
+        self.assertNotIn("on_top", created)
+        self.assertEqual(
+            (created["x"], created["y"], created["width"], created["height"]),
+            (0, 25, 1440, 875),
+        )
+
+    def test_opening_focuses_the_popup_without_setting_a_window_level(self):
+        ns_app = SimpleNamespace(activateIgnoringOtherApps_=mock.Mock())
+        window = self._fake_appkit_window()
+        with mock.patch.dict(sys.modules, self._fake_frameworks(ns_app)), \
+             mock.patch.object(native_shell, "_content_nswindow", return_value=window):
+            native_shell._mac_after_show()
+
+        ns_app.activateIgnoringOtherApps_.assert_called_once_with(True)
+        window.makeKeyAndOrderFront_.assert_called_once_with(None)
+        window.setLevel_.assert_not_called()
+
+    def test_recall_focuses_the_popup_without_setting_a_window_level(self):
+        ns_app = SimpleNamespace(activateIgnoringOtherApps_=mock.Mock())
+        window = self._fake_appkit_window()
+        win = _FakeWin()
+        with mock.patch.dict(sys.modules, self._fake_frameworks(ns_app)), \
+             mock.patch.object(native_shell, "_content_nswindow", return_value=window):
+            native_shell._show_and_focus(win)
+
+        self.assertEqual(win.show_calls, 1)
+        ns_app.activateIgnoringOtherApps_.assert_called_once_with(True)
+        window.makeKeyAndOrderFront_.assert_called_once_with(None)
+        window.setLevel_.assert_not_called()
+
+
 if __name__ == "__main__":
     unittest.main()

@@ -790,6 +790,51 @@ class RealTkActionButtonSmokeTests(unittest.TestCase):
         self.assertEqual(calls, ["stop"])
 
 
+class AlwaysOnTopTests(unittest.TestCase):
+    """The panel floats above other windows, matching the macOS Swift panel's `.floating` level
+    (Owner, 2026-09-16 — reverses the 2026-07-17 "not always-on-top on Windows" decision)."""
+
+    class _FakeRoot:
+        def __init__(self, error=None):
+            self.calls = []
+            self.error = error
+
+        def attributes(self, *args):
+            if self.error is not None:
+                raise self.error("bad window attribute \"-topmost\"")
+            self.calls.append(args)
+
+    def test_root_is_floated_above_other_windows(self):
+        root = self._FakeRoot()
+        self.assertTrue(panel.apply_always_on_top(root, _FakeTk))
+        self.assertEqual(root.calls, [("-topmost", True)])
+
+    def test_tk_without_topmost_leaves_the_panel_running(self):
+        for error in (_FakeTk.TclError, AttributeError, TypeError):
+            with self.subTest(error=error.__name__):
+                root = self._FakeRoot(error=error)
+                self.assertFalse(panel.apply_always_on_top(root, _FakeTk))
+
+    def test_real_tk_panel_window_reports_topmost(self):
+        try:
+            import tkinter as tk
+        except ImportError as exc:
+            self.skipTest("tkinter unavailable: %s" % exc)
+        try:
+            root = tk.Tk()
+        except tk.TclError as exc:
+            self.skipTest("Tk display unavailable: %s" % exc)
+        self.addCleanup(root.destroy)
+        root.withdraw()
+        with mock.patch.object(tk, "Tk", return_value=root), \
+             mock.patch.object(panel.tk_icon, "claim_app_identity"), \
+             mock.patch.object(panel.tk_icon, "apply_window_icon"), \
+             mock.patch.object(panel.tk_icon, "apply_dock_app_name"), \
+             mock.patch.object(panel.tk_icon, "apply_dock_icon"):
+            app = panel.StopPanelApp()
+        self.assertTrue(bool(app.root.attributes("-topmost")))
+
+
 class RenderHelperTests(unittest.TestCase):
     NOW = 1_000_000.0
 
@@ -1292,6 +1337,9 @@ class CancelContractTests(unittest.TestCase):
         app._polling = set()
         app._retired = set()
         app._not_found_polls = {}
+        app._next_poll_at = {}
+        app._poll_failures = {}
+        app._auth_failures = {}
         app._lock = threading.Lock()
         app._render = mock.Mock()
         return app
@@ -1884,6 +1932,9 @@ class DiskResurrectionTests(unittest.TestCase):
         app._server_verified = set()
         app._state_epochs = {}
         app._not_found_polls = {}
+        app._next_poll_at = {}
+        app._poll_failures = {}
+        app._auth_failures = {}
         app._lock = threading.Lock()
         return app
 
@@ -1955,6 +2006,9 @@ class RegistryReapTests(unittest.TestCase):
         app._server_verified = set()
         app._state_epochs = {}
         app._not_found_polls = {}
+        app._next_poll_at = {}
+        app._poll_failures = {}
+        app._auth_failures = {}
         app._lock = threading.Lock()
         return app
 
