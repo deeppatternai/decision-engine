@@ -33,24 +33,29 @@ class PublicInstallEntryPointTests(unittest.TestCase):
                 ("ipv6:::dec", 1363),
             ],
             "dp-install.ps1": [
-                ("ipv6:::e", line)
-                for line in (
-                    45,
-                    1242,
-                    1319,
-                    1588,
-                    1757,
-                    1766,
-                    1776,
-                    1784,
-                    1804,
-                    1814,
-                    1879,
-                    1947,
-                )
+                ("ipv6:::e", 59),
+                # Fixed public SHA-256 digests for the pinned private runtimes.
+                ("secret:bearer-hex-token", 515),
+                ("secret:bearer-hex-token", 520),
+                *(
+                    ("ipv6:::e", line)
+                    for line in (
+                        1644,
+                        1870,
+                        2044,
+                        2053,
+                        2063,
+                        2071,
+                        2091,
+                        2101,
+                        2166,
+                        2255,
+                        2263,
+                    )
+                ),
             ],
             "dp-uninstall.ps1": [
-                ("ipv6:::e", line) for line in (38, 392, 1816, 1822)
+                ("ipv6:::e", line) for line in (39, 139, 487, 2334, 2340)
             ],
         }
 

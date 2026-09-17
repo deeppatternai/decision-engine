@@ -7,10 +7,10 @@ Safely uninstalls or quarantines Deep Pattern managed state on native Windows.
 The default mode is read-only. Pass -Apply only after reviewing the dry-run
 plan. The uninstaller removes only integrations whose current managed fields
 still match Decision Engine ownership evidence. Foreign or modified entries,
-unexpected reparse points, active managed runtime processes, and unknown root
-layouts stop the entire operation before mutation. Apply mode first asks the
-user to quit the owning Agent and can then terminate only a revalidated,
-current-user managed DE MCP launcher process.
+unexpected reparse points, unverified runtime processes, and unknown root
+layouts stop the entire operation before mutation. Apply mode can terminate
+only revalidated, current-user managed DE/AQG child processes after explicit
+confirmation; Agent applications themselves are never terminated.
 
 Source/worktree checkouts are always preserved. Removed managed roots and
 configuration snapshots are retained under the current user's private
@@ -32,6 +32,7 @@ Set-StrictMode -Version Latest
 $ErrorActionPreference = "Stop"
 $ProgramName = "dp-uninstall"
 $ExitProcessBlocked = 5
+$script:PrivateBootstrapRoot = $null
 
 function Stop-Uninstall {
     param([Parameter(Mandatory = $true)][string]$Message)
@@ -129,6 +130,26 @@ function Invoke-Clean {
     }
 }
 
+function Test-ManagedPrivatePythonCandidate {
+    param([Parameter(Mandatory = $true)][string]$Candidate)
+
+    $root = Join-Path $HomePath ".deeppattern\de-python"
+    $expected = Join-Path $root "Scripts\python.exe"
+    $marker = Join-Path $root ".deeppattern-python-env"
+    if (-not [string]::Equals(
+            [IO.Path]::GetFullPath($Candidate),
+            [IO.Path]::GetFullPath($expected),
+            [StringComparison]::OrdinalIgnoreCase
+        ) -or
+        -not (Test-Path -LiteralPath $root -PathType Container) -or
+        (Test-ReparsePoint -Path $root) -or
+        -not (Test-Path -LiteralPath $marker -PathType Leaf) -or
+        (Test-ReparsePoint -Path $marker)) {
+        return $false
+    }
+    return @(Get-Content -LiteralPath $marker -ErrorAction SilentlyContinue) -contains "schema=1"
+}
+
 function Test-Python {
     param([Parameter(Mandatory = $true)][string]$Candidate)
     if (-not (Test-Path -LiteralPath $Candidate -PathType Leaf)) {
@@ -138,7 +159,10 @@ function Test-Python {
         -Path $Candidate `
         -PublisherPattern "(?i:Python Software Foundation|Microsoft Corporation|Anaconda)"
     if ($null -eq $verified) {
-        return $false
+        if (-not (Test-ManagedPrivatePythonCandidate -Candidate $Candidate)) {
+            return $false
+        }
+        $verified = (Get-Item -LiteralPath $Candidate -Force).FullName
     }
     $probe = Invoke-Clean -FilePath $verified -ArgumentList @(
         "-I", "-c", "import sys; raise SystemExit(0 if sys.version_info[:2] >= (3, 12) else 1)"
@@ -149,14 +173,81 @@ function Test-Python {
     return $true
 }
 
+function New-PrivateUninstallBootstrap {
+    $managedRoot = Join-Path $HomePath ".deeppattern\de-python"
+    $marker = Join-Path $managedRoot ".deeppattern-python-env"
+    $baseLine = @(
+        Get-Content -LiteralPath $marker -ErrorAction Stop |
+            Where-Object { $_ -like "base_python=*" }
+    )
+    if ($baseLine.Count -ne 1) {
+        Stop-Uninstall "The private Python environment does not identify one base runtime."
+    }
+    $basePython = [string]$baseLine[0].Substring("base_python=".Length)
+    $verifiedBase = Get-VerifiedAuthenticodePath `
+        -Path $basePython `
+        -PublisherPattern "(?i:Python Software Foundation|Microsoft Corporation|Anaconda)"
+    if ($null -ne $verifiedBase) {
+        return $verifiedBase
+    }
+
+    $runtimeRoot = Join-Path $HomePath ".deeppattern\runtimes"
+    $fullBase = [IO.Path]::GetFullPath($basePython)
+    $fullRuntimeRoot = [IO.Path]::GetFullPath($runtimeRoot).TrimEnd("\") + "\"
+    if (-not $fullBase.StartsWith($fullRuntimeRoot, [StringComparison]::OrdinalIgnoreCase) -or
+        [IO.Path]::GetFileName($fullBase) -ne "python.exe") {
+        Stop-Uninstall "The private Python base runtime identity cannot be proven."
+    }
+    $pythonDirectory = Split-Path -Parent $fullBase
+    $runtimeDirectory = Split-Path -Parent $pythonDirectory
+    $runtimeMarker = Join-Path $runtimeDirectory ".deeppattern-python-runtime"
+    if (-not (Test-Path -LiteralPath $runtimeMarker -PathType Leaf) -or
+        (Test-ReparsePoint -Path $runtimeDirectory) -or
+        (Test-ReparsePoint -Path $runtimeMarker) -or
+        (@(Get-Content -LiteralPath $runtimeMarker -ErrorAction Stop) -notcontains "schema=1")) {
+        Stop-Uninstall "The private Python base runtime marker cannot be verified."
+    }
+
+    $script:PrivateBootstrapRoot = Join-Path (
+        [IO.Path]::GetTempPath()
+    ) ("dp-uninstall-python-" + [Guid]::NewGuid().ToString("N"))
+    $bootstrapDirectory = Join-Path $script:PrivateBootstrapRoot "python"
+    Write-Host "Preparing a temporary verified Deep Pattern Python runtime for uninstall."
+    Write-Host "This copies the private runtime before it is removed and may take a moment; no input is required."
+    $bootstrapTimer = [System.Diagnostics.Stopwatch]::StartNew()
+    try {
+        New-Item -ItemType Directory -Path $script:PrivateBootstrapRoot | Out-Null
+        Copy-Item -LiteralPath $pythonDirectory -Destination $bootstrapDirectory -Recurse -Force
+        $bootstrapPython = Join-Path $bootstrapDirectory "python.exe"
+        $probe = Invoke-Clean -FilePath $bootstrapPython -ArgumentList @(
+            "-I", "-c", "import ssl, sys, tkinter; raise SystemExit(0 if sys.version_info[:2] >= (3, 12) else 1)"
+        ) -Capture
+        if ($probe.ExitCode -ne 0) {
+            throw "temporary private Python verification failed"
+        }
+        $bootstrapTimer.Stop()
+        Write-Host ("Temporary uninstall runtime ready in {0:N1} seconds." -f $bootstrapTimer.Elapsed.TotalSeconds)
+        return $bootstrapPython
+    }
+    catch {
+        Remove-Item -LiteralPath $script:PrivateBootstrapRoot -Recurse -Force -ErrorAction SilentlyContinue
+        $script:PrivateBootstrapRoot = $null
+        Stop-Uninstall "The temporary private Python uninstall runtime could not be prepared."
+    }
+}
+
 function Resolve-Python {
     $candidates = New-Object System.Collections.Generic.List[string]
     if (-not [string]::IsNullOrWhiteSpace($env:DE_AQG_PYTHON)) {
         $candidates.Add($env:DE_AQG_PYTHON)
     }
-    $managedPython = Join-Path $HomePath ".deeppattern\decision-engine\.venv\Scripts\python.exe"
-    if (Test-Path -LiteralPath $managedPython -PathType Leaf) {
-        $candidates.Add($managedPython)
+    foreach ($managedPython in @(
+        (Join-Path $HomePath ".deeppattern\de-python\Scripts\python.exe"),
+        (Join-Path $HomePath ".deeppattern\decision-engine\.venv\Scripts\python.exe")
+    )) {
+        if (Test-Path -LiteralPath $managedPython -PathType Leaf) {
+            $candidates.Add($managedPython)
+        }
     }
     $launchers = New-Object System.Collections.Generic.List[string]
     foreach ($entry in @(
@@ -205,7 +296,11 @@ function Resolve-Python {
     }
     foreach ($candidate in ($candidates | Select-Object -Unique)) {
         if (Test-Python -Candidate $candidate) {
-            return (Get-Item -LiteralPath $candidate).FullName
+            $resolved = (Get-Item -LiteralPath $candidate).FullName
+            if (Test-ManagedPrivatePythonCandidate -Candidate $resolved) {
+                return New-PrivateUninstallBootstrap
+            }
+            return $resolved
         }
     }
     Stop-Uninstall "Python 3.12 or newer is required."
@@ -278,7 +373,7 @@ function Confirm-UserAction {
     param([Parameter(Mandatory = $true)][string]$Message)
 
     try {
-        $answer = Read-Host ("{0} [y/N]" -f $Message)
+        $answer = Read-Host ("{0} [Y/N]" -f $Message)
     }
     catch {
         return $false
@@ -414,12 +509,23 @@ function Get-LikelyHostForProcess {
         }
         switch -Regex ($snapshot.Name) {
             "^(?i:claude\.exe)$" { return "Claude Desktop" }
+            "^(?i:chatgpt\.exe)$" { return "Codex (ChatGPT)" }
             "^(?i:codebuddy.*\.exe)$" { return "CodeBuddy" }
             "^(?i:codex.*\.exe)$" { return "Codex" }
             "^(?i:cursor.*\.exe)$" { return "Cursor" }
             "^(?i:qoder.*\.exe)$" { return "Qoder" }
             "^(?i:trae.*\.exe)$" { return "TRAE" }
             "^(?i:workbuddy.*\.exe)$" { return "WorkBuddy" }
+        }
+        $identityText = ("{0} {1} {2}" -f $snapshot.Name, $snapshot.ExecutablePath, $snapshot.CommandLine)
+        switch -Regex ($identityText) {
+            "(?i:ChatGPT)" { return "Codex (ChatGPT)" }
+            "(?i:Claude)" { return "Claude Desktop" }
+            "(?i:CodeBuddy)" { return "CodeBuddy" }
+            "(?i:Cursor)" { return "Cursor" }
+            "(?i:Qoder)" { return "Qoder" }
+            "(?i:TRAE)" { return "TRAE" }
+            "(?i:WorkBuddy)" { return "WorkBuddy" }
         }
         $current = $snapshot.ParentProcessId
     }
@@ -442,73 +548,191 @@ function Test-SameProcessSnapshot {
     )
 }
 
-function Resolve-ActiveManagedSessions {
-    $processIds = @(Get-LiveManagedLeasePids)
-    if ($processIds.Count -eq 0) {
-        Write-Host "Live DE MCP sessions were reported, but their process identities could not be read safely."
-        return $false
-    }
+function Test-ManagedCommandReference {
+    param([Parameter(Mandatory = $true)]$Snapshot)
 
-    Write-Host "Active DE/AQG runtime processes were detected."
-    foreach ($processId in $processIds) {
-        $snapshot = Get-ProcessSnapshot -ProcessId $processId
-        $parent = if ($null -eq $snapshot) { "unknown" } else { [string]$snapshot.ParentProcessId }
-        Write-Host ("BLOCKED PROCESS pid={0} ppid={1} host={2} family=mcp-launcher" -f $processId, $parent, (Get-LikelyHostForProcess -ProcessId $processId))
+    if ([string]::IsNullOrWhiteSpace($Snapshot.CommandLine)) { return $false }
+    $command = $Snapshot.CommandLine.Replace("\", "/").ToLowerInvariant()
+    foreach ($root in @(
+        (Join-Path $HomePath ".deeppattern\decision-engine"),
+        (Join-Path $HomePath ".deeppattern\agent-quality-gates"),
+        (Join-Path $HomePath ".deeppattern\de-python")
+    )) {
+        if ($command.Contains($root.Replace("\", "/").ToLowerInvariant())) {
+            return $true
+        }
     }
-    Write-Host "Completely quit the listed Agent hosts; closing only their windows is not sufficient."
+    return $false
+}
+
+function Get-ManagedProcessCandidatePids {
+    $ids = New-Object System.Collections.Generic.HashSet[int]
+    foreach ($processId in @(Get-LiveManagedLeasePids)) {
+        $null = $ids.Add([int]$processId)
+    }
     try {
-        $answer = Read-Host "After quitting them, press Enter to recheck immediately (or type N to cancel)"
+        foreach ($process in @(Get-CimInstance -ClassName Win32_Process -ErrorAction Stop)) {
+            if ([string]::IsNullOrWhiteSpace([string]$process.CommandLine) -or
+                [string]$process.CommandLine -notmatch "(?i:installer\.(?:launcher|shim)|mcp_bootstrap\.py)") {
+                continue
+            }
+            $snapshot = Get-ProcessSnapshot -ProcessId ([int]$process.ProcessId)
+            if ($null -ne $snapshot -and
+                (Test-ManagedLauncherSnapshot -Snapshot $snapshot) -and
+                (Test-ManagedCommandReference -Snapshot $snapshot)) {
+                $null = $ids.Add([int]$snapshot.ProcessId)
+            }
+        }
     }
     catch {
-        return $false
+        # Lease-backed PIDs remain usable if the broad inventory cannot be read.
     }
-    if ($answer -match "^(?i:n|no|q|quit)$") {
-        return $false
-    }
+    return @($ids | Sort-Object)
+}
 
-    $remaining = @(Get-LiveManagedLeasePids)
-    if ($remaining.Count -eq 0) {
-        Write-Host "All blocking Agent processes exited normally."
-        return $true
+function Get-VisibleLauncherSnapshots {
+    $snapshots = New-Object System.Collections.Generic.List[object]
+    try {
+        foreach ($process in @(Get-CimInstance -ClassName Win32_Process -ErrorAction Stop)) {
+            if ([string]::IsNullOrWhiteSpace([string]$process.CommandLine) -or
+                [string]$process.CommandLine -notmatch "(?i:installer\.(?:launcher|shim)|mcp_bootstrap\.py)") {
+                continue
+            }
+            $snapshot = Get-ProcessSnapshot -ProcessId ([int]$process.ProcessId)
+            if ($null -ne $snapshot -and (Test-ManagedLauncherSnapshot -Snapshot $snapshot)) {
+                $snapshots.Add($snapshot)
+            }
+        }
+    }
+    catch {
+        return @()
+    }
+    # Windows PowerShell 5.1 can throw "Argument types do not match" when its
+    # dynamic binder applies @() directly to a generic List[object].
+    return $snapshots.ToArray()
+}
+
+function Write-ManagedProcessSummary {
+    param([Parameter(Mandatory = $true)]$Snapshots)
+
+    Write-Host "ACTIVE AGENT SESSIONS:"
+    $groups = $Snapshots | Group-Object { Get-LikelyHostForProcess -ProcessId $_.ProcessId }
+    foreach ($group in $groups) {
+        $hostName = [string]$group.Name
+        if ($hostName -eq "Unknown Agent") {
+            Write-Host "  Unknown Agent (host could not be identified):"
+        }
+        else {
+            Write-Host ("  {0}:" -f $hostName)
+        }
+        Write-Host ("    {0} active MCP session(s)" -f $group.Count)
+        foreach ($snapshot in $group.Group) {
+            Write-Host ("    PID={0} PPID={1} executable={2}" -f
+                $snapshot.ProcessId, $snapshot.ParentProcessId, $snapshot.ExecutablePath)
+            if ($hostName -eq "Unknown Agent") {
+                $ancestorId = $snapshot.ParentProcessId
+                $visited = New-Object System.Collections.Generic.HashSet[int]
+                for ($depth = 0; $depth -lt 5 -and $ancestorId -gt 0; $depth++) {
+                    if (-not $visited.Add([int]$ancestorId)) { break }
+                    $ancestor = Get-ProcessSnapshot -ProcessId $ancestorId
+                    if ($null -eq $ancestor) { break }
+                    Write-Host ("    ancestor={0} executable={1} (PID={2})" -f
+                        $ancestor.Name, $ancestor.ExecutablePath, $ancestor.ProcessId)
+                    $ancestorId = $ancestor.ParentProcessId
+                }
+            }
+        }
+    }
+}
+
+function Get-ManagedTerminationOrder {
+    param([Parameter(Mandatory = $true)]$Snapshots)
+
+    $byPid = @{}
+    foreach ($snapshot in $Snapshots) {
+        $byPid[[int]$snapshot.ProcessId] = $snapshot
+    }
+    $ranked = foreach ($snapshot in $Snapshots) {
+        $depth = 0
+        $parentId = [int]$snapshot.ParentProcessId
+        $visited = @{}
+        while ($parentId -gt 0 -and $byPid.ContainsKey($parentId) -and -not $visited.ContainsKey($parentId)) {
+            $visited[$parentId] = $true
+            $depth++
+            $parentId = [int]$byPid[$parentId].ParentProcessId
+        }
+        [pscustomobject]@{
+            Depth = $depth
+            Snapshot = $snapshot
+        }
+    }
+    return @(
+        $ranked |
+            Sort-Object -Property `
+                @{ Expression = { $_.Depth }; Descending = $true }, `
+                @{ Expression = { $_.Snapshot.ProcessId }; Descending = $false } |
+            ForEach-Object { $_.Snapshot }
+    )
+}
+
+function Resolve-ActiveManagedSessions {
+    $processIds = @(Get-ManagedProcessCandidatePids)
+    $visible = @(Get-VisibleLauncherSnapshots)
+    if ($visible.Count -gt 0) {
+        Write-ManagedProcessSummary -Snapshots $visible
+    }
+    if ($processIds.Count -eq 0) {
+        Write-Host "Live DE/AQG processes were reported, but no process identity was safe to terminate automatically."
+        return $false
     }
 
     $frozen = New-Object System.Collections.Generic.List[object]
-    foreach ($processId in $remaining) {
+    foreach ($processId in $processIds) {
         $snapshot = Get-ProcessSnapshot -ProcessId $processId
         if ($null -ne $snapshot -and
             (Test-ManagedLauncherSnapshot -Snapshot $snapshot) -and
-            (Test-ManagedLeasePid -ProcessId $processId)) {
+            ((Test-ManagedLeasePid -ProcessId $processId) -or
+             (Test-ManagedCommandReference -Snapshot $snapshot))) {
             $frozen.Add($snapshot)
         }
     }
-    if ($frozen.Count -ne $remaining.Count) {
-        Write-Host "No remaining process is eligible for managed termination. Fully quit the listed Agent hosts and rerun the uninstaller."
+    if ($frozen.Count -eq 0) {
+        Write-Host "No active process is eligible for managed termination. Close the identified Agent application and rerun the uninstaller."
         return $false
     }
 
-    $pidList = ($frozen | ForEach-Object { [string]$_.ProcessId }) -join ", "
-    if (-not (Confirm-UserAction -Message ("Terminate the verified managed DE/AQG process(es) pid={0}?" -f $pidList))) {
-        Write-Host "Managed processes were not terminated; uninstall remains blocked."
+    if ($visible.Count -eq 0) {
+        Write-ManagedProcessSummary -Snapshots $frozen
+    }
+    Write-Host "The listed processes are verified DE/AQG child processes. Agent applications themselves will not be closed."
+    if (-not (Confirm-UserAction -Message ("Terminate {0} verified Deep Pattern process(es) now?" -f $frozen.Count))) {
+        Write-Host "UNINSTALL_PENDING: process termination was declined; no files or settings were changed."
         return $false
     }
-    foreach ($snapshot in $frozen) {
+    $terminationOrder = @(Get-ManagedTerminationOrder -Snapshots $frozen.ToArray())
+    foreach ($snapshot in $terminationOrder) {
         $current = Get-ProcessSnapshot -ProcessId $snapshot.ProcessId
-        if ($null -eq $current -or
-            -not (Test-SameProcessSnapshot -Expected $snapshot -Actual $current) -or
+        if ($null -eq $current) {
+            Write-Host ("Verified Deep Pattern process pid={0} already exited." -f $snapshot.ProcessId)
+            continue
+        }
+        if (-not (Test-SameProcessSnapshot -Expected $snapshot -Actual $current) -or
             -not (Test-ManagedLauncherSnapshot -Snapshot $current) -or
-            -not (Test-ManagedLeasePid -ProcessId $snapshot.ProcessId)) {
+            (-not (Test-ManagedLeasePid -ProcessId $snapshot.ProcessId) -and
+             -not (Test-ManagedCommandReference -Snapshot $current))) {
             Write-Host ("BLOCKED PROCESS pid={0} termination refused because its identity changed or ownership could not be re-proven." -f $snapshot.ProcessId)
             return $false
         }
         try {
             Stop-Process -Id $snapshot.ProcessId -Force -ErrorAction Stop
-            Write-Host ("Terminated verified managed process pid={0}." -f $snapshot.ProcessId)
+            Write-Host ("Terminated verified Deep Pattern process pid={0}." -f $snapshot.ProcessId)
         }
         catch {
             Write-Host ("BLOCKED PROCESS pid={0} termination failed: {1}" -f $snapshot.ProcessId, $_.Exception.GetType().Name)
             return $false
         }
     }
+    Start-Sleep -Milliseconds 500
     return $true
 }
 
@@ -516,6 +740,7 @@ if ([System.Environment]::OSVersion.Platform -ne [System.PlatformID]::Win32NT) {
     Stop-Uninstall "This entrypoint supports native Windows only."
 }
 
+Write-Host "Preparing the verified Deep Pattern uninstall environment..."
 $PythonPath = Resolve-Python
 $GitPath = Resolve-Git
 $temporaryRoot = Join-Path ([IO.Path]::GetTempPath()) ("dp-uninstall-" + [Guid]::NewGuid().ToString("N"))
@@ -549,6 +774,7 @@ EXIT_BLOCKED = 3
 EXIT_PROCESS_BLOCKED = 5
 SERVER_NAME = "decision-engine"
 MAX_CONFIG_BYTES = 4 * 1024 * 1024
+MAX_UNINSTALL_BACKUPS = 5
 GIT_EXE = ""
 PROCESS_INVENTORY_PATH: Path | None = None
 PROCESS_INVENTORY_SHA256 = ""
@@ -592,6 +818,10 @@ DE_PRODUCT_REMOTES = {
     "gitee": "https://gitee.com/deeppatternai/decision-engine.git",
 }
 AQG_PRODUCT_REMOTE = "https://github.com/deeppatternai/agent-quality-gates.git"
+UNINSTALL_BACKUP_NAME = re.compile(
+    r"(?P<stamp>[0-9]{8}-[0-9]{6})(?:-(?P<suffix>[0-9]+))?"
+    r"-dp-uninstall-(?P<scope>de|aqg|both)"
+)
 
 
 def known_windows_config_paths(home: Path) -> tuple[Path, ...]:
@@ -978,6 +1208,102 @@ def toml_without_server(text: str) -> tuple[str, bool]:
     return "".join(output), changed
 
 
+def safe_managed_directory(path: Path, home: Path) -> bool:
+    return (
+        path.is_dir()
+        and not is_reparse(path)
+        and reject_reparse_components(path, home) is None
+    )
+
+
+def marker_has_schema(path: Path, marker_name: str) -> bool:
+    marker = path / marker_name
+    if not marker.is_file() or is_reparse(marker):
+        return False
+    try:
+        return "schema=1" in marker.read_text(encoding="utf-8").splitlines()
+    except (OSError, UnicodeError):
+        return False
+
+
+def managed_runtime_path_owned(path: Path, dp: Path, home: Path) -> bool:
+    if not safe_managed_directory(path, home):
+        return False
+    if path == dp / "de-python":
+        return marker_has_schema(path, ".deeppattern-python-env")
+    if path == dp / "runtimes":
+        try:
+            children = tuple(path.iterdir())
+        except OSError:
+            return False
+        return all(
+            safe_managed_directory(child, home)
+            and marker_has_schema(child, ".deeppattern-python-runtime")
+            for child in children
+        )
+    if path == dp / "runtime-backups":
+        try:
+            children = tuple(path.iterdir())
+        except OSError:
+            return False
+        return all(
+            safe_managed_directory(child, home)
+            and (
+                marker_has_schema(child, ".deeppattern-python-runtime")
+                or marker_has_schema(child, ".deeppattern-python-env")
+            )
+            for child in children
+        )
+    return False
+
+
+def managed_uninstall_backups(home: Path, dp: Path) -> list[Path]:
+    base = dp / "uninstall-backups"
+    if not lexists(base):
+        return []
+    if not safe_managed_directory(base, home):
+        raise RuntimeError("uninstall backup root is not a safe directory: %s" % base)
+    roots: list[tuple[str, int, str, Path]] = []
+    for child in base.iterdir():
+        match = UNINSTALL_BACKUP_NAME.fullmatch(child.name)
+        if match is None or not safe_managed_directory(child, home):
+            continue
+        manifest = child / "manifest.json"
+        if not manifest.is_file() or is_reparse(manifest):
+            continue
+        try:
+            data = json.loads(manifest.read_text(encoding="utf-8"))
+        except (OSError, UnicodeError, ValueError):
+            continue
+        if (
+            data.get("schema") != 1
+            or data.get("platform") != "win32"
+            or data.get("scope") != match.group("scope")
+            or not isinstance(data.get("items"), list)
+        ):
+            continue
+        recorded_home = data.get("home")
+        if recorded_home is not None and path_key(Path(recorded_home)) != path_key(home):
+            continue
+        roots.append((match.group("stamp"), int(match.group("suffix") or 0), child.name, child))
+    return [item[3] for item in sorted(roots)]
+
+
+def prune_uninstall_backups(home: Path, dp: Path, current: Path | None = None) -> int:
+    roots = managed_uninstall_backups(home, dp)
+    if current is not None and current not in roots:
+        raise RuntimeError("current uninstall backup cannot be revalidated: %s" % current)
+    obsolete = roots[:-MAX_UNINSTALL_BACKUPS]
+    for path in obsolete:
+        shutil.rmtree(path)
+    if obsolete:
+        print(
+            "PRUNED %d old uninstall backup(s); retained latest %d"
+            % (len(obsolete), MAX_UNINSTALL_BACKUPS)
+        )
+    return len(obsolete)
+
+
 @dataclass
 class Action:
     kind: str
@@ -1095,7 +1421,7 @@ class Inventory:
 
     def inspect_root(self, root: Path, component: str) -> None:
         if not lexists(root):
-            self.notes.append("PRESERVE absent %s" % root)
+            self.notes.append("ABSENT %s" % root)
             return
         if is_reparse(root):
             if component != "aqg":
@@ -1398,11 +1724,143 @@ class Inventory:
         if not found:
             self.notes.append("PRESERVE no provable DE integration residue without a managed root")
 
+    def proven_aqg_version_target(self, path: Path) -> bool:
+        if not safe_managed_directory(path, self.home):
+            return False
+        required = (
+            path / ".git",
+            path / "scripts" / "install_aqg_clients.py",
+            path / "VERSION",
+            path / "requirements.txt",
+        )
+        if not all(item.exists() and not is_reparse(item) for item in required):
+            return False
+        try:
+            head = git_output(path, "rev-parse", "HEAD")
+        except (OSError, subprocess.SubprocessError, ValueError):
+            return False
+        return (
+            aqg_checkout_has_product_remote(path)
+            and checkout_is_clean(path)
+            and aqg_managed_target_name_matches(path, head)
+        )
+
+    def inspect_managed_state_cleanup(self) -> None:
+        if self.scope in ("de", "both"):
+            install_lock = self.dp / ".install.lock"
+            if lexists(install_lock):
+                if (
+                    is_reparse(install_lock)
+                    or not install_lock.is_file()
+                    or reject_reparse_components(install_lock, self.home) is not None
+                ):
+                    self.blockers.append(
+                        "DE install lock ownership cannot be proven: %s" % install_lock
+                    )
+                else:
+                    self.add(
+                        "quarantine-aux",
+                        install_lock,
+                        "DE install lock",
+                        expected_sha256=sha256_file(install_lock),
+                    )
+            for path in (
+                self.dp / "de-python",
+                self.dp / "runtimes",
+                self.dp / "runtime-backups",
+            ):
+                if not lexists(path):
+                    continue
+                if managed_runtime_path_owned(path, self.dp, self.home):
+                    self.add("quarantine-aux", path, "owned Deep Pattern private Python state")
+                else:
+                    self.blockers.append(
+                        "Deep Pattern runtime ownership cannot be proven: %s" % path
+                    )
+            installations = self.dp / "installations"
+            for name in ("decision-engine.json", "decision-engine.identity.lock"):
+                path = installations / name
+                if not lexists(path):
+                    continue
+                if is_reparse(path) or not path.is_file():
+                    self.blockers.append("DE installation record ownership is unknown: %s" % path)
+                else:
+                    self.add("quarantine-aux", path, "owned DE installation record")
+
+        if self.scope in ("aqg", "both"):
+            for path, detail in (
+                (self.dp / "aqg-state", "AQG managed state"),
+                (self.dp / "aqg-backups", "AQG legacy backup archive"),
+            ):
+                if not lexists(path):
+                    continue
+                if safe_managed_directory(path, self.home):
+                    self.add("quarantine-aux", path, detail)
+                else:
+                    self.blockers.append("AQG auxiliary ownership cannot be proven: %s" % path)
+
+            versions = self.dp / "versions"
+            if lexists(versions):
+                if not safe_managed_directory(versions, self.home):
+                    self.blockers.append("AQG versions path is not a safe directory: %s" % versions)
+                else:
+                    for child in sorted(versions.iterdir(), key=lambda item: item.name.lower()):
+                        if self.aqg_target is not None and path_key(child) == path_key(self.aqg_target):
+                            continue
+                        owned_backup = (
+                            child.name == "aqg-backups"
+                            and safe_managed_directory(child, self.home)
+                        )
+                        if owned_backup or self.proven_aqg_version_target(child):
+                            self.add(
+                                "quarantine-aqg-version",
+                                child,
+                                "unreferenced AQG managed version or backup residue",
+                            )
+                        else:
+                            self.blockers.append(
+                                "AQG versions contains unproven content that must be preserved: %s"
+                                % child
+                            )
+
+        planned = {path_key(action.path) for action in self.actions}
+        directories: list[Path] = []
+        if self.scope in ("de", "both"):
+            directories.extend((self.dp / "installations", self.dp / "popup-sessions"))
+        if self.scope in ("aqg", "both"):
+            directories.append(self.dp / "versions")
+        for directory in directories:
+            if not lexists(directory):
+                continue
+            if not safe_managed_directory(directory, self.home):
+                self.blockers.append("managed state path is not a safe directory: %s" % directory)
+                continue
+            children = tuple(directory.iterdir())
+            if children and not all(path_key(child) in planned for child in children):
+                self.notes.append("PRESERVE non-empty managed state directory %s" % directory)
+                continue
+            self.add("remove-empty-dir", directory, "remove after managed contents are quarantined")
+
+    def inspect_backup_retention(self) -> None:
+        try:
+            roots = managed_uninstall_backups(self.home, self.dp)
+        except RuntimeError as exc:
+            self.blockers.append(str(exc))
+            return
+        creates_backup = any(action.kind != "backup-retention" for action in self.actions)
+        if len(roots) + int(creates_backup) > MAX_UNINSTALL_BACKUPS:
+            self.add(
+                "backup-retention",
+                self.dp / "uninstall-backups",
+                "retain latest %d managed backups after successful uninstall"
+                % MAX_UNINSTALL_BACKUPS,
+            )
+
     def inspect(self) -> None:
         if lexists(self.source_root):
             self.notes.append("PRESERVE protected source/worktree %s" % self.source_root)
         else:
-            self.notes.append("PRESERVE absent protected source/worktree %s" % self.source_root)
+            self.notes.append("ABSENT protected source/worktree %s" % self.source_root)
         if self.scope in ("de", "both"):
             self.inspect_root(self.de_root, "de")
             self.inspect_de_integrations()
@@ -1411,6 +1869,8 @@ class Inventory:
             self.inspect_root(self.aqg_root, "aqg")
             if lexists(self.aqg_root) and self.aqg_uninstaller is None:
                 self.blockers.append("AQG official uninstaller ownership cannot be proven")
+        self.inspect_managed_state_cleanup()
+        self.inspect_backup_retention()
 
 
 def has_only_guidable_process_blockers(blockers: Iterable[str]) -> bool:
@@ -1427,6 +1887,8 @@ def print_inventory(inv: Inventory, apply: bool) -> None:
     for action in inv.actions:
         if action.kind == "aqg-uninstall":
             print("RUN %s (%s)" % (action.path, action.detail))
+        elif action.kind == "backup-retention":
+            print("PRUNE %s (%s)" % (action.path, action.detail))
         else:
             print("REMOVE %s (%s)" % (action.path, action.detail))
     for note in inv.notes:
@@ -1434,7 +1896,7 @@ def print_inventory(inv: Inventory, apply: bool) -> None:
     for blocker in inv.blockers:
         print("BLOCKED %s" % blocker)
     if inv.blockers and apply and has_only_guidable_process_blockers(inv.blockers):
-        print("ACTION REQUIRED: close the listed Agent hosts; guided process cleanup follows.")
+        print("ACTION REQUIRED: confirmation for verified managed process cleanup follows.")
     elif inv.blockers:
         print("STOP: ownership or runtime state is not fully provable; no mutation is allowed.")
     elif not apply:
@@ -1442,12 +1904,13 @@ def print_inventory(inv: Inventory, apply: bool) -> None:
 
 
 class Manifest:
-    def __init__(self, root: Path, scope: str) -> None:
+    def __init__(self, root: Path, home: Path, scope: str) -> None:
         self.root = root
         self.data: dict[str, Any] = {
             "schema": 1,
             "platform": "win32",
             "scope": scope,
+            "home": str(home),
             "created_at": time.strftime("%Y-%m-%dT%H:%M:%SZ", time.gmtime()),
             "items": [],
         }
@@ -1666,24 +2129,50 @@ def invoke_aqg_uninstaller(inv: Inventory) -> None:
 
 def apply_inventory(inv: Inventory) -> Path:
     backup = create_backup_root(inv)
-    manifest = Manifest(backup, inv.scope)
+    manifest = Manifest(backup, inv.home, inv.scope)
     manifest.write()
     if inv.scope in ("aqg", "both"):
         invoke_aqg_uninstaller(inv)
 
-    de_actions: list[Action] = []
+    effective_actions: list[Action] = []
     if inv.scope in ("de", "both"):
         fresh = Inventory(inv.home, "de")
         fresh.inspect()
-        fresh.blockers = [item for item in fresh.blockers if not item.startswith("live host process")]
+        fresh.blockers = [
+            item for item in fresh.blockers
+            if not any(item.startswith(prefix) for prefix in GUIDABLE_PROCESS_BLOCKER_PREFIXES)
+        ]
         if fresh.blockers:
             raise RuntimeError("DE state changed after AQG uninstall: " + "; ".join(fresh.blockers))
-        de_actions = fresh.actions
+        effective_actions.extend(fresh.actions)
+    if inv.scope in ("aqg", "both"):
+        fresh = Inventory(inv.home, "aqg")
+        fresh.inspect()
+        if fresh.blockers:
+            raise RuntimeError("AQG state changed after official uninstall: " + "; ".join(fresh.blockers))
+        effective_actions.extend(fresh.actions)
 
-    config_actions = [a for a in de_actions if a.kind in {"edit-json", "edit-toml"}]
-    route_actions = [a for a in de_actions if a.kind == "remove-skill-route"]
-    record_actions = [a for a in de_actions if a.kind == "quarantine-record"]
-    de_root_actions = [a for a in de_actions if a.kind == "quarantine-root"]
+    deduplicated: list[Action] = []
+    seen: set[tuple[str, str, str | None]] = set()
+    for action in effective_actions:
+        key = (action.kind, path_key(action.path), action.client)
+        if key not in seen:
+            seen.add(key)
+            deduplicated.append(action)
+    effective_actions = deduplicated
+
+    config_actions = [a for a in effective_actions if a.kind in {"edit-json", "edit-toml"}]
+    route_actions = [a for a in effective_actions if a.kind == "remove-skill-route"]
+    record_actions = [a for a in effective_actions if a.kind == "quarantine-record"]
+    aux_actions = [
+        a for a in effective_actions
+        if a.kind in {"quarantine-aux", "quarantine-aqg-version"}
+    ]
+    root_actions = [
+        a for a in effective_actions
+        if a.kind in {"quarantine-root", "quarantine-root-link"}
+    ]
+    empty_dir_actions = [a for a in effective_actions if a.kind == "remove-empty-dir"]
 
     for index, action in enumerate(config_actions, 1):
         apply_config(action, inv.de_root, backup, manifest, index)
@@ -1694,20 +2183,22 @@ def apply_inventory(inv: Inventory) -> Path:
     for index, action in enumerate(record_actions, 1):
         quarantine_path(action, backup, manifest, index)
         manifest.write()
-
-    if inv.scope in ("aqg", "both"):
-        aqg_actions = [
-            a for a in inv.actions if a.kind in {"quarantine-root", "quarantine-root-link"}
-            and (a.path == inv.aqg_root or a.path == inv.aqg_target)
-        ]
-        for index, action in enumerate(aqg_actions, 1):
-            quarantine_path(action, backup, manifest, index)
-            manifest.write()
-
-    for index, action in enumerate(de_root_actions, 1):
+    for index, action in enumerate(aux_actions, 1):
         quarantine_path(action, backup, manifest, index)
         manifest.write()
+    for index, action in enumerate(root_actions, 1):
+        quarantine_path(action, backup, manifest, index)
+        manifest.write()
+    for action in sorted(empty_dir_actions, key=lambda item: len(item.path.parts), reverse=True):
+        if not lexists(action.path):
+            continue
+        if is_reparse(action.path) or not action.path.is_dir() or any(action.path.iterdir()):
+            raise RuntimeError("managed state directory did not become safely empty: %s" % action.path)
+        action.path.rmdir()
+        manifest.add(action.path, None, "remove-empty-dir")
+        manifest.write()
 
+    prune_uninstall_backups(inv.home, inv.dp, backup)
     manifest.write()
     return backup
 
@@ -1721,6 +2212,18 @@ def verify_after_apply(home: Path, scope: str) -> None:
         remaining.append(str(dp / "agent-quality-gates"))
     if remaining:
         raise RuntimeError("post-uninstall verification found remaining roots: " + ", ".join(remaining))
+    check = Inventory(home, scope)
+    check.inspect()
+    remaining_actions = [
+        action for action in check.actions if action.kind != "backup-retention"
+    ]
+    if check.blockers:
+        raise RuntimeError("post-uninstall verification blocked: " + "; ".join(check.blockers))
+    if remaining_actions:
+        raise RuntimeError(
+            "post-uninstall verification found remaining in-scope state: "
+            + ", ".join(str(action.path) for action in remaining_actions[:8])
+        )
 
 
 def parse_args(argv: list[str]) -> argparse.Namespace:
@@ -1769,6 +2272,17 @@ def main(argv: list[str]) -> int:
         return EXIT_BLOCKED
     if not args.apply:
         return EXIT_OK
+    cleanup_actions = [
+        action for action in inv.actions if action.kind != "backup-retention"
+    ]
+    if not cleanup_actions:
+        try:
+            prune_uninstall_backups(inv.home, inv.dp)
+        except Exception as exc:
+            print("ERROR: uninstall backup retention failed: %s" % exc, file=sys.stderr)
+            return EXIT_BLOCKED
+        print("PASS: uninstall verified; no in-scope installation found")
+        return EXIT_OK
     try:
         backup = apply_inventory(inv)
         verify_after_apply(inv.home, inv.scope)
@@ -1776,6 +2290,10 @@ def main(argv: list[str]) -> int:
         print("ERROR: uninstall stopped without a clean verification: %s" % exc, file=sys.stderr)
         return EXIT_BLOCKED
     print("PASS: uninstall verified; quarantine=%s" % backup)
+    print(
+        "Restart affected Agent applications before using Deep Pattern again "
+        "so they reload the updated MCP configuration."
+    )
     return EXIT_OK
 
 
@@ -1828,5 +2346,9 @@ try {
 finally {
     if (Test-Path -LiteralPath $temporaryRoot) {
         Remove-Item -LiteralPath $temporaryRoot -Recurse -Force -ErrorAction SilentlyContinue
+    }
+    if (-not [string]::IsNullOrWhiteSpace([string]$script:PrivateBootstrapRoot) -and
+        (Test-Path -LiteralPath $script:PrivateBootstrapRoot)) {
+        Remove-Item -LiteralPath $script:PrivateBootstrapRoot -Recurse -Force -ErrorAction SilentlyContinue
     }
 }

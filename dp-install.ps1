@@ -9,9 +9,10 @@ Deep Pattern product repositories, verifies the expected main/stable channel
 shape, and then delegates host MCP, skill, hook, junction, and ACL work to the
 shipped DE/AQG Python adapters. Native Windows installation uses Git for
 Windows Bash as required by AI_SETUP.md; WSL is deliberately rejected. Missing
-Git or Python prerequisites can be installed through WinGet after explicit
-confirmation. Repeated installs can identify and offer to terminate only
-verified current-user DE MCP launcher processes before one immediate retry.
+Git can be installed through WinGet after explicit confirmation. Python runs
+from a verified Deep Pattern private runtime and managed environment, with an
+existing trusted Python or WinGet used only as a fallback. Active Agent MCP
+sessions defer a signed update without blocking activation or host repair.
 
 The script accepts no product options. The existing masked activation window is
 the only interactive product input surface.
@@ -29,13 +30,26 @@ $ProgramName = "dp-install"
 $DecisionEngineRepository = "https://github.com/deeppatternai/decision-engine.git"
 $AqgRepository = "https://github.com/deeppatternai/agent-quality-gates.git"
 $AqgRef = "main"
+$DeepPatternRoot = Join-Path $HOME ".deeppattern"
 $ManagedRoot = Join-Path $HOME ".deeppattern\decision-engine"
 $AqgRoot = Join-Path $HOME ".deeppattern\agent-quality-gates"
+$ManagedPythonRoot = Join-Path $DeepPatternRoot "de-python"
+$ManagedPythonPath = Join-Path $ManagedPythonRoot "Scripts\python.exe"
+$ManagedPythonMarker = Join-Path $ManagedPythonRoot ".deeppattern-python-env"
+$PrivateRuntimeRoot = Join-Path $DeepPatternRoot "runtimes"
+$PrivateRuntimeBackupRoot = Join-Path $DeepPatternRoot "runtime-backups"
+$PrivatePythonVersion = "3.13.15"
+$PrivatePythonBuild = "20260901"
+$PrivatePythonRelease = "20260901"
+$PrivatePythonBaseUrl = "https://github.com/astral-sh/python-build-standalone/releases/download/$PrivatePythonRelease"
+$PrivateRuntimeMarkerName = ".deeppattern-python-runtime"
 $ExitFailure = 1
 $ExitUsage = 2
 $ExitBlocked = 3
 $ExitPartial = 4
 $script:AqgUpdatePending = $false
+$script:UpdateDeferred = $false
+$script:DeferredSessionPids = @()
 
 function Stop-Install {
     param(
@@ -54,7 +68,7 @@ function Confirm-UserAction {
     param([Parameter(Mandatory = $true)][string]$Message)
 
     try {
-        $answer = Read-Host ("{0} [y/N]" -f $Message)
+        $answer = Read-Host ("{0} [Y/N]" -f $Message)
     }
     catch {
         return $false
@@ -452,19 +466,336 @@ function Find-Python {
     return $null
 }
 
+function Test-PrivatePythonExecutable {
+    param([Parameter(Mandatory = $true)][string]$Candidate)
+
+    if (-not [IO.Path]::IsPathRooted($Candidate) -or
+        -not (Test-Path -LiteralPath $Candidate -PathType Leaf) -or
+        (Test-ReparsePoint -Path $Candidate)) {
+        return $false
+    }
+    $probe = Invoke-WithCleanEnvironment -FilePath $Candidate -ArgumentList @(
+        "-I", "-c",
+        "import ssl, sys, tkinter, venv; import pip; raise SystemExit(0 if sys.version_info[:2] >= (3, 12) else 1)"
+    ) -Capture
+    return $probe.ExitCode -eq 0
+}
+
+function Assert-PrivateDirectory {
+    param(
+        [Parameter(Mandatory = $true)][string]$Path,
+        [Parameter(Mandatory = $true)][string]$Description
+    )
+
+    if (-not (Test-Path -LiteralPath $Path)) {
+        New-Item -ItemType Directory -Path $Path | Out-Null
+    }
+    $item = Get-Item -LiteralPath $Path -Force
+    if (-not $item.PSIsContainer -or (Test-ReparsePoint -Path $Path)) {
+        Stop-Install "$Path is not a regular $Description directory; preserve it and stop." $ExitBlocked
+    }
+    $owner = (Get-Acl -LiteralPath $Path -ErrorAction Stop).GetOwner(
+        [System.Security.Principal.SecurityIdentifier]
+    ).Value
+    if ($owner -ne [System.Security.Principal.WindowsIdentity]::GetCurrent().User.Value) {
+        Stop-Install "$Path is not owned by the current Windows user; preserve it and stop." $ExitBlocked
+    }
+}
+
+function Get-PrivateRuntimeSpec {
+    $architecture = [string]$env:PROCESSOR_ARCHITEW6432
+    if ([string]::IsNullOrWhiteSpace($architecture)) {
+        $architecture = [string]$env:PROCESSOR_ARCHITECTURE
+    }
+    if ([string]::IsNullOrWhiteSpace($architecture)) {
+        $architecture = [string]$env:PROCESSOR_IDENTIFIER
+    }
+    if ($architecture -match "^(?i:AMD64|x86_64)") {
+        $runtimeArchitecture = "x86_64"
+        $sha256 = "9bcc038a0bf180612ed56dec93d4977d035e80b8d9320ef51a38c287baf134b7"
+        $size = 47042104L
+    }
+    elseif ($architecture -match "^(?i:ARM64|aarch64)") {
+        $runtimeArchitecture = "aarch64"
+        $sha256 = "ce87247378f43f88e0202a0fa6d3cdb5f5fb246a3bc61b2fb604bd49b7862508"
+        $size = 43801216L
+    }
+    else {
+        Stop-Install "Unsupported Windows architecture for the private Python runtime: $architecture"
+    }
+    $runtimeId = "cpython-$PrivatePythonVersion+$PrivatePythonBuild-$runtimeArchitecture-pc-windows-msvc"
+    $asset = "$runtimeId-install_only.tar.gz"
+    return [pscustomobject]@{
+        Architecture = $runtimeArchitecture
+        RuntimeId = $runtimeId
+        Asset = $asset
+        Url = "$PrivatePythonBaseUrl/$($asset.Replace('+', '%2B'))"
+        Sha256 = $sha256
+        Size = $size
+        Directory = Join-Path $PrivateRuntimeRoot $runtimeId
+    }
+}
+
+function Resolve-TrustedSystemTool {
+    param(
+        [Parameter(Mandatory = $true)][string]$Name,
+        [Parameter(Mandatory = $true)][string]$PublisherPattern
+    )
+
+    $candidate = Join-Path $env:WINDIR "System32\$Name"
+    return Get-VerifiedAuthenticodePath -Path $candidate -PublisherPattern $PublisherPattern
+}
+
+function Test-PrivateRuntime {
+    param([Parameter(Mandatory = $true)]$Spec)
+
+    $marker = Join-Path $Spec.Directory $PrivateRuntimeMarkerName
+    $python = Join-Path $Spec.Directory "python\python.exe"
+    if (-not (Test-Path -LiteralPath $Spec.Directory -PathType Container) -or
+        (Test-ReparsePoint -Path $Spec.Directory) -or
+        -not (Test-Path -LiteralPath $marker -PathType Leaf) -or
+        (Test-ReparsePoint -Path $marker)) {
+        return $false
+    }
+    $lines = @(Get-Content -LiteralPath $marker -ErrorAction SilentlyContinue)
+    if ($lines -notcontains "schema=1" -or
+        $lines -notcontains ("runtime_id={0}" -f $Spec.RuntimeId) -or
+        $lines -notcontains ("sha256={0}" -f $Spec.Sha256)) {
+        return $false
+    }
+    return Test-PrivatePythonExecutable -Candidate $python
+}
+
+function Get-RuntimeBackupPath {
+    param([Parameter(Mandatory = $true)][string]$Label)
+
+    Assert-PrivateDirectory -Path $PrivateRuntimeBackupRoot -Description "Deep Pattern runtime backup"
+    $stamp = Get-Date -Format "yyyyMMdd-HHmmss"
+    $candidate = Join-Path $PrivateRuntimeBackupRoot "$stamp-$Label"
+    $suffix = 0
+    while (Test-Path -LiteralPath $candidate) {
+        $suffix++
+        $candidate = Join-Path $PrivateRuntimeBackupRoot "$stamp-$suffix-$Label"
+    }
+    return $candidate
+}
+
+function Move-ToRuntimeBackup {
+    param(
+        [Parameter(Mandatory = $true)][string]$Path,
+        [Parameter(Mandatory = $true)][string]$Label
+    )
+
+    if (-not (Test-Path -LiteralPath $Path)) { return }
+    $item = Get-Item -LiteralPath $Path -Force
+    if (-not $item.PSIsContainer -or (Test-ReparsePoint -Path $Path)) {
+        Stop-Install "$Path is not a regular Deep Pattern runtime directory; preserve it and stop." $ExitBlocked
+    }
+    $destination = Get-RuntimeBackupPath -Label $Label
+    Move-Item -LiteralPath $Path -Destination $destination -ErrorAction Stop
+    Write-Host "Preserved the previous runtime state at $destination."
+}
+
+function Install-PrivatePythonRuntime {
+    $spec = Get-PrivateRuntimeSpec
+    Assert-PrivateDirectory -Path $DeepPatternRoot -Description "Deep Pattern"
+    Assert-PrivateDirectory -Path $PrivateRuntimeRoot -Description "Deep Pattern runtime"
+
+    if (Test-Path -LiteralPath $spec.Directory) {
+        if (Test-PrivateRuntime -Spec $spec) {
+            Write-Host ("Reusing Deep Pattern private Python {0} at {1}." -f $PrivatePythonVersion, $spec.Directory)
+            return (Join-Path $spec.Directory "python\python.exe")
+        }
+        if (-not (Confirm-UserAction "The Deep Pattern private Python runtime is incomplete or invalid. Preserve it and download a verified replacement?")) {
+            Stop-Install "The invalid private Python runtime was preserved; repair was declined." $ExitBlocked
+        }
+        Move-ToRuntimeBackup -Path $spec.Directory -Label "private-python-runtime"
+    }
+    else {
+        Write-Host ("Deep Pattern requires its verified private Python {0} runtime." -f $PrivatePythonVersion)
+        Write-Host ("Downloading about {0:N0} MB into {1} without changing system Python." -f ($spec.Size / 1MB), $PrivateRuntimeRoot)
+    }
+
+    $curl = Resolve-TrustedSystemTool -Name "curl.exe" -PublisherPattern "(?i:Microsoft Corporation|Microsoft Windows)"
+    $tar = Resolve-TrustedSystemTool -Name "tar.exe" -PublisherPattern "(?i:Microsoft Corporation|Microsoft Windows)"
+    if ([string]::IsNullOrWhiteSpace($curl) -or [string]::IsNullOrWhiteSpace($tar)) {
+        Write-Warning "Trusted Windows curl.exe or tar.exe is unavailable; the private Python runtime cannot be prepared."
+        return $null
+    }
+
+    $stage = Join-Path $PrivateRuntimeRoot (".python-runtime-stage-" + [Guid]::NewGuid().ToString("N"))
+    $archive = Join-Path $stage $spec.Asset
+    $extract = Join-Path $stage "extract"
+    New-Item -ItemType Directory -Path $extract -Force | Out-Null
+    try {
+        Write-Host ("Downloading Deep Pattern private Python {0} for {1}..." -f $PrivatePythonVersion, $spec.Architecture)
+        $downloadCode = Invoke-WithCleanEnvironment -FilePath $curl -ArgumentList @(
+            "--fail", "--location", "--show-error", "--progress-bar",
+            "--proto", "=https", "--tlsv1.2", "--connect-timeout", "20", "--retry", "2",
+            "--output", $archive, $spec.Url
+        )
+        if ($downloadCode -ne 0 -or -not (Test-Path -LiteralPath $archive -PathType Leaf)) {
+            Write-Warning "Private Python download failed; no existing runtime was overwritten."
+            return $null
+        }
+        $actualSize = (Get-Item -LiteralPath $archive -Force).Length
+        $actualSha = (Get-FileHash -LiteralPath $archive -Algorithm SHA256).Hash.ToLowerInvariant()
+        if ($actualSize -ne $spec.Size -or $actualSha -ne $spec.Sha256) {
+            Write-Warning "Private Python download failed its fixed size or SHA-256 check; nothing was installed."
+            return $null
+        }
+
+        $listing = Invoke-WithCleanEnvironment -FilePath $tar -ArgumentList @("-tzf", $archive) -Capture
+        if ($listing.ExitCode -ne 0 -or $listing.Output.Count -eq 0) {
+            Write-Warning "Private Python archive could not be inspected; nothing was installed."
+            return $null
+        }
+        foreach ($rawMember in $listing.Output) {
+            $member = ([string]$rawMember).Trim().Replace("\", "/")
+            $segments = @($member.Split("/") | Where-Object { $_ -ne "" })
+            if ([string]::IsNullOrWhiteSpace($member) -or
+                ($member -ne "python" -and -not $member.StartsWith("python/")) -or
+                $member.StartsWith("/") -or
+                $member -match "^[A-Za-z]:" -or
+                $segments -contains "..") {
+                Write-Warning "Private Python archive has an unexpected path layout; nothing was installed."
+                return $null
+            }
+        }
+        $extractCode = Invoke-WithCleanEnvironment -FilePath $tar -ArgumentList @("-xzf", $archive, "-C", $extract)
+        if ($extractCode -ne 0) {
+            Write-Warning "Private Python archive extraction failed; nothing was installed."
+            return $null
+        }
+        $topLevel = @(Get-ChildItem -LiteralPath $extract -Force)
+        $extractedPython = Join-Path $extract "python"
+        if ($topLevel.Count -ne 1 -or $topLevel[0].Name -ne "python" -or
+            -not (Test-Path -LiteralPath $extractedPython -PathType Container) -or
+            (Test-ReparsePoint -Path $extractedPython) -or
+            @(Get-ChildItem -LiteralPath $extractedPython -Recurse -Force | Where-Object {
+                ($_.Attributes -band [IO.FileAttributes]::ReparsePoint) -ne 0
+            }).Count -ne 0 -or
+            -not (Test-PrivatePythonExecutable -Candidate (Join-Path $extractedPython "python.exe"))) {
+            Write-Warning "The verified private Python archive does not provide ssl, venv, tkinter, and pip on this Windows device."
+            return $null
+        }
+
+        $stagedRuntime = Join-Path $stage "runtime"
+        New-Item -ItemType Directory -Path $stagedRuntime | Out-Null
+        Move-Item -LiteralPath $extractedPython -Destination (Join-Path $stagedRuntime "python")
+        $markerLines = @(
+            "schema=1",
+            "runtime_id=$($spec.RuntimeId)",
+            "python_version=$PrivatePythonVersion",
+            "architecture=$($spec.Architecture)",
+            "source=$($spec.Url)",
+            "sha256=$($spec.Sha256)"
+        )
+        [IO.File]::WriteAllLines(
+            (Join-Path $stagedRuntime $PrivateRuntimeMarkerName),
+            $markerLines,
+            $script:Utf8NoBom
+        )
+        if (Test-Path -LiteralPath $spec.Directory) {
+            Stop-Install "$($spec.Directory) appeared during download; preserve it and retry." $ExitBlocked
+        }
+        Move-Item -LiteralPath $stagedRuntime -Destination $spec.Directory
+        if (-not (Test-PrivateRuntime -Spec $spec)) {
+            Stop-Install "$($spec.Directory) was installed but failed final verification; preserve it and stop." $ExitBlocked
+        }
+        Write-Host ("Deep Pattern private Python runtime ready at {0}." -f $spec.Directory)
+        return (Join-Path $spec.Directory "python\python.exe")
+    }
+    finally {
+        if (Test-Path -LiteralPath $stage) {
+            Remove-Item -LiteralPath $stage -Recurse -Force -ErrorAction SilentlyContinue
+        }
+    }
+}
+
+function Test-ManagedPythonEnvironment {
+    if (-not (Test-Path -LiteralPath $ManagedPythonRoot -PathType Container) -or
+        (Test-ReparsePoint -Path $ManagedPythonRoot) -or
+        -not (Test-Path -LiteralPath $ManagedPythonMarker -PathType Leaf) -or
+        (Test-ReparsePoint -Path $ManagedPythonMarker)) {
+        return $false
+    }
+    $lines = @(Get-Content -LiteralPath $ManagedPythonMarker -ErrorAction SilentlyContinue)
+    return ($lines -contains "schema=1") -and
+        (Test-PrivatePythonExecutable -Candidate $ManagedPythonPath)
+}
+
+function New-ManagedPythonEnvironment {
+    param([Parameter(Mandatory = $true)][string]$BasePython)
+
+    Assert-PrivateDirectory -Path $DeepPatternRoot -Description "Deep Pattern"
+    $stage = Join-Path $DeepPatternRoot (".de-python-stage-" + [Guid]::NewGuid().ToString("N"))
+    $stagedEnvironment = Join-Path $stage "de-python"
+    New-Item -ItemType Directory -Path $stage | Out-Null
+    try {
+        $code = Invoke-WithCleanEnvironment -FilePath $BasePython -ArgumentList @("-I", "-m", "venv", $stagedEnvironment)
+        $stagedPython = Join-Path $stagedEnvironment "Scripts\python.exe"
+        if ($code -ne 0 -or -not (Test-PrivatePythonExecutable -Candidate $stagedPython)) {
+            Stop-Install "Could not create a complete private Deep Pattern Python environment with $BasePython." $ExitBlocked
+        }
+        [IO.File]::WriteAllLines(
+            (Join-Path $stagedEnvironment ".deeppattern-python-env"),
+            @("schema=1", "base_python=$BasePython"),
+            $script:Utf8NoBom
+        )
+        if (Test-Path -LiteralPath $ManagedPythonRoot) {
+            Stop-Install "$ManagedPythonRoot appeared while Python was being prepared; preserve it and retry." $ExitBlocked
+        }
+        Move-Item -LiteralPath $stagedEnvironment -Destination $ManagedPythonRoot
+    }
+    finally {
+        if (Test-Path -LiteralPath $stage) {
+            Remove-Item -LiteralPath $stage -Recurse -Force -ErrorAction SilentlyContinue
+        }
+    }
+    if (-not (Test-ManagedPythonEnvironment)) {
+        Stop-Install "The private Deep Pattern Python environment failed final verification." $ExitBlocked
+    }
+    Write-Host "Created the private Deep Pattern Python environment at $ManagedPythonRoot."
+    return $ManagedPythonPath
+}
+
 function Resolve-Python {
-    $python = Find-Python
-    if (-not [string]::IsNullOrWhiteSpace($python)) {
-        return $python
+    if (Test-ManagedPythonEnvironment) {
+        Write-Host "Reusing the private Deep Pattern Python environment at $ManagedPythonRoot."
+        return $ManagedPythonPath
     }
-    Write-Host "Python 3.12 or newer with ssl, venv, pip, and tkinter is missing."
-    Install-WinGetPackage -PackageId "Python.Python.3.13" -DisplayName "Python 3.13"
-    $python = Find-Python
-    if ([string]::IsNullOrWhiteSpace($python)) {
-        Stop-Install "WinGet finished, but Python 3.12 or newer with ssl, venv, pip, and tkinter could not be verified. Open a new PowerShell window and retry."
+    if (Test-Path -LiteralPath $ManagedPythonRoot) {
+        if (-not (Confirm-UserAction "The private Deep Pattern Python environment is unusable. Preserve it and rebuild it?")) {
+            Stop-Install "$ManagedPythonRoot was preserved; repair was declined." $ExitBlocked
+        }
+        Move-ToRuntimeBackup -Path $ManagedPythonRoot -Label "de-python"
     }
-    Write-Host ("Python prerequisite ready: {0}" -f $python)
-    return $python
+
+    $basePython = $null
+    if (-not [string]::IsNullOrWhiteSpace($env:DE_PYTHON)) {
+        if (-not (Test-PythonExecutable -Candidate $env:DE_PYTHON)) {
+            Stop-Install "DE_PYTHON does not identify an Authenticode-verified Python 3.12+ with ssl, venv, tkinter, and pip."
+        }
+        $basePython = (Get-Item -LiteralPath $env:DE_PYTHON -Force).FullName
+        Write-Host "Using the explicitly selected DE_PYTHON only to prepare the private Deep Pattern environment."
+    }
+    else {
+        $basePython = Install-PrivatePythonRuntime
+    }
+    if ([string]::IsNullOrWhiteSpace($basePython)) {
+        Write-Warning "A verified private Python runtime could not be used. Checking an existing trusted Python or WinGet fallback."
+        $basePython = Find-Python
+    }
+    if ([string]::IsNullOrWhiteSpace($basePython)) {
+        Write-Host "Python 3.12 or newer with ssl, venv, pip, and tkinter is missing."
+        Install-WinGetPackage -PackageId "Python.Python.3.13" -DisplayName "Python 3.13"
+        $basePython = Find-Python
+    }
+    if ([string]::IsNullOrWhiteSpace($basePython)) {
+        Stop-Install "A compatible verified Python could not be prepared. Open a new PowerShell window and retry."
+    }
+    return New-ManagedPythonEnvironment -BasePython $basePython
 }
 
 function Test-ReparsePoint {
@@ -610,10 +941,21 @@ function Assert-OwnedAqgDirectory {
     if (-not $item.PSIsContainer -or (Test-ReparsePoint -Path $Path)) {
         Stop-Install "AQG backup path is not a regular directory: $Path" $ExitBlocked
     }
+    $managedBoundary = [IO.Path]::GetFullPath((Join-Path $HOME ".deeppattern")).TrimEnd("\")
+    $fullPath = [IO.Path]::GetFullPath($item.FullName).TrimEnd("\")
+    if ($fullPath -ne $managedBoundary -and
+        -not $fullPath.StartsWith(($managedBoundary + "\"), [StringComparison]::OrdinalIgnoreCase)) {
+        Stop-Install "AQG backup path is outside the current user's Deep Pattern directory: $Path" $ExitBlocked
+    }
     $acl = Get-Acl -LiteralPath $Path -ErrorAction Stop
     $owner = $acl.GetOwner([System.Security.Principal.SecurityIdentifier]).Value
-    if ($owner -ne [System.Security.Principal.WindowsIdentity]::GetCurrent().User.Value) {
-        Stop-Install "AQG backup directory is not owned by the current Windows user: $Path" $ExitBlocked
+    $trustedOwners = @(
+        [System.Security.Principal.WindowsIdentity]::GetCurrent().User.Value,
+        "S-1-5-18",       # LocalSystem can own state created by an elevated installer.
+        "S-1-5-32-544"   # Builtin Administrators is the common elevated owner.
+    )
+    if ($owner -notin $trustedOwners) {
+        Stop-Install "AQG backup directory owner is not the current user or a trusted Windows installer identity: $Path" $ExitBlocked
     }
     foreach ($rule in $acl.Access) {
         $sid = $rule.IdentityReference.Translate([System.Security.Principal.SecurityIdentifier]).Value
@@ -696,11 +1038,8 @@ function Repair-AqgBackupResidue {
     foreach ($path in @($dp, (Split-Path -Parent $source), $source, $destination)) {
         Assert-OwnedAqgDirectory -Path $path
     }
-    Write-Host "AQG version migration is blocked by historical backups at $source."
-    Write-Host "Fully quit Agent hosts first. Backups will be moved intact, not deleted, merged or overwritten."
-    if (-not (Confirm-UserAction "Move these backups into a new legacy-versions archive under $destination and continue?")) {
-        Stop-Install "Legacy backups were preserved; installation paused before AQG host configuration." $ExitPartial
-    }
+    Write-Host "AQG historical backups were found at $source."
+    Write-Host "They will be moved intact into a new legacy-versions archive under $destination; nothing will be deleted, merged, or overwritten."
     foreach ($path in @($dp, (Split-Path -Parent $source), $source, $destination)) {
         Assert-OwnedAqgDirectory -Path $path
     }
@@ -726,19 +1065,37 @@ sys.dont_write_bytecode = True
 sys.path.insert(0, str(root))
 os.environ["AQG_ROOT"] = str(logical)
 os.chdir(logical.parent)
-# The official updater currently distinguishes directory symlinks from junctions.
-# Never pass an unrecognized junction to a migration that could move its target.
-if getattr(logical.lstat(), "st_reparse_tag", 0) == 0xA0000003:
+
+
+def official_link_kind(path):
+    try:
+        from scripts.aqg_update import stage
+    except ImportError:
+        return "symlink" if path.is_symlink() else None
+    classifier = getattr(stage, "current_link_kind", None)
+    if classifier is None:
+        return "symlink" if path.is_symlink() else None
+    try:
+        return classifier(path)
+    except (OSError, RuntimeError, ValueError):
+        return None
+
+
+# Older AQG releases cannot safely update through a directory junction. Only
+# pass one to an updater that explicitly classifies it as a supported link kind.
+if getattr(logical.lstat(), "st_reparse_tag", 0) == 0xA0000003 \
+        and official_link_kind(logical) != "junction":
     print("AQG status=legacy-junction: configuration can be retained, but automatic update compatibility is unverified.")
     raise SystemExit(5)
 if mode == "migrate":
     from scripts.aqg_update.migrate import ensure_managed_layout
     result = ensure_managed_layout(logical)
     print(f"AQG layout: {result.reason}")
-    if not result.managed or not logical.is_symlink():
-        print("AQG layout is pending. Resolve the reason above; if Windows denies symlink creation, enable Developer Mode or use an approved elevated terminal, then retry.")
+    link_kind = official_link_kind(logical)
+    if not result.managed or link_kind not in {"symlink", "junction"}:
+        print("AQG layout is pending. The verified checkout remains usable, but this AQG release cannot enable ordinary-user automatic updates on this Windows device.")
         raise SystemExit(4)
-    print(f"AQG managed entrance: {logical} -> {logical.resolve(strict=True)}")
+    print(f"AQG managed entrance ({link_kind}): {logical} -> {logical.resolve(strict=True)}")
     raise SystemExit(0)
 from scripts.aqg_update.run import check
 result = check(root=logical, remote=remote, channel="stable", apply=True)
@@ -761,6 +1118,14 @@ raise SystemExit(4 if result.outcome in {"pending", "busy", "deferred"} else 2)
         $script:AqgUpdatePending = $true
         Write-Warning "Preserving the verified legacy AQG junction. Automatic update support remains pending; no version tree was replaced."
         return
+    }
+    if ($code -eq 4 -and $Mode -eq "migrate") {
+        $pendingLayout = Get-VerifiedAqgLayout
+        if ($pendingLayout.Layout -eq "regular") {
+            $script:AqgUpdatePending = $true
+            Write-Warning "AQG remains a verified regular checkout. Installation will continue, but AQG automatic updates are pending a junction-capable public release."
+            return
+        }
     }
     if ($code -ne 0) {
         $exitCode = if ($code -eq 4) { $ExitPartial } else { $ExitBlocked }
@@ -1009,6 +1374,40 @@ function Invoke-ManagedPython {
     }
 }
 
+function Invoke-ManagedPermanentSetup {
+    if (-not (Test-Path -LiteralPath $ManagedRoot -PathType Container)) {
+        Stop-Install "The managed Decision Engine root is missing before activation." $ExitBlocked
+    }
+
+    $setupScript = @'
+from pathlib import Path
+import sys
+
+root = Path(sys.argv[1]).resolve(strict=True)
+entry = (root / "installer" / "permanent_setup.py").resolve(strict=True)
+sys.path.insert(0, str(root))
+
+from installer import permanent_setup
+
+if Path(permanent_setup.__file__).resolve(strict=True) != entry:
+    raise RuntimeError("managed permanent setup identity mismatch")
+
+show_status_dialog = permanent_setup._show_gui_message
+
+def show_error_dialog_only(title, message, *, error=False):
+    if error:
+        show_status_dialog(title, message, error=True)
+
+permanent_setup._show_gui_message = show_error_dialog_only
+raise SystemExit(permanent_setup.main([]))
+'@
+    return Invoke-PythonScript `
+        -PythonPath $script:PythonPath `
+        -ScriptText $setupScript `
+        -ScriptArguments @($ManagedRoot) `
+        -WorkingDirectory $ManagedRoot
+}
+
 function Test-ManagedRootGitState {
     $script:ManagedRootValidationError = $null
     $status = Invoke-WithCleanEnvironment -FilePath $GitPath -ArgumentList @(
@@ -1171,30 +1570,32 @@ try:
         root, timeout_seconds=wait_budget
     ) as startup_gate:
         recovery = launcher._finalize_journal(root)
-        if recovery is not None and recovery.status in {
+        if recovery is not None and recovery.status == "deferred_active_session":
+            result = recovery
+        elif recovery is not None and recovery.status in {
             "repair_required",
             "retry_pending",
-            "deferred_active_session",
             "skipped_locked",
         }:
             raise ShellError(f"managed update recovery returned {recovery.status}")
-        if getattr(startup_gate, "waited", False):
-            raise ShellError(
-                "another managed update attempt completed; retry to verify the current signed stable release"
+        else:
+            if getattr(startup_gate, "waited", False):
+                raise ShellError(
+                    "another managed update attempt completed; retry to verify the current signed stable release"
+                )
+            if not launcher._updates_enabled(root):
+                raise ShellError("managed update protocol is not ready")
+            state = updater._read_update_state(root)
+            if launcher._head_commit(root) != state.last_release_commit:
+                raise ShellError("managed HEAD differs from the protected release state")
+            trusted_keys = load_trusted_release_keys(
+                root,
+                deadline=deadline,
+                expected_commit=state.last_release_commit,
             )
-        if not launcher._updates_enabled(root):
-            raise ShellError("managed update protocol is not ready")
-        state = updater._read_update_state(root)
-        if launcher._head_commit(root) != state.last_release_commit:
-            raise ShellError("managed HEAD differs from the protected release state")
-        trusted_keys = load_trusted_release_keys(
-            root,
-            deadline=deadline,
-            expected_commit=state.last_release_commit,
-        )
-        if not trusted_keys:
-            raise ShellError("managed release trust store contains no active key")
-        result = launcher._attempt_update(root, trusted_keys, deadline=deadline)
+            if not trusted_keys:
+                raise ShellError("managed release trust store contains no active key")
+            result = launcher._attempt_update(root, trusted_keys, deadline=deadline)
 except (
     ShellError,
     OSError,
@@ -1205,11 +1606,12 @@ except (
     raise SystemExit(1)
 
 accepted_statuses = {"up_to_date", "candidate_ready", "updated"}
+deferred_statuses = {"deferred_active_session"}
 blocker_pids = ",".join(
     str(blocker.pid) for blocker in result.blockers if blocker.pid is not None
 )
 print(f"{result.status}\t{blocker_pids}")
-if result.status not in accepted_statuses:
+if result.status not in accepted_statuses | deferred_statuses:
     details = [f"status={result.status}"]
     if result.error_code:
         details.append(f"error_code={result.error_code}")
@@ -1288,48 +1690,6 @@ function Get-ProcessSnapshot {
     }
 }
 
-function Test-ManagedLeasePid {
-    param([Parameter(Mandatory = $true)][int]$ProcessId)
-
-    $script = @'
-from pathlib import Path
-import sys
-
-root = Path(sys.argv[1]).resolve(strict=True)
-sys.path.insert(0, str(root))
-from installer import update_coordination
-
-expected = int(sys.argv[2])
-live = update_coordination.live_shim_sessions(root)
-raise SystemExit(0 if any(item.pid == expected for item in live) else 1)
-'@
-    $probe = Invoke-PythonScript `
-        -PythonPath $script:PythonPath `
-        -ScriptText $script `
-        -ScriptArguments @($ManagedRoot, [string]$ProcessId) `
-        -WorkingDirectory $ManagedRoot `
-        -Capture
-    return $probe.ExitCode -eq 0
-}
-
-function Test-ManagedLauncherSnapshot {
-    param([Parameter(Mandatory = $true)]$Snapshot)
-
-    $currentIdentity = [Security.Principal.WindowsIdentity]::GetCurrent().Name
-    if (-not [string]::Equals($Snapshot.Owner, $currentIdentity, [StringComparison]::OrdinalIgnoreCase)) {
-        return $false
-    }
-    if ([string]::IsNullOrWhiteSpace($Snapshot.ExecutablePath) -or
-        [string]::IsNullOrWhiteSpace($Snapshot.CommandLine)) {
-        return $false
-    }
-    $executableName = [IO.Path]::GetFileName($Snapshot.ExecutablePath)
-    if ($executableName -notmatch "^(?i:python(?:w)?(?:[0-9.]*)?\.exe)$") {
-        return $false
-    }
-    return $Snapshot.CommandLine -match "(?i:installer\.(?:launcher|shim)|mcp_bootstrap\.py)"
-}
-
 function Get-LikelyHostForProcess {
     param([Parameter(Mandatory = $true)][int]$ProcessId)
 
@@ -1341,6 +1701,7 @@ function Get-LikelyHostForProcess {
         }
         switch -Regex ($snapshot.Name) {
             "^(?i:claude\.exe)$" { return "Claude Desktop" }
+            "^(?i:chatgpt\.exe)$" { return "Codex (ChatGPT)" }
             "^(?i:codebuddy.*\.exe)$" { return "CodeBuddy" }
             "^(?i:codex.*\.exe)$" { return "Codex" }
             "^(?i:cursor.*\.exe)$" { return "Cursor" }
@@ -1348,109 +1709,19 @@ function Get-LikelyHostForProcess {
             "^(?i:trae.*\.exe)$" { return "TRAE" }
             "^(?i:workbuddy.*\.exe)$" { return "WorkBuddy" }
         }
+        $identityText = ("{0} {1} {2}" -f $snapshot.Name, $snapshot.ExecutablePath, $snapshot.CommandLine)
+        switch -Regex ($identityText) {
+            "(?i:ChatGPT)" { return "Codex (ChatGPT)" }
+            "(?i:Claude)" { return "Claude Desktop" }
+            "(?i:CodeBuddy)" { return "CodeBuddy" }
+            "(?i:Cursor)" { return "Cursor" }
+            "(?i:Qoder)" { return "Qoder" }
+            "(?i:TRAE)" { return "TRAE" }
+            "(?i:WorkBuddy)" { return "WorkBuddy" }
+        }
         $current = $snapshot.ParentProcessId
     }
     return "Unknown Agent"
-}
-
-function Test-SameProcessSnapshot {
-    param(
-        [Parameter(Mandatory = $true)]$Expected,
-        [Parameter(Mandatory = $true)]$Actual
-    )
-
-    return (
-        $Expected.ProcessId -eq $Actual.ProcessId -and
-        $Expected.ParentProcessId -eq $Actual.ParentProcessId -and
-        $Expected.Started -eq $Actual.Started -and
-        $Expected.ExecutablePath -eq $Actual.ExecutablePath -and
-        $Expected.CommandLine -eq $Actual.CommandLine -and
-        $Expected.Owner -eq $Actual.Owner
-    )
-}
-
-function Resolve-ActiveManagedSessions {
-    param([Parameter(Mandatory = $true)][int[]]$ProcessIds)
-
-    Write-Host "Decision Engine is still in use by the following active MCP session(s):"
-    foreach ($processId in $ProcessIds) {
-        $snapshot = Get-ProcessSnapshot -ProcessId $processId
-        $parent = if ($null -eq $snapshot) { "unknown" } else { [string]$snapshot.ParentProcessId }
-        $hostName = Get-LikelyHostForProcess -ProcessId $processId
-        Write-Host ("  PID={0} likely-host={1} parent-pid={2}" -f $processId, $hostName, $parent)
-    }
-    Write-Host "Completely quit the listed Agent host applications; closing only their windows is not sufficient."
-    try {
-        $answer = Read-Host "After quitting them, press Enter to recheck immediately (or type N to stop)"
-    }
-    catch {
-        return $false
-    }
-    if ($answer -match "^(?i:n|no|q|quit)$") {
-        return $false
-    }
-
-    $remaining = @($ProcessIds | Where-Object { Test-ManagedLeasePid -ProcessId $_ })
-    if ($remaining.Count -eq 0) {
-        return $true
-    }
-
-    $frozen = New-Object System.Collections.Generic.List[object]
-    foreach ($processId in $remaining) {
-        $snapshot = Get-ProcessSnapshot -ProcessId $processId
-        if ($null -ne $snapshot -and
-            (Test-ManagedLauncherSnapshot -Snapshot $snapshot) -and
-            (Test-ManagedLeasePid -ProcessId $processId)) {
-            $frozen.Add($snapshot)
-        }
-    }
-    if ($frozen.Count -ne $remaining.Count) {
-        Write-Host "The remaining process identity is not safe to terminate automatically. Quit the Agent host and rerun the installer."
-        return $false
-    }
-
-    Write-Host "The remaining process(es) are current-user managed DE MCP launchers:"
-    foreach ($snapshot in $frozen) {
-        Write-Host ("  PID={0} likely-host={1}" -f $snapshot.ProcessId, (Get-LikelyHostForProcess -ProcessId $snapshot.ProcessId))
-    }
-    Write-Host "Stop-Process will target only these DE MCP launcher processes, not the Agent applications."
-    if (-not (Confirm-UserAction -Message "Terminate these verified managed DE sessions and retry?")) {
-        return $false
-    }
-
-    foreach ($snapshot in $frozen) {
-        $current = Get-ProcessSnapshot -ProcessId $snapshot.ProcessId
-        if ($null -eq $current -or
-            -not (Test-SameProcessSnapshot -Expected $snapshot -Actual $current) -or
-            -not (Test-ManagedLauncherSnapshot -Snapshot $current) -or
-            -not (Test-ManagedLeasePid -ProcessId $snapshot.ProcessId)) {
-            Write-Host ("Termination refused for PID={0} because its identity changed or ownership could not be re-proven." -f $snapshot.ProcessId)
-            return $false
-        }
-        try {
-            Stop-Process -Id $snapshot.ProcessId -Force -ErrorAction Stop
-            Write-Host ("Terminated verified managed DE session PID={0}." -f $snapshot.ProcessId)
-        }
-        catch {
-            Write-Host ("Termination failed for PID={0}: {1}" -f $snapshot.ProcessId, $_.Exception.GetType().Name)
-            return $false
-        }
-    }
-    return $true
-}
-
-function Invoke-ManagedStableUpdateWithRetry {
-    $result = Invoke-ManagedStableUpdate
-    if ($result.ExitCode -eq 0 -and -not [string]::IsNullOrWhiteSpace($result.Status)) {
-        return $result
-    }
-    if ($result.Status -eq "deferred_active_session" -and $result.BlockerPids.Count -gt 0) {
-        if (Resolve-ActiveManagedSessions -ProcessIds $result.BlockerPids) {
-            Write-Host "Retrying the signed stable update once..."
-            return Invoke-ManagedStableUpdate
-        }
-    }
-    return $result
 }
 
 if (-not (Test-NativeWindows)) {
@@ -1499,13 +1770,13 @@ if ($managedRootWasPresent) {
     }
 
     if ($activationStateBeforeUpdate -eq "activated") {
-        Write-Host "Found a complete signed and activated Decision Engine install; updating signed stable before host repair without reopening activation."
+        Write-Host "Found a complete signed and activated Decision Engine install; checking signed stable before host repair without reopening activation."
     }
     else {
-        Write-Host "Found a complete signed Decision Engine stable install with activation pending; updating signed stable before resuming setup."
+        Write-Host "Found a complete signed Decision Engine stable install with activation pending; checking signed stable before resuming setup. Active MCP sessions will defer the update without blocking activation."
     }
     Write-Host "Checking and applying the newest signed Decision Engine stable release before continuing..."
-    $managedUpdate = Invoke-ManagedStableUpdateWithRetry
+    $managedUpdate = Invoke-ManagedStableUpdate
     if ($managedUpdate.ExitCode -ne 0 -or [string]::IsNullOrWhiteSpace($managedUpdate.Status)) {
         $preserved = Test-CompleteManagedRoot
         if ($preserved) {
@@ -1516,11 +1787,20 @@ if ($managedRootWasPresent) {
                 $configDigestAfterFailure -eq $configDigestBeforeUpdate
             )
         }
-        if ($preserved) {
-            $failedStatus = if ($null -eq $managedUpdate.Status) { "unknown" } else { $managedUpdate.Status }
-            Stop-Install "Signed stable update status $failedStatus; the existing release and activation state were verified and preserved. The guided close-and-retry flow did not clear every active session." $ExitFailure
+        if ($preserved -and
+            $managedUpdate.Status -eq "deferred_active_session" -and
+            $managedUpdate.BlockerPids.Count -gt 0) {
+            $script:UpdateDeferred = $true
+            $script:DeferredSessionPids = @($managedUpdate.BlockerPids)
+            Write-Host "Active MCP sessions are using the current verified Decision Engine release. The signed update is deferred; setup will continue without stopping Agent applications."
         }
-        Stop-Install "Signed stable update did not complete and the previous release could not be re-verified. Preserve the managed root and use the owner-guided recovery flow." $ExitBlocked
+        elseif ($preserved) {
+            $failedStatus = if ($null -eq $managedUpdate.Status) { "unknown" } else { $managedUpdate.Status }
+            Stop-Install "Signed stable update status $failedStatus; the existing release and activation state were verified and preserved." $ExitFailure
+        }
+        elseif (-not $preserved) {
+            Stop-Install "Signed stable update did not complete and the previous release could not be re-verified. Preserve the managed root and use the owner-guided recovery flow." $ExitBlocked
+        }
     }
     if (-not (Test-CompleteManagedRoot)) {
         Stop-Install "Signed stable update returned $($managedUpdate.Status), but the managed release no longer validates." $ExitBlocked
@@ -1533,7 +1813,9 @@ if ($managedRootWasPresent) {
     if ($configDigestAfterUpdate -ne $configDigestBeforeUpdate) {
         Stop-Install "Signed stable update returned $($managedUpdate.Status), but the protected activation configuration changed." $ExitBlocked
     }
-    Write-Host "Decision Engine signed stable update status: $($managedUpdate.Status)"
+    if (-not $script:UpdateDeferred) {
+        Write-Host "Decision Engine signed stable update status: $($managedUpdate.Status)"
+    }
 }
 
 $tempRoot = Join-Path ([System.IO.Path]::GetTempPath()) ("dp-install-" + [Guid]::NewGuid().ToString("N"))
@@ -1656,21 +1938,25 @@ try {
     }
 
     Write-Host "Installing the signed Decision Engine stable release..."
-    # The public install.sh performs its own newline-delimited host loop. Native
-    # Windows can surface CRLF client IDs through that Bash boundary, so keep the
-    # signed bootstrap in Python and let the validated JSON phase below own all
-    # host wiring.
-    Push-Location -LiteralPath $sourceRoot
-    try {
-        $installCode = Invoke-WithCleanEnvironment -FilePath $script:PythonPath -ArgumentList @(
-            "-m", "installer.bootstrap_managed_install", "install"
-        )
+    if ($managedRootWasPresent) {
+        Write-Host "Reusing the existing verified signed Decision Engine checkout without cloning or replacing it."
     }
-    finally {
-        Pop-Location
-    }
-    if ($installCode -ne 0) {
-        Stop-Install "The core installer failed. Preserve its output and run dp-uninstall.ps1 -Scope both -Apply before a clean retry." $ExitBlocked
+    else {
+        # The public install.sh performs its own newline-delimited host loop.
+        # Keep the signed bootstrap in Python and let the validated JSON phase
+        # below own all native Windows host wiring.
+        Push-Location -LiteralPath $sourceRoot
+        try {
+            $installCode = Invoke-WithCleanEnvironment -FilePath $script:PythonPath -ArgumentList @(
+                "-m", "installer.bootstrap_managed_install", "install"
+            )
+        }
+        finally {
+            Pop-Location
+        }
+        if ($installCode -ne 0) {
+            Stop-Install "The core installer failed. Preserve its output and run dp-uninstall.ps1 -Scope both -Apply before a clean retry." $ExitBlocked
+        }
     }
 
     if (-not (Test-Path -LiteralPath $ManagedRoot -PathType Container) -or (Test-ReparsePoint -Path $ManagedRoot)) {
@@ -1688,7 +1974,8 @@ try {
 
     if ($activationState -ne "activated") {
         Write-Host "Opening the masked Decision Engine activation window..."
-        $setupCode = Invoke-ManagedPython -Arguments @("-m", "installer.permanent_setup")
+        $setupCode = Invoke-ManagedPermanentSetup
+        Write-Host "Activation window completed; continuing installation..."
         $activationProbe = Invoke-ManagedPython -Arguments @(
             "-c",
             "from installer import activate, config; print('activated' if activate.is_permanently_activated(config.load_json(config.de_config_path())) else 'pending')"
@@ -1934,6 +2221,27 @@ raise SystemExit(1 if failed else 0)
         }
     }
 
+    if ($script:UpdateDeferred) {
+        Write-Host "Decision Engine deferred update report:"
+        Write-Host ("Activation: {0}" -f $(if ($activationState -eq "activated") { "complete" } else { "pending" }))
+        Write-Host "DE update: deferred because Agent MCP sessions are active"
+        Write-Host "Active MCP sessions recorded when this update was deferred:"
+        foreach ($processId in $script:DeferredSessionPids) {
+            $snapshot = Get-ProcessSnapshot -ProcessId $processId
+            if ($null -eq $snapshot) {
+                Write-Host ("  PID={0} likely-host=session exited after deferral" -f $processId)
+                continue
+            }
+            Write-Host ("  PID={0} likely-host={1} parent-pid={2} executable={3}" -f
+                $processId,
+                (Get-LikelyHostForProcess -ProcessId $processId),
+                $snapshot.ParentProcessId,
+                $snapshot.ExecutablePath)
+        }
+        Write-Host "Fully quit every listed Agent application before reopening any of them."
+        Write-Host "The first new MCP session will retry the pending signed update."
+    }
+
     Write-Host ("{0}: source={1}" -f $ProgramName, $sourceSha)
     Write-Host ("{0}: activation={1}" -f $ProgramName, $activationState)
     Write-Host ("{0}: restart every configured host before runtime verification" -f $ProgramName)
@@ -1945,6 +2253,14 @@ raise SystemExit(1 if failed else 0)
             }
         }
         [Console]::Error.WriteLine(("{0}: PARTIAL: supported components were installed, but host verification or AQG automatic update compatibility remains incomplete." -f $ProgramName))
+        exit $ExitPartial
+    }
+    if ($script:UpdateDeferred) {
+        if ($activationState -eq "activated") {
+            Write-Host ("{0}: SUCCESS_WITH_RESTART_REQUIRED: device activation and host configuration are complete; the current verified DE release was preserved and its signed update remains pending." -f $ProgramName)
+            exit 0
+        }
+        [Console]::Error.WriteLine(("{0}: PARTIAL: device activation and the signed DE update remain pending; the current verified release and host configuration were preserved." -f $ProgramName))
         exit $ExitPartial
     }
     Write-Host ("{0}: PASS: installation completed; runtime verification requires host restart" -f $ProgramName)
