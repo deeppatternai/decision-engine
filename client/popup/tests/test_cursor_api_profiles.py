@@ -49,6 +49,7 @@ class CursorApiProfileTestCase(unittest.TestCase):
                 "chat_ready",
                 "close",
                 "copy_visual_image",
+                "copy_visual_image_data_url",
                 "copy_visual_image_hires",
                 "hide",
                 "minimize",
@@ -57,10 +58,11 @@ class CursorApiProfileTestCase(unittest.TestCase):
                 "retry_chat",
                 "snapshot_region",
                 "toggle_maximize",
+                "visual_capture_capabilities",
                 "window_state",
             },
         )
-        for forbidden in ("commit", "initial_state", "layout", "share_visual_image"):
+        for forbidden in ("commit", "initial_state", "layout", "share_visual_image", "share_visual_image_data_url"):
             self.assertNotIn(forbidden, methods)
         self.assertFalse(hasattr(api, "delete_chat"))
         self.assertFalse(hasattr(native_shell.PopupApi("unused"), "delete_chat"))
@@ -165,6 +167,7 @@ class CursorApiProfileTestCase(unittest.TestCase):
                 "close",
                 "commit",
                 "copy_visual_image",
+                "copy_visual_image_data_url",
                 "copy_visual_image_hires",
                 "dismiss",
                 "hide",
@@ -174,6 +177,7 @@ class CursorApiProfileTestCase(unittest.TestCase):
                 "move_window",
                 "resize_window",
                 "toggle_maximize",
+                "visual_capture_capabilities",
                 "window_state",
             },
         )

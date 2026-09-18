@@ -41,12 +41,15 @@ import json
 import math
 import os
 import re
+import shutil
 import struct
+import subprocess
 import sys
 import tempfile
 import threading
 import time
 import uuid
+import zlib
 from pathlib import Path
 from typing import Any, Dict, Optional
 from urllib.parse import urlsplit
@@ -86,10 +89,13 @@ def _read_html_lang(html_path: str) -> str:
 _MAX_VISUAL_CHARS = 8000
 _MAX_CAPTURE_IMAGE_B64 = getattr(chat_backend, "_MAX_IMG_B64", 12 * 1024 * 1024)
 _MAX_WINDOWS_CAPTURE_PIXELS = 40_000_000
+_MAX_PAGE_CAPTURE_SIDE = 8192
+_MAX_PAGE_CAPTURE_PIXELS = 16_777_216
 _MAX_CAPTURE_SCALE_FACTOR = 3
 
 _IS_MAC = sys.platform == "darwin"
 _IS_WINDOWS = sys.platform == "win32"
+_IS_LINUX = sys.platform.startswith("linux")
 # Menu-bar (status-bar) icon file: the client ships it under desktop/macos/bin/. This file lives at
 # client/popup/native_shell.py, so the repo root is parent.parent.parent. If it's missing on an installed
 # client, _apply_mac_chrome falls back to a ◧ glyph — the icon is polish, the toggle works regardless.
@@ -1062,6 +1068,18 @@ class PopupApi:
                 return {"ok": False, "dragging": False}
         return {"ok": True, "dragging": True}
 
+    def visual_capture_capabilities(self) -> Dict[str, Any]:
+        """Report whether this native backend can snapshot the popup WebView.
+
+        The page uses this no-side-effect preflight so platforms without native snapshots can choose a
+        page-local region fallback while screenshot/share remain honest about native support. The capture
+        methods keep their own platform gates because the bridge is untrusted input and backend
+        capabilities can differ by installed native stack.
+        """
+        if _visual_capture_supported():
+            return {"ok": True, "supported": True}
+        return {"ok": True, "supported": False, "reason": "unsupported"}
+
     def copy_visual_image(self, rect: Any = None) -> Dict[str, Any]:
         """Screenshot the LEFT visual region → PNG → clipboard AS AN IMAGE. Windows requires the strict
         artifact rect + viewport; macOS preserves its existing optional full-view fallback. Other platforms
@@ -1107,6 +1125,26 @@ class PopupApi:
             return {"ok": False}
         return {"ok": _copy_windows_png_to_clipboard(self._win, png)}
 
+    def copy_visual_image_data_url(self, image: Any = None) -> Dict[str, Any]:
+        """Copy a page-rendered PNG data URL to the platform image clipboard."""
+        if self._closed:
+            return {"ok": False}
+        png = _decode_png_data_url(image)
+        if png is None:
+            return {"ok": False}
+        if _IS_WINDOWS:
+            return {"ok": _copy_windows_png_to_clipboard(self._win, png)}
+        if _IS_MAC:
+            try:
+                from Foundation import NSData
+                data = NSData.dataWithBytes_length_(png, len(png))
+            except Exception:  # aqg: top-level boundary — missing Foundation means no clipboard
+                return {"ok": False}
+            return {"ok": bool(_copy_png_to_clipboard(data))}
+        if _IS_LINUX:
+            return {"ok": _copy_linux_png_to_clipboard(png)}
+        return {"ok": False, "reason": "unsupported"}
+
     def share_visual_image(self, rect: Any = None, anchor: Any = None) -> Dict[str, Any]:
         """Screenshot the LEFT visual region → PNG → the platform-native share experience. Windows requires
         the strict artifact rect + viewport; macOS also uses ``anchor`` for its existing menu placement."""
@@ -1127,6 +1165,26 @@ class PopupApi:
         if png is None:
             return {"ok": False}
         return {"ok": _present_share_menu(png, anchor)}
+
+    def share_visual_image_data_url(self, image: Any = None, anchor: Any = None) -> Dict[str, Any]:
+        """Share or open a page-rendered PNG data URL through the platform's best native surface."""
+        if self._closed:
+            return {"ok": False}
+        png = _decode_png_data_url(image)
+        if png is None:
+            return {"ok": False}
+        if _IS_WINDOWS:
+            return {"ok": _present_windows_share(self._win, png)}
+        if _IS_MAC:
+            try:
+                from Foundation import NSData
+                data = NSData.dataWithBytes_length_(png, len(png))
+            except Exception:  # aqg: top-level boundary — missing Foundation means no share
+                return {"ok": False}
+            return {"ok": _present_share_menu(data, anchor)}
+        if _IS_LINUX:
+            return {"ok": _present_linux_share(png)}
+        return {"ok": False, "reason": "unsupported"}
 
     def snapshot_region(self, rect: Any = None) -> Dict[str, Any]:
         """Point-to-ask: screenshot the user-FRAMED region → PNG → a ``data:image/png;base64,…`` URL the PAGE
@@ -1839,8 +1897,14 @@ class _CursorWindowApi:
     def copy_visual_image(self, rect: Any = None) -> Dict[str, Any]:
         return self._core.copy_visual_image(rect)
 
+    def copy_visual_image_data_url(self, image: Any = None) -> Dict[str, Any]:
+        return self._core.copy_visual_image_data_url(image)
+
     def copy_visual_image_hires(self, rect: Any = None, factor: Any = 2) -> Dict[str, Any]:
         return self._core.copy_visual_image_hires(rect, factor)
+
+    def visual_capture_capabilities(self) -> Dict[str, Any]:
+        return self._core.visual_capture_capabilities()
 
 
 _CURSOR_GE_ARG_MISSING = object()
@@ -2357,6 +2421,145 @@ def _png_dimensions(png):
             width * height > _MAX_WINDOWS_CAPTURE_PIXELS):
         return None
     return (width, height)
+
+
+def _decode_png_data_url(data_url):
+    """Decode a page-rendered PNG data URL after bounding size and validating the PNG header."""
+    if not isinstance(data_url, str):
+        return None
+    prefix = "data:image/png;base64,"
+    if not data_url.startswith(prefix) or len(data_url) > len(prefix) + _MAX_CAPTURE_IMAGE_B64:
+        return None
+    payload = data_url[len(prefix):]
+    if not payload or len(payload) % 4 != 0:
+        return None
+    try:
+        png = base64.b64decode(payload.encode("ascii"), validate=True)
+    except (ValueError, UnicodeEncodeError):
+        return None
+    dimensions = _png_dimensions(png)
+    if (
+        len(png) > (_MAX_CAPTURE_IMAGE_B64 * 3 // 4)
+        or dimensions is None
+        or not _png_container_is_complete(png)
+    ):
+        return None
+    width, height = dimensions
+    if width > _MAX_PAGE_CAPTURE_SIDE or height > _MAX_PAGE_CAPTURE_SIDE or width * height > _MAX_PAGE_CAPTURE_PIXELS:
+        return None
+    return png
+
+
+def _png_container_is_complete(png) -> bool:
+    if not isinstance(png, (bytes, bytearray)) or not bytes(png).startswith(b"\x89PNG\r\n\x1a\n"):
+        return False
+    offset = 8
+    saw_ihdr = False
+    while offset < len(png):
+        if offset + 12 > len(png):
+            return False
+        length = struct.unpack(">I", png[offset:offset + 4])[0]
+        chunk_type = bytes(png[offset + 4:offset + 8])
+        data_start = offset + 8
+        data_end = data_start + length
+        crc_end = data_end + 4
+        if data_end < data_start or crc_end > len(png):
+            return False
+        expected_crc = struct.unpack(">I", png[data_end:crc_end])[0]
+        actual_crc = zlib.crc32(chunk_type + bytes(png[data_start:data_end])) & 0xFFFFFFFF
+        if actual_crc != expected_crc:
+            return False
+        if not saw_ihdr:
+            if chunk_type != b"IHDR" or length != 13:
+                return False
+            saw_ihdr = True
+        elif chunk_type == b"IHDR":
+            return False
+        offset = crc_end
+        if chunk_type == b"IEND":
+            return offset == len(png)
+    return False
+
+
+def _copy_linux_png_to_clipboard(png) -> bool:
+    """Copy PNG bytes to the Linux image clipboard through GTK when the GTK backend is available."""
+    if not _IS_LINUX or _png_dimensions(png) is None:
+        return False
+    try:
+        import gi
+        gi.require_version("Gtk", "3.0")
+        gi.require_version("Gdk", "3.0")
+        gi.require_version("GdkPixbuf", "2.0")
+        from gi.repository import Gdk, GdkPixbuf, Gtk
+
+        loader = GdkPixbuf.PixbufLoader.new_with_type("png")
+        loader.write(png)
+        loader.close()
+        pixbuf = loader.get_pixbuf()
+        if pixbuf is None:
+            return False
+        clipboard = Gtk.Clipboard.get(Gdk.SELECTION_CLIPBOARD)
+        clipboard.set_image(pixbuf)
+        clipboard.store()
+        while Gtk.events_pending():
+            Gtk.main_iteration_do(False)
+        return True
+    except Exception:  # aqg: top-level boundary — Linux clipboard availability varies by desktop/session
+        return False
+
+
+_LINUX_SHARE_TEMP_PATHS_LOCK = threading.Lock()
+_LINUX_SHARE_TEMP_PATHS = set()
+
+
+def _cleanup_linux_share_path(path: str) -> None:
+    try:
+        Path(path).unlink(missing_ok=True)
+    except Exception:  # aqg: top-level boundary — temp cleanup must never affect popup lifetime
+        pass
+    with _LINUX_SHARE_TEMP_PATHS_LOCK:
+        _LINUX_SHARE_TEMP_PATHS.discard(path)
+
+
+def _cleanup_linux_share_at_exit() -> None:
+    with _LINUX_SHARE_TEMP_PATHS_LOCK:
+        paths = list(_LINUX_SHARE_TEMP_PATHS)
+        _LINUX_SHARE_TEMP_PATHS.clear()
+    for path in paths:
+        try:
+            Path(path).unlink(missing_ok=True)
+        except Exception:  # aqg: top-level boundary — best-effort atexit cleanup
+            pass
+
+
+def _present_linux_share(png, timeout=5.0) -> bool:
+    """Open a temporary PNG with the desktop's default handler as Linux's share fallback."""
+    if not _IS_LINUX or _png_dimensions(png) is None or shutil.which("xdg-open") is None:
+        return False
+    path = None
+    try:
+        descriptor, path = tempfile.mkstemp(prefix="de-ge-share-", suffix=".png")
+        with os.fdopen(descriptor, "wb") as handle:
+            handle.write(png)
+            handle.flush()
+            os.fsync(handle.fileno())
+        subprocess.Popen(
+            ["xdg-open", path],
+            stdout=subprocess.DEVNULL,
+            stderr=subprocess.DEVNULL,
+            stdin=subprocess.DEVNULL,
+            start_new_session=True,
+        )
+        with _LINUX_SHARE_TEMP_PATHS_LOCK:
+            _LINUX_SHARE_TEMP_PATHS.add(path)
+        timer = threading.Timer(max(30.0, float(timeout) * 60.0), _cleanup_linux_share_path, args=(path,))
+        timer.daemon = True
+        timer.start()
+        return True
+    except Exception:  # aqg: top-level boundary — no portal/default handler must fail closed
+        if path:
+            _cleanup_linux_share_path(path)
+        return False
 
 
 _WINDOWS_CAPTURE_LOCK = threading.Lock()
@@ -3305,6 +3508,7 @@ def _cleanup_windows_share_at_exit():
 
 
 atexit.register(_cleanup_windows_share_at_exit)
+atexit.register(_cleanup_linux_share_at_exit)
 
 
 def _schedule_windows_share_cleanup(state, delay=5.0):

@@ -1566,6 +1566,153 @@ _GE_CHROME_JS = """
   var box = document.getElementById('ge-region-box');
   var imagePreview = document.getElementById('ge-image-preview');
   var S = __GE_CHROME_STRINGS__;
+  var visualCaptureSupported = null;
+  var visualCaptureProbe = null;
+
+  function probeVisualCapture() {
+    if (visualCaptureSupported !== null) return Promise.resolve(visualCaptureSupported);
+    var a = api();
+    if (!a || !a.visual_capture_capabilities) { visualCaptureSupported = true; return Promise.resolve(true); }
+    if (visualCaptureProbe) return visualCaptureProbe;
+    try {
+      visualCaptureProbe = Promise.resolve(a.visual_capture_capabilities())
+        .then(function (res) {
+          visualCaptureSupported = !(res && res.supported === false);
+          visualCaptureProbe = null;
+          return visualCaptureSupported;
+        })
+        .catch(function () {
+          visualCaptureSupported = true;
+          visualCaptureProbe = null;
+          return true;
+        });
+    } catch (e) {
+      visualCaptureSupported = true;
+      visualCaptureProbe = null;
+      return Promise.resolve(true);
+    }
+    return visualCaptureProbe;
+  }
+
+  function rectLeft(r) { return Number(r && r.left != null ? r.left : r && r.x) || 0; }
+  function rectTop(r) { return Number(r && r.top != null ? r.top : r && r.y) || 0; }
+  function rectWidth(r) { return Math.max(0, Number(r && r.width != null ? r.width : r && r.w) || 0); }
+  function rectHeight(r) { return Math.max(0, Number(r && r.height != null ? r.height : r && r.h) || 0); }
+  function captureRect(x, y, w, h) { return { x: x, y: y, w: w, h: h, left: x, top: y, width: w, height: h, right: x + w, bottom: y + h }; }
+
+  function pageCaptureSubject() {
+    if (!art || !art.querySelector) return null;
+    return art.querySelector('.ge-vis svg') || art.querySelector('.ge-vis img');
+  }
+
+  function pageVisualCaptureSupported() {
+    var subject = pageCaptureSubject();
+    if (!subject || typeof document.createElement !== 'function' || typeof Image !== 'function') return false;
+    var tag = String(subject.tagName || '').toLowerCase();
+    if (tag !== 'svg' && tag !== 'img') return false;
+    if (tag === 'svg' && typeof XMLSerializer !== 'function') return false;
+    try {
+      var c = document.createElement('canvas');
+      return !!(c && c.getContext && c.toDataURL && c.getContext('2d'));
+    } catch (e) { return false; }
+  }
+
+  function subjectImageSource(subject, rect, scale) {
+    var tag = String(subject && subject.tagName || '').toLowerCase();
+    if (tag === 'img') return subject.currentSrc || subject.src || null;
+    if (tag !== 'svg' || typeof XMLSerializer !== 'function') return null;
+    try {
+      var clone = subject.cloneNode(true);
+      clone.setAttribute('width', String(Math.max(1, Math.round(rectWidth(rect) * scale))));
+      clone.setAttribute('height', String(Math.max(1, Math.round(rectHeight(rect) * scale))));
+      if (!clone.getAttribute('xmlns')) clone.setAttribute('xmlns', 'http://www.w3.org/2000/svg');
+      return 'data:image/svg+xml;charset=utf-8,' + encodeURIComponent(new XMLSerializer().serializeToString(clone));
+    } catch (e) { return null; }
+  }
+
+  function scaledFont(font, scale) {
+    return String(font || '13px sans-serif').replace(/(\\d+(?:\\.\\d+)?)px/, function (_, n) {
+      return String(Math.max(1, Number(n) * scale)) + 'px';
+    });
+  }
+
+  function drawSignature(ctx, r, scale) {
+    if (!art || !art.querySelector || !ctx) return;
+    var sig = art.querySelector('.ge-signature');
+    if (!sig || !sig.getBoundingClientRect) return;
+    var text = sig.textContent || '';
+    if (!text) return;
+    var sr = sig.getBoundingClientRect();
+    var rx = rectLeft(r), ry = rectTop(r), rw = rectWidth(r), rh = rectHeight(r);
+    var sx = rectLeft(sr), sy = rectTop(sr), sw = rectWidth(sr), sh = rectHeight(sr);
+    var left = Math.max(rx, sx), top = Math.max(ry, sy);
+    var right = Math.min(rx + rw, sx + sw), bottom = Math.min(ry + rh, sy + sh);
+    if (right <= left || bottom <= top) return;
+    var style = window.getComputedStyle ? window.getComputedStyle(sig) : null;
+    ctx.fillStyle = (style && style.color) || '#b0a99c';
+    ctx.font = scaledFont((style && style.font) || '13px sans-serif', scale);
+    ctx.textAlign = 'center';
+    ctx.textBaseline = 'middle';
+    ctx.fillText(
+      text,
+      (sx + sw / 2 - rx) * scale,
+      (sy + sh / 2 - ry) * scale,
+      Math.max(1, sw * scale)
+    );
+  }
+
+  function captureVisualFromPage(r) {
+    return new Promise(function (resolve) {
+      var subject = pageCaptureSubject();
+      if (!subject || !subject.getBoundingClientRect) { resolve({ok: false, reason: 'unsupported'}); return; }
+      var subjectRect = subject.getBoundingClientRect();
+      var scale = Math.max(1, Math.min(2, Number(window.devicePixelRatio) || 1));
+      var rx = rectLeft(r), ry = rectTop(r), rw = rectWidth(r), rh = rectHeight(r);
+      var sx = rectLeft(subjectRect), sy = rectTop(subjectRect), sw = rectWidth(subjectRect), sh = rectHeight(subjectRect);
+      var width = Math.max(1, Math.ceil(rw * scale)), height = Math.max(1, Math.ceil(rh * scale));
+      if (width > 8192 || height > 8192 || width * height > 16777216) {
+        resolve({ok: false});
+        return;
+      }
+      var canvas, ctx;
+      try {
+        canvas = document.createElement('canvas');
+        canvas.width = width; canvas.height = height;
+        ctx = canvas.getContext && canvas.getContext('2d');
+      } catch (e) { ctx = null; }
+      if (!canvas || !ctx || !canvas.toDataURL) { resolve({ok: false, reason: 'unsupported'}); return; }
+      var src = subjectImageSource(subject, subjectRect, scale);
+      if (!src) { resolve({ok: false, reason: 'unsupported'}); return; }
+      var img = new Image();
+      var settled = false;
+      var timer = setTimeout(function () { finish({ok: false, reason: 'unsupported'}); }, 8000);
+      function finish(res) {
+        if (settled) return;
+        settled = true;
+        if (timer) clearTimeout(timer);
+        img.onload = img.onerror = null;
+        resolve(res);
+      }
+      img.onload = function () {
+        try {
+          ctx.fillStyle = '#fff';
+          ctx.fillRect(0, 0, width, height);
+          ctx.drawImage(
+            img,
+            (sx - rx) * scale,
+            (sy - ry) * scale,
+            sw * scale,
+            sh * scale
+          );
+          drawSignature(ctx, r, scale);
+          var image = canvas.toDataURL('image/png');
+          finish(String(image).indexOf('data:image/png;base64,') === 0 ? {ok: true, image: image} : {ok: false});
+        } catch (e) { finish({ok: false}); }
+      };
+      img.onerror = function () { finish({ok: false, reason: 'unsupported'}); };
+      try { img.src = src; } catch (e) { finish({ok: false, reason: 'unsupported'}); }
+    });
+  }
 
   // ---- toast: brief bottom-center confirmation ----
   var _toastTimer = null;
@@ -1615,23 +1762,51 @@ _GE_CHROME_JS = """
   //      just-changed layout has painted before the native snapshot fires. Native shell only; an honest
   //      toast when the host reports {ok:false, reason:'unsupported'} (a platform that can't capture). ----
   function captureArtifact(fn, naMsg, errMsg, unsMsg, onOk, extra) {
-    var a = api();
     if (!art) return;
-    if (!a || !a[fn]) { showToast(naMsg); return; }
-    hideToast();   // a lingering toast sits over the .artifact — drop it so it isn't captured into the shot
-    requestAnimationFrame(function () { requestAnimationFrame(function () {
-      var r = art.getBoundingClientRect();
-      var args = [[r.x, r.y, r.width, r.height, window.innerWidth, window.innerHeight]];
-      if (extra) args.push(extra);
-      try {
-        Promise.resolve(a[fn].apply(a, args))
-          .then(function (res) {
-            if (res && res.ok === false) showToast(res.reason === 'unsupported' ? unsMsg : errMsg);
-            else if (onOk) onOk();
-          })
-          .catch(function () { showToast(errMsg); });
-      } catch (e) { showToast(errMsg); }
-    }); });
+    function runPageCapture() {
+      var a = api();
+      var dataFn = fn === 'copy_visual_image' ? 'copy_visual_image_data_url'
+        : fn === 'share_visual_image' ? 'share_visual_image_data_url' : null;
+      if (!dataFn || !pageVisualCaptureSupported()) { showToast(unsMsg); return; }
+      if (!a || !a[dataFn]) { showToast(naMsg); return; }
+      hideToast();
+      requestAnimationFrame(function () { requestAnimationFrame(function () {
+        var r = art.getBoundingClientRect();
+        captureVisualFromPage(captureRect(rectLeft(r), rectTop(r), rectWidth(r), rectHeight(r))).then(function (res) {
+          if (!res || res.ok === false || !res.image) { showToast(res && res.reason === 'unsupported' ? unsMsg : errMsg); return; }
+          var args = [res.image];
+          if (extra) args.push(extra);
+          try {
+            Promise.resolve(a[dataFn].apply(a, args))
+              .then(function (outcome) {
+                if (outcome && outcome.ok === false) showToast(outcome.reason === 'unsupported' ? unsMsg : errMsg);
+                else if (onOk) onOk();
+              })
+              .catch(function () { showToast(errMsg); });
+          } catch (e) { showToast(errMsg); }
+        }).catch(function () { showToast(errMsg); });
+      }); });
+    }
+    if (visualCaptureSupported === false) { runPageCapture(); return; }
+    probeVisualCapture().then(function (supported) {
+      var a = api();
+      if (!supported) { runPageCapture(); return; }
+      if (!a || !a[fn]) { showToast(naMsg); return; }
+      hideToast();   // a lingering toast sits over the .artifact — drop it so it isn't captured into the shot
+      requestAnimationFrame(function () { requestAnimationFrame(function () {
+        var r = art.getBoundingClientRect();
+        var args = [[rectLeft(r), rectTop(r), rectWidth(r), rectHeight(r), window.innerWidth, window.innerHeight]];
+        if (extra) args.push(extra);
+        try {
+          Promise.resolve(a[fn].apply(a, args))
+            .then(function (res) {
+              if (res && res.ok === false) showToast(res.reason === 'unsupported' ? unsMsg : errMsg);
+              else if (onOk) onOk();
+            })
+            .catch(function () { showToast(errMsg); });
+        } catch (e) { showToast(errMsg); }
+      }); });
+    }).catch(function () { showToast(errMsg); });
   }
   var shotBtn = document.getElementById('shot-btn');
   if (shotBtn) shotBtn.onclick = function () {
@@ -1666,7 +1841,20 @@ _GE_CHROME_JS = """
     var y = Math.min(Math.max(cy - side / 2, v.top), v.bottom - side);
     return { x: x, y: y, w: side, h: side };
   }
-  function enterRegion() { if (!regionBtn || regionBtn.disabled) return; regionMode = true; regionBtn.classList.add('is-active'); if (art) art.classList.add('regioning'); showToast(S.arm); }
+  function enterRegionNow() { regionMode = true; regionBtn.classList.add('is-active'); if (art) art.classList.add('regioning'); showToast(S.arm); }
+  function enterRegion() {
+    if (!regionBtn || regionBtn.disabled) return;
+    if (visualCaptureSupported === false) {
+      if (pageVisualCaptureSupported()) enterRegionNow();
+      else showToast(S.reg_uns);
+      return;
+    }
+    probeVisualCapture().then(function (supported) {
+      if (!supported && !pageVisualCaptureSupported()) { showToast(S.reg_uns); return; }
+      if (!regionBtn || regionBtn.disabled || regionMode) return;
+      enterRegionNow();
+    }).catch(function () { if (!regionBtn || regionBtn.disabled || regionMode) return; enterRegionNow(); });
+  }
   function exitRegion() { snapGen++; regionMode = false; rDragging = false; if (regionBtn) regionBtn.classList.remove('is-active'); if (art) art.classList.remove('regioning'); if (box) box.hidden = true; }
   if (regionBtn) regionBtn.addEventListener('click', function () { regionMode ? exitRegion() : enterRegion(); });
 
@@ -1697,7 +1885,8 @@ _GE_CHROME_JS = """
   function captureRegion(r) {
     if (capturing) return;                                 // reentrancy guard: no parallel captures
     var a = api();
-    if (!a || !a.snapshot_region) { showToast(S.reg_na); exitRegion(); return; }
+    var pageCapture = visualCaptureSupported === false && pageVisualCaptureSupported();
+    if (!pageCapture && (!a || !a.snapshot_region)) { showToast(S.reg_na); exitRegion(); return; }
     capturing = true;
     var myGen = ++snapGen;
     var stale = function () { return myGen !== snapGen; };  // cancel/reselect during the async capture
@@ -1706,7 +1895,11 @@ _GE_CHROME_JS = """
     var fail = function (reason) { capturing = false; if (stale()) return; showToast(reason === 'unsupported' ? S.reg_uns : S.reg_err); };
     requestAnimationFrame(function () { requestAnimationFrame(function () {
       var p;
-      try { p = Promise.resolve(a.snapshot_region([r.x, r.y, r.w, r.h, window.innerWidth, window.innerHeight])); }
+      try {
+        p = pageCapture
+          ? captureVisualFromPage(r)
+          : Promise.resolve(a.snapshot_region([r.x, r.y, r.w, r.h, window.innerWidth, window.innerHeight]));
+      }
       catch (e) { fail(); return; }
       p.then(function (res) {
         if (stale()) { capturing = false; return; }        // superseded → drop the result, never attach

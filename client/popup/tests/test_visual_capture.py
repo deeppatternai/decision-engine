@@ -9,12 +9,15 @@ Run (stdlib only, from the repo root):
 
 from __future__ import annotations
 
+import base64
+import struct
 import threading
 import sys
 import tempfile
 import time
 import types
 import unittest
+import zlib
 from pathlib import Path
 from unittest import mock
 
@@ -1184,6 +1187,81 @@ class WindowsShareLifecycleTests(unittest.TestCase):
             self.assertTrue(ns._present_windows_share(win, self._minimal_png(), timeout=0.01))
         self.assertEqual(start.call_count, 2)
         self.assertTrue(any(state is first for state in ns._WINDOWS_SHARE_RETAINED))
+
+
+class VisualCaptureCapabilityTests(unittest.TestCase):
+    @staticmethod
+    def _png_bytes(width=12, height=34):
+        def chunk(kind, data):
+            return (
+                struct.pack(">I", len(data))
+                + kind
+                + data
+                + struct.pack(">I", zlib.crc32(kind + data) & 0xFFFFFFFF)
+            )
+
+        rows = b"".join(b"\x00" + (b"\x00\x00\x00" * width) for _ in range(height))
+        ihdr = struct.pack(">IIBBBBB", width, height, 8, 2, 0, 0, 0)
+        return b"\x89PNG\r\n\x1a\n" + chunk(b"IHDR", ihdr) + chunk(b"IDAT", zlib.compress(rows)) + chunk(b"IEND", b"")
+
+    @classmethod
+    def _png_data_url(cls):
+        png = cls._png_bytes()
+        return "data:image/png;base64," + base64.b64encode(png).decode("ascii")
+
+    def test_reports_unsupported_without_attempting_a_capture(self):
+        api = ns.PopupApi("/tmp/de-popup-test-result.json")
+        with mock.patch.object(ns, "_visual_capture_supported", return_value=False):
+            self.assertEqual(
+                api.visual_capture_capabilities(),
+                {"ok": True, "supported": False, "reason": "unsupported"},
+            )
+
+    def test_reports_supported_when_native_backend_exists(self):
+        api = ns.PopupApi("/tmp/de-popup-test-result.json")
+        with mock.patch.object(ns, "_visual_capture_supported", return_value=True):
+            self.assertEqual(api.visual_capture_capabilities(), {"ok": True, "supported": True})
+
+    @mock.patch.object(ns, "_IS_MAC", False)
+    @mock.patch.object(ns, "_IS_WINDOWS", False)
+    @mock.patch.object(ns, "_IS_LINUX", True)
+    def test_linux_copy_visual_image_data_url_dispatches_to_clipboard_helper(self):
+        api = ns.PopupApi("/tmp/de-popup-test-result.json")
+        with mock.patch.object(ns, "_copy_linux_png_to_clipboard", return_value=True) as copy:
+            self.assertEqual(api.copy_visual_image_data_url(self._png_data_url()), {"ok": True})
+        self.assertTrue(copy.call_args.args[0].startswith(b"\x89PNG\r\n\x1a\n"))
+
+    @mock.patch.object(ns, "_IS_MAC", False)
+    @mock.patch.object(ns, "_IS_WINDOWS", False)
+    @mock.patch.object(ns, "_IS_LINUX", True)
+    def test_linux_share_visual_image_data_url_dispatches_to_share_helper(self):
+        api = ns.PopupApi("/tmp/de-popup-test-result.json")
+        with mock.patch.object(ns, "_present_linux_share", return_value=True) as share:
+            self.assertEqual(api.share_visual_image_data_url(self._png_data_url()), {"ok": True})
+        self.assertTrue(share.call_args.args[0].startswith(b"\x89PNG\r\n\x1a\n"))
+
+    def test_visual_image_data_url_rejects_non_png_payloads(self):
+        api = ns.PopupApi("/tmp/de-popup-test-result.json")
+        bad = "data:image/jpeg;base64," + base64.b64encode(b"not-png").decode("ascii")
+        self.assertEqual(api.copy_visual_image_data_url(bad), {"ok": False})
+        self.assertEqual(api.share_visual_image_data_url("data:image/png;base64,%%%%"), {"ok": False})
+
+    @mock.patch.object(ns, "_IS_MAC", False)
+    @mock.patch.object(ns, "_IS_WINDOWS", False)
+    @mock.patch.object(ns, "_IS_LINUX", True)
+    def test_visual_image_data_url_rejects_truncated_png_before_helper(self):
+        truncated = b"\x89PNG\r\n\x1a\n" + b"\x00\x00\x00\rIHDR" + (12).to_bytes(4, "big") + (34).to_bytes(4, "big")
+        data_url = "data:image/png;base64," + base64.b64encode(truncated).decode("ascii")
+        api = ns.PopupApi("/tmp/de-popup-test-result.json")
+        with mock.patch.object(ns, "_copy_linux_png_to_clipboard", return_value=True) as copy:
+            self.assertEqual(api.copy_visual_image_data_url(data_url), {"ok": False})
+        copy.assert_not_called()
+
+    def test_visual_image_data_url_rejects_png_dimensions_over_page_capture_budget(self):
+        api = ns.PopupApi("/tmp/de-popup-test-result.json")
+        too_wide = "data:image/png;base64," + base64.b64encode(self._png_bytes(width=8193, height=1)).decode("ascii")
+        self.assertEqual(api.copy_visual_image_data_url(too_wide), {"ok": False})
+
 
 class SubviewFrameTests(unittest.TestCase):
     """`_subview_frame_in_content`: map a CSS (top-left) rect to an NSView frame ((x,y),(w,h))."""

@@ -58,7 +58,7 @@ class FramelessChromeSmoke(unittest.TestCase):
         html = _render()
         # The Windows compositor PNG can differ from CSS pixels at any DPI/window state. Both the whole
         # artifact and a selected region must send the live viewport dimensions used for strict scaling.
-        self.assertIn("r.width, r.height, window.innerWidth, window.innerHeight", html)
+        self.assertIn("rectWidth(r), rectHeight(r), window.innerWidth, window.innerHeight", html)
         self.assertIn("r.w, r.h, window.innerWidth, window.innerHeight", html)
 
     def test_header_controls_use_one_uniform_gap(self):

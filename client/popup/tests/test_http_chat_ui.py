@@ -118,18 +118,19 @@ class FakeNode {
   }
   click() { this.dispatchEvent({type: 'click'}); if (typeof this.onclick === 'function') this.onclick({target: this}); }
   focus() { this.focused = true; }
-  getBoundingClientRect() { return {left: 10, top: 20, width: 200, height: 100}; }
+  getBoundingClientRect() { return {x: 10, y: 20, left: 10, top: 20, width: 200, height: 100, right: 210, bottom: 120}; }
 }
 const ids = [
   'ge-chat-scroll', 'ge-composer', 'composer-input', 'composer-send', 'ge-imgchips',
   'ge-chat-status', 'ge-chat-status-text', 'ge-retry', 'ge-input-error', 'region-btn',
   'ge-i18n', 'ge-welcome', 'ge-image-preview', 'ge-image-preview-image',
-  'ge-image-preview-close',
+  'ge-image-preview-close', 'ge-toast', 'ge-region-box', 'artifact',
+  'shot-btn', 'share-btn',
   // The frameless header's own controls: ✕ destroys the popup, — minimizes it. Present so a test can
   // prove Escape's move from close to minimize did not disturb either explicit button.
   'close-btn', 'hide-btn'
 ];
-const BUTTON_IDS = new Set(['ge-image-preview-close', 'close-btn', 'hide-btn']);
+const BUTTON_IDS = new Set(['ge-image-preview-close', 'close-btn', 'hide-btn', 'shot-btn', 'share-btn']);
 const nodes = {};
 ids.forEach((id) => {
   const tag = id === 'composer-input' ? 'textarea'
@@ -146,12 +147,13 @@ nodes['ge-i18n'].dataset.placeholder = 'Ask';
 nodes['ge-welcome'].textContent = 'Welcome';
 nodes['ge-chat-scroll'].appendChild(nodes['ge-welcome']);
 const documentListeners = {};
+const windowListeners = {};
 const document = {
   documentElement: {lang: 'en'},
   getElementById(id) { return nodes[id] || null; },
   createElement(tag) { createdTags.push(String(tag).toLowerCase()); return new FakeNode(tag); },
   createTextNode(text) { const node = new FakeNode('#text'); node.textContent = text; return node; },
-  querySelector() { return null; },
+  querySelector(selector) { return selector === '.artifact' ? nodes['artifact'] : null; },
   querySelectorAll() { return []; },
   addEventListener(type, callback) { (documentListeners[type] || (documentListeners[type] = [])).push(callback); },
   dispatchEvent(event) {
@@ -171,6 +173,11 @@ const api = {
   chat_ready() { calls.push(['chat_ready']); return {ok: true, state: 'capability_checking'}; },
   ask() { calls.push(['ask'].concat(Array.from(arguments))); return {ok: true}; },
   retry_chat() { calls.push(['retry_chat'].concat(Array.from(arguments))); return {ok: true, status: 'recovering'}; },
+  visual_capture_capabilities() { calls.push(['visual_capture_capabilities']); return {ok: true, supported: true}; },
+  copy_visual_image() { calls.push(['copy_visual_image'].concat(Array.from(arguments))); return {ok: true}; },
+  copy_visual_image_data_url() { calls.push(['copy_visual_image_data_url'].concat(Array.from(arguments))); return {ok: true}; },
+  share_visual_image() { calls.push(['share_visual_image'].concat(Array.from(arguments))); return {ok: true}; },
+  share_visual_image_data_url() { calls.push(['share_visual_image_data_url'].concat(Array.from(arguments))); return {ok: true}; },
   close() { calls.push(['close']); return {ok: true}; },
   // The real bridge aliases hide() onto minimize(): a real OS minimize on Windows, orderOut + Dock
   // recall on macOS. Recorded separately from close so a test can tell "went away" from "destroyed".
@@ -183,7 +190,17 @@ const window = {
     randomUUID() { return '123e4567-e89b-42d3-a456-426614174000'; },
     getRandomValues(bytes) { for (let i = 0; i < bytes.length; i += 1) bytes[i] = i; return bytes; }
   },
-  addEventListener() {}
+  addEventListener(type, callback) { (windowListeners[type] || (windowListeners[type] = [])).push(callback); },
+  dispatchEvent(event) {
+    event = event || {};
+    event.preventDefault = event.preventDefault || function () { event.defaultPrevented = true; };
+    const callbacks = (windowListeners[event.type] || []).slice();
+    callbacks.forEach((callback) => callback(event));
+    return !event.defaultPrevented;
+  },
+  innerWidth: 900,
+  innerHeight: 640,
+  devicePixelRatio: 1
 };
 global.document = document;
 global.window = window;
@@ -260,6 +277,58 @@ def _run_js(
     if completed.returncode:
         raise AssertionError(completed.stderr)
     return json.loads(completed.stdout)
+
+
+_SVG_PAGE_CAPTURE_PREAMBLE = r"""
+const svg = new FakeNode('svg');
+svg.getBoundingClientRect = function () {
+  return {left: 10, top: 20, width: 200, height: 100, right: 210, bottom: 120};
+};
+svg.cloneNode = function () {
+  return {
+    setAttribute() {},
+    removeAttribute() {},
+    getAttribute(name) { return name === 'viewBox' ? '0 0 200 100' : null; }
+  };
+};
+nodes['artifact'].querySelector = function (selector) {
+  return selector.indexOf('svg') >= 0 ? svg : null;
+};
+global.XMLSerializer = class {
+  serializeToString() { return '<svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 200 100"></svg>'; }
+};
+global.Image = class {
+  set src(value) {
+    this._src = value;
+    setImmediate(() => { if (typeof this.onload === 'function') this.onload(); });
+  }
+  get src() { return this._src; }
+};
+const realCreateElement = document.createElement.bind(document);
+document.createElement = function (tag) {
+  if (String(tag).toLowerCase() !== 'canvas') return realCreateElement(tag);
+  return {
+    width: 0,
+    height: 0,
+    getContext(kind) {
+      if (kind !== '2d') return null;
+      return {
+        fillStyle: '',
+        font: '',
+        textAlign: '',
+        textBaseline: '',
+        fillRect() {},
+        fillText() { calls.push(['fillText'].concat(Array.from(arguments))); },
+        drawImage() { calls.push(['drawImage'].concat(Array.from(arguments).slice(1))); }
+      };
+    },
+    toDataURL(type) {
+      calls.push(['toDataURL', type]);
+      return TEST_VALID_PNG;
+    }
+  };
+};
+"""
 
 
 class HttpChatShellCommandTestCase(unittest.TestCase):
@@ -2395,6 +2464,155 @@ class HttpChatPageContractTestCase(unittest.TestCase):
         # Esc losing its close duty must not take the explicit ✕ with it.
         self.assertEqual(result["closeCalls"], 1)
         self.assertEqual(result["hideCalls"], 1)
+
+    def test_unsupported_visual_capture_does_not_enter_region_mode(self):
+        result = _run_js(r"""
+          nodes['region-btn'].disabled = false;
+          nodes['region-btn'].click();
+          setImmediate(function () {
+            finish({
+              regioning: nodes['artifact'].classList.contains('regioning'),
+              toast: nodes['ge-toast'].textContent,
+              capabilityCalls: calls.filter((call) => call[0] === 'visual_capture_capabilities').length,
+              snapshotCalls: calls.filter((call) => call[0] === 'snapshot_region').length
+            });
+          });
+        """, include_chrome=True, preamble=r"""
+          api.visual_capture_capabilities = function () {
+            calls.push(['visual_capture_capabilities']);
+            return {ok: true, supported: false, reason: 'unsupported'};
+          };
+          api.snapshot_region = function () {
+            calls.push(['snapshot_region'].concat(Array.from(arguments)));
+            return {ok: false, reason: 'unsupported'};
+          };
+        """)
+
+        self.assertFalse(result["regioning"])
+        self.assertEqual(result["toast"], "Region-ask is not supported here")
+        self.assertGreaterEqual(result["capabilityCalls"], 1)
+        self.assertEqual(result["snapshotCalls"], 0)
+
+    def test_linux_page_region_capture_attaches_svg_crop_without_native_snapshot(self):
+        result = _run_js(r"""
+          nodes['region-btn'].disabled = false;
+          nodes['region-btn'].click();
+          setImmediate(function () {
+            nodes['artifact'].dispatchEvent({type: 'mousedown', button: 0, clientX: 40, clientY: 50});
+            window.dispatchEvent({type: 'mouseup', clientX: 90, clientY: 100});
+            runAnimationFrames();
+            runAnimationFrames();
+            setImmediate(function () {
+              finish({
+                toast: nodes['ge-toast'].textContent,
+                chips: nodes['ge-imgchips'].children.length,
+                drawCalls: calls.filter((call) => call[0] === 'drawImage').length,
+                capabilityCalls: calls.filter((call) => call[0] === 'visual_capture_capabilities').length,
+                snapshotCalls: calls.filter((call) => call[0] === 'snapshot_region').length
+              });
+            });
+          });
+        """, include_chrome=True, preamble=r"""
+          api.visual_capture_capabilities = function () {
+            calls.push(['visual_capture_capabilities']);
+            return {ok: true, supported: false, reason: 'unsupported'};
+          };
+          api.snapshot_region = function () {
+            calls.push(['snapshot_region'].concat(Array.from(arguments)));
+            return {ok: false, reason: 'unsupported'};
+          };
+        """ + _SVG_PAGE_CAPTURE_PREAMBLE)
+
+        self.assertEqual(result["toast"], "Added to your follow-up — type a question to send")
+        self.assertEqual(result["chips"], 1)
+        self.assertEqual(result["drawCalls"], 1)
+        self.assertGreaterEqual(result["capabilityCalls"], 1)
+        self.assertEqual(result["snapshotCalls"], 0)
+
+    def test_linux_page_capture_copies_screenshot_without_native_snapshot(self):
+        result = _run_js(r"""
+          nodes['shot-btn'].click();
+          setImmediate(function () {
+            runAnimationFrames();
+            runAnimationFrames();
+            setImmediate(function () {
+              finish({
+                toast: nodes['ge-toast'].textContent,
+                drawCalls: calls.filter((call) => call[0] === 'drawImage').length,
+                nativeCopyCalls: calls.filter((call) => call[0] === 'copy_visual_image').length,
+                dataCopyCalls: calls.filter((call) => call[0] === 'copy_visual_image_data_url').length,
+                copiedPrefix: (calls.find((call) => call[0] === 'copy_visual_image_data_url') || [])[1]
+              });
+            });
+          });
+        """, include_chrome=True, preamble=r"""
+          api.visual_capture_capabilities = function () {
+            calls.push(['visual_capture_capabilities']);
+            return {ok: true, supported: false, reason: 'unsupported'};
+          };
+        """ + _SVG_PAGE_CAPTURE_PREAMBLE)
+
+        self.assertEqual(result["toast"], "Screenshot copied")
+        self.assertEqual(result["drawCalls"], 1)
+        self.assertEqual(result["nativeCopyCalls"], 0)
+        self.assertEqual(result["dataCopyCalls"], 1)
+        self.assertTrue(result["copiedPrefix"].startswith("data:image/png;base64,"))
+
+    def test_linux_page_capture_times_out_stalled_image_load(self):
+        result = _run_js(r"""
+          nodes['shot-btn'].click();
+          setImmediate(function () {
+            runAnimationFrames();
+            runAnimationFrames();
+            runTimeouts();
+            setImmediate(function () {
+              finish({
+                toast: nodes['ge-toast'].textContent,
+                dataCopyCalls: calls.filter((call) => call[0] === 'copy_visual_image_data_url').length
+              });
+            });
+          });
+        """, include_chrome=True, preamble=r"""
+          api.visual_capture_capabilities = function () {
+            calls.push(['visual_capture_capabilities']);
+            return {ok: true, supported: false, reason: 'unsupported'};
+          };
+        """ + _SVG_PAGE_CAPTURE_PREAMBLE + r"""
+          global.Image = class {
+            set src(value) { this._src = value; }
+            get src() { return this._src; }
+          };
+        """)
+
+        self.assertEqual(result["toast"], "Screenshot to clipboard is not supported here")
+        self.assertEqual(result["dataCopyCalls"], 0)
+
+    def test_linux_page_capture_shares_without_native_snapshot(self):
+        result = _run_js(r"""
+          nodes['share-btn'].click();
+          setImmediate(function () {
+            runAnimationFrames();
+            runAnimationFrames();
+            setImmediate(function () {
+              finish({
+                drawCalls: calls.filter((call) => call[0] === 'drawImage').length,
+                nativeShareCalls: calls.filter((call) => call[0] === 'share_visual_image').length,
+                dataShareCalls: calls.filter((call) => call[0] === 'share_visual_image_data_url').length,
+                sharedPrefix: (calls.find((call) => call[0] === 'share_visual_image_data_url') || [])[1]
+              });
+            });
+          });
+        """, include_chrome=True, preamble=r"""
+          api.visual_capture_capabilities = function () {
+            calls.push(['visual_capture_capabilities']);
+            return {ok: true, supported: false, reason: 'unsupported'};
+          };
+        """ + _SVG_PAGE_CAPTURE_PREAMBLE)
+
+        self.assertEqual(result["drawCalls"], 1)
+        self.assertEqual(result["nativeShareCalls"], 0)
+        self.assertEqual(result["dataShareCalls"], 1)
+        self.assertTrue(result["sharedPrefix"].startswith("data:image/png;base64,"))
 
     def test_sent_message_reuses_clickable_image_thumbnails(self):
         result = _run_js(r"""
