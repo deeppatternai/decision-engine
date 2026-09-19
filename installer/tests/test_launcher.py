@@ -463,6 +463,28 @@ class LauncherTests(unittest.TestCase):
         self.assertEqual(completed[0]["update_status"], "deferred_active_session")
         self.assertEqual(completed[0]["blocker_count"], 2)
 
+    def test_up_to_date_check_persists_a_successful_completion_receipt(self):
+        current = update_transaction.UpdateResult(
+            "up_to_date", "1" * 40, "1" * 40, None, None,
+        )
+        with (
+            mock.patch.object(launcher, "_managed_control_present", return_value=True),
+            mock.patch.object(launcher, "_head_commit", return_value="1" * 40),
+            mock.patch.object(launcher, "_finalize_journal", return_value=None),
+            mock.patch.object(launcher, "_updates_enabled", return_value=True),
+            mock.patch.object(
+                launcher, "load_trusted_release_keys",
+                return_value={"test": mock.sentinel.key},
+            ),
+            mock.patch.object(launcher, "_attempt_update", return_value=current) as update,
+            mock.patch.object(launcher, "_serve_shim", return_value=4),
+        ):
+            self.assertEqual(launcher.launch(self.root), 4)
+        update.assert_called_once()
+        attempt = launcher.update_staging.read_attempt(self.root)
+        self.assertIsNotNone(attempt)
+        self.assertEqual(attempt[1], "up_to_date")
+
     def test_rolled_back_staged_candidate_does_not_block_next_discovery(self):
         staged = mock.Mock()
         staged.manifest = mock.sentinel.manifest

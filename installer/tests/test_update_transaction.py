@@ -17,7 +17,9 @@ from pathlib import Path
 from types import SimpleNamespace
 from unittest import mock
 
+from installer.tests.test_release_contract import _TEST_E, _TEST_N, _sign
 from installer import (
+    doctor,
     launcher,
     managed_install,
     release_acquisition,
@@ -1080,6 +1082,172 @@ class UpdateTransactionTests(unittest.TestCase):
         state = json.loads(self.state_path.read_text(encoding="utf-8"))
         self.assertEqual(state["last_release_commit"], self.old_commit)
         self.assertEqual(self.state_path.read_bytes(), before)
+
+    def test_current_signed_release_with_live_shim_reports_up_to_date_to_doctor(self):
+        current_manifest = replace(
+            self.manifest,
+            release_sequence=22,
+            version="0.2.2",
+            tag="v0.2.2",
+            commit=self.old_commit,
+            key_id="test-release-key",
+        )
+        self._write_state(
+            last_manifest_sha256=release_contract.manifest_sha256(current_manifest),
+            source="github",
+            last_attempt_at="2026-09-19T00:00:00Z",
+            last_result="up_to_date",
+            previous_commit=self.old_commit,
+            target_commit=self.old_commit,
+            running_commit=self.old_commit,
+            running_version="0.2.2",
+            error_code=None,
+            transaction_id=None,
+        )
+        signature = _sign(current_manifest)
+        acquired = release_acquisition.AcquiredRelease(
+            release_acquisition.GITHUB_SOURCE, current_manifest, signature,
+        )
+        _holder, _lease_path = self._spawn_lease_holder()
+        keys = {
+            "test-release-key": release_contract.RsaPublicKey(
+                key_id="test-release-key", modulus=_TEST_N, exponent=_TEST_E,
+            )
+        }
+        with (
+            mock.patch.object(release_acquisition, "discover_release", return_value=acquired),
+            mock.patch.object(release_acquisition, "fetch_release_objects") as fetch,
+            mock.patch.object(update_staging, "stage_release") as stage,
+            mock.patch.object(doctor.config, "managed_component_root", return_value=self.root),
+            mock.patch.object(release_acquisition, "load_trusted_release_keys", return_value=keys),
+            mock.patch.object(launcher, "load_trusted_release_keys", return_value=keys),
+            mock.patch.object(launcher, "_harden_config_with_diagnostics"),
+            mock.patch.object(launcher, "_serve_shim", return_value=0),
+        ):
+            self.assertTrue(update_coordination.live_shim_sessions(self.root))
+            self.assertEqual(launcher.launch(self.root), 0)
+            attempt = update_staging.read_attempt(self.root)
+            diagnosis = doctor.check_managed_update()
+            invalid = release_acquisition.AcquiredRelease(
+                release_acquisition.GITHUB_SOURCE,
+                current_manifest,
+                replace(signature, signature="AA=="),
+            )
+            with mock.patch.object(release_acquisition, "discover_release", return_value=invalid):
+                with self.assertRaises(release_contract.ReleaseContractError):
+                    launcher._attempt_update(self.root, keys, deadline=time.monotonic() + 60)
+        self.assertEqual(diagnosis.status, "PASS")
+        self.assertIsNotNone(attempt)
+        self.assertEqual(attempt[1], "up_to_date")
+        fetch.assert_not_called()
+        stage.assert_not_called()
+
+    def test_current_release_does_not_ignore_a_mismatched_live_shim(self):
+        self.manifest = replace(
+            self.manifest,
+            release_sequence=22,
+            version="0.2.2",
+            tag="v0.2.2",
+            commit=self.old_commit,
+        )
+        self.verified = release_contract.VerifiedRelease(self.manifest, "test-key")
+        self._write_state(
+            last_manifest_sha256=release_contract.manifest_sha256(self.manifest),
+            source="github",
+            last_attempt_at="2026-09-19T00:00:00Z",
+            last_result="up_to_date",
+            previous_commit=self.old_commit,
+            target_commit=self.old_commit,
+            running_commit=self.old_commit,
+            running_version="0.2.2",
+            error_code=None,
+            transaction_id=None,
+        )
+        other_session = update_coordination.LiveShimSession(
+            self.root / "other-lease", None, None, self.new_commit, None,
+        )
+        with mock.patch.object(
+            update_coordination, "live_shim_sessions", return_value=(other_session,)
+        ):
+            result = self._apply()
+        self.assertEqual(result.status, "deferred_active_session")
+        self.assertEqual(result.blockers, (other_session,))
+
+    def test_current_release_with_pending_state_still_defers_live_shim(self):
+        self.manifest = replace(
+            self.manifest,
+            release_sequence=22,
+            version="0.2.2",
+            tag="v0.2.2",
+            commit=self.old_commit,
+        )
+        self.verified = release_contract.VerifiedRelease(self.manifest, "test-key")
+        _holder, _lease_path = self._spawn_lease_holder()
+        base_state = {
+            "last_manifest_sha256": release_contract.manifest_sha256(self.manifest),
+            "source": "github",
+            "last_attempt_at": "2026-09-19T00:00:00Z",
+            "last_result": "up_to_date",
+            "previous_commit": self.old_commit,
+            "target_commit": self.old_commit,
+            "running_commit": self.old_commit,
+            "running_version": "0.2.2",
+            "error_code": None,
+            "transaction_id": None,
+        }
+        for pending in (
+            {"transaction_id": "a" * 32},
+            {"error_code": "interrupted"},
+            {"last_result": "candidate_ready", "transaction_id": "a" * 32},
+        ):
+            with self.subTest(pending=pending):
+                self._write_state(**{**base_state, **pending})
+                result = self._apply()
+                self.assertEqual(result.status, "deferred_active_session")
+
+    def test_state_change_after_inspection_does_not_bypass_live_shim(self):
+        self.manifest = replace(
+            self.manifest,
+            release_sequence=22,
+            version="0.2.2",
+            tag="v0.2.2",
+            commit=self.old_commit,
+        )
+        self.verified = release_contract.VerifiedRelease(self.manifest, "test-key")
+        self._write_state(
+            last_manifest_sha256=release_contract.manifest_sha256(self.manifest),
+            source="github",
+            last_attempt_at="2026-09-19T00:00:00Z",
+            last_result="up_to_date",
+            previous_commit=self.old_commit,
+            target_commit=self.old_commit,
+            running_commit=self.old_commit,
+            running_version="0.2.2",
+            error_code=None,
+            transaction_id=None,
+        )
+        _holder, _lease_path = self._spawn_lease_holder()
+        inspect = updater.inspect_update
+
+        def interrupted_inspection(*args, **kwargs):
+            result = inspect(*args, **kwargs)
+            self._write_state(
+                last_manifest_sha256=release_contract.manifest_sha256(self.manifest),
+                source="github",
+                last_attempt_at="2026-09-19T00:00:00Z",
+                last_result="candidate_ready",
+                previous_commit=self.old_commit,
+                target_commit=self.old_commit,
+                running_commit=self.new_commit,
+                running_version="0.2.3",
+                error_code=None,
+                transaction_id="a" * 32,
+            )
+            return result
+
+        with mock.patch.object(updater, "inspect_update", side_effect=interrupted_inspection):
+            result = self._apply()
+        self.assertEqual(result.status, "deferred_active_session")
 
     def test_staged_release_installs_offline_after_live_session_exits(self):
         acquired = release_acquisition.AcquiredRelease(

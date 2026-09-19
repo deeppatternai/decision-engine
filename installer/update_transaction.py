@@ -2400,8 +2400,34 @@ def apply_present_update(
 
             _require_protocol_ready(canonical)
             state = updater._read_update_state(canonical)
+            inspected_state = state
+            inspection = None
+            if (
+                state.last_result in {"up_to_date", "updated"}
+                and state.running_commit == state.last_release_commit
+                and state.running_version == state.last_version
+                and state.target_commit == state.last_release_commit
+                and state.error_code is None
+                and state.transaction_id is None
+                and manifest.commit == state.last_release_commit
+                and manifest.release_sequence == state.last_release_sequence
+                and manifest.version == state.last_version
+                and release_contract.manifest_sha256(manifest)
+                == state.last_manifest_sha256
+            ):
+                # A settled release needs no shim handoff. Verify the signed
+                # checkout before letting a live session skip the deferral gate.
+                inspection = updater.inspect_update(
+                    canonical, manifest, signature, trusted_keys
+                )
+                state = updater._read_update_state(canonical)
             live = update_coordination.live_shim_sessions(canonical, transaction=transaction)
-            if live:
+            if live and (
+                inspection is None
+                or inspection.status != "up_to_date"
+                or state != inspected_state
+                or any(item.running_commit != state.last_release_commit for item in live)
+            ):
                 if (
                     state.last_result == "candidate_ready"
                     and state.target_commit == state.last_release_commit
@@ -2426,10 +2452,11 @@ def apply_present_update(
                     live,
                 )
 
-            inspection = updater.inspect_update(
-                canonical, manifest, signature, trusted_keys
-            )
-            state = updater._read_update_state(canonical)
+            if inspection is None:
+                inspection = updater.inspect_update(
+                    canonical, manifest, signature, trusted_keys
+                )
+                state = updater._read_update_state(canonical)
             if inspection.status == "up_to_date":
                 if (
                     state.last_result == "candidate_ready"
