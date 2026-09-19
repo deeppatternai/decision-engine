@@ -4,6 +4,7 @@ from __future__ import annotations
 
 import argparse
 import contextlib
+import errno
 import getpass
 import hashlib
 import json
@@ -16,8 +17,10 @@ import ssl
 import stat
 import subprocess
 import sys
+import threading
 import time
 import uuid
+import weakref
 from http.client import HTTPException
 from pathlib import Path
 from typing import Any, Dict, Iterable, Optional
@@ -509,16 +512,47 @@ def _open_append_log(path: Path, *, binary: bool = False):
     return os.fdopen(fd, "a", encoding="utf-8")
 
 
+_WINDOWS_THREAD_LOCKS_GUARD = threading.Lock()
+_WINDOWS_THREAD_LOCKS = weakref.WeakValueDictionary()
+_WINDOWS_THREAD_LOCK_TIMEOUT_S = 10.0
+
+
+def _windows_thread_lock(key: str):
+    """Share one mutex per normalized path while any caller holds or waits for it."""
+    with _WINDOWS_THREAD_LOCKS_GUARD:
+        lock = _WINDOWS_THREAD_LOCKS.get(key)
+        if lock is None:
+            lock = threading.RLock()
+            _WINDOWS_THREAD_LOCKS[key] = lock
+        return lock
+
+
+@contextlib.contextmanager
+def _bounded_windows_thread_lock(key: str) -> Iterable[None]:
+    # All runner file-lock acquisitions route through _exclusive_path_locks.
+    # RLock avoids a thread-layer self-deadlock; OS-level reentry is not supported.
+    lock = _windows_thread_lock(key)
+    if not lock.acquire(timeout=_WINDOWS_THREAD_LOCK_TIMEOUT_S):
+        raise OSError(errno.EDEADLK, os.strerror(errno.EDEADLK))
+    try:
+        yield
+    finally:
+        lock.release()
+
+
 @contextlib.contextmanager
 def _exclusive_path_locks(paths: Iterable[Path]) -> Iterable[None]:
-    """Acquire every distinct lock in order and release all of them on failure."""
+    """Acquire distinct file locks in caller order; release all on failure."""
+    unique_paths = {}
+    for path in paths:
+        unique_paths.setdefault(_path_key(path), path)
     with contextlib.ExitStack() as stack:
-        seen = set()
-        for path in paths:
-            key = _path_key(path)
-            if key in seen:
-                continue
-            seen.add(key)
+        if fcntl is None and msvcrt is not None:
+            # A total order avoids AB/BA thread deadlocks without changing the
+            # legacy-first OS lock order shared with previous client versions.
+            for key in sorted(unique_paths):
+                stack.enter_context(_bounded_windows_thread_lock(key))
+        for path in unique_paths.values():
             if _path_key(path.parent) == _path_key(runtime_locks_dir()):
                 _ensure_private_dir(path.parent)
             else:

@@ -2,15 +2,20 @@
 
 from __future__ import annotations
 
-import json
+import concurrent.futures
 import contextlib
+import errno
+import gc
 import io
+import json
 import os
 import shutil
 import subprocess
 import tempfile
 import threading
+import time
 import unittest
+import weakref
 from pathlib import Path
 from unittest import mock
 
@@ -357,6 +362,201 @@ with runner.active_runs_lock():
                 with runner._exclusive_path_locks(paths):
                     pass
         self.assertTrue(first.closed)
+
+    def test_same_process_threads_serialize_one_lock_without_blocking_other_paths(self):
+        contested = self.root / "thread-race.lock"
+        independent = self.root / "independent.lock"
+        first_holds_lock = threading.Event()
+        release_first = threading.Event()
+        second_attempting_lock = threading.Event()
+        second_done = threading.Event()
+        held = set()
+        guard = threading.Lock()
+        original_thread_lock = runner._bounded_windows_thread_lock
+
+        @contextlib.contextmanager
+        def observed_thread_lock(key):
+            if key == runner._path_key(contested) and first_holds_lock.is_set():
+                second_attempting_lock.set()
+            with original_thread_lock(key):
+                yield
+
+        @contextlib.contextmanager
+        def file_lock(path):
+            key = runner._path_key(path)
+            with guard:
+                if key in held:
+                    raise OSError(36, "Resource deadlock avoided")
+                held.add(key)
+            try:
+                if path == contested and not first_holds_lock.is_set():
+                    first_holds_lock.set()
+                    if not release_first.wait(timeout=5):
+                        raise AssertionError("first lock holder was not released")
+                yield
+            finally:
+                with guard:
+                    held.remove(key)
+
+        def acquire(path, *, done=None):
+            try:
+                with runner._exclusive_path_locks((path,)):
+                    return True
+            finally:
+                if done is not None:
+                    done.set()
+
+        with mock.patch.object(runner, "_open_lock_file", side_effect=lambda path: contextlib.nullcontext(path)), \
+             mock.patch.object(runner, "_exclusive_file_lock", side_effect=file_lock), \
+             mock.patch.object(runner, "_bounded_windows_thread_lock", side_effect=observed_thread_lock), \
+             mock.patch.object(runner, "fcntl", None), \
+             mock.patch.object(runner, "msvcrt", object()), \
+             concurrent.futures.ThreadPoolExecutor(max_workers=3) as pool:
+            first = pool.submit(acquire, contested)
+            try:
+                self.assertTrue(first_holds_lock.wait(timeout=2))
+                other = pool.submit(acquire, independent)
+                self.assertTrue(other.result(timeout=2))
+                second = pool.submit(acquire, contested, done=second_done)
+                self.assertTrue(second_attempting_lock.wait(timeout=2))
+                self.assertFalse(second_done.wait(timeout=0.2), "second holder did not wait for the first")
+            finally:
+                release_first.set()
+            self.assertTrue(first.result(timeout=5))
+            self.assertTrue(second.result(timeout=5))
+
+    def test_multi_path_thread_locks_have_canonical_order_without_reordering_file_locks(self):
+        first_path = self.root / "z-legacy.lock"
+        second_path = self.root / "a-current.lock"
+        observed = []
+
+        @contextlib.contextmanager
+        def thread_lock(key):
+            observed.append(("thread", key))
+            yield
+
+        @contextlib.contextmanager
+        def file_lock(path):
+            observed.append(("file", runner._path_key(path)))
+            yield
+
+        with mock.patch.object(runner, "_bounded_windows_thread_lock", side_effect=thread_lock), \
+             mock.patch.object(runner, "_open_lock_file", side_effect=lambda path: contextlib.nullcontext(path)), \
+             mock.patch.object(runner, "_exclusive_file_lock", side_effect=file_lock), \
+             mock.patch.object(runner, "fcntl", None), \
+             mock.patch.object(runner, "msvcrt", object()):
+            with runner._exclusive_path_locks((first_path, second_path)):
+                pass
+
+        first_key, second_key = (runner._path_key(path) for path in (first_path, second_path))
+        self.assertEqual(observed, [
+            ("thread", second_key), ("thread", first_key),
+            ("file", first_key), ("file", second_key),
+        ])
+
+    def test_windows_thread_lock_timeout_is_bounded_and_recoverable(self):
+        path = self.root / "contended.lock"
+        holding = threading.Event()
+        release = threading.Event()
+
+        def hold():
+            with runner._exclusive_path_locks((path,)):
+                holding.set()
+                if not release.wait(timeout=5):
+                    raise AssertionError("test lock holder was not released")
+
+        def contend():
+            with runner._exclusive_path_locks((path,)):
+                return True
+
+        with mock.patch.object(runner, "fcntl", None), \
+             mock.patch.object(runner, "msvcrt", object()), \
+             mock.patch.object(runner, "_exclusive_file_lock", side_effect=lambda _h: contextlib.nullcontext()), \
+             mock.patch.object(runner, "_WINDOWS_THREAD_LOCK_TIMEOUT_S", 0.05, create=True), \
+             concurrent.futures.ThreadPoolExecutor(max_workers=2) as pool:
+            first = pool.submit(hold)
+            try:
+                self.assertTrue(holding.wait(timeout=2))
+                second = pool.submit(contend)
+                with self.assertRaises(OSError) as caught:
+                    second.result(timeout=0.5)
+                self.assertEqual(caught.exception.errno, errno.EDEADLK)
+            finally:
+                release.set()
+            first.result(timeout=5)
+            self.assertTrue(contend())
+
+    def test_windows_thread_lock_released_after_os_lock_failure(self):
+        path = self.root / "failure.lock"
+        with mock.patch.object(runner, "fcntl", None), \
+             mock.patch.object(runner, "msvcrt", object()), \
+             mock.patch.object(runner, "_exclusive_file_lock", side_effect=[
+                 OSError("injected OS lock failure"), contextlib.nullcontext(),
+             ]):
+            with self.assertRaisesRegex(OSError, "injected OS lock failure"):
+                with runner._exclusive_path_locks((path,)):
+                    pass
+
+            with concurrent.futures.ThreadPoolExecutor(max_workers=1) as pool:
+                def retry():
+                    with runner._exclusive_path_locks((path,)):
+                        return True
+
+                self.assertTrue(pool.submit(retry).result(timeout=2))
+
+    def test_windows_thread_lock_registry_keeps_active_lock_and_reclaims_idle_lock(self):
+        path = self.root / "lifecycle.lock"
+        key = runner._path_key(path)
+        lock = runner._windows_thread_lock(key)
+        reference = weakref.ref(lock)
+        with mock.patch.object(runner, "fcntl", None), \
+             mock.patch.object(runner, "msvcrt", object()), \
+             mock.patch.object(runner, "_exclusive_file_lock", side_effect=lambda _h: contextlib.nullcontext()):
+            with runner._exclusive_path_locks((path,)):
+                self.assertIs(runner._windows_thread_lock(key), lock)
+        del lock
+        gc.collect()
+        self.assertIsNone(reference())
+
+    @unittest.skipUnless(os.name == "nt", "requires the real Windows msvcrt byte lock")
+    def test_real_windows_byte_lock_serializes_threads_and_reverse_order_paths(self):
+        path = self.root / "real-byte.lock"
+        for _ in range(5):
+            barrier = threading.Barrier(8)
+
+            def acquire(_index):
+                barrier.wait(timeout=3)
+                with runner._exclusive_path_locks((path,)):
+                    time.sleep(0.001)
+                return True
+
+            with concurrent.futures.ThreadPoolExecutor(max_workers=8) as pool:
+                self.assertEqual(list(pool.map(acquire, range(8))), [True] * 8)
+
+        code = """
+from concurrent.futures import ThreadPoolExecutor
+from pathlib import Path
+from threading import Barrier
+import sys, time
+from client import runner
+a, b = Path(sys.argv[1]), Path(sys.argv[2])
+for _ in range(5):
+    barrier = Barrier(2)
+    def acquire(paths):
+        barrier.wait(timeout=3)
+        with runner._exclusive_path_locks(paths):
+            time.sleep(0.002)
+    with ThreadPoolExecutor(max_workers=2) as pool:
+        list(pool.map(acquire, ((a, b), (b, a))))
+"""
+        env = os.environ.copy()
+        env["DE_CONFIG_PATH"] = str(self.config)
+        env["PYTHONPATH"] = str(Path(__file__).resolve().parents[2])
+        result = subprocess.run(
+            [os.sys.executable, "-c", code, str(self.root / "a.lock"), str(self.root / "b.lock")],
+            env=env, capture_output=True, text=True, timeout=10,
+        )
+        self.assertEqual(result.returncode, 0, result.stderr)
 
     def test_concurrent_clear_keeps_registry_copies_identical(self):
         runner.save_active_run({"run_id": "r1", "status": "queued"})
