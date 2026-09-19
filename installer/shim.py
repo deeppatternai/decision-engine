@@ -37,7 +37,7 @@ import time
 import uuid
 from http.client import HTTPConnection, HTTPException, HTTPSConnection, RemoteDisconnected
 from pathlib import Path
-from typing import Any, Callable, Dict, Optional, TextIO
+from typing import Any, Callable, Dict, List, Optional, TextIO
 from urllib.error import HTTPError, URLError
 from urllib.parse import quote, urlsplit
 from urllib.request import HTTPHandler, HTTPSHandler, Request, build_opener
@@ -557,6 +557,7 @@ _ENTITLEMENT_ACTIONS = {
     "credits_exhausted": "add_credits",
     "rate_limited": "wait_or_retry",
 }
+_ENTITLEMENT_HTTP_STATUSES = frozenset({402, 403, 429})
 _MCP_INSUFFICIENT_BALANCE_MARKER = "insufficient_balance"
 
 
@@ -565,17 +566,130 @@ def _is_mcp_insufficient_balance_text(text: str) -> bool:
     return isinstance(text, str) and _MCP_INSUFFICIENT_BALANCE_MARKER in text
 
 
-def _contains_mcp_insufficient_balance_marker(value: Any) -> bool:
-    """Find the server-owned balance marker anywhere in a received MCP response."""
-    if isinstance(value, str):
-        return _is_mcp_insufficient_balance_text(value)
-    if isinstance(value, dict):
-        return any(
-            _contains_mcp_insufficient_balance_marker(item)
-            for item in value.items()
+# The only run status that can carry an entitlement refusal. A payload that reports any other
+# status is describing work that RAN, so a marker inside it is content (a finding, a quoted stack
+# frame, chat history), not a verdict about this request.
+_MCP_ENTITLEMENT_FAILURE_STATUSES = frozenset({"failed"})
+
+
+def _mcp_content_texts(result: Any) -> List[str]:
+    """Every ``content[*].text`` block of an MCP tool result, in order."""
+    content = result.get("content") if isinstance(result, dict) else None
+    if not isinstance(content, list) or len(content) > 32:
+        return []
+    return [
+        block["text"] for block in content
+        if isinstance(block, dict) and isinstance(block.get("text"), str)
+    ]
+
+
+def _mcp_run_view(decoded: Any) -> Optional[Dict[str, Any]]:
+    """Unwrap the ``{schema_version, skill, payload}`` envelope around a run view, if present."""
+    if not isinstance(decoded, dict):
+        return None
+    nested = decoded.get("payload")
+    if isinstance(nested, dict) and ("skill" in decoded or "schema_version" in decoded):
+        return nested
+    return decoded
+
+
+def _mcp_entitlement_reason_has_marker(value: Any) -> bool:
+    """Recognize the marker only in bounded server-owned reason fields."""
+    if _is_mcp_insufficient_balance_text(value):
+        return True
+    if not isinstance(value, dict):
+        return False
+    return any(
+        _is_mcp_insufficient_balance_text(value.get(field))
+        for field in ("code", "message")
+    )
+
+
+def _mcp_view_has_entitlement_reason(candidate: Any) -> bool:
+    if not isinstance(candidate, dict):
+        return False
+    return any(
+        _mcp_entitlement_reason_has_marker(candidate.get(field))
+        for field in ("error", "reason")
+    )
+
+
+def _entitlement_refusal_is_authoritative(response: Any) -> bool:
+    """Whether this response MEANS "the server refused this request for want of credits".
+
+    The marker's presence is not the decision — its LOCATION is. A successful audit answer may
+    legitimately name ``insufficient_balance`` in a finding, in quoted code, in conversation
+    history, or in a title, and converting any of those into an account action silently discards
+    a hosted result the user paid for and replaces it with a local advisory answering a different
+    question. So only two locations are trusted, and every ambiguous envelope fails closed:
+
+    * ``result.isError is True`` — the server itself declared this call a failure. Plain-text
+      failure prose may carry the marker; decoded run views still restrict it to ``error`` or
+      ``reason`` fields so model-controlled display metadata cannot become an account verdict.
+    * ``isError`` absent (the legacy Hub envelope) AND nothing in the envelope claims the work
+      succeeded. A run view is trusted here only when its ``status`` is ``failed`` and the marker
+      sits in its ``error`` reason field — never in ``title`` or any other display metadata.
+
+    An ``isError`` that is present but not exactly ``True`` (``False``, ``None``, a string) and a
+    JSON-RPC envelope carrying both ``result`` and ``error`` are both rejected outright: the first
+    is either an explicit success or too malformed to prove anything, and the second is forbidden
+    by JSON-RPC 2.0, so neither may spend an account action.
+    """
+    if not isinstance(response, dict):
+        return False
+    if response.get("error") is not None and response.get("result") is not None:
+        return False
+    result = response.get("result")
+    if not isinstance(result, dict):
+        return False
+
+    is_error = result.get("isError")
+    if "isError" in result and is_error is not True:
+        return False
+    server_declared_failure = is_error is True
+
+    texts = _mcp_content_texts(result)
+    if not any(_is_mcp_insufficient_balance_text(text) for text in texts):
+        return False
+
+    decoded_views = []
+    unstructured_texts = []
+    for text in texts:
+        try:
+            decoded = json.loads(text)
+        except (TypeError, ValueError):
+            unstructured_texts.append(text)
+            continue
+        view = _mcp_run_view(decoded)
+        if view is not None:
+            decoded_views.append((view, decoded))
+
+    if server_declared_failure:
+        return (
+            any(_is_mcp_insufficient_balance_text(text) for text in unstructured_texts)
+            or any(
+                _mcp_view_has_entitlement_reason(candidate)
+                for view, decoded in decoded_views
+                for candidate in (view, decoded)
+            )
         )
-    if isinstance(value, (list, tuple)):
-        return any(_contains_mcp_insufficient_balance_marker(item) for item in value)
+
+    # Legacy envelopes have no explicit failure bit, so a success/running claim in ANY block
+    # vetoes a historical failed view elsewhere in the same response.
+    for view, decoded in decoded_views:
+        for candidate in (view, decoded):
+            status = candidate.get("status") if isinstance(candidate, dict) else None
+            if isinstance(status, str) and (
+                status.strip().lower() not in _MCP_ENTITLEMENT_FAILURE_STATUSES
+            ):
+                return False
+
+    for view, decoded in decoded_views:
+        status = view.get("status")
+        if not isinstance(status, str):
+            continue  # legacy envelopes must state the failure, not leave it to be inferred
+        if any(_mcp_view_has_entitlement_reason(candidate) for candidate in (view, decoded)):
+            return True
     return False
 
 
@@ -698,6 +812,10 @@ def _local_audit_completion_args(arguments: Any) -> Optional[Dict[str, str]]:
     return {"local_id": local_id, "status": status}
 
 
+def _new_local_run_id() -> str:
+    return "local_%s" % secrets.token_hex(12)
+
+
 def _local_advisory_response(
     rid: Any,
     *,
@@ -705,11 +823,18 @@ def _local_advisory_response(
     action: Optional[str] = None,
     title: Optional[str] = None,
     ui_locale: Optional[str] = None,
+    run_id: Optional[str] = None,
 ) -> Dict[str, Any]:
-    """Build the one local-audit envelope used by all approved downgrade boundaries."""
+    """Build the one local-audit envelope used by all approved downgrade boundaries.
+
+    ``run_id`` lets a caller reuse the local run a previous fallback already created for the same
+    Hosted run. It is validated here rather than trusted: a persisted id that does not match the
+    local-run shape is discarded and a fresh one minted.
+    """
     from client import runner
 
-    run_id = "local_%s" % secrets.token_hex(12)
+    if not runner._valid_local_fallback_id(run_id):
+        run_id = _new_local_run_id()
     safe_title = title.strip() if isinstance(title, str) else ""
     run: Dict[str, Any] = {
         "run_id": run_id,
@@ -814,7 +939,7 @@ def _account_action_payload(payload: Any) -> Optional[Dict[str, Any]]:
 
 def _account_action_contract(raw_error: str, http_status: int) -> Optional[Dict[str, Any]]:
     """Accept only the server-owned entitlement reason/action contract."""
-    if http_status not in (402, 403, 429):
+    if http_status not in _ENTITLEMENT_HTTP_STATUSES:
         return None
     try:
         payload = json.loads(raw_error)
@@ -827,19 +952,20 @@ def _account_action_response(response: Any) -> Optional[Dict[str, Any]]:
     """Read the same contract when the Hub wraps it in JSON-RPC error.data."""
     if not isinstance(response, dict):
         return None
-
-    # ``insufficient_balance`` is the server's authoritative business marker. It may arrive in the
-    # initial submit envelope, a later wait/status envelope, or JSON text nested inside either one.
-    # Once bytes have been received, converting that deterministic rejection to one local advisory
-    # is not a replay. Do not make the fallback depend on MCP wrapper shape or localized prose.
-    if _contains_mcp_insufficient_balance_marker(response):
-        return _credits_exhausted_action()
+    if response.get("error") is not None and response.get("result") is not None:
+        return None
 
     error = response.get("error")
     data = error.get("data") if isinstance(error, dict) else None
     structured = _account_action_payload(data)
     if structured is not None:
         return structured
+
+    # ``insufficient_balance`` is the server's authoritative legacy marker, but only where the
+    # envelope's own shape says the request was REFUSED (see _entitlement_refusal_is_authoritative).
+    # A valid structured contract above always wins over this compatibility path.
+    if _entitlement_refusal_is_authoritative(response):
+        return _credits_exhausted_action()
     return None
 
 
@@ -1179,11 +1305,14 @@ class Forwarder:
                                  else err_body.decode("utf-8", errors="replace"))
                 except (HTTPException, OSError):
                     raw_error = ""   # a truncated error body must not escape the ShellError contract
-                if _is_mcp_insufficient_balance_text(raw_error):
-                    raise EntitlementBlockedError(_credits_exhausted_action()) from None
                 account_action = _account_action_contract(raw_error, exc.code)
                 if account_action is not None:
                     raise EntitlementBlockedError(account_action) from None
+                if (
+                    exc.code in _ENTITLEMENT_HTTP_STATUSES
+                    and _is_mcp_insufficient_balance_text(raw_error)
+                ):
+                    raise EntitlementBlockedError(_credits_exhausted_action()) from None
                 raise ShellError("HTTP %s from /mcp: %s" % (exc.code, raw_error or exc.reason))
             finally:
                 try:
@@ -1226,11 +1355,6 @@ class Forwarder:
             # Location subclass neither URLError nor OSError, so they escaped raw — and their
             # str() echoes server-chosen bytes. Report the type only.
             raise ShellError("/mcp request failed: %s" % type(exc).__name__) from None
-        if _is_mcp_insufficient_balance_text(raw):
-            # A service may answer with a plain-text body rather than a JSON-RPC envelope. The
-            # authenticated response is still an authoritative balance rejection; normalize it at
-            # the transport boundary so the normal serve() downgrade path owns the UI transition.
-            raise EntitlementBlockedError(_credits_exhausted_action()) from None
         if not raw:
             return {}
         try:
@@ -2554,6 +2678,46 @@ def _audit_fallback_context(
     return None
 
 
+def _claim_local_fallback_replacement(
+    hosted_run_id: Optional[str], context: Dict[str, Any]
+) -> Optional[Dict[str, Any]]:
+    """Resolve the ONE local run that replaces ``hosted_run_id``, creating it only once.
+
+    Returns ``{"run_id", "title", "ui_locale", "created"}``. ``created`` is False when a previous
+    fallback — in this process or in an earlier one — already replaced this Hosted run, and it is
+    what keeps a polling agent from collecting a new advisory and a new Stop panel per follow-up.
+
+    Without a Hosted identity there is nothing to key on, so every such downgrade stays distinct:
+    guessing a shared key would merge unrelated audits, which is strictly worse than a duplicate.
+    For a known Hosted identity, registry trouble returns ``None``. Minting an untracked id would
+    violate the one-replacement invariant on every later poll and recreate the duplicate-popup bug.
+    """
+    title = context.get("title")
+    ui_locale = context.get("ui_locale")
+    fresh = {"run_id": _new_local_run_id(), "title": title,
+             "ui_locale": ui_locale, "created": True}
+    if not hosted_run_id:
+        return fresh
+    try:
+        from client import runner
+
+        entry = runner.remember_local_fallback_replacement(
+            hosted_run_id, fresh["run_id"], title=title, ui_locale=ui_locale
+        )
+    except Exception as exc:  # aqg: top-level boundary -- display bookkeeping cannot break MCP
+        _log("local fallback replacement mapping unavailable: %r" % exc)
+        return None
+    created = entry.get("local_id") == fresh["run_id"]
+    return {
+        "run_id": entry.get("local_id") or fresh["run_id"],
+        # Both the first response and every reuse return the same bounded, normalized metadata that
+        # was persisted by the winning claim.
+        "title": entry.get("title", ""),
+        "ui_locale": entry.get("ui_locale"),
+        "created": created,
+    }
+
+
 def _remove_hosted_run_for_local_fallback(run_id: Optional[str]) -> None:
     """Remove the already-visible Hosted row before adding its local replacement."""
     if not run_id:
@@ -3142,6 +3306,7 @@ def serve(
         # Everything else: forward inline (fast hub round-trip).
         forced_local_fallback = False
         forced_local_panel_locale = None
+        forced_local_fallback_reused = False
         try:
             response = forwarder.forward(
                 _with_client_host_metadata(message, resolved_client_host)
@@ -3153,16 +3318,24 @@ def serve(
                 and fallback_context is not None
                 and exc.data.get("local_advisory_available") is True
             ):
+                blocked_run_id = _audit_request_run_id(message)
+                replacement = _claim_local_fallback_replacement(
+                    blocked_run_id, fallback_context
+                )
+                if replacement is None:
+                    emit(_jsonrpc_error(message.get("id"), -32001, str(exc), exc.data))
+                    continue
                 response = _local_advisory_response(
                     message.get("id"),
                     reason=exc.data["reason"],
                     action=exc.data.get("action"),
-                    title=fallback_context.get("title"),
-                    ui_locale=fallback_context.get("ui_locale"),
+                    title=replacement["title"],
+                    ui_locale=replacement["ui_locale"],
+                    run_id=replacement["run_id"],
                 )
                 forced_local_fallback = True
-                forced_local_panel_locale = fallback_context.get("ui_locale")
-                blocked_run_id = _audit_request_run_id(message)
+                forced_local_fallback_reused = not replacement["created"]
+                forced_local_panel_locale = replacement["ui_locale"]
                 if blocked_run_id is not None:
                     # DE-026 / R-076, F26-02: this downgrade is DETERMINISTIC — the hosted run is
                     # over and one DE Lite advisory has replaced it. Retire it from the in-flight
@@ -3258,7 +3431,13 @@ def serve(
         response_run_id = _audit_response_run_id(response)
         response_status = _audit_response_status(response)
         request_run_id = _audit_request_run_id(message)
-        correlation_run_id = response_run_id or request_run_id
+        # A follow-up request names the Hosted run being polled. Prefer that stable identity over
+        # a response-side alias; submit requests have no run id and therefore use the new response
+        # id. Both transport and response-carried entitlement failures now claim the same key.
+        correlation_run_id = request_run_id or response_run_id
+        observed_run_ids = tuple(dict.fromkeys(
+            run_id for run_id in (request_run_id, response_run_id) if run_id is not None
+        ))
 
         # Submit is asynchronous: the balance marker can arrive in a later wait/status/result
         # response. Keep only the display metadata needed for that one in-flight audit; never keep
@@ -3284,24 +3463,40 @@ def serve(
             fallback_context = _audit_fallback_context(message, response)
         local_fallback = forced_local_fallback
         local_panel_locale = forced_local_panel_locale
+        local_fallback_reused = forced_local_fallback_reused
         if (
             is_request
             and account_action is not None
             and account_action.get("local_advisory_available") is True
             and fallback_context is not None
         ):
-            response = _local_advisory_response(
-                message.get("id"),
-                reason=account_action["reason"],
-                action=account_action.get("action"),
-                title=fallback_context.get("title"),
-                ui_locale=fallback_context.get("ui_locale"),
+            replacement = _claim_local_fallback_replacement(
+                correlation_run_id, fallback_context
             )
-            local_fallback = True
-            local_panel_locale = fallback_context.get("ui_locale")
-            if correlation_run_id is not None:
-                pending_audits.pop(correlation_run_id, None)
-                _remove_hosted_run_for_local_fallback(correlation_run_id)
+            if replacement is not None:
+                response = _local_advisory_response(
+                    message.get("id"),
+                    reason=account_action["reason"],
+                    action=account_action.get("action"),
+                    title=replacement["title"],
+                    ui_locale=replacement["ui_locale"],
+                    run_id=replacement["run_id"],
+                )
+                local_fallback = True
+                local_fallback_reused = not replacement["created"]
+                local_panel_locale = replacement["ui_locale"]
+                if correlation_run_id is not None:
+                    for run_id in observed_run_ids:
+                        pending_audits.pop(run_id, None)
+                    # Still unconditional: a status poll between two follow-ups can re-add the
+                    # hosted row, and it must not outlive the local run that replaced it.
+                    for run_id in observed_run_ids:
+                        _remove_hosted_run_for_local_fallback(run_id)
+            elif correlation_run_id is not None and (
+                response_status in _TERMINAL_AUDIT_SUBMIT_STATUSES
+            ):
+                for run_id in observed_run_ids:
+                    pending_audits.pop(run_id, None)
         elif (
             correlation_run_id is not None
             and response_status in _TERMINAL_AUDIT_SUBMIT_STATUSES
@@ -3310,7 +3505,8 @@ def serve(
             # while omitting the run_id the REQUEST already named. Correlate on either identity
             # so a finished run is actually retired; the status still has to be terminal, and
             # `correlation_run_id` comes from this exchange alone, so no unrelated run is touched.
-            pending_audits.pop(correlation_run_id, None)
+            for run_id in observed_run_ids:
+                pending_audits.pop(run_id, None)
         # A request MUST get a reply (JSON-RPC 2.0) — even if the server sent an
         # empty body, emit an error rather than leaving the client hanging on
         # that id. Notifications (no id) get no reply regardless.
@@ -3345,9 +3541,11 @@ def serve(
                         # Only hosts that SHOULD have had them: staying quiet here is
                         # what made a missing open_ge undiagnosable from the outside.
                         _log("display tools withheld: %s" % withheld)
-                elif method == "tools/call" and (
+                elif method == "tools/call" and not local_fallback_reused and (
                     tool_name in _AUDIT_SUBMIT_TOOLS or local_fallback
                 ):
+                    # A reused local replacement already has its row and its panel: relaunching
+                    # per follow-up is exactly the duplicate this fix exists to prevent.
                     # a hub audit just started via the MCP path → pop the client stop panel (off-thread,
                     # best-effort) so an agent-driven audit gets the same panel the CLI already does.
                     # Guard the spawn itself: Thread.start() runs on THIS transport thread and can raise

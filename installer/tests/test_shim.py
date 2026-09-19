@@ -22,6 +22,7 @@ import types
 import socket
 import time
 import unittest
+from concurrent.futures import ThreadPoolExecutor
 from http.server import BaseHTTPRequestHandler, HTTPServer
 from pathlib import Path
 from unittest import mock
@@ -2346,7 +2347,10 @@ class LocalEntitlementResponseTestCase(unittest.TestCase):
         failed = {
             "jsonrpc": "2.0",
             "id": 2,
-            "result": {"content": [{"type": "text", "text": "insufficient_balance"}]},
+            "result": {
+                "isError": True,
+                "content": [{"type": "text", "text": "insufficient_balance"}],
+            },
         }
 
         class SequencedForwarder:
@@ -2512,7 +2516,10 @@ class LocalEntitlementResponseTestCase(unittest.TestCase):
         # only scopes this follow-up to an audit and supplies cleanup correlation.
         failed = {
             "jsonrpc": "2.0", "id": 1,
-            "result": {"content": [{"type": "text", "text": "insufficient_balance"}]},
+            "result": {
+                "isError": True,
+                "content": [{"type": "text", "text": "insufficient_balance"}],
+            },
         }
         wait = {
             "jsonrpc": "2.0", "id": 1, "method": "tools/call",
@@ -2644,7 +2651,7 @@ class LocalEntitlementResponseTestCase(unittest.TestCase):
         self.assertEqual(len(forwarder.sent), 1)
         spawn.assert_called_once()
 
-    def test_mcp_tool_wrapped_insufficient_balance_without_is_error_enters_local_advisory(self):
+    def test_mcp_tool_wrapped_insufficient_balance_without_is_error_is_returned_unchanged(self):
         response = {
             "jsonrpc": "2.0", "id": 1,
             "result": {
@@ -2666,11 +2673,10 @@ class LocalEntitlementResponseTestCase(unittest.TestCase):
         with mock.patch.object(shim, "_spawn_stopper_for_audit") as spawn:
             out = _run(forwarder, [json.dumps(request)], client_host="codex")[0]
 
-        payload = json.loads(out["result"]["content"][0]["text"])
-        self.assertEqual(payload["payload"]["degrade_reason"], "credits_exhausted")
-        self.assertEqual(payload["payload"]["degrade_action"], "add_credits")
+        self.assertEqual(out["result"], response["result"])
+        self.assertNotIn("credits_exhausted", json.dumps(out))
         self.assertEqual(len(forwarder.sent), 1)
-        spawn.assert_called_once()
+        spawn.assert_called_once_with(response)
 
     def test_mcp_tool_multiline_insufficient_balance_wrapper_enters_local_advisory(self):
         response = {
@@ -2990,7 +2996,324 @@ class LocalEntitlementResponseTestCase(unittest.TestCase):
                 self.assertIsNone(payload["payload"]["audit_id"])
                 spawn.assert_called_once()
 
-    def test_mcp_insufficient_balance_marker_wins_over_response_envelope_shape(self):
+    def test_failed_envelope_with_extra_content_blocks_enters_local_advisory(self):
+        """R3: a genuine failed MCP envelope stays authoritative however many text blocks the
+        server splits its failure across. `isError=True` is the authority; the prose is not."""
+        request = {
+            "jsonrpc": "2.0", "id": 1, "method": "tools/call",
+            "params": {"name": "audit_skill_submit", "arguments": {
+                "skill_name": "audit", "args": {
+                    "title": "Multi-block balance envelope audit", "content": "artifact"
+                }
+            }},
+        }
+        response = {
+            "jsonrpc": "2.0", "id": 1, "result": {
+                "isError": True,
+                "content": [
+                    {"type": "text", "text": "credit: insufficient_balance"},
+                    {"type": "text", "text": "additional server text"},
+                ],
+            },
+        }
+        with mock.patch.object(shim, "_spawn_stopper_for_audit") as spawn:
+            out = _run(
+                FakeForwarder(responses={"tools/call": response}),
+                [json.dumps(request)], client_host="codex",
+            )[0]
+        payload = json.loads(out["result"]["content"][0]["text"])
+        self.assertEqual(payload["payload"]["degrade_reason"], "credits_exhausted")
+        self.assertTrue(payload["payload"]["local"])
+        spawn.assert_called_once()
+
+    def test_marker_in_a_successful_audit_answer_is_returned_unchanged(self):
+        """R1/S1.1: `insufficient_balance` inside a SUCCESSFUL answer is CONTENT, not a verdict.
+
+        Findings, quoted code, chat history and summary prose all legitimately name the marker.
+        Treating any of them as an entitlement decision silently destroys a hosted audit result
+        the user paid for and replaces it with a local advisory that answers a different question.
+        A follow-up tool is used deliberately: for a follow-up nothing but a real downgrade may
+        create a local run or a Stop panel, so the assertions below are unambiguous.
+        """
+        wait = {
+            "jsonrpc": "2.0", "id": 1, "method": "tools/call",
+            "params": {"name": "wait_audit", "arguments": {"run_id": "aud_successful_marker"}},
+        }
+        successful_bodies = (
+            ("findings", json.dumps({
+                "run_id": "aud_successful_marker",
+                "status": "completed",
+                "title": "Balance handling review",
+                "findings": [{
+                    "severity": "high",
+                    "detail": "the checkout path never handles insufficient_balance",
+                }],
+            })),
+            ("quoted code", json.dumps({
+                "run_id": "aud_successful_marker",
+                "status": "completed",
+                "title": "Balance handling review",
+                "summary": "auditor 3 quoted `raise PaymentError(\"insufficient_balance\")`",
+            })),
+            ("conversation history", json.dumps({
+                "run_id": "aud_successful_marker",
+                "status": "completed",
+                "history": ["an earlier attempt was rejected with insufficient_balance"],
+            })),
+            ("plain prose", "The audit completed; no auditor reported insufficient_balance."),
+        )
+        for label, text in successful_bodies:
+            response = {
+                "jsonrpc": "2.0", "id": 1,
+                "result": {"isError": False, "content": [{"type": "text", "text": text}]},
+            }
+            with self.subTest(body=label), \
+                    mock.patch.object(shim, "_spawn_stopper_for_audit") as spawn, \
+                    mock.patch.object(runner, "forget_active_run") as forget:
+                out = _run(
+                    FakeForwarder(responses={"tools/call": response}),
+                    [json.dumps(wait)], client_host="codex",
+                )[0]
+                self.assertEqual(
+                    out["result"], response["result"],
+                    "a successful hosted answer must reach the model byte-identical",
+                )
+                spawn.assert_not_called()      # no local Stopper
+                forget.assert_not_called()     # the hosted run is still the user's run
+
+    def test_non_authoritative_or_malformed_marker_locations_fail_closed(self):
+        """R1/R3: only a location whose MEANING is 'this request was refused' may spend an
+        account action. A bool-shaped `isError`, a JSON-RPC envelope that is internally
+        contradictory, or a marker sitting in display metadata is not such a location."""
+        wait = {
+            "jsonrpc": "2.0", "id": 1, "method": "tools/call",
+            "params": {"name": "wait_audit", "arguments": {"run_id": "aud_non_authoritative"}},
+        }
+        cases = (
+            # `isError` present but not a boolean: an envelope this malformed proves nothing.
+            ("non-bool isError", {
+                "jsonrpc": "2.0", "id": 1, "result": {
+                    "isError": None,
+                    "content": [{"type": "text", "text": "credit: insufficient_balance"}],
+                },
+            }),
+            # JSON-RPC 2.0 forbids `result` and `error` together — fail closed, do not guess.
+            ("result and error together", {
+                "jsonrpc": "2.0", "id": 1,
+                "error": {"code": -32000, "message": "malformed response"},
+                "result": {
+                    "isError": True,
+                    "content": [{"type": "text", "text": "credit: insufficient_balance"}],
+                },
+            }),
+            ("successful result and entitlement error data together", {
+                "jsonrpc": "2.0", "id": 1,
+                "result": {"isError": False, "content": [{
+                    "type": "text", "text": "completed hosted result",
+                }]},
+                "error": {"code": -32000, "data": {
+                    "status": "account_action_required",
+                    "reason": "credits_exhausted",
+                    "retryable": False,
+                    "action": "add_credits",
+                    "local_advisory_available": True,
+                }},
+            }),
+            # Display metadata is attacker/model-influenced text, never an entitlement verdict.
+            ("marker only in the title", {
+                "jsonrpc": "2.0", "id": 1, "result": {"content": [{
+                    "type": "text", "text": json.dumps({
+                        "run_id": "aud_non_authoritative",
+                        "status": "completed",
+                        "title": "How we handle insufficient_balance",
+                    }),
+                }]},
+            }),
+            # A payload that claims success AND carries a failure code contradicts itself.
+            ("completed status with an error field", {
+                "jsonrpc": "2.0", "id": 1, "result": {"content": [{
+                    "type": "text", "text": json.dumps({
+                        "run_id": "aud_non_authoritative",
+                        "status": "completed",
+                        "error": "credit: insufficient_balance",
+                    }),
+                }]},
+            }),
+        )
+        for label, response in cases:
+            with self.subTest(case=label), \
+                    mock.patch.object(shim, "_spawn_stopper_for_audit") as spawn, \
+                    mock.patch.object(runner, "forget_active_run") as forget:
+                out = _run(
+                    FakeForwarder(responses={"tools/call": response}),
+                    [json.dumps(wait)], client_host="codex",
+                )[0]
+                self.assertEqual(out, response)
+                spawn.assert_not_called()
+                forget.assert_not_called()
+
+    def test_is_error_true_does_not_promote_a_marker_from_display_metadata(self):
+        """A server failure bit does not turn model-controlled title text into an entitlement."""
+        wait = {
+            "jsonrpc": "2.0", "id": 1, "method": "tools/call",
+            "params": {"name": "wait_audit", "arguments": {
+                "run_id": "aud_failed_for_another_reason",
+            }},
+        }
+        response = {
+            "jsonrpc": "2.0", "id": 1, "result": {
+                "isError": True,
+                "content": [{"type": "text", "text": json.dumps({
+                    "run_id": "aud_failed_for_another_reason",
+                    "status": "failed",
+                    "title": "Review insufficient_balance handling",
+                    "error": "auditor process timed out",
+                })}],
+            },
+        }
+
+        with mock.patch.object(shim, "_spawn_stopper_for_audit") as spawn:
+            out = _run(
+                FakeForwarder(responses={"tools/call": response}),
+                [json.dumps(wait)], client_host="codex",
+            )[0]
+
+        self.assertEqual(out, response)
+        spawn.assert_not_called()
+
+    def test_legacy_success_block_vetoes_a_historical_failed_marker_block(self):
+        """R1: one successful run view makes the whole legacy envelope non-authoritative."""
+        wait = {
+            "jsonrpc": "2.0", "id": 1, "method": "tools/call",
+            "params": {"name": "wait_audit", "arguments": {
+                "run_id": "aud_legacy_mixed",
+            }},
+        }
+        response = {
+            "jsonrpc": "2.0", "id": 1, "result": {"content": [
+                {"type": "text", "text": json.dumps({
+                    "run_id": "aud_legacy_mixed",
+                    "status": "completed",
+                    "summary": "Hosted audit completed successfully",
+                })},
+                {"type": "text", "text": json.dumps({
+                    "run_id": "aud_older_attempt",
+                    "status": "failed",
+                    "error": "historical insufficient_balance",
+                })},
+            ]},
+        }
+
+        with mock.patch.object(shim, "_spawn_stopper_for_audit") as spawn, \
+                mock.patch.object(runner, "forget_active_run") as forget:
+            out = _run(
+                FakeForwarder(responses={"tools/call": response}),
+                [json.dumps(wait)], client_host="codex",
+            )[0]
+
+        self.assertEqual(out, response)
+        spawn.assert_not_called()
+        forget.assert_not_called()
+
+    def test_is_error_true_makes_structured_marker_shape_authoritative(self):
+        request = {
+            "jsonrpc": "2.0", "id": 1, "method": "tools/call",
+            "params": {"name": "audit_skill_submit", "arguments": {
+                "skill_name": "audit", "args": {
+                    "title": "Structured balance audit", "content": "artifact",
+                },
+            }},
+        }
+        response = {
+            "jsonrpc": "2.0", "id": 1, "result": {
+                "isError": True,
+                "content": [{"type": "text", "text": json.dumps({
+                    "status": "rejected",
+                    "error": {"code": "insufficient_balance"},
+                })}],
+            },
+        }
+
+        with mock.patch.object(shim, "_spawn_stopper_for_audit") as spawn:
+            out = _run(
+                FakeForwarder(responses={"tools/call": response}),
+                [json.dumps(request)], client_host="codex",
+            )[0]
+
+        payload = json.loads(out["result"]["content"][0]["text"])["payload"]
+        self.assertEqual(payload["degrade_reason"], "credits_exhausted")
+        spawn.assert_called_once()
+
+    def test_legacy_failed_structured_error_is_authoritative(self):
+        request = {
+            "jsonrpc": "2.0", "id": 1, "method": "tools/call",
+            "params": {"name": "audit_skill_submit", "arguments": {
+                "skill_name": "audit", "args": {
+                    "title": "Legacy structured balance audit", "content": "artifact",
+                },
+            }},
+        }
+        response = {
+            "jsonrpc": "2.0", "id": 1, "result": {"content": [{
+                "type": "text", "text": json.dumps({
+                    "status": "failed",
+                    "error": {"code": "insufficient_balance"},
+                }),
+            }]},
+        }
+
+        with mock.patch.object(shim, "_spawn_stopper_for_audit") as spawn:
+            out = _run(
+                FakeForwarder(responses={"tools/call": response}),
+                [json.dumps(request)], client_host="codex",
+            )[0]
+
+        payload = json.loads(out["result"]["content"][0]["text"])["payload"]
+        self.assertEqual(payload["degrade_reason"], "credits_exhausted")
+        spawn.assert_called_once()
+
+    def test_oversized_legacy_content_fails_closed_before_a_truncated_success_veto(self):
+        blocks = [{"type": "text", "text": json.dumps({
+            "status": "failed", "error": "credit: insufficient_balance",
+        })}]
+        blocks.extend(
+            {"type": "text", "text": json.dumps({"note": index})}
+            for index in range(31)
+        )
+        blocks.append({"type": "text", "text": json.dumps({
+            "status": "completed", "summary": "the audit ran",
+        })})
+        response = {"jsonrpc": "2.0", "id": 1, "result": {"content": blocks}}
+
+        self.assertFalse(shim._entitlement_refusal_is_authoritative(response))
+
+    def test_outer_success_status_vetoes_a_nested_legacy_failure(self):
+        response = {
+            "jsonrpc": "2.0", "id": 1, "result": {"content": [{
+                "type": "text", "text": json.dumps({
+                    "schema_version": 1,
+                    "status": "completed",
+                    "payload": {
+                        "status": "failed",
+                        "error": "credit: insufficient_balance",
+                    },
+                }),
+            }]},
+        }
+
+        self.assertFalse(shim._entitlement_refusal_is_authoritative(response))
+
+    def test_envelope_without_marker_does_not_attempt_json_decode(self):
+        response = {
+            "jsonrpc": "2.0", "id": 1, "result": {
+                "content": [{"type": "text", "text": '{"status":"completed"}'}],
+            },
+        }
+        with mock.patch.object(shim.json, "loads") as loads:
+            self.assertFalse(shim._entitlement_refusal_is_authoritative(response))
+        loads.assert_not_called()
+
+    def test_no_marker_failures_are_returned_unchanged(self):
         request = {
             "jsonrpc": "2.0", "id": 1, "method": "tools/call",
             "params": {"name": "audit_skill_submit", "arguments": {
@@ -2999,42 +3322,6 @@ class LocalEntitlementResponseTestCase(unittest.TestCase):
                 }
             }},
         }
-        marker_responses = (
-            {"jsonrpc": "2.0", "id": 1, "result": {
-                "isError": False,
-                "content": [{"type": "text", "text": "credit: insufficient_balance"}],
-            }},
-            {"jsonrpc": "2.0", "id": 1, "result": {
-                "isError": None,
-                "content": [{"type": "text", "text": "credit: insufficient_balance"}],
-            }},
-            {"jsonrpc": "2.0", "id": 1, "result": {
-                "isError": True,
-                "content": [
-                    {"type": "text", "text": "credit: insufficient_balance"},
-                    {"type": "text", "text": "additional server text"},
-                ],
-            }},
-            {"jsonrpc": "2.0", "id": 1,
-             "error": {"code": -32000, "message": "malformed response"},
-             "result": {
-                 "isError": True,
-                 "content": [{"type": "text", "text": "credit: insufficient_balance"}],
-             }},
-        )
-        for response in marker_responses:
-            with self.subTest(response=response), mock.patch.object(
-                shim, "_spawn_stopper_for_audit"
-            ) as spawn:
-                out = _run(
-                    FakeForwarder(responses={"tools/call": response}),
-                    [json.dumps(request)], client_host="codex",
-                )[0]
-            payload = json.loads(out["result"]["content"][0]["text"])
-            self.assertEqual(payload["payload"]["degrade_reason"], "credits_exhausted")
-            self.assertTrue(payload["payload"]["local"])
-            spawn.assert_called_once()
-
         no_marker_responses = (
             {"jsonrpc": "2.0", "id": 1, "result": {
                 "isError": True,
@@ -3096,6 +3383,375 @@ class LocalEntitlementResponseTestCase(unittest.TestCase):
         payload = json.loads(out["result"]["content"][0]["text"])
         self.assertEqual(payload["payload"]["degrade_reason"], "subscription_expired")
         spawn.assert_called_once()
+
+
+class LocalFallbackIdempotencyTestCase(unittest.TestCase):
+    """R2: one Hosted run has at most ONE local replacement during the retention window.
+
+    An agent polls a run until it gets an answer. Every follow-up after the credits ran out
+    carries the same authoritative failure, so a fallback that mints a fresh `local_<random>`
+    each time produces N advisory rows and N Stop panels for ONE audit the user started once —
+    and, because the hosted row is deleted on the first fallback, nothing upstream is left to
+    deduplicate against. The mapping therefore has to survive the process, not just the loop.
+    """
+
+    def setUp(self):
+        tmp = tempfile.TemporaryDirectory()
+        self.addCleanup(tmp.cleanup)
+        self.root = Path(tmp.name)
+        self.registry_path = self.root / "active-runs.json"
+        env = {
+            "DE_CONFIG_PATH": str(self.root / "config.json"),
+            "DE_ACTIVE_RUNS": str(self.registry_path),
+            "DE_ACTIVE_RUN": str(self.root / "active-run.json"),
+            "DE_ACTIVE_RUNS_WRITE_PATHS": json.dumps([str(self.registry_path)]),
+            "DE_ACTIVE_RUN_WRITE_PATHS": json.dumps([str(self.root / "active-run.json")]),
+            "DE_ACTIVE_RUNS_LOCK_PATHS": json.dumps([str(self.root / "runs.lock")]),
+        }
+        patcher = mock.patch.dict(os.environ, env)
+        patcher.start()
+        self.addCleanup(patcher.stop)
+
+    _HOSTED_RUN_ID = "aud_repeat_followup"
+
+    def _failed_followup_response(self):
+        """The authoritative failed envelope a wait/status follow-up returns once credits ran out."""
+        return {
+            "jsonrpc": "2.0", "id": 1,
+            "result": {"isError": True, "content": [{"type": "text", "text": json.dumps({
+                "run_id": self._HOSTED_RUN_ID,
+                "status": "failed",
+                "title": "Repeated follow-up balance audit",
+                "ui_locale": "zh-CN",
+                "error": "credit: insufficient_balance",
+            })}]},
+        }
+
+    def _wait_request(self):
+        return {
+            "jsonrpc": "2.0", "id": 1, "method": "tools/call",
+            "params": {"name": "wait_audit", "arguments": {"run_id": self._HOSTED_RUN_ID}},
+        }
+
+    def _follow_up_once(self):
+        """One fresh shim invocation carrying one follow-up — a restart, not a second loop pass."""
+        with mock.patch.object(shim, "_spawn_stopper_for_audit") as spawn:
+            out = _run(
+                FakeForwarder(responses={"tools/call": self._failed_followup_response()}),
+                [json.dumps(self._wait_request())], client_host="codex",
+            )[0]
+        payload = json.loads(out["result"]["content"][0]["text"])["payload"]
+        self.assertEqual(payload["degrade_reason"], "credits_exhausted")
+        self.assertTrue(payload["local"])
+        return payload, spawn
+
+    def _replacement_ids(self):
+        """Every local run id the registry has recorded as replacing a hosted run.
+
+        The local advisory ROW is written by the Stop-panel path these tests mock out, so the
+        persisted mapping is what proves the replacement survives the process.
+        """
+        if not self.registry_path.exists():
+            return []
+        registry = json.loads(self.registry_path.read_text(encoding="utf-8"))
+        mapping = registry.get("local_fallback_replacements", {})
+        return sorted(entry["local_id"] for entry in mapping.values())
+
+    def test_five_followups_in_one_process_reuse_one_local_run_and_one_stopper(self):
+        """S2.1: five follow-ups inside ONE shim process → one local ID, one Stopper, one row."""
+        lines = [json.dumps(self._wait_request()) for _ in range(5)]
+        with mock.patch.object(shim, "_spawn_stopper_for_audit") as spawn:
+            outputs = _run(
+                FakeForwarder(responses={"tools/call": self._failed_followup_response()}),
+                lines, client_host="codex",
+            )
+
+        self.assertEqual(len(outputs), 5)
+        local_ids = []
+        for out in outputs:
+            payload = json.loads(out["result"]["content"][0]["text"])["payload"]
+            self.assertEqual(payload["degrade_reason"], "credits_exhausted")
+            self.assertTrue(payload["local"])
+            local_ids.append(payload["run_id"])
+
+        self.assertEqual(
+            len(set(local_ids)), 1,
+            "five follow-ups for one hosted run produced %d distinct local runs: %r"
+            % (len(set(local_ids)), local_ids),
+        )
+        self.assertEqual(
+            spawn.call_count, 1,
+            "the local Stop panel must be launched at most once per hosted run",
+        )
+        self.assertEqual(self._replacement_ids(), sorted(set(local_ids)))
+
+    def test_a_followup_after_shim_restart_reuses_the_persisted_local_run(self):
+        """S2.1: the mapping is PERSISTED, so a brand-new shim process reuses the same local ID.
+
+        Process-local memoization passes the loop test above and still fails here, which is the
+        realistic case: an editor restarts its MCP server, the agent polls again, and the user
+        gets a second advisory for an audit that already has one.
+        """
+        first, first_spawn = self._follow_up_once()
+        first_spawn.assert_called_once()
+        self.assertEqual(self._replacement_ids(), [first["run_id"]])
+
+        second, second_spawn = self._follow_up_once()
+        self.assertEqual(
+            second["run_id"], first["run_id"],
+            "a follow-up after restart minted a new local run (%s -> %s)"
+            % (first["run_id"], second["run_id"]),
+        )
+        second_spawn.assert_not_called()
+        self.assertEqual(self._replacement_ids(), [first["run_id"]])
+
+    def test_the_reused_local_replacement_keeps_its_title_and_locale(self):
+        """R3 must survive R2: reuse returns the SAME advisory, not a degraded stub of it."""
+        first, _ = self._follow_up_once()
+        second, _ = self._follow_up_once()
+        for payload in (first, second):
+            self.assertEqual(payload["title"], "Repeated follow-up balance audit")
+            self.assertEqual(payload["ui_locale"], "zh-CN")
+            self.assertIsNone(payload["audit_id"])
+            self.assertTrue(payload["advisory_only"])
+
+    def test_first_and_reused_claim_return_the_same_normalized_metadata(self):
+        first = shim._claim_local_fallback_replacement(
+            self._HOSTED_RUN_ID, {"title": "", "ui_locale": "en-GB"}
+        )
+        reused = shim._claim_local_fallback_replacement(
+            self._HOSTED_RUN_ID, {"title": "Later title", "ui_locale": "zh-CN"}
+        )
+
+        self.assertTrue(first["created"])
+        self.assertEqual(first["title"], "")
+        self.assertEqual(first["ui_locale"], "en-US")
+        self.assertFalse(reused["created"])
+        self.assertEqual(reused["run_id"], first["run_id"])
+        self.assertEqual(reused["title"], "")
+        self.assertEqual(reused["ui_locale"], "en-US")
+
+    def test_the_hosted_row_is_still_retired_on_the_first_fallback(self):
+        """Reuse must not regress hosted cleanup: the paid row still goes away exactly once."""
+        runner.save_active_run({
+            "run_id": self._HOSTED_RUN_ID, "status": "running",
+            "title": "Repeated follow-up balance audit", "ui_locale": "zh-CN",
+        })
+        self.assertIn(self._HOSTED_RUN_ID, json.loads(
+            self.registry_path.read_text(encoding="utf-8")
+        )["runs"])
+
+        self._follow_up_once()
+        self.assertNotIn(self._HOSTED_RUN_ID, json.loads(
+            self.registry_path.read_text(encoding="utf-8")
+        )["runs"])
+
+    def test_two_different_hosted_runs_get_two_different_local_replacements(self):
+        """The mapping is keyed by hosted run: dedup must not collapse unrelated audits."""
+        first, _ = self._follow_up_once()
+        self._HOSTED_RUN_ID = "aud_repeat_followup_other"
+        second, _ = self._follow_up_once()
+        self.assertNotEqual(first["run_id"], second["run_id"])
+
+    def test_a_followup_with_no_request_run_id_is_never_deduplicated(self):
+        """Fail closed: with no hosted identity there is no key, so no reuse may be guessed."""
+        response = {
+            "jsonrpc": "2.0", "id": 1,
+            "result": {"isError": True, "content": [{"type": "text", "text": json.dumps({
+                "status": "failed",
+                "title": "Anonymous balance audit",
+                "error": "credit: insufficient_balance",
+            })}]},
+        }
+        request = {
+            "jsonrpc": "2.0", "id": 1, "method": "tools/call",
+            "params": {"name": "audit_skill_submit", "arguments": {
+                "skill_name": "audit",
+                "args": {"title": "Anonymous balance audit", "content": "artifact"},
+            }},
+        }
+        seen = []
+        for _ in range(2):
+            with mock.patch.object(shim, "_spawn_stopper_for_audit"):
+                out = _run(
+                    FakeForwarder(responses={"tools/call": response}),
+                    [json.dumps(request)], client_host="codex",
+                )[0]
+            seen.append(json.loads(out["result"]["content"][0]["text"])["payload"]["run_id"])
+        self.assertNotEqual(seen[0], seen[1])
+
+    def test_a_malformed_persisted_mapping_is_replaced_by_one_valid_local_run(self):
+        """A corrupt/hostile value is ignored and atomically replaced by a valid claim."""
+        now = time.time()
+        for corrupt in (
+            {"not": "a string"},
+            "",
+            "aud_not_a_local_id",
+            17,
+            ["local_x"],
+            {"local_id": "local_x", "expires_at": now + 60},
+            {"local_id": "local_" + ("a" * 65), "expires_at": now + 60},
+        ):
+            with self.subTest(mapping=corrupt):
+                self.registry_path.write_text(json.dumps({
+                    "schema_version": 1,
+                    "runs": {},
+                    "local_fallback_replacements": {self._HOSTED_RUN_ID: corrupt},
+                    "updated_at": time.time(),
+                }), encoding="utf-8")
+                payload, spawn = self._follow_up_once()
+                self.assertRegex(payload["run_id"], r"^local_[0-9a-f]{24}$")
+                spawn.assert_called_once()
+                self.assertEqual(self._replacement_ids(), [payload["run_id"]])
+
+    def test_persisted_mapping_locale_is_normalized_and_bounded(self):
+        entry = runner.remember_local_fallback_replacement(
+            self._HOSTED_RUN_ID,
+            "local_" + ("a" * 24),
+            title="title",
+            ui_locale="zh_CN.UTF-8",
+        )
+        self.assertEqual(entry["ui_locale"], "zh-CN")
+        registry = json.loads(self.registry_path.read_text(encoding="utf-8"))
+        persisted = registry["local_fallback_replacements"][self._HOSTED_RUN_ID]
+        self.assertEqual(persisted["ui_locale"], "zh-CN")
+        hostile = dict(persisted, ui_locale="x" * 10000)
+        validated = runner._valid_local_fallback_entry(hostile, time.time())
+        self.assertIsNone(validated["ui_locale"])
+
+    def test_hosted_mapping_key_is_bounded_before_persistence(self):
+        local_id = "local_" + ("a" * 24)
+        for hosted_run_id in ("", " leading", "trailing ", "aud\ncontrol", "a" * 257):
+            with self.subTest(hosted_run_id=repr(hosted_run_id)):
+                with self.assertRaises(runner.AuditError):
+                    runner.remember_local_fallback_replacement(hosted_run_id, local_id)
+        self.assertFalse(self.registry_path.exists())
+
+    def test_mapping_prune_drops_expired_rows_and_keeps_newest_64(self):
+        now = 1000.0
+        mapping = {
+            "aud_expired": {
+                "local_id": "local_" + ("f" * 24),
+                "expires_at": now,
+                "title": "expired",
+                "ui_locale": "en-US",
+            },
+        }
+        for index in range(65):
+            mapping["aud_%02d" % index] = {
+                "local_id": "local_%024x" % index,
+                "expires_at": now + index + 1,
+                "title": "run %d" % index,
+                "ui_locale": "en-US",
+            }
+        registry = {"runs": {}, "local_fallback_replacements": mapping}
+
+        runner._prune_local_fallback_replacements(registry, now)
+
+        kept = registry["local_fallback_replacements"]
+        self.assertEqual(len(kept), 64)
+        self.assertNotIn("aud_expired", kept)
+        self.assertNotIn("aud_00", kept)
+        self.assertIn("aud_64", kept)
+        malformed = {"runs": {}, "local_fallback_replacements": []}
+        runner._prune_local_fallback_replacements(malformed, now)
+        self.assertNotIn("local_fallback_replacements", malformed)
+
+    def test_http_and_response_fallback_reuse_one_mapping_and_one_stopper(self):
+        class BalanceBlockedForwarder:
+            def forward(self, _message):
+                raise shim.EntitlementBlockedError(shim._credits_exhausted_action())
+
+        with mock.patch.object(shim, "_spawn_stopper_for_audit") as first_spawn:
+            first = _run(
+                BalanceBlockedForwarder(),
+                [json.dumps(self._wait_request())], client_host="codex",
+            )[0]
+        first_payload = json.loads(first["result"]["content"][0]["text"])["payload"]
+        first_spawn.assert_called_once()
+
+        response = self._failed_followup_response()
+        response_view = json.loads(response["result"]["content"][0]["text"])
+        response_view["run_id"] = "aud_response_alias"
+        response["result"]["content"][0]["text"] = json.dumps(response_view)
+        runner.save_active_run({
+            "run_id": "aud_response_alias", "status": "failed",
+            "title": "Aliased hosted row", "ui_locale": "en-US",
+        })
+        with mock.patch.object(shim, "_spawn_stopper_for_audit") as second_spawn:
+            second = _run(
+                FakeForwarder(responses={"tools/call": response}),
+                [json.dumps(self._wait_request())], client_host="codex",
+            )[0]
+        second_payload = json.loads(
+            second["result"]["content"][0]["text"]
+        )["payload"]
+        self.assertEqual(second_payload["run_id"], first_payload["run_id"])
+        second_spawn.assert_not_called()
+        self.assertEqual(self._replacement_ids(), [first_payload["run_id"]])
+        registry = json.loads(self.registry_path.read_text(encoding="utf-8"))
+        self.assertNotIn("aud_response_alias", registry.get("runs", {}))
+
+    def test_concurrent_claims_converge_on_one_persisted_replacement(self):
+        def claim(index):
+            return runner.remember_local_fallback_replacement(
+                self._HOSTED_RUN_ID,
+                "local_%024x" % index,
+                title="Concurrent audit",
+                ui_locale="en-US",
+            )["local_id"]
+
+        with ThreadPoolExecutor(max_workers=16) as pool:
+            claimed = list(pool.map(claim, range(128)))
+
+        self.assertEqual(len(claimed), 128)
+        self.assertEqual(len(set(claimed)), 1)
+        self.assertEqual(self._replacement_ids(), [claimed[0]])
+
+    def test_registry_failure_preserves_hosted_failure_without_local_popup(self):
+        """R2: no durable claim means no local id may be minted or displayed.
+
+        Returning a fresh untracked id here would recreate the production bug: every poll while
+        the registry is unavailable would create another DE Lite row and another Stop panel.
+        """
+        response = self._failed_followup_response()
+        for _ in range(2):
+            with mock.patch.object(
+                runner,
+                "remember_local_fallback_replacement",
+                side_effect=OSError("registry unavailable"),
+            ), mock.patch.object(shim, "_spawn_stopper_for_audit") as spawn:
+                out = _run(
+                    FakeForwarder(responses={"tools/call": response}),
+                    [json.dumps(self._wait_request())],
+                    client_host="codex",
+                )[0]
+            self.assertEqual(out["result"], response["result"])
+            self.assertFalse(shim._audit_run_payload(out).get("local", False))
+            spawn.assert_not_called()
+
+        self.assertEqual(self._replacement_ids(), [])
+
+    def test_registry_failure_on_http_entitlement_returns_error_without_local_popup(self):
+        class BalanceBlockedForwarder:
+            def forward(self, _message):
+                raise shim.EntitlementBlockedError(shim._credits_exhausted_action())
+
+        with mock.patch.object(
+            runner,
+            "remember_local_fallback_replacement",
+            side_effect=OSError("registry unavailable"),
+        ), mock.patch.object(shim, "_spawn_stopper_for_audit") as spawn:
+            out = _run(
+                BalanceBlockedForwarder(),
+                [json.dumps(self._wait_request())],
+                client_host="codex",
+            )[0]
+
+        self.assertEqual(out["error"]["code"], -32001)
+        self.assertEqual(out["error"]["data"]["reason"], "credits_exhausted")
+        self.assertNotIn("result", out)
+        spawn.assert_not_called()
 
 
 class ForwarderConfigTestCase(unittest.TestCase):
@@ -5043,7 +5699,39 @@ class ForwardRedirectTests(unittest.TestCase):
                 self.assertEqual(payload["payload"]["degrade_action"], action)
                 spawn.assert_called_once()
 
-    def test_plain_success_body_with_insufficient_balance_marker_enters_local_advisory(self):
+    def test_structured_rate_limit_contract_precedes_legacy_balance_marker(self):
+        hub = self._hub(
+            raw=json.dumps({
+                "status": "account_action_required",
+                "reason": "rate_limited",
+                "retryable": True,
+                "action": "wait_or_retry",
+                "local_advisory_available": True,
+                "detail": "A prior attempt mentioned insufficient_balance",
+            }).encode("utf-8"),
+            status=429,
+        )
+        request = {
+            "jsonrpc": "2.0", "id": 1, "method": "tools/call",
+            "params": {"name": "audit_skill_submit", "arguments": {
+                "skill_name": "audit", "args": {
+                    "title": "Rate limited audit", "content": "artifact",
+                },
+            }},
+        }
+
+        with mock.patch.object(shim, "_spawn_stopper_for_audit") as spawn:
+            out = _run(
+                shim.Forwarder(hub.base, "secret"),
+                [json.dumps(request)], client_host="codex",
+            )[0]
+
+        payload = json.loads(out["result"]["content"][0]["text"])["payload"]
+        self.assertEqual(payload["degrade_reason"], "rate_limited")
+        self.assertEqual(payload["degrade_action"], "wait_or_retry")
+        spawn.assert_called_once()
+
+    def test_plain_success_body_with_insufficient_balance_marker_is_not_an_entitlement(self):
         hub = self._hub(raw=b"insufficient_balance", status=200)
         request = {
             "jsonrpc": "2.0", "id": 1, "method": "tools/call",
@@ -5060,9 +5748,34 @@ class ForwardRedirectTests(unittest.TestCase):
                 client_host="codex",
             )[0]
 
-        payload = json.loads(out["result"]["content"][0]["text"])
-        self.assertEqual(payload["payload"]["degrade_reason"], "credits_exhausted")
-        spawn.assert_called_once()
+        self.assertEqual(out["error"]["code"], -32001)
+        self.assertIn("invalid JSON from /mcp", out["error"]["message"])
+        self.assertNotIn("result", out)
+        spawn.assert_not_called()
+
+    def test_non_entitlement_http_errors_with_balance_marker_do_not_enter_lite(self):
+        for status in (400, 401, 404):
+            with self.subTest(status=status):
+                hub = self._hub(raw=b"credit: insufficient_balance", status=status)
+                request = {
+                    "jsonrpc": "2.0", "id": 1, "method": "tools/call",
+                    "params": {"name": "audit_skill_submit", "arguments": {
+                        "skill_name": "audit", "args": {
+                            "title": "HTTP marker audit", "content": "artifact",
+                        }
+                    }},
+                }
+                with mock.patch.object(shim, "_spawn_stopper_for_audit") as spawn:
+                    out = _run(
+                        shim.Forwarder(hub.base, "secret"),
+                        [json.dumps(request)],
+                        client_host="codex",
+                    )[0]
+
+                self.assertEqual(out["error"]["code"], -32001)
+                self.assertIn("HTTP %s from /mcp" % status, out["error"]["message"])
+                self.assertNotIn("result", out)
+                spawn.assert_not_called()
 
     def test_http_402_insufficient_balance_marker_enters_local_advisory(self):
         hub = self._hub(raw=b"credit: insufficient_balance", status=402)

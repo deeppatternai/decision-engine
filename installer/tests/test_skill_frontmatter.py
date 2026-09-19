@@ -39,11 +39,15 @@ class SkillFrontmatterCompatibilityTests(unittest.TestCase):
                 "synthesize prior audits",
             ),
             "audit-explore": (
-                "帮我把这个模糊想法理清楚",
-                "equivalent producer-direction phrases in any language",
+                "vague, unformed idea",
+                "equivalent intent in any language",
+                "/audit-explore",
             ),
             "audit-forecast": ("预测平台怎么看", "what do forecasters predict"),
-            "audit-market-research": ("市场调研", "TAM/SAM/SOM"),
+            "audit-market-research": (
+                "retrieving and citing external evidence",
+                "TAM/SAM/SOM",
+            ),
             "discussion-board": ("讨论板", "drag/reorder cards"),
             "graphic-explanation": ("用图解释一下", "draw a diagram to explain"),
             "layer-check": ("竞品层级", "layer check"),

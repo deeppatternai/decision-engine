@@ -28,6 +28,7 @@ from . import (
     release_contract,
     startup_diagnostics,
     update_coordination,
+    update_staging,
     update_transaction,
     updater,
 )
@@ -38,10 +39,29 @@ from .release_acquisition import load_trusted_release_keys
 STARTUP_UPDATE_BUDGET_SECONDS = 60.0
 STARTUP_LEADER_GRACE_SECONDS = 5.0
 CLIENT_HOST_ENV = "DE_MCP_CLIENT_HOST"
+_DISCARD_STAGED_STATUSES = frozenset({
+    "rolled_back", "update_failed", "signature_failed", "incompatible_runtime",
+    "quarantined",
+})
+_FINISHED_UPDATE_STATUSES = frozenset({"candidate_ready", "up_to_date", "updated"})
 
 
 def _log(message: str) -> None:
     print("de-launcher: %s" % message, file=sys.stderr)
+
+
+def _clear_staged_best_effort(root: Path) -> None:
+    try:
+        update_staging.clear_release(root)
+    except update_staging.UpdateStagingError as exc:
+        _log(str(exc))
+
+
+def _finish_attempt_best_effort(root: Path, attempt_id: str, status: str) -> None:
+    try:
+        update_staging.finish_attempt(root, attempt_id, status)
+    except update_staging.UpdateStagingError as exc:
+        _log(str(exc))
 
 
 def _resolved_client_host(value: Optional[str]) -> Optional[str]:
@@ -254,18 +274,40 @@ def _attempt_update(
         == state.last_manifest_sha256
     ):
         release_acquisition.fetch_release_objects(root, acquired, deadline=deadline)
+        update_staging.stage_release(root, acquired, state, trusted_keys)
     # Once mutation starts it must reach a durable commit or rollback boundary;
     # the acquisition deadline decides whether it is safe to start, not whether
     # an in-flight filesystem transaction may be killed halfway through.
     release_acquisition._remaining(deadline)
-    return update_transaction.apply_present_update(
-        root,
-        acquired.manifest,
-        acquired.signature,
-        trusted_keys,
-        source=acquired.source.name,
-        lock_timeout_seconds=0.0,
-    )
+    try:
+        result = update_transaction.apply_present_update(
+            root,
+            acquired.manifest,
+            acquired.signature,
+            trusted_keys,
+            source=acquired.source.name,
+            lock_timeout_seconds=0.0,
+        )
+    except (ShellError, OSError, ValueError):
+        # The journal, if present, remains authoritative for recovery.  The
+        # cached release is expendable and must not poison every later startup.
+        _clear_staged_best_effort(root)
+        raise
+    if result.status in _FINISHED_UPDATE_STATUSES | _DISCARD_STAGED_STATUSES:
+        _clear_staged_best_effort(root)
+    return result
+
+
+def _update_outcome(status: str) -> str:
+    if status in {"up_to_date", "updated"}:
+        return "success"
+    if status == "candidate_ready":
+        return "ready"
+    if status in {"deferred_active_session", "deferred_slow_network"}:
+        return "deferred"
+    if status == "skipped_locked":
+        return "skipped"
+    return "refused"
 
 
 def _load_candidate_shim(root: Path) -> ModuleType:
@@ -492,6 +534,7 @@ def launch(
             client_host=client_host,
         )
     initial_commit = _head_commit(managed_root)
+    completion_before = update_staging.read_completion(managed_root)
     wait_budget = max(0.0, float(startup_budget_seconds)) + STARTUP_LEADER_GRACE_SECONDS
     startup_diagnostics.append_event(
         managed_root,
@@ -519,7 +562,8 @@ def launch(
                 "recovery_completed",
                 "recovery",
                 client_host=_resolved_client_host(client_host),
-                outcome="success" if recovery is not None else "skipped",
+                outcome=_update_outcome(recovery.status) if recovery is not None else "skipped",
+                update_status=recovery.status if recovery is not None else None,
             )
             suppress_update = recovery is not None and recovery.status in {
                 "repair_required",
@@ -527,10 +571,9 @@ def launch(
                 "deferred_active_session",
                 "skipped_locked",
             }
-            # A launcher that waited observed another complete startup-update
-            # attempt. After takeover/finalization it skips only redundant
-            # network discovery, then rereads the checkout for admission.
-            if not getattr(startup_gate, "waited", False) and not suppress_update:
+            # A waited lock proves only that another process held it.  That
+            # process may have died before finishing discovery or application.
+            if not suppress_update:
                 if _updates_enabled(managed_root):
                     try:
                         update_started = time.monotonic()
@@ -554,15 +597,57 @@ def launch(
                             deadline=deadline,
                             expected_commit=state.last_release_commit,
                         )
+                        result = None
                         if trusted_keys:
-                            _attempt_update(managed_root, trusted_keys, deadline=deadline)
+                            try:
+                                staged = update_staging.load_release(
+                                    managed_root, state, trusted_keys
+                                )
+                            except update_staging.UpdateStagingError as exc:
+                                _log(str(exc))
+                                _clear_staged_best_effort(managed_root)
+                                staged = None
+                            if staged is not None:
+                                attempt_id = update_staging.begin_attempt(managed_root)
+                                release_acquisition._remaining(deadline)
+                                try:
+                                    result = update_transaction.apply_present_update(
+                                        managed_root, staged.manifest, staged.signature,
+                                        trusted_keys, source=staged.source.name,
+                                        lock_timeout_seconds=0.0,
+                                    )
+                                except (ShellError, OSError, ValueError):
+                                    _clear_staged_best_effort(managed_root)
+                                    raise
+                                if result.status in _FINISHED_UPDATE_STATUSES | _DISCARD_STAGED_STATUSES:
+                                    _clear_staged_best_effort(managed_root)
+                                _finish_attempt_best_effort(
+                                    managed_root, attempt_id, result.status
+                                )
+                            elif (
+                                getattr(startup_gate, "waited", False)
+                                and (completion := update_staging.read_completion(managed_root))
+                                != completion_before
+                                and completion is not None
+                            ):
+                                pass
+                            else:
+                                attempt_id = update_staging.begin_attempt(managed_root)
+                                result = _attempt_update(
+                                    managed_root, trusted_keys, deadline=deadline
+                                )
+                                _finish_attempt_best_effort(
+                                    managed_root, attempt_id, result.status
+                                )
                         startup_diagnostics.append_event(
                             managed_root,
                             "update_completed",
                             "update",
                             client_host=_resolved_client_host(client_host),
                             elapsed_ms=int((time.monotonic() - update_started) * 1000),
-                            outcome="success" if trusted_keys else "skipped",
+                            outcome=_update_outcome(result.status) if result else "skipped",
+                            update_status=result.status if result else None,
+                            blocker_count=len(result.blockers) if result else None,
                         )
                     except (ShellError, OSError, ValueError) as exc:
                         # MCP stdout is protocol-only. The current known-good

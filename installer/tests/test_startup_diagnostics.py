@@ -50,6 +50,16 @@ class StartupDiagnosticLogTests(unittest.TestCase):
         self.assertNotIn("token", entry)
         self.assertNotIn("message", entry)
 
+    def test_deferred_update_has_explicit_status_and_bounded_blocker_count(self) -> None:
+        startup_diagnostics.append_event(
+            self.root, "update_completed", "update", outcome="deferred",
+            update_status="deferred_active_session", blocker_count=2,
+        )
+        entry = self._entries()[0]
+        self.assertEqual(entry["outcome"], "deferred")
+        self.assertEqual(entry["update_status"], "deferred_active_session")
+        self.assertEqual(entry["blocker_count"], 2)
+
     def test_log_is_reset_before_crossing_its_size_bound(self) -> None:
         with mock.patch.object(startup_diagnostics, "MAX_STARTUP_LOG_BYTES", 1):
             startup_diagnostics.append_event(

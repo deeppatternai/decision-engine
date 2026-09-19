@@ -64,8 +64,14 @@ _SAFE_PHASES = frozenset(
     }
 )
 _SAFE_OUTCOMES = frozenset(
-    {"started", "ready", "success", "error", "skipped", "refused", "clean_exit"}
+    {"started", "ready", "success", "error", "skipped", "deferred", "refused", "clean_exit"}
 )
+_SAFE_UPDATE_STATUSES = frozenset({
+    "up_to_date", "candidate_ready", "updated", "deferred_active_session",
+    "deferred_slow_network", "skipped_locked", "incompatible_runtime",
+    "signature_failed", "update_failed", "rolled_back", "rollback_failed",
+    "retry_pending", "quarantined", "repair_required",
+})
 _SAFE_FORWARDERS = frozenset({"hosted", "lite", "offline", "unknown"})
 _SAFE_REASON_CODES = frozenset(
     {
@@ -167,6 +173,8 @@ def append_event(
     attempt: Optional[int] = None,
     forwarder: Optional[str] = None,
     outcome: Optional[str] = None,
+    update_status: Optional[str] = None,
+    blocker_count: Optional[int] = None,
     reason_code: Optional[str] = None,
     error_type: Optional[str] = None,
 ) -> None:
@@ -196,6 +204,10 @@ def append_event(
             entry["forwarder"] = _safe_label(forwarder, _SAFE_FORWARDERS)
         if outcome is not None:
             entry["outcome"] = _safe_label(outcome, _SAFE_OUTCOMES)
+        if update_status is not None:
+            entry["update_status"] = _safe_label(update_status, _SAFE_UPDATE_STATUSES)
+        if isinstance(blocker_count, int):
+            entry["blocker_count"] = max(0, min(blocker_count, 999))
         if reason_code is not None:
             entry["reason_code"] = _safe_label(reason_code, _SAFE_REASON_CODES)
         if isinstance(error_type, str) and error_type:

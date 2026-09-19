@@ -4,8 +4,8 @@
 Reads the house style from `assets/report_style.json` (user-editable, ships with
 the skill — see SKILL.md "DOCX report table style") and a structured report JSON,
 and emits a .docx with the style applied DETERMINISTICALLY — so the format is
-identical on every machine, no agent-interpretation drift (改造方案
-2026-05-27, Owner spec: 换机器一字不差). Style lives in the JSON (client-side,
+identical for a fixed resolved-font environment, with no agent-interpretation drift
+(report redesign 2026-05-27, Owner spec). Style lives in the JSON (client-side,
 user-editable); this script just applies it.
 
 Usage:
@@ -114,7 +114,7 @@ def _style_run(run, style, *, size_pt, bold=False, color_hex=None) -> None:
     font.bold = bold
     if color_hex:
         font.color.rgb = RGBColor.from_string(_norm_hex(color_hex))
-    # CJK font via eastAsia (so 中文 uses LiSong Pro, not the Latin face)
+    # CJK font via eastAsia (so Han text uses LiSong Pro, not the Latin face)
     rpr = run._element.get_or_add_rPr()
     rfonts = rpr.find(qn("w:rFonts"))
     if rfonts is None:
@@ -165,7 +165,7 @@ def _add_table(doc, spec, style) -> None:
 
 def _apply_machine_fonts(style: dict, lang) -> dict:
     """Override the style's Latin + CJK faces with ones ACTUALLY INSTALLED on this machine for the
-    run's language, reducing local tofu (方块) when the house-style font is absent (e.g. LiSong Pro
+    run's language, reducing local missing-glyph boxes (tofu) when the house-style font is absent (e.g. LiSong Pro
     on recent macOS / any Linux). DOCX fonts are not embedded, so another reader machine still needs
     the selected family or a compatible substitute. The house-style font stays the first preference, so a
     machine that HAS it is unchanged; the pick is cached after the first report (Owner 2026-07-24).
@@ -179,9 +179,9 @@ def _apply_machine_fonts(style: dict, lang) -> dict:
         style["font"]["body_latin"] = picked["body_latin"]
         style["font"]["body_cjk"] = picked["body_cjk"]
         src = "recorded" if picked.get("from_cache") else "auto-selected on this machine"
-        print(f"\U0001f524 fonts ({src}): latin={picked['body_latin']} \u00b7 cjk={picked['body_cjk']}")
+        print(f"[fonts] {src}: latin={picked['body_latin']}; cjk={picked['body_cjk']}")
     except Exception as e:  # font adaptation is best-effort, never break the render
-        print(f"\U0001f524 font auto-select skipped ({type(e).__name__}: {e}); using style defaults")
+        print(f"[fonts] auto-select skipped ({type(e).__name__}: {e}); using style defaults")
     return style
 
 

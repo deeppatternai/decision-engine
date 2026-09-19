@@ -18,9 +18,12 @@ from types import SimpleNamespace
 from unittest import mock
 
 from installer import (
+    launcher,
     managed_install,
+    release_acquisition,
     release_contract,
     update_coordination,
+    update_staging,
     update_transaction,
     updater,
     windows_security,
@@ -1077,6 +1080,39 @@ class UpdateTransactionTests(unittest.TestCase):
         state = json.loads(self.state_path.read_text(encoding="utf-8"))
         self.assertEqual(state["last_release_commit"], self.old_commit)
         self.assertEqual(self.state_path.read_bytes(), before)
+
+    def test_staged_release_installs_offline_after_live_session_exits(self):
+        acquired = release_acquisition.AcquiredRelease(
+            release_acquisition.GITHUB_SOURCE, self.manifest, self.signature,
+        )
+        keys = {"test-key": mock.sentinel.key}
+        holder, _lease = self._spawn_lease_holder()
+        with (
+            mock.patch.object(release_contract, "authorize_release", return_value=self.verified),
+            mock.patch.object(release_acquisition, "discover_release", return_value=acquired),
+            mock.patch.object(release_acquisition, "fetch_release_objects") as fetch,
+        ):
+            self.assertEqual(
+                launcher._attempt_update(self.root, keys, deadline=time.monotonic() + 60).status,
+                "deferred_active_session",
+            )
+        fetch.assert_called_once()
+        self.assertTrue((self.root / update_staging.STAGED_RELEASE_RELATIVE_PATH).exists())
+        holder.stdin.close()
+        holder.wait(timeout=10)
+        with (
+            mock.patch.object(launcher, "load_trusted_release_keys", return_value=keys),
+            mock.patch.object(release_contract, "authorize_release", return_value=self.verified),
+            mock.patch.object(update_transaction, "_run_candidate_smoke"),
+            mock.patch.object(release_acquisition, "discover_release", side_effect=AssertionError("network used")) as network,
+            mock.patch.object(launcher, "_handoff_to_fresh_launcher", return_value=0) as handoff,
+        ):
+            self.assertEqual(launcher.launch(self.root), 0)
+        network.assert_not_called()
+        handoff.assert_called_once()
+        self.assertEqual(self._git("rev-parse", "HEAD").stdout.strip(), self.new_commit)
+        self.assertEqual(updater._read_update_state(self.root).last_release_commit, self.new_commit)
+        self.assertFalse((self.root / update_staging.STAGED_RELEASE_RELATIVE_PATH).exists())
 
     def test_existing_journal_plus_live_shim_defers_then_recovers(self):
         holder, _lease = self._spawn_lease_holder()

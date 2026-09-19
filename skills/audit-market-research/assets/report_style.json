@@ -1,6 +1,6 @@
 {
   "_comment": "audit-market-research DOCX report style. USER-EDITABLE and ships with the skill: every machine defaults to this format; edit values locally to change your house style WITHOUT touching code. On the thin client this file lives CLIENT-SIDE (the server holds no style — style is presentation, not IP). The report renderer reads these values; keep the keys stable (the SKILL.md 'DOCX report table style' section mirrors these defaults).",
-  "_origin": "改造方案 2026-05-27 (Owner spec: shippable + user-editable + client-side). Extracted from the SKILL.md DOCX convention.",
+  "_origin": "Report redesign 2026-05-27 (Owner spec: shippable + user-editable + client-side). Extracted from the SKILL.md DOCX convention.",
   "_scope": "Cell style + visual identity ONLY. Does NOT dictate the document framework; the skill keeps its own sections/content.",
   "_font_note": "body_latin/body_cjk are the FIRST-CHOICE faces. When the renderer is given --lang it auto-selects an on-machine font for the run's script via font_resolver.py and RECORDS it (per-user cache), keeping these when installed and falling through to the next candidate when absent — reducing local tofu from an absent LiSong Pro. DOCX fonts are not embedded, so another reader machine still needs the selected family or a compatible substitute. Edit these to change the preferred house faces.",
   "font": {

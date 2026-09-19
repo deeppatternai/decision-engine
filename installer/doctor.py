@@ -1164,6 +1164,7 @@ def check_managed_update() -> CheckResult:
     from installer import (
         release_acquisition,
         update_coordination,
+        update_staging,
         update_transaction,
         updater,
     )
@@ -1248,6 +1249,26 @@ def check_managed_update() -> CheckResult:
             "update",
             detail,
             fix="Restart the agent once; if it remains unconfirmed, run update repair.",
+        )
+    try:
+        staged = update_staging.load_release(root, state, trusted)
+    except update_staging.UpdateStagingError:
+        return CheckResult(
+            "WARN", "update", detail + "; staged release is invalid",
+            fix="The next update check will fetch and verify the release again.",
+        )
+    if staged is not None:
+        return CheckResult(
+            "WARN", "update",
+            detail + "; downloaded=%s pending_install" % staged.manifest.version,
+            fix="Exit all DE MCP sessions, then restart the host to retry installation.",
+        )
+    attempt = update_staging.read_attempt(root)
+    if attempt is not None and attempt[1] not in {"up_to_date", "candidate_ready", "updated"}:
+        status = "in_progress_or_interrupted" if attempt[1] == "started" else attempt[1]
+        return CheckResult(
+            "WARN", "update", detail + "; last_check=" + status,
+            fix="Wait for an active check; if this persists, exit all DE MCP sessions and restart the host.",
         )
     return CheckResult("PASS", "update", detail)
 

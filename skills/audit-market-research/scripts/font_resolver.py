@@ -4,7 +4,7 @@
 WHY THIS EXISTS. `assets/report_style.json` ships a house style whose CJK face is `LiSong Pro`
 (and Latin `Georgia`). `LiSong Pro` was dropped from recent macOS and is absent on most Linux /
 Windows machines, so a report rendered there names a font Word cannot find and the CJK text falls
-back to a face with no Han glyphs → 方块 (tofu). The renderer used to hard-name the style font
+back to a face with no Han glyphs, producing missing-glyph boxes (tofu). The renderer used to hard-name the style font
 regardless of what the machine actually has.
 
 WHAT THIS DOES (Owner 2026-07-24). On the FIRST report, pick a font that is ACTUALLY INSTALLED on
@@ -109,7 +109,7 @@ _FC_LIST_TIMEOUT_S = 4.0
 
 # macOS ships many CJK faces (incl. PingFang / LiSong Pro) as ON-DEMAND downloadable assets under
 # these paths — fc-list reports them, but they are NOT resident and may be purged or absent on the
-# machine that renders and locally opens the DOCX, so naming one can render 方块 (tofu). We treat
+# machine that renders and locally opens the DOCX, so naming one can render missing-glyph boxes. We treat
 # ONLY resident fonts as installed for local reliability. A font the user
 # installs into a normal font dir is resident and still counts. NOTE: this makes "keep a present
 # LiSong Pro" effectively unreachable on stock recent macOS (LiSong Pro lives only here), so the
@@ -363,7 +363,7 @@ def resolve_fonts(lang: str, style: dict, *, cache_path: Optional[Path] = ...,
         if (isinstance(cached, dict) and cached.get("body_latin") and cached.get("body_cjk")
                 and _still_installed(cached["body_latin"], inst)
                 and _still_installed(cached["body_cjk"], inst)):
-            # The recorded pick, re-validated as still present — reuse it (the "记录下来" contract).
+            # Reuse the recorded pick after confirming that it is still installed.
             return {"body_latin": cached["body_latin"], "body_cjk": cached["body_cjk"],
                     "from_cache": True}
 

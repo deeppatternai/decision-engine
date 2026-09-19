@@ -279,6 +279,71 @@ class CheckTests(unittest.TestCase):
         self.assertIn("installed=0.2.0@111111111111", result.detail)
         self.assertIn("running=111111111111", result.detail)
 
+    def test_managed_update_warns_when_signed_release_is_staged(self):
+        state = updater.UpdateState(
+            schema=1, channel="stable", last_release_sequence=2,
+            last_release_commit="1" * 40, last_manifest_sha256="2" * 64,
+            last_version="0.2.0", running_commit="1" * 40,
+            running_version="0.2.0", last_result="up_to_date",
+        )
+        with tempfile.TemporaryDirectory() as tmp:
+            root = Path(tmp)
+            for relative in (
+                ".managed-install.json", updater.UPDATE_STATE_RELATIVE_PATH,
+                Path(".runtime") / "update-protocol.json",
+            ):
+                path = root / relative
+                path.parent.mkdir(parents=True, exist_ok=True)
+                path.write_text("{}", encoding="utf-8")
+            staged = mock.Mock()
+            staged.manifest.version = "0.2.3"
+            with (
+                mock.patch.object(doctor.config, "managed_component_root", return_value=root),
+                mock.patch.object(updater, "_read_update_state", return_value=state),
+                mock.patch("installer.update_transaction._require_protocol_ready"),
+                mock.patch("installer.release_acquisition.load_trusted_release_keys", return_value={"production": mock.sentinel.key}),
+                mock.patch("installer.update_staging.load_release", return_value=staged),
+            ):
+                result = doctor.check_managed_update()
+        self.assertEqual(result.status, "WARN")
+        self.assertIn("0.2.3", result.detail)
+
+    def test_managed_update_warns_after_deferred_attempt_without_stage(self):
+        state = updater.UpdateState(
+            schema=1, channel="stable", last_release_sequence=2,
+            last_release_commit="1" * 40, last_manifest_sha256="2" * 64,
+            last_version="0.2.0", running_commit="1" * 40,
+            running_version="0.2.0", last_result="up_to_date",
+        )
+        with tempfile.TemporaryDirectory() as tmp:
+            root = Path(tmp)
+            for relative in (
+                ".managed-install.json", updater.UPDATE_STATE_RELATIVE_PATH,
+                Path(".runtime") / "update-protocol.json",
+            ):
+                path = root / relative
+                path.parent.mkdir(parents=True, exist_ok=True)
+                path.write_text("{}", encoding="utf-8")
+            with (
+                mock.patch.object(doctor.config, "managed_component_root", return_value=root),
+                mock.patch.object(updater, "_read_update_state", return_value=state),
+                mock.patch("installer.update_transaction._require_protocol_ready"),
+                mock.patch("installer.release_acquisition.load_trusted_release_keys", return_value={"production": mock.sentinel.key}),
+                mock.patch("installer.update_staging.load_release", return_value=None),
+                mock.patch("installer.update_staging.read_attempt", return_value=("a" * 32, "deferred_active_session")) as attempt,
+            ):
+                result = doctor.check_managed_update()
+                attempt.return_value = ("b" * 32, "started")
+                interrupted = doctor.check_managed_update()
+                attempt.return_value = ("c" * 32, "deferred_slow_network")
+                slow_network = doctor.check_managed_update()
+        self.assertEqual(result.status, "WARN")
+        self.assertIn("deferred_active_session", result.detail)
+        self.assertEqual(interrupted.status, "WARN")
+        self.assertIn("in_progress_or_interrupted", interrupted.detail)
+        self.assertEqual(slow_network.status, "WARN")
+        self.assertIn("deferred_slow_network", slow_network.detail)
+
     def test_managed_update_reports_retry_pending_as_recoverable(self):
         state = updater.UpdateState(
             schema=1,

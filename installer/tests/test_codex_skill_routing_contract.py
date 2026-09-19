@@ -107,6 +107,86 @@ class CodexSkillRoutingContractTests(unittest.TestCase):
                     " ".join(text.split()),
                 )
 
+    def test_audit_brainstorming_is_an_english_progressive_router(self):
+        skill_root = ROOT / "skills" / "audit-brainstorming"
+        entrypoint = self._skill("audit-brainstorming")
+        hosted = (skill_root / "references" / "hosted-workflow.md").read_text(
+            encoding="utf-8"
+        )
+        result = (skill_root / "references" / "result-contract.md").read_text(
+            encoding="utf-8"
+        )
+        frontmatter = entrypoint.split("---", 2)[1]
+        normalized_entrypoint = " ".join(entrypoint.split())
+        normalized_hosted = " ".join(hosted.split())
+
+        self.assertLessEqual(len(entrypoint.splitlines()), 70)
+        self.assertTrue(entrypoint.isascii())
+        self.assertTrue(hosted.isascii())
+        self.assertTrue(result.isascii())
+        for required in (
+            "formed hypothesis",
+            "audit-explore",
+            "audit-market-research",
+            "audit-writing-plans",
+            "audit for defects in deliverables",
+        ):
+            with self.subTest(frontmatter=required):
+                self.assertIn(required, frontmatter)
+        for execution_detail in (
+            "Triggers on",
+            "counter_arguments",
+            "falsifiability_criteria",
+            "epistemology_fields_filled",
+        ):
+            with self.subTest(execution_detail=execution_detail):
+                self.assertNotIn(execution_detail, frontmatter)
+
+        for required in (
+            "Identifying what evidence is missing belongs here",
+            "acquiring or validating that evidence belongs",
+            "explicit invocation prevents silent rerouting",
+            "confidential, restricted, or proprietary material",
+            "references/hosted-workflow.md",
+            "references/result-contract.md",
+        ):
+            with self.subTest(entrypoint=required):
+                self.assertIn(required, normalized_entrypoint)
+
+        for required in (
+            'skill_name="audit-brainstorming"',
+            '"title"',
+            '"content"',
+            '"context"',
+            '"stakes"',
+            '"mode"',
+            '"domain"',
+            "Steelman + Pre-mortem framing",
+            "Never invoke the placeholders literally",
+            "submitting a duplicate",
+        ):
+            with self.subTest(hosted=required):
+                self.assertIn(required, normalized_hosted)
+
+        for required in (
+            "overall_assessment",
+            "strengths[]",
+            "risks[]",
+            "counter_arguments[]",
+            "assumptions[]",
+            "falsifiability_criteria",
+            "null_hypothesis_or_default",
+            "base_rate_or_reference_class",
+            "confidence_update_needed",
+            "recommended_evidence_order[]",
+            "epistemology_fields_filled",
+            "convergent_assessment",
+            "accepted_as_residual",
+            "converted_to_experiment",
+        ):
+            with self.subTest(result=required):
+                self.assertIn(required, result)
+
     def test_audit_keeps_authentication_diagnostics_explicitly_requested(self):
         self.assertIn(
             "For explicitly requested authentication diagnostics, use the `fast_smoke` profile.",
@@ -124,6 +204,92 @@ class CodexSkillRoutingContractTests(unittest.TestCase):
                 frontmatter = self._skill(name).split("---", 2)[1]
                 self.assertIn("description:", frontmatter)
                 self.assertGreater(len(frontmatter), 120)
+
+
+class MarketResearchP3ContractTests(unittest.TestCase):
+    @classmethod
+    def setUpClass(cls):
+        skill = ROOT / "skills/audit-market-research"
+        cls.text = "\n".join(
+            (skill / path).read_text(encoding="utf-8")
+            for path in (
+                "SKILL.md",
+                "references/ground-truth.md",
+                "references/analysis-and-synthesis.md",
+            )
+        )
+        cls.normalized = " ".join(cls.text.split())
+
+    def test_p3_contract_matrix(self):
+        section = self.text.split("### P3 response decision table", 1)[1].split("\n## ", 1)[0]
+        rows = {}
+        for line in section.splitlines():
+            if not line.startswith("| ") or line.startswith("| Case") or line.startswith("|---"):
+                continue
+            cells = [cell.strip() for cell in line.strip("| ").split("|")]
+            if len(cells) == 3:
+                rows[cells[0]] = (cells[1], cells[2])
+        self.assertEqual(
+            {name: verdict for name, (_, verdict) in rows.items()},
+            {
+                "missing, dual, empty, or non-array container": "STOP",
+                "non-object member": "STOP",
+                "defect-audit markers in any member": "STOP",
+                "blank or empty generation analysis": "STOP",
+                "blank or empty hypothesis analysis": "STOP",
+                "unknown member shape": "STOP",
+                "valid generation member": "continue",
+                "valid hypothesis member": "continue",
+                "mixed valid generation and hypothesis members": "continue",
+            },
+        )
+        self.assertIn("exactly one", section)
+        self.assertIn("`audits` or `per_vendor_analysis`", section)
+        self.assertIn("every member", section)
+
+    def test_p3_requires_provenance_and_substantive_shapes(self):
+        section = self.text.split("### P3 response decision table", 1)[1].split("\n## ", 1)[0]
+        normalized = " ".join(section.split())
+        for phrase in (
+            "`skill_name=audit-market-research`",
+            "`phase=multi_lens`",
+            "matching P2 pointer",
+            "conflicting `artifact_intent`",
+            "nonempty `insights[]`",
+            "nonblank `overall_assessment`",
+            "`strengths[]`, `risks[]`, `counter_arguments[]`, or `assumptions[]`",
+            "`overall_verdict`, `findings`, or `dimension_status`",
+            "`findings[i].blocking`",
+            "optional context, not required shape keys",
+            "both `insights` and `overall_assessment`",
+            "verified P3 pointers",
+        ):
+            with self.subTest(phrase=phrase):
+                self.assertIn(phrase, normalized)
+        self.assertNotIn("top-level `blocking`", section)
+
+    def test_contrarian_is_only_a_request_signal(self):
+        for phrase in (
+            "`contrarian=true`",
+            "`trust_signals.contrarian_requested`",
+            "not proof that a dedicated contrarian voice ran",
+            "unconfirmed unless a separate execution signal confirms it",
+        ):
+            self.assertIn(phrase, self.normalized)
+        self.assertNotIn("server forces a contrarian vendor", self.text)
+
+    def test_quick_mock_and_p4_skip_claims_do_not_conflict(self):
+        self.assertIn("Quick uses mock ground truth and stops after P2", self.text)
+        self.assertIn("`mock_ground_truth` (quick only)", self.text)
+        self.assertIn("Deep may conditionally run deterministic mock P4", self.normalized)
+        self.assertIn("Quick has no P4 response because it stops after P2", self.normalized)
+        for stale in (
+            "mock_ground_truth` (deep/quick)",
+            "mock_ground_truth` (deep/quick floor)",
+            "deep/quick = MOCK",
+            "mode_skip` (Fast/Deep)",
+        ):
+            self.assertNotIn(stale, self.text)
 
 
 if __name__ == "__main__":

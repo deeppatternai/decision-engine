@@ -4,8 +4,11 @@ from __future__ import annotations
 
 import contextlib
 import io
+import subprocess
+import sys
 import tempfile
 import threading
+import time
 import types
 import unittest
 from pathlib import Path
@@ -157,6 +160,9 @@ class LauncherTests(unittest.TestCase):
         acquired.manifest.tag = "v0.1.0"
         acquired.source.name = "github"
         keys = {"production": mock.sentinel.key}
+        expected = update_transaction.UpdateResult(
+            "up_to_date", "1" * 40, "1" * 40, None, None,
+        )
         with (
             mock.patch.object(
                 launcher.release_acquisition,
@@ -177,7 +183,7 @@ class LauncherTests(unittest.TestCase):
             ),
             mock.patch.object(launcher.release_acquisition, "fetch_release_objects") as fetch_objects,
             mock.patch.object(
-                launcher.update_transaction, "apply_present_update", return_value=mock.sentinel.result
+                launcher.update_transaction, "apply_present_update", return_value=expected
             ) as apply,
         ):
             result = launcher._attempt_update(self.root, keys, deadline=1e18)
@@ -191,7 +197,7 @@ class LauncherTests(unittest.TestCase):
         # Same commit/digest as protected state -> no redundant object fetch.
         fetch_objects.assert_not_called()
         apply.assert_called_once()
-        self.assertIs(result, mock.sentinel.result)
+        self.assertIs(result, expected)
 
     def test_update_transaction_failure_still_serves_known_good(self):
         with (
@@ -227,6 +233,9 @@ class LauncherTests(unittest.TestCase):
 
         def update(*_args, **_kwargs):
             events.append("update")
+            return update_transaction.UpdateResult(
+                "up_to_date", "1" * 40, "1" * 40, None, None,
+            )
 
         with (
             mock.patch.object(launcher, "_managed_control_present", return_value=True),
@@ -316,7 +325,7 @@ class LauncherTests(unittest.TestCase):
             ],
         )
 
-    def test_waiting_startup_follower_finalizes_journal_without_redundant_update(self):
+    def test_waiting_follower_retries_when_leader_left_no_completion_receipt(self):
         @contextlib.contextmanager
         def waited_gate(*_args, **_kwargs):
             yield types.SimpleNamespace(waited=True)
@@ -330,15 +339,261 @@ class LauncherTests(unittest.TestCase):
                 side_effect=waited_gate,
             ),
             mock.patch.object(launcher, "_finalize_journal", return_value=None) as finalize,
-            mock.patch.object(launcher, "_attempt_update") as update,
+            mock.patch.object(launcher, "_updates_enabled", return_value=True),
+            mock.patch.object(launcher, "load_trusted_release_keys", return_value={"test": mock.sentinel.key}),
+            mock.patch.object(launcher, "_attempt_update", return_value=update_transaction.UpdateResult(
+                "up_to_date", "1" * 40, "1" * 40, None, None,
+            )) as update,
             mock.patch.object(launcher, "_serve_shim", return_value=4) as serve,
         ):
             result = launcher.launch(self.root)
 
         self.assertEqual(result, 4)
         finalize.assert_called_once_with(self.root)
-        update.assert_not_called()
+        update.assert_called_once()
         serve.assert_called_once()
+
+    def test_killed_lock_holder_does_not_suppress_waiting_follower_update(self):
+        ready = self.root / "holder.ready"
+        script = (
+            "import pathlib,sys; from unittest import mock; "
+            "from installer import update_coordination as c; "
+            "root=pathlib.Path(sys.argv[1]); ready=pathlib.Path(sys.argv[2]); "
+            "patch=mock.patch.object(c.managed_install,'canonical_managed_root',return_value=root); "
+            "patch.start(); gate=c.startup_update_gate(root,timeout_seconds=10); "
+            "gate.__enter__(); ready.write_text('ready'); sys.stdin.read()"
+        )
+        holder = subprocess.Popen(
+            [sys.executable, "-c", script, str(self.root), str(ready)],
+            stdin=subprocess.PIPE, stdout=subprocess.DEVNULL,
+            stderr=subprocess.PIPE, text=True,
+        )
+        def cleanup_holder():
+            if holder.poll() is None:
+                holder.kill()
+            holder.wait(timeout=10)
+            holder.stdin.close()
+            holder.stderr.close()
+        self.addCleanup(cleanup_holder)
+        deadline = time.monotonic() + 10
+        while not ready.exists() and time.monotonic() < deadline:
+            if holder.poll() is not None:
+                self.fail("lock holder exited early: %s" % holder.stderr.read())
+            time.sleep(0.01)
+        self.assertTrue(ready.exists())
+        blocked = threading.Event()
+        result = []
+        native_try_lock = update_coordination._try_lock
+
+        def watched_try_lock(fd):
+            acquired = native_try_lock(fd)
+            if threading.current_thread().name == "waiting-follower" and not acquired:
+                blocked.set()
+            return acquired
+
+        def follower():
+            result.append(launcher.launch(self.root))
+
+        with (
+            mock.patch.object(update_coordination.managed_install, "canonical_managed_root", return_value=self.root.resolve()),
+            mock.patch.object(update_coordination, "startup_update_gate", side_effect=self.native_startup_update_gate),
+            mock.patch.object(update_coordination, "_try_lock", side_effect=watched_try_lock),
+            mock.patch.object(launcher, "_managed_control_present", return_value=True),
+            mock.patch.object(launcher, "_head_commit", return_value="1" * 40),
+            mock.patch.object(launcher, "_finalize_journal", return_value=None),
+            mock.patch.object(launcher, "_updates_enabled", return_value=True),
+            mock.patch.object(launcher, "load_trusted_release_keys", return_value={"test": mock.sentinel.key}),
+            mock.patch.object(launcher, "_attempt_update", return_value=update_transaction.UpdateResult(
+                "up_to_date", "1" * 40, "1" * 40, None, None,
+            )) as update,
+            mock.patch.object(launcher, "_serve_shim", return_value=4),
+        ):
+            thread = threading.Thread(target=follower, name="waiting-follower")
+            thread.start()
+            self.assertTrue(blocked.wait(5), "follower did not wait for startup lock")
+            holder.kill()
+            holder.wait(timeout=10)
+            thread.join(timeout=10)
+        self.assertFalse(thread.is_alive())
+        self.assertEqual(result, [4])
+        update.assert_called_once()
+
+    def test_waiting_follower_skips_network_after_any_new_completed_receipt(self):
+        @contextlib.contextmanager
+        def waited_gate(*_args, **_kwargs):
+            yield types.SimpleNamespace(waited=True)
+
+        with (
+            mock.patch.object(launcher, "_managed_control_present", return_value=True),
+            mock.patch.object(launcher, "_head_commit", return_value="1" * 40),
+            mock.patch.object(launcher.update_coordination, "startup_update_gate", side_effect=waited_gate),
+            mock.patch.object(launcher, "_finalize_journal", return_value=None),
+            mock.patch.object(launcher, "_updates_enabled", return_value=True),
+            mock.patch.object(launcher, "load_trusted_release_keys", return_value={"test": mock.sentinel.key}),
+            mock.patch.object(launcher.update_staging, "read_completion") as completion,
+            mock.patch.object(launcher, "_attempt_update") as update,
+            mock.patch.object(launcher, "_serve_shim", return_value=4),
+        ):
+            for status in ("up_to_date", "candidate_ready", "updated", "deferred_slow_network"):
+                with self.subTest(status=status):
+                    completion.side_effect = [("a" * 32, "up_to_date"), ("b" * 32, status)]
+                    self.assertEqual(launcher.launch(self.root), 4)
+        update.assert_not_called()
+
+    def test_deferred_update_is_logged_as_deferred_with_blocker_count(self):
+        events = []
+        deferred = update_transaction.UpdateResult(
+            "deferred_active_session", "1" * 40, None, None, None,
+            "live_shim_session", (mock.sentinel.first, mock.sentinel.second),
+        )
+        with (
+            mock.patch.object(launcher, "_managed_control_present", return_value=True),
+            mock.patch.object(launcher, "_head_commit", return_value="1" * 40),
+            mock.patch.object(launcher, "_finalize_journal", return_value=None),
+            mock.patch.object(launcher, "_updates_enabled", return_value=True),
+            mock.patch.object(launcher, "load_trusted_release_keys", return_value={"test": mock.sentinel.key}),
+            mock.patch.object(launcher, "_attempt_update", return_value=deferred),
+            mock.patch.object(launcher, "_serve_shim", return_value=4),
+            mock.patch.object(launcher.startup_diagnostics, "append_event", side_effect=lambda *a, **kw: events.append((a[1], kw))),
+        ):
+            self.assertEqual(launcher.launch(self.root), 4)
+        completed = [fields for name, fields in events if name == "update_completed"]
+        self.assertEqual(len(completed), 1)
+        self.assertEqual(completed[0]["outcome"], "deferred")
+        self.assertEqual(completed[0]["update_status"], "deferred_active_session")
+        self.assertEqual(completed[0]["blocker_count"], 2)
+
+    def test_rolled_back_staged_candidate_does_not_block_next_discovery(self):
+        staged = mock.Mock()
+        staged.manifest = mock.sentinel.manifest
+        staged.signature = mock.sentinel.signature
+        staged.source.name = "github"
+        rolled_back = update_transaction.UpdateResult(
+            "rolled_back", "1" * 40, "2" * 40, None, None,
+        )
+        current = update_transaction.UpdateResult(
+            "up_to_date", "1" * 40, "1" * 40, None, None,
+        )
+        with (
+            mock.patch.object(launcher, "_managed_control_present", return_value=True),
+            mock.patch.object(launcher, "_head_commit", return_value="1" * 40),
+            mock.patch.object(launcher, "_finalize_journal", return_value=None),
+            mock.patch.object(launcher, "_updates_enabled", return_value=True),
+            mock.patch.object(launcher, "load_trusted_release_keys", return_value={"test": mock.sentinel.key}),
+            mock.patch.object(launcher.update_staging, "load_release", side_effect=[staged, None]),
+            mock.patch.object(launcher.update_staging, "clear_release") as clear,
+            mock.patch.object(launcher.update_transaction, "apply_present_update", return_value=rolled_back),
+            mock.patch.object(launcher, "_attempt_update", return_value=current) as network,
+            mock.patch.object(launcher, "_serve_shim", return_value=4),
+        ):
+            self.assertEqual(launcher.launch(self.root), 4)
+            self.assertEqual(launcher.launch(self.root), 4)
+        clear.assert_called_once_with(self.root)
+        network.assert_called_once()
+
+    def test_updated_staged_candidate_is_cleared(self):
+        staged = mock.Mock()
+        staged.manifest = mock.sentinel.manifest
+        staged.signature = mock.sentinel.signature
+        staged.source.name = "github"
+        updated = update_transaction.UpdateResult(
+            "updated", "1" * 40, "2" * 40, None, None,
+        )
+        with (
+            mock.patch.object(launcher, "_managed_control_present", return_value=True),
+            mock.patch.object(launcher, "_head_commit", return_value="1" * 40),
+            mock.patch.object(launcher, "_finalize_journal", return_value=None),
+            mock.patch.object(launcher, "_updates_enabled", return_value=True),
+            mock.patch.object(launcher, "load_trusted_release_keys", return_value={"test": mock.sentinel.key}),
+            mock.patch.object(launcher.update_staging, "load_release", return_value=staged),
+            mock.patch.object(launcher.update_staging, "clear_release") as clear,
+            mock.patch.object(launcher.update_transaction, "apply_present_update", return_value=updated),
+            mock.patch.object(launcher, "_serve_shim", return_value=4),
+        ):
+            self.assertEqual(launcher.launch(self.root), 4)
+        clear.assert_called_once_with(self.root)
+
+    def test_invalid_staged_record_does_not_block_fresh_signed_discovery(self):
+        current = update_transaction.UpdateResult(
+            "up_to_date", "1" * 40, "1" * 40, None, None,
+        )
+        with (
+            mock.patch.object(launcher, "_managed_control_present", return_value=True),
+            mock.patch.object(launcher, "_head_commit", return_value="1" * 40),
+            mock.patch.object(launcher, "_finalize_journal", return_value=None),
+            mock.patch.object(launcher, "_updates_enabled", return_value=True),
+            mock.patch.object(launcher, "load_trusted_release_keys", return_value={"test": mock.sentinel.key}),
+            mock.patch.object(launcher.update_staging, "load_release", side_effect=launcher.update_staging.UpdateStagingError("corrupt")),
+            mock.patch.object(launcher.update_staging, "clear_release") as clear,
+            mock.patch.object(launcher, "_attempt_update", return_value=current) as network,
+            mock.patch.object(launcher, "_serve_shim", return_value=4),
+        ):
+            self.assertEqual(launcher.launch(self.root), 4)
+        network.assert_called_once()
+        clear.assert_called_once_with(self.root)
+
+    def test_receipt_write_failure_still_serves_known_good_shim(self):
+        with (
+            mock.patch.object(launcher, "_managed_control_present", return_value=True),
+            mock.patch.object(launcher, "_head_commit", return_value="1" * 40),
+            mock.patch.object(launcher, "_finalize_journal", return_value=None),
+            mock.patch.object(launcher, "_updates_enabled", return_value=True),
+            mock.patch.object(launcher, "load_trusted_release_keys", return_value={"test": mock.sentinel.key}),
+            mock.patch.object(launcher.update_staging, "begin_attempt", side_effect=launcher.update_staging.UpdateStagingError("read only")),
+            mock.patch.object(launcher, "_serve_shim", return_value=4) as serve,
+        ):
+            self.assertEqual(launcher.launch(self.root), 4)
+        serve.assert_called_once()
+
+    def test_completion_receipt_failure_does_not_misreport_applied_result(self):
+        events = []
+        applied = update_transaction.UpdateResult(
+            "candidate_ready", "1" * 40, "2" * 40, None, None,
+        )
+        with (
+            mock.patch.object(launcher, "_managed_control_present", return_value=True),
+            mock.patch.object(launcher, "_head_commit", return_value="1" * 40),
+            mock.patch.object(launcher, "_finalize_journal", return_value=None),
+            mock.patch.object(launcher, "_updates_enabled", return_value=True),
+            mock.patch.object(launcher, "load_trusted_release_keys", return_value={"test": mock.sentinel.key}),
+            mock.patch.object(launcher, "_attempt_update", return_value=applied),
+            mock.patch.object(launcher.update_staging, "finish_attempt", side_effect=launcher.update_staging.UpdateStagingError("write failed")),
+            mock.patch.object(launcher.startup_diagnostics, "append_event", side_effect=lambda *a, **kw: events.append((a[1], kw))),
+            mock.patch.object(launcher, "_serve_shim", return_value=4),
+        ):
+            self.assertEqual(launcher.launch(self.root), 4)
+        completed = [fields for name, fields in events if name == "update_completed"]
+        self.assertEqual(len(completed), 1)
+        self.assertEqual(completed[0]["update_status"], "candidate_ready")
+        self.assertEqual(completed[0]["outcome"], "ready")
+
+    def test_failed_local_candidate_is_discarded_before_next_discovery(self):
+        staged = mock.Mock()
+        staged.manifest = mock.sentinel.manifest
+        staged.signature = mock.sentinel.signature
+        staged.source.name = "github"
+        current = update_transaction.UpdateResult(
+            "up_to_date", "1" * 40, "1" * 40, None, None,
+        )
+        with (
+            mock.patch.object(launcher, "_managed_control_present", return_value=True),
+            mock.patch.object(launcher, "_head_commit", return_value="1" * 40),
+            mock.patch.object(launcher, "_finalize_journal", return_value=None),
+            mock.patch.object(launcher, "_updates_enabled", return_value=True),
+            mock.patch.object(launcher, "load_trusted_release_keys", return_value={"test": mock.sentinel.key}),
+            mock.patch.object(launcher.update_staging, "load_release", side_effect=[staged, None]),
+            mock.patch.object(launcher.update_staging, "clear_release") as clear,
+            mock.patch.object(
+                launcher.update_transaction, "apply_present_update",
+                side_effect=update_transaction.UpdateTransactionError("local candidate failed"),
+            ),
+            mock.patch.object(launcher, "_attempt_update", return_value=current) as network,
+            mock.patch.object(launcher, "_serve_shim", return_value=4),
+        ):
+            self.assertEqual(launcher.launch(self.root), 4)
+            self.assertEqual(launcher.launch(self.root), 4)
+        clear.assert_called_once_with(self.root)
+        network.assert_called_once()
 
     def test_serve_holds_lease_and_marks_the_actual_running_commit(self):
         events = []
@@ -601,6 +856,7 @@ class LauncherTests(unittest.TestCase):
         shim.serve.assert_not_called()
 
     def test_repair_required_finalization_suppresses_new_update_attempt(self):
+        events = []
         repair = update_transaction.UpdateResult(
             "repair_required", "1" * 40, "2" * 40, "a" * 32, "recovery", "repair"
         )
@@ -610,9 +866,13 @@ class LauncherTests(unittest.TestCase):
             mock.patch.object(launcher, "_finalize_journal", return_value=repair),
             mock.patch.object(launcher, "_attempt_update") as update,
             mock.patch.object(launcher, "_serve_shim", return_value=0),
+            mock.patch.object(launcher.startup_diagnostics, "append_event", side_effect=lambda *a, **kw: events.append((a[1], kw))),
         ):
             launcher.launch(self.root, stdin=io.StringIO(), stdout=io.StringIO())
         update.assert_not_called()
+        recovered = [fields for name, fields in events if name == "recovery_completed"]
+        self.assertEqual(recovered[0]["outcome"], "refused")
+        self.assertEqual(recovered[0]["update_status"], "repair_required")
 
     def test_head_change_hands_stdio_to_a_fresh_interpreter(self):
         with (

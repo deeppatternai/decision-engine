@@ -832,6 +832,7 @@ def _remove_active_run_projection(run_id: str) -> None:
 def prune_active_runs(registry: Dict[str, Any], now: Optional[float] = None) -> Dict[str, Any]:
     now = time.time() if now is None else now
     _prune_local_terminal_tombstones(registry, now)
+    _prune_local_fallback_replacements(registry, now)
     runs = registry.get("runs")
     if not isinstance(runs, dict):
         registry["runs"] = {}
@@ -1061,6 +1062,158 @@ def save_local_advisory_run(
             registry_writer=registry_writer,
             payload_writer=payload_writer,
         )
+
+
+# One Hosted run has at most ONE local replacement (design R2). The mapping outlives the shim
+# process because the hosted row is DELETED on the first fallback: after that nothing upstream can
+# deduplicate, so a restarted shim polling the same run would mint a second advisory for an audit
+# the user started once. Bounded like the tombstone map and pruned on the same schedule.
+LOCAL_FALLBACK_MAPPING_TTL_S = 24 * 60 * 60.0
+_MAX_LOCAL_FALLBACK_MAPPINGS = 64
+_LOCAL_FALLBACK_KEY = "local_fallback_replacements"
+_LOCAL_FALLBACK_ID_MIN_HEX_CHARS = 8
+_LOCAL_FALLBACK_ID_MAX_HEX_CHARS = 64
+_MAX_HOSTED_RUN_ID_CHARS = 256
+
+
+def _valid_hosted_run_id(value: Any) -> bool:
+    return (
+        isinstance(value, str)
+        and 0 < len(value) <= _MAX_HOSTED_RUN_ID_CHARS
+        and value == value.strip()
+        and all(ord(character) >= 0x20 and ord(character) != 0x7F for character in value)
+    )
+
+
+def _valid_local_fallback_id(value: Any) -> bool:
+    if not isinstance(value, str) or not value.startswith("local_"):
+        return False
+    suffix = value[6:]
+    return (
+        _LOCAL_FALLBACK_ID_MIN_HEX_CHARS <= len(suffix) <= _LOCAL_FALLBACK_ID_MAX_HEX_CHARS
+        and all(character in "0123456789abcdef" for character in suffix)
+    )
+
+
+def _local_fallback_locale(value: Any) -> Optional[str]:
+    """Normalize a bounded explicit en/zh tag without consulting ambient locale state."""
+    if not isinstance(value, str) or len(value) > 64:
+        return None
+    tag = value.strip().lower().replace("_", "-").split(".", 1)[0]
+    if tag == "en" or tag.startswith("en-"):
+        return "en-US"
+    if tag == "zh" or tag.startswith("zh-"):
+        return "zh-CN"
+    return None
+
+
+def _valid_local_fallback_entry(entry: Any, now: float) -> Optional[Dict[str, Any]]:
+    """Accept only a live, well-formed mapping entry. Anything else is treated as absent.
+
+    Fail closed: a corrupt or hostile registry must never be able to hand back a run id that is
+    not a local advisory id, and must never widen what a later reuse writes into the panel.
+    """
+    if not isinstance(entry, dict):
+        return None
+    local_id = entry.get("local_id")
+    expires_at = entry.get("expires_at")
+    if (
+        not _valid_local_fallback_id(local_id)
+        or not isinstance(expires_at, (int, float))
+        or isinstance(expires_at, bool)
+        or not math.isfinite(expires_at)
+        or expires_at <= now
+    ):
+        return None
+    title = entry.get("title")
+    locale = entry.get("ui_locale")
+    return {
+        "local_id": local_id,
+        "expires_at": float(expires_at),
+        "title": _bounded_title(title) if isinstance(title, str) else "",
+        "ui_locale": _local_fallback_locale(locale),
+    }
+
+
+def _prune_local_fallback_replacements(
+    registry: Dict[str, Any], now: Optional[float] = None
+) -> Dict[str, Any]:
+    """Drop expired/malformed rows, then retain the bounded set with furthest expiries."""
+    now = time.time() if now is None else now
+    mapping = registry.get(_LOCAL_FALLBACK_KEY)
+    if mapping is None:
+        return registry
+    if not isinstance(mapping, dict):
+        registry.pop(_LOCAL_FALLBACK_KEY, None)
+        return registry
+    kept: Dict[str, Any] = {}
+    for run_id, entry in mapping.items():
+        valid = _valid_local_fallback_entry(entry, now) if _valid_hosted_run_id(run_id) else None
+        if valid is not None:
+            kept[run_id] = valid
+    if len(kept) > _MAX_LOCAL_FALLBACK_MAPPINGS:
+        newest = sorted(kept.items(), key=lambda item: item[1]["expires_at"], reverse=True)
+        kept = dict(newest[:_MAX_LOCAL_FALLBACK_MAPPINGS])
+    if kept:
+        registry[_LOCAL_FALLBACK_KEY] = kept
+    else:
+        registry.pop(_LOCAL_FALLBACK_KEY, None)
+    return registry
+
+
+def remember_local_fallback_replacement(
+    hosted_run_id: str,
+    local_id: str,
+    *,
+    title: Optional[str] = None,
+    ui_locale: Optional[str] = None,
+    ttl_s: float = LOCAL_FALLBACK_MAPPING_TTL_S,
+) -> Dict[str, Any]:
+    """Claim ``local_id`` as the one local replacement for ``hosted_run_id``.
+
+    Returns the winning entry, which is NOT necessarily the one passed in: if a concurrent
+    follow-up already claimed this hosted run, the existing claim is returned unchanged and the
+    caller must use it. That check-and-set happens under ``active_runs_lock()``, which is what
+    makes "at most one replacement" hold across processes rather than only inside one loop.
+
+    Only bounded identifiers and display metadata are persisted — never response text, findings,
+    or artifact bytes.
+    """
+    if (
+        not _valid_hosted_run_id(hosted_run_id)
+        or not _valid_local_fallback_id(local_id)
+    ):
+        raise AuditError("invalid local fallback replacement mapping")
+    ttl = (
+        ttl_s
+        if isinstance(ttl_s, (int, float)) and not isinstance(ttl_s, bool)
+        and math.isfinite(ttl_s) and ttl_s > 0
+        else LOCAL_FALLBACK_MAPPING_TTL_S
+    )
+    with active_runs_lock():
+        now = time.time()
+        # prune_active_runs also prunes/normalizes this map, so the read below sees only live,
+        # well-formed entries and a stale claim can never win over a fresh downgrade.
+        registry = prune_active_runs(load_active_runs_registry(), now)
+        mapping = registry.get(_LOCAL_FALLBACK_KEY)
+        mapping = mapping if isinstance(mapping, dict) else {}
+        existing = _valid_local_fallback_entry(mapping.get(hosted_run_id), now)
+        if existing is not None:
+            # An earlier follow-up already replaced this run. Return its claim without rewriting
+            # the registry, so a poll loop cannot extend the mapping's life indefinitely.
+            return existing
+        entry = {
+            "local_id": local_id,
+            "expires_at": now + ttl,
+            "title": _bounded_title(title) if isinstance(title, str) else "",
+            "ui_locale": _local_fallback_locale(ui_locale),
+        }
+        mapping[hosted_run_id] = entry
+        registry[_LOCAL_FALLBACK_KEY] = mapping
+        _prune_local_fallback_replacements(registry, now)
+        registry["updated_at"] = now
+        _write_active_runs_registry(registry)
+        return entry
 
 
 def complete_local_advisory_run(
