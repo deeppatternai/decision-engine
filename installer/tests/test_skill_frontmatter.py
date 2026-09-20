@@ -43,12 +43,18 @@ class SkillFrontmatterCompatibilityTests(unittest.TestCase):
                 "equivalent intent in any language",
                 "/audit-explore",
             ),
-            "audit-forecast": ("预测平台怎么看", "what do forecasters predict"),
+            "audit-forecast": (
+                "existing forecasters or prediction markets",
+                "specific, time-bound outcome",
+                "equivalent intent in any language",
+                "abstain when matching sources are unavailable",
+                "Never generate a new probability",
+            ),
             "audit-market-research": (
                 "retrieving and citing external evidence",
                 "TAM/SAM/SOM",
             ),
-            "discussion-board": ("讨论板", "drag/reorder cards"),
+            "discussion-board": ("interactive discussion board", "board-based rearrangement"),
             "graphic-explanation": ("用图解释一下", "draw a diagram to explain"),
             "layer-check": ("竞品层级", "layer check"),
         }
@@ -60,6 +66,13 @@ class SkillFrontmatterCompatibilityTests(unittest.TestCase):
                 description = json.loads(line.removeprefix("description: "))
                 for phrase in phrases:
                     self.assertIn(phrase, description)
+
+    def test_audit_forecast_description_is_english_only(self):
+        line = (ROOT / "skills" / "audit-forecast" / "SKILL.md").read_text(
+            encoding="utf-8"
+        ).splitlines()[2]
+        description = json.loads(line.removeprefix("description: "))
+        self.assertTrue(description.isascii())
 
     def test_descriptions_fit_qoder_desktop_metadata_limit(self):
         """Qoder Desktop 1.106.3 disables Skills above 1024 characters."""

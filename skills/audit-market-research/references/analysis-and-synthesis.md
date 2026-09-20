@@ -19,7 +19,7 @@ SUBMIT_TOOL(
         "phase": "multi_lens",
         "mode": "deep" | "premium",
         "title": "<research title>",
-        "research_type": "<same scope value>",
+        "research_type": "comparison",
         "research_method": "<same scope value>",
         "language": "<same BCP-47 value>",
         "question": "<same question>",
@@ -96,13 +96,18 @@ SUBMIT_TOOL(
     args={
         "phase": "synthetic_customer",
         "mode": "deep" | "premium",
+        "research_type": "comparison",
+        "research_method": "<same scope value>",
+        "language": "<same BCP-47 value>",
+        "question": "<same question>",
+        "topic": "<same topic>",
+        "framework_hints": "<same scope value>",
         "upstream_p2_run_id": "<P2 run_id>",
         "upstream_p2_artifact_sha": "<P2 artifact_sha>",
         "upstream_p3_run_id": "<P3 run_id>",
         "upstream_p3_artifact_sha": "<P3 artifact_sha>",
         "calibration_present": true | false,
-        "calibration_ref": "<authoritative calibration reference when present>",
-        "<scope fields>": "<same values>"
+        "calibration_ref": "<authoritative calibration reference when present>"
     }
 )
 ```
@@ -133,13 +138,18 @@ SUBMIT_TOOL(
     args={
         "phase": "synthesize",
         "mode": "deep" | "premium",
+        "research_type": "comparison",
+        "research_method": "<same scope value>",
+        "language": "<same BCP-47 value>",
+        "question": "<same question>",
+        "topic": "<same topic>",
+        "framework_hints": "<same scope value>",
         "upstream_p2_run_id": "<P2 run_id>",
         "upstream_p2_artifact_sha": "<P2 artifact_sha>",
         "upstream_p3_run_id": "<P3 run_id>",
         "upstream_p3_artifact_sha": "<P3 artifact_sha>",
         "upstream_p4_run_id": "<P4 run_id, optional>",
-        "upstream_p4_artifact_sha": "<P4 artifact_sha, optional>",
-        "<scope fields>": "<same values>"
+        "upstream_p4_artifact_sha": "<P4 artifact_sha, optional>"
     }
 )
 ```

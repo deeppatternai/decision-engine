@@ -1,6 +1,6 @@
 ---
 name: audit-forecast
-description: "Aggregate how existing external forecasters and prediction markets currently estimate one specific, verifiable, time-bound outcome. Use for prediction-consensus questions such as “市场现在认为某事发生的概率是多少”, “预测平台怎么看”, “what do forecasters predict”, or /audit-forecast. Return consensus strength, divergence, and falsifiers from retrieval-grounded sources. Do not use for broad market sizing, general research, personal guesses, or non-verifiable futures."
+description: "Use when the user asks what existing forecasters or prediction markets currently expect for one specific, time-bound outcome with an external resolution rule, including equivalent intent in any language. Aggregate retrieved estimates into a sourced consensus, explain disagreement and what could change the outlook, and abstain when matching sources are unavailable. Never generate a new probability or use this for broad market research or open-ended speculation."
 ---
 
 # /audit-forecast — Prediction-consensus scanner (aggregate, never produce)
@@ -16,11 +16,11 @@ description: "Aggregate how existing external forecasters and prediction markets
 
 - **Anti-self-production is the whole point.** The server AGGREGATES existing market /
   model predictions; it must NEVER emit "the AI's own forecast" (LLMs are unreliable on
-  out-of-distribution future events). A fail-closed server OUTPUT GATE re-enforces this:
-  every figure carries the verbatim source excerpt it came from; no market found ⇒ an
-  honest `no_market` abstention with NO figures; consensus is DERIVED from the listed
-  sources. A violation FAILS the run — it never reaches the user. **Present what the
-  MARKET predicts, never a number you or the model invented.**
+  out-of-distribution future events). A fail-closed server OUTPUT GATE ties each retrieved
+  source figure to a verbatim source excerpt; consensus is DERIVED only from the listed
+  source figures. If configured sources find no usable match, return an honest `no_market`
+  abstention with NO figures. A violation FAILS the run — it never reaches the user.
+  **Present what the sources predict, never a number you or the model invented.**
 - **Retrieval-only, FREE sources.** The server pools keyless free sources — **real-money
   prediction markets** + **model/analyst picks**. There is NO paid odds API and
   NO LLM panel producing numbers. (More sources land as the Owner provisions them.)
@@ -42,6 +42,11 @@ Dedup: same proposition scanned within 5 turns + no material change → re-rende
 
 An admissible proposition is a dict requiring **ALL** of:
 
+Build it from user-provided or verified event details. If the specific event, future deadline,
+outcomes, or external resolver cannot be established, ask for the missing information; do not
+invent missing event details. For a current forecast, choose a future UTC resolution deadline
+from those details; this is client preparation, not an additional server gate claim.
+
 **Admissibility fields** — the server INPUT gate HARD-rejects the proposition unless ALL are present:
 
 | field | rule |
@@ -58,14 +63,18 @@ error naming the offending field. Fix and resubmit only if the proposition is ge
 determinate; if it is inherently open-ended, tell the user it is not forecastable.
 
 **Retrieval fields** — the input gate does NOT check these, but the free sources need them to
-actually FIND the market. Omit `subject` and the run returns an honest `no_market` with no data:
+actually FIND a matching prediction. Treat `subject` as a client pre-flight requirement rather
+than knowingly submitting a request that will return `no_market`:
 
 | field | rule |
 |---|---|
-| `subject` | **REQUIRED for any data** — the specific outcome/entity the sources match on (e.g. `"Team A"`, `"Argentina"`, a ticker). Without it BOTH pooled sources fail closed → `no_market`. |
-| `source_hints` | recommended per-source locator hints — a dict of per-source keys → `{"event_slug": "..."}` **or** `{"title_keyword": "..."}` that locates the market for a market-locator source (concrete source keys are hub-provided). Omit it and the market-locator source abstains (other sources still try via `subject`). |
+| `subject` | **Client-required for any data**, though not hard-gated server-side — the specific outcome/entity the sources match on (e.g. `"Team A"`, `"Argentina"`, a ticker). Identify it from verified event details or ask the user. Without it the currently described pooled sources return no usable match (`no_market`). |
+| `source_hints` | Optional per-source locator hints — a dict of hub-provided source keys → `{"event_slug": "..."}` **or** `{"title_keyword": "..."}`. Supply only known locator values; never guess source-specific slugs. Without a hint the market-locator source abstains (other sources still try via `subject`). |
 
 ## Calling pattern
+
+All tool names in this section are illustrative; bind the exact names exposed by the current host.
+The example placeholders must be replaced with verified event details before submission.
 
 ```
 mcp__decision-engine__audit_skill_submit(
@@ -73,35 +82,57 @@ mcp__decision-engine__audit_skill_submit(
     args={
         "mode": "premium",              # quick | deep | premium (default premium)
         "proposition": {
-            "statement": "Team A wins the 2026 Cup final vs Team B",
+            "statement": "Team A wins the named final against Team B",
             "proposition_type": "match_result",
-            "event_id": "cup-2026-final-teamA-teamB",
-            "horizon_utc": "2026-07-19T20:00:00Z",
+            "event_id": "<specific event instance ID>",
+            "horizon_utc": "<future ISO-8601 UTC resolution deadline>",
             "outcome_set": ["Team A wins", "Team B wins", "draw"],
             "resolution_authority": "official competition result",
             "subject": "Team A",                       # what the sources match on — REQUIRED for real data
-            "source_hints": {},                        # optional per-source locator hints (concrete keys are hub-provided)
+            "source_hints": {},                        # add only verified, hub-supported locator hints
         },
     },
-)
-# LLM/retrieval is async — POLL, never block (wait_audit is deprecated).
-# IN-LOOP poll (status + per-auditor progress ONLY; carries NO forecast payload):
-mcp__decision-engine__check_audit_status(run_id="<id>")   # → {status, auditors:[...], error}
-#   backoff ~10s cadence; re-render per-auditor auditors[] each round; never infer failure
-#   from elapsed time. Bound the loop: unknown/error status (run_not_found once the run was
-#   already seen, or a transport error) → surface + STOP; keep a total timeout / stay interruptible.
-# TERMINAL fetch (ONLY this carries the forecast payload — status tools never do):
-mcp__decision-engine__audit_skill_result(skill_name="audit-forecast", run_id="<id>")
-# (audit_skill_status is the skill-scoped status echo; audit_skill_events / _cancel also available;
-#  artifact_intent is FORCED "hypothesis" server-side.)
+)  # → {run_id, status="queued", ...}
 ```
+
+The retrieval workflow is asynchronous. If submission returns an unknown outcome, do not retry
+blindly: reconcile through a returned `run_id` or a host-provided request/idempotency ID when
+available; otherwise surface the unknown submission outcome and stop. After a known submission,
+preserve the `run_id`; do not start another run for the same proposition while this one may still
+be active. Observe with the host-exposed `audit_skill_status` or `check_audit_status` at
+bounded backoff (normally about ten seconds), and show per-auditor progress when the status
+includes it. If the host exposes
+`wait_audit`, bounded wait chunks are also valid; do not assume it is either universally
+available or deprecated. Keep a total observation checkpoint appropriate to the selected mode;
+if status remains unknown or errors persist after bounded retries and reconciliation, preserve
+the `run_id`, report the uncertainty, and stop the current polling loop. Stay interruptible and
+do not infer run failure from elapsed time alone.
+
+On `completed`, fetch `audit_skill_result(skill_name="audit-forecast", run_id=...)`;
+status responses carry progress, not the forecast payload. On `failed` or `cancelled`, surface
+the reason and stop. For a transient observation error or a previously seen `run_id` that
+becomes unknown, retry briefly and reconcile with available events and result tools. If state
+remains uncertain, preserve the `run_id` and report that uncertainty; never guess a result or
+submit a duplicate run. The server forces `artifact_intent="hypothesis"` for this workflow.
+Use `audit_skill_events` for reconciliation when available; request `audit_skill_cancel` only
+when the user asks to cancel and the host supports it.
+
+## Presenting the result
+
+For a completed run, present only returned source figures and server-derived consensus.
+Explain agreement, divergence, and falsifiers or catalysts when the result contains them;
+do not invent a missing figure, source, or explanation. `no_market` means the configured
+sources found no usable match for this proposition, not that no forecast exists anywhere.
+Show the abstention without a probability or a fabricated zero. A failed or cancelled run
+has no usable forecast.
 
 ## Voice / source-name privacy (apply client-side)
 
-Every result carries `debug_authorized`. When **`false`** (normal users) the payload is
-ALREADY redacted — refer to every pooled source (`provenance[].via`,
-`provenance[].source_url`) ONLY as `Voice N` / `Source N` in EVERYTHING the user sees; NEVER
-name a vendor/source. When **`true`** (operator) you may use real names. The forecast SUBJECT
+Every result normally carries `debug_authorized`. Unless `debug_authorized` is explicitly `true`,
+including when it is missing or malformed, treat the caller as unauthorized: refer to every pooled
+source (`provenance[].via`, `provenance[].source_url`) ONLY as `Voice N` / `Source N` in EVERYTHING
+the user sees; NEVER name a vendor/source or echo raw identity tokens even if the payload contains
+them. When **`true`** (operator) you may use real names. The forecast SUBJECT
 can legitimately be a named entity ("will Argentina win…") — keep the subject; redaction only
 strips source-identity tokens. Do not surface pricing / credit cost in user-facing prose.
 
@@ -109,22 +140,22 @@ strips source-identity tokens. Do not surface pricing / credit cost in user-faci
 
 | Signal | Meaning |
 |---|---|
-| `canonical_sha` | sha256 over payload (always present) |
+| `canonical_sha` | sha256 over payload (always present); does not prove the forecast is correct |
 | `artifact_intent` | forced `hypothesis` (a forecast is not a defect review) |
 | `stakes` | forecast stakes classification |
 | `proposition_type` | echoed proposition type |
-| `free_sources_planned` | the free source roster the run queried |
+| `free_sources_planned` | the free source roster planned for querying, not proof that each yielded data |
 
 ## Anti-patterns
 
-- ❌ Present a probability/number that isn't carried verbatim from a listed source (the server gate blocks it; never route around it)
+- ❌ Present an unsupported probability/number that cannot be traced to listed source figures or their server-derived consensus; the server gate blocks it, so never route around that gate
 - ❌ Reword a gate-rejected open-ended claim to force it through — a rejection is the honest answer
 - ❌ Add a paid odds API / your own model's "estimate" — free-source retrieval-only by design
-- ❌ Name a pooled source when `debug_authorized=false` — use `Voice N` / `Source N`
+- ❌ Name a pooled source unless `debug_authorized` is explicitly `true` — use `Voice N` / `Source N`
 - ❌ Emphasize cost / "free" as a selling point in user-facing output
 
 ## Pre-flight
 
 - Device token configured
-- Build the `proposition` BEFORE calling — include `subject` (+ `source_hints`) or the run returns `no_market`; the gate rejects an inadmissible one before any work
-- High-stakes by nature → keep `mode="premium"` unless the user explicitly asks for a cheap/quick pass
+- Build the `proposition` BEFORE calling — include `subject`, plus verified `source_hints` if available; the gate rejects an inadmissible one before any work
+- `mode="premium"` is the current default. Use a quick/cheap pass only when the user explicitly asks and the host supports it; do not guess an unsupported mode or assume every forecast is equally high-stakes

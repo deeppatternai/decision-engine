@@ -43,9 +43,10 @@ SUBMIT_TOOL(
 ) -> envelope {run_id, status="queued", ...}
 ```
 
-The server forces `artifact_intent="explore_diverge"` and returns 9 HMW reframes plus 3 PO
-provocations. Render the returned candidates with vendor attribution, without ranking them by
-confidence. The user selects one problem reframe before P3.
+The server forces `artifact_intent="explore_diverge"`. Candidate counts depend on the configured
+panel and each seat's response. Render every returned HMW reframe and PO provocation grouped by
+vendor, using the actual counts and without ranking by confidence. The user selects one problem
+reframe before P3.
 
 ## P3 Diverge Solution
 
@@ -66,8 +67,9 @@ SUBMIT_TOOL(
 ) -> envelope {run_id, status="queued", ...}
 ```
 
-The server returns 9 solution directions. Render them with vendor attribution and equal weight. The
-user selects one or two solution directions before P4.
+Solution-direction counts depend on the configured panel and each seat's response. Render every
+returned direction grouped by vendor with equal weight, using the actual counts. The user selects
+one or two solution directions before P4.
 
 ## Wait And Observe
 

@@ -24,7 +24,10 @@ selection, and the full regulated client-only path.
    or duration estimates.
 7. If the topic concerns an AI vendor, model provider, or another subject where panel members may
    have commercial self-interest, disclose that convergence can amplify shared incentives.
-8. Get an explicit path and tier choice. Silence, prior use, or enthusiasm is not authorization.
+8. Before hosted authorization, explain that the run will use the comparison path even for other
+   research topics. A source selected only by another research class may be omitted, and synthesis
+   may include a comparison view.
+9. Get an explicit path and tier choice. Silence, prior use, or enthusiasm is not authorization.
 
 ## Tier Choice
 
@@ -56,11 +59,11 @@ The scope fields are:
 
 | Field | Meaning |
 |---|---|
-| `research_type` | The research class, such as comparison, market sizing, consumer voice, or strategy |
+| `research_type` | Set the hosted P1 scope to the fixed literal `comparison` and reuse it on P2-P5; never use a localized description or another category value. The regulated local path does not submit this field |
 | `research_method` | The intended research method or evidence approach |
 | `language` | The output and research language as BCP-47 |
-| `question` | The decision-relevant question the report must answer |
-| `topic` | The market, category, customer group, geography, or commercial subject |
+| `question` | The decision-relevant question and, when relevant, the actual research category the report must address |
+| `topic` | The market, actual research category, customer group, geography, or commercial subject |
 | `framework_hints` | User-supplied scope metadata; never convert it into P3 methodology-lens injection |
 | `mode` | Quick, Deep, or Premium for hosted runs |
 
@@ -68,8 +71,17 @@ Pass the same scope fields on every server submission. Preserve explicit unset v
 silently inventing defaults. The server computes `scope_sha` and rejects downstream artifacts whose
 device, mode, phase, scope, run state, or digest does not match.
 
+The server's dedicated `consumer_voc` source route is no longer forced by this field. Put the
+actual research category in `question` or `topic` and include it in the P2 retrieval query.
+Keyword-based routing may select relevant sources, but does not guarantee the dedicated route.
+
+If an older run chain used a different `research_type`, do not change the value partway through that
+chain. Before starting a new P2 run with `research_type="comparison"`, repeat the applicable P0
+cost and path disclosure and obtain approval for the new P1 scope. Use only the new chain's pointers
+for P3-P5.
+
 Show the scope to the user and obtain approval before P2. A material change to the question, topic,
-language, method, research type, framework hints, or mode creates a new scope and new run chain.
+language, method, framework hints, or mode creates a new scope and new run chain.
 
 ## Regulated Client-Only Route
 

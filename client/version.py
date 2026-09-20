@@ -10,5 +10,5 @@ It is a property of the RUNNING code, not user config — activation reports thi
 """
 from __future__ import annotations
 
-CLIENT_VERSION = "0.2.96"
+CLIENT_VERSION = "0.2.97"
 USER_AGENT = f"decision-engine-client/{CLIENT_VERSION}"

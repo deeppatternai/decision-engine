@@ -34,7 +34,7 @@ SUBMIT_TOOL(
         "phase": "ground_truth",
         "mode": "quick" | "deep" | "premium",
         "title": "<short research title>",
-        "research_type": "<approved scope value>",
+        "research_type": "comparison",
         "research_method": "<approved scope value>",
         "language": "<BCP-47>",
         "question": "<approved research question>",
@@ -46,7 +46,8 @@ SUBMIT_TOOL(
 ```
 
 The scope fields must match P1 verbatim. `content` is used only for P2 retrieval. Later phases pass
-server-owned artifacts by pointers, not by copying their content.
+server-owned artifacts by pointers, not by copying their content. Put the actual research category
+in `question` or `topic`, not in `research_type`.
 
 ## Current Tier Behavior
 

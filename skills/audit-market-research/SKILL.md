@@ -69,6 +69,10 @@ remain visible as degraded reasons.
 
 - Skill activation is not consent to transmit data. No server call occurs before P0 authorization.
 - Pass the same P1 scope fields on every server submission so the server can bind one `scope_sha`.
+- Set `research_type` to the literal string `comparison` in P1's hosted scope and reuse it on
+  every P2-P5 submission. This intentionally selects comparison-scoped server synthesis; put the
+  actual research category in `question` or `topic`. If an older chain used another value, start a
+  new chain at P2 instead of changing that field midchain.
 - Pass server artifacts between phases only by verified `run_id` and `artifact_sha` pointers. Never
   paste a server-owned fact pack or analysis back as downstream `content`.
 - Do not pass frameworks or methodology lenses to P3. The server assesses declared diversity after

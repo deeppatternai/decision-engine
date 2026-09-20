@@ -34,9 +34,11 @@ class CodexSkillRoutingContractTests(unittest.TestCase):
     def test_board_skill_owns_interactive_adjustment_and_never_falls_back(self):
         text = self._skill("discussion-board")
         frontmatter = text.split("---", 2)[1]
-        self.assertIn("interactive board", frontmatter)
+        self.assertIn("interactive discussion board", frontmatter)
+        self.assertIn("by hand and submit", frontmatter)
+        self.assertNotIn("audit-", frontmatter)
         self.assertIn("Decision Engine board popup only", frontmatter)
-        self.assertIn("Do not substitute an inline board", frontmatter)
+        self.assertIn("do not substitute an inline board", frontmatter)
         self.assertIn("Fail-closed, never degrade", text)
         self.assertIn("Never a browser fallback", text)
 
@@ -87,6 +89,55 @@ class CodexSkillRoutingContractTests(unittest.TestCase):
         text = self._skill("audit-adjudication")
         self.assertNotIn("--activation-secret", text)
         self.assertIn("installer.permanent_setup", text)
+
+    def test_forecast_skill_preserves_result_and_abstention_contract(self):
+        text = self._skill("audit-forecast")
+        normalized = " ".join(text.split())
+        for phrase in (
+            "`subject`",
+            "`source_hints`",
+            "`no_market`",
+            "audit_skill_result",
+            "debug_authorized",
+            "Voice N",
+            "Source N",
+            "preserve the `run_id`",
+            "do not invent missing event details",
+        ):
+            self.assertIn(phrase, normalized)
+        sections = {}
+        for heading in (
+            "The `proposition` contract (you build this; the server hard-gates it)",
+            "Calling pattern",
+            "Presenting the result",
+            "Voice / source-name privacy (apply client-side)",
+            "Anti-patterns",
+        ):
+            sections[heading] = " ".join(
+                text.split(f"## {heading}\n", 1)[1].split("\n## ", 1)[0].split()
+            )
+        proposition = sections["The `proposition` contract (you build this; the server hard-gates it)"]
+        self.assertIn("`horizon_utc` | ISO-8601 timestamp", proposition)
+        self.assertIn("future UTC", proposition)
+        calling = sections["Calling pattern"]
+        for phrase in (
+            "All tool names in this section are illustrative",
+            "total observation checkpoint",
+            "unknown submission outcome",
+            "preserve the `run_id`",
+            "submit a duplicate run",
+        ):
+            self.assertIn(phrase, calling)
+        result = sections["Presenting the result"]
+        self.assertIn("configured sources found no usable match", result)
+        self.assertIn("without a probability or a fabricated zero", result)
+        privacy = sections["Voice / source-name privacy (apply client-side)"]
+        self.assertIn("Unless `debug_authorized` is explicitly `true`", privacy)
+        self.assertIn("missing or malformed", privacy)
+        self.assertIn("`Voice N` / `Source N`", privacy)
+        self.assertIn("never route around", sections["Anti-patterns"])
+        self.assertNotIn("2026-07-19T20:00:00Z", normalized)
+        self.assertNotIn("wait_audit is deprecated", normalized)
 
     def test_audit_workflows_do_not_require_a_provider_probe_or_skip_preparation(self):
         texts = {"audit": self._audit_package()}

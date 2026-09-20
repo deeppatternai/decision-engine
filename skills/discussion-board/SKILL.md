@@ -1,6 +1,6 @@
 ---
 name: discussion-board
-description: "Open an existing decision, plan, or item set as an interactive board for the user to rearrange, prioritize, edit, annotate, and submit. Use when the user asks to open a discussion board, 看板, 讨论板, drag/reorder cards, adjust priorities, annotate an image/document, or collaboratively revise existing items. Use the Decision Engine board popup only. Do not substitute an inline board, static diagram, or visual explanation; bare mentions of board/看板 without an intent to interact do not trigger."
+description: "Open an interactive discussion board when the user wants to edit an existing plan, item set, diagram, image, or document by hand and submit the result. Use for board-based rearrangement, prioritization, or annotation in any language. Use the Decision Engine board popup only; do not substitute an inline board, static visual explanation, or text-only revision. A bare mention of a board without interactive intent is not a trigger."
 ---
 
 # /discussion-board — Hand-adjust a decision on an interactive board (server-rendered)
@@ -21,8 +21,21 @@ For every discussion-board request, run this gate before continuing. Before insp
 task's MCP/tool list, checking whether `open_db_board` exists, assembling the board spec, or calling
 `open_db_board`, run the local read-only probe:
 
+On macOS/Linux (bash):
+
 ```bash
 python3 "${CODEX_HOME:-$HOME/.codex}/skills/audit/scripts/de_lite_capability_status.py"
+```
+
+On Windows (PowerShell):
+
+```powershell
+$codexHome = if ($env:CODEX_HOME) { $env:CODEX_HOME } else { Join-Path $HOME ".codex" }
+$probe = Join-Path $codexHome "skills/audit/scripts/de_lite_capability_status.py"
+$managedPython = Join-Path $HOME ".deeppattern/de-python/Scripts/python.exe"
+if (Test-Path -LiteralPath $managedPython -PathType Leaf) { & $managedPython $probe }
+elseif (Get-Command py -ErrorAction SilentlyContinue) { py -3 $probe }
+else { python $probe }
 ```
 
 The probe returns only `status=unactivated`, `status=activated`, or `status=unknown`; it does not
@@ -46,6 +59,9 @@ Do not mix the two languages. Only `status=activated` or `status=unknown` may co
 | Turn a plan / audit findings / a set of options into cards the user drags + reprioritizes by hand | Review an existing artifact for defects → `/audit` |
 | Let the user annotate an image or a document page and send the markup back | Generate commercial insight → `/audit-market-research` |
 
+Use the Decision Engine board popup only. Do not substitute an inline board, static diagram,
+or text-only revision for the interactive hand-adjustment workflow.
+
 **Dedup**: don't re-open the same unchanged items turn after turn. When you do need
 the board again, call `open_db_board` again with the same spec — a fresh server render is
 the ONLY supported path; never cache or re-open the prior board HTML locally or in a system
@@ -59,23 +75,9 @@ browser (you never hold the HTML anyway — the shim does).
    - `image` — one inert `data:image/…` picture as the annotatable stage (pen / shape /
      text drawn ON it, marked-up image comes back). Spec: `image`.
    - `document` — a stack of page images (each a `data:` URI) to mark up. Spec: `pages`.
-   - `diagram` — an interactive **node-graph** the user drags into shape (a flowchart /
-     mindmap / tree / cycle / concept-map the user rearranges by hand, then Submits).
-     Spec: `diagram` (see below). The SERVER computes the layout and the client only
-     places + free-drags + re-fetches on 复位 — no layout IP reaches you. Best for the
-     node+edge families: `flow`, `mindmap`, `tree`, `cycle`, `concept-map`, `org`,
-     `sequence`, `state-machine`; and the **structured** families `entity-relationship`
-     (ER), `truth-table`, `decision-table`, and `decision-matrix` — each renders real
-     structured content inside the nodes (attribute rows / a truth grid / a rule table / a
-     weighted score matrix); and the **axis/band/chrome** families `swot`, `affinity`,
-     `canvas`, `funnel`, `journey`, `swimlane`, `story-map`, `gantt`, `venn`, `fishbone`,
-     `quadrants`, and `timeline` — each renders its full background chrome (a named 2×2 grid /
-     titled cluster regions / the 9-pane BMC template / a funnel-or-pyramid silhouette / a
-     stage×track grid with an emotion curve / tinted lane bands / a two-level activity→task×
-     release backbone / duration bars on tracks under a time ruler / overlapping set circles /
-     an effect spine with category bones / a scatter axis-cross with scale ticks / point events
-     on tracks under a time ruler, each with its axis / band / lane / set / category labels; see
-     the per-family field table below).
+   - `diagram` — an interactive diagram the user adjusts and Submits. Spec: `diagram`.
+     Read [diagram-spec.md](references/diagram-spec.md) only when assembling a `diagram`
+     board; it covers every supported family and field. The server computes all geometry.
    - **Out of scope for the current release**: `embed`, `liveUrl`. The server **fails
      cleanly** on these (a `400` with a stable error code) — surface that the stage is
      unsupported and stop; do **NOT** fall back.
@@ -99,110 +101,10 @@ browser (you never hold the HTML anyway — the shim does).
    for `document`, pass `"pages": ["data:…", …]`. Do NOT invent rendering instructions —
    the server owns how the spec becomes a board.
 
-   For a **`diagram`** board, drop `columns` and pass a `diagram` object — `layout` (one
-   of the node+edge families above), `nodes`, and `edges` (user content only; the SERVER
-   computes every coordinate):
-   ```json
-   {"title": "登录流程",
-    "diagram": {
-      "layout": "flow",
-      "nodes": [
-        {"id": "n1", "text": "开始", "shape": "round"},
-        {"id": "n2", "text": "输入校验"},
-        {"id": "n3", "text": "有效?", "shape": "diamond"},
-        {"id": "n4", "text": "进入首页"},
-        {"id": "n5", "text": "报错"}],
-      "edges": [
-        {"from": "n1", "to": "n2"}, {"from": "n2", "to": "n3"},
-        {"from": "n3", "to": "n4"}, {"from": "n3", "to": "n5"}]},
-    "notes": "", "comments": []}
-   ```
-   Each node needs a unique `id` and a `text` label; `shape` is optional (`round` /
-   `diamond`, else a plain box). `edges` carry `{from, to}` node ids and an optional
-   `label` — the relation word / branch / condition / message the line stands for
-   (`{"from":"n3","to":"n5","label":"否"}`). The server places the caption on the edge's
-   own shape (a line's midpoint, an elbow's stub, an arc's apex) and it rides / hides with
-   the edge when the user drags; the families that draw no line (see below) carry no caption.
-   Do NOT pass coordinates, sizes, or any layout hint — the server owns the geometry.
-
-   **Appearance (optional).** A node may carry `color` — one of the semantic keys `start`
-   (blue) / `good` (green) / `bad` (red) / `warn` (amber) / `neutral` (default teal) / `black`
-   — tinting the card. An edge's line inherits its SOURCE (`from`) node's colour by default, so
-   one node's out-lines read as one colour; pass `color` on the edge (same keys) to override
-   that, and `dash: true` for a dashed line. Arrowheads and entity-relationship crow's-foot
-   symbols take the line's colour too. Example: `{"from":"n3","to":"n5","label":"否","color":
-   "bad","dash":true}`. (On a `timeline`, a dependency that runs BACKWARD in time — `from.t >
-   to.t`, a predecessor scheduled after its successor — is auto-flagged a red dashed conflict
-   line, overriding its own colour/dash; you do not set this.)
-
-   The **relation** families `sequence` and `state-machine` read a few extra per-node / per-edge
-   fields (still user content only — the SERVER computes every coordinate + all message order):
-   - `sequence`: each node is a participant lifeline — `col:` its column order (0-based, left→
-     right). Each `edge` is a message — `order:` its time order down the page (0-based), and
-     `kind:` the line style `"sync"` (solid, default) / `"async"` (open) / `"return"` (dashed).
-     A message from a participant to itself (`from == to`) draws a self-call loop; `label` is the
-     message text (rendered larger than other families' edge labels).
-   - `state-machine`: each node is a state — `marker:` a pseudo-state `"start"` (an entry disc)
-     or `"final"` (a ring + inner disc); `shape: "diamond"` a decision/choice state. Each `edge`
-     is a transition, its `label` the trigger/condition (`"启动"` / `"是"`); a `from == to` edge
-     is a self-transition (a lifted top-arc).
-
-   The **structured** families carry extra per-node content (still user content only — the
-   SERVER computes every coordinate + all derived values):
-   - `entity-relationship`: each node is an entity — add `attrs: ["id","name","email"]`
-     (attribute rows rendered inside the entity box). `edges` are the relationships.
-   - `truth-table`: each node is a boolean function — `inputs: ["A","B"]`, `outputs: ["Q"]`,
-     `values: "0001"` (ONE output = a 2ⁿ-char string of `0`/`1`/`x`; MULTIPLE outputs = an
-     array, one such string per output). The 2ⁿ input rows are auto-enumerated (≤ 10 inputs).
-   - `decision-table`: each node is a rule set — `rules: ["R1","R2","R3"]`, `conditions:
-     [{"n":"已收货","c":["Y","N","Y"]}]`, `actions: [{"n":"允许退款","c":["✓","✓",""]}]`
-     (one `c` entry per rule).
-   - `decision-matrix`: options scored against criteria — put the criteria on the top-level
-     `diagram.axes`: `{"cols":["成本","性能","易用"], "weights":[3,2,2]}`; each node is an
-     option with `cells: ["8","6","7"]` (one per criterion). The server derives the weighted
-     Total column + highlights the winning row — do NOT compute or pass totals.
-
-   The **axis/band** families draw a labelled background the cards sort INTO — a card carries
-   only its group index, the group titles ride `diagram.axes` (still user content only; the
-   server draws every band / cell / axis / curve):
-   - `swot`: a named 2×2 — each node `cluster: 0..3` (0=TL 1=TR 2=BL 3=BR); `axes.clusters`
-     the 4 bin titles (default 优势/劣势/机会/威胁) + `axes.bandCols` / `axes.bandRows` the
-     two axis labels (e.g. `["内部","外部"]` / `["积极","消极"]`). Relabel to Eisenhower etc.
-   - `affinity`: free theme clustering — each node `cluster: 0-based` theme index (omit for
-     未分类 → tray); `axes.clusters` the theme titles. Cards regroup by drag.
-   - `canvas`: the 9-pane Business-Model / Lean canvas — each node `cluster: 0..8` (pane
-     index); `axes.clusters` the 9 pane titles (default BMC; relabel → Lean Canvas).
-   - `funnel`: stacked stages — each node `tier: 0-based` band; `axes.tiers` the stage titles;
-     `axes.orientation: "funnel"` (wide top) or `"pyramid"` (wide bottom).
-   - `journey`: a 2-D stage×track grid + an emotion curve — each node `col:` stage + `lane:`
-     track (its cell); `axes.cols` stage titles, `axes.lanes` track titles, and `axes.emotion`
-     a per-stage sentiment array in `[-1,+1]` (one per column) that draws the curve.
-   - `swimlane`: lane bands — each node `lane: 0-based` band; `axes.lanes` the lane titles;
-     `axes.laneAxis: "row"` (horizontal bands, default) or `"col"` (vertical bands).
-   - `story-map`: a user-story map — a task×release grid under a two-level activity backbone.
-     Each node `col:` task column + `lane:` release row (its cell); `axes.cols` task titles,
-     `axes.lanes` release titles, `axes.activities` the activity titles + `axes.colAct` a
-     per-column activity index array (one per task column) that draws the top-level activity
-     spanning band above the tasks.
-   - `gantt`: duration bars on tracks under a time ruler — each node `lane:` track + `t:` start
-     + `t1:` end (a bar; omit `t1` → a milestone diamond); `axes.lanes` the track titles,
-     `axes.bottom` the time-axis caption, optional `axes.ticks: [{"t":0,"label":"1月"}]` for
-     custom date ticks (else nice numbers). Bars/milestones sit at their `t` on the shared scale.
-   - `venn`: overlapping set circles — `axes.sets` the 2–3 set titles; each node `region:` an
-     array of the set indices it belongs to (e.g. `[0]` a single set, `[0,1,2]` the triple
-     overlap; omit → an external item outside every circle).
-   - `fishbone`: an Ishikawa / cause-effect diagram — `axes.effect` the effect/problem title
-     (the head box), `axes.cats` the category-bone titles; each node `cat:` its category index
-     (the cause snaps onto that bone; omit → the 未分类 tray).
-   - `quadrants`: a 2×2 / scatter quadrant — `axes.top` / `axes.bottom` / `axes.left` /
-     `axes.right` the 4 edge direction titles (x→right, y→top aliases too), `axes.q` the 4
-     corner labels `[top-right, top-left, bottom-left, bottom-right]`; each node `value: [vx,vy]`
-     a numeric point (scatter — the card sits at its value with axis scale ticks + a mean line;
-     omit `value` on every node → a categorical 2×2 the cards spread across).
-   - `timeline`: point events on tracks under a time ruler — each node `lane:` track + `t:` the
-     event time; `axes.lanes` the track titles, `axes.bottom` the time-axis caption, optional
-     `axes.ticks: [{"t":0,"label":"1月"}]` for custom date ticks (else nice numbers). Events sit
-     centred at their `t` on the shared scale.
+   For a **`diagram`** board, read [diagram-spec.md](references/diagram-spec.md) only when
+   `stage=diagram`. If the reference cannot be read, stop and report that the diagram stage
+   cannot be assembled; do not guess a spec. Drop `columns` and pass a `diagram` object
+   containing user content. Do NOT pass geometry; the server computes it.
 3. **Open** the board (`open_db_board`) — the shim fetches the finished board and pops it
    detached, returning a `popup_id` immediately. The user drags / reprioritizes / edits /
    annotates on their own time, then hits Submit.

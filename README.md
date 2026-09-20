@@ -1,6 +1,6 @@
 # Decision Engine
 
-**English** · [简体中文](README.zh-CN.md) · **v0.2.96**
+**English** · [简体中文](README.zh-CN.md) · **v0.2.97**
 
 > **A second opinion you can actually trust — because it comes from many
 > independent minds, not one model agreeing with itself.**
