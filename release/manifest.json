@@ -1,12 +1,12 @@
 {
   "channel": "stable",
-  "commit": "c9b7ad26604f4a9d8557d8277a21235dcce946d1",
+  "commit": "75ec6e8e32749d77ff1fe6bccd048aca75548e59",
   "key_id": "stable-2026-08",
   "min_python": "3.12",
-  "published_at": "2026-09-20T02:45:46Z",
-  "release_sequence": 93,
+  "published_at": "2026-09-20T12:12:53Z",
+  "release_sequence": 94,
   "repository_id": "deeppatternai/decision-engine",
   "schema": 1,
-  "tag": "v0.2.96",
-  "version": "0.2.96"
+  "tag": "v0.2.97",
+  "version": "0.2.97"
 }
