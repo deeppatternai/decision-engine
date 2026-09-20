@@ -1,12 +1,12 @@
 ---
 name: audit-explore
-description: "Develop a vague, unformed idea into a clear, falsifiable hypothesis through guided framing and, when authorized, an external panel. Use for /audit-explore and equivalent intent in any language when the user wants to clarify or develop a rough concept before evaluation. Do not trigger on isolated words such as idea or explore, or when the primary task is existing code or repository exploration. Use audit-brainstorming for formed hypotheses, audit-market-research for external evidence, audit-writing-plans for implementation documentation, and audit for deliverable defects."
+description: "Develop a vague, unformed idea into a clear, falsifiable hypothesis through guided framing and an external panel by default for routine content. Use for /audit-explore and equivalent intent in any language when the user wants to clarify or develop a rough concept before evaluation. Do not trigger on isolated words such as idea or explore, or when the primary task is existing code or repository exploration. Use audit-brainstorming for formed hypotheses, audit-market-research for external evidence, audit-writing-plans for implementation documentation, and audit for deliverable defects."
 ---
 
 # /audit-explore - From vague idea to falsifiable hypothesis
 
 Use this skill to clarify an idea that is not yet specific enough to evaluate. The client owns
-framing, consent, user choices, and the final handoff. Decision Engine owns any authorized external
+framing, content routing, user choices, and the final handoff. Decision Engine owns external
 divergence and convergence panels and their server-side methodology lenses.
 
 ## Routing
@@ -27,8 +27,8 @@ evidence-first or code-inspection request routes to the corresponding specialist
 
 ## Phase Map
 
-1. **P0 Consent:** classify the content, explain available execution paths, and obtain the user's
-   explicit choice before any external transmission.
+1. **P0 Route:** classify the content. Routine use takes the hosted path without a separate
+   consent prompt; sensitive content may need approval or a local-only path.
 2. **P1 Frame:** use 5-Whys and JTBD questions to create a frame the user approves.
 3. **P2 Diverge Problem:** produce problem reframes; the user selects one.
 4. **P3 Diverge Solution:** produce solution directions; the user selects one or two.
@@ -40,10 +40,10 @@ evidence-first or code-inspection request routes to the corresponding specialist
 
 - At activation, read only [consent-and-framing.md](references/consent-and-framing.md). It owns P0,
   P1, data handling, and the complete client-only path.
-- Only on an authorized external path, after an approved frame, read
+- Only on a hosted path, after an approved frame, read
   [hosted-exploration.md](references/hosted-exploration.md). It owns P2 and P3 submissions,
   polling, user selections, and the independent client voice.
-- Only on that authorized external path, when entering P4 or rendering the hosted final envelope,
+- Only on that hosted path, when entering P4 or rendering the hosted final envelope,
   read
   [convergence-and-result.md](references/convergence-and-result.md). It owns convergence, trust
   signals, the exit gate, presentation, and downstream confirmation.
@@ -53,13 +53,17 @@ instructions.
 
 ## Always-On Invariants
 
-- External processing is optional. Never treat skill activation as transmission consent.
-- Regulated content is never transmitted externally. Keep other non-public content client-side
-  unless a runtime-discoverable authoritative policy and explicit user authorization both permit
-  the exact transmission. Secrets and credentials are never submitted.
+- Ordinary user-directed `/audit-explore` use proceeds through MCP without a separate external
+  consent prompt. Classify the exact P2, P3, and P4 payloads; do not silently choose local-only.
+- Secrets, regulated data, unconsented third-party identifiers, and material under a confidentiality
+  duty must be removed or kept local. First-party identifiers can be sensitive but shareable with
+  exact-payload approval. Routine personal planning context is not automatically sensitive.
+- Classify Prohibited before Sensitive before Routine; uncertainty takes the stricter route.
+- For sensitive but shareable content, show the complete exact user-derived payload and recipients
+  and obtain explicit authorization before each changed submission. Pending is not local-only.
 - The user approves the P1 frame, chooses the P2 reframe and P3 direction, and confirms every
   downstream transition. Never auto-converge or auto-chain.
-- The client never supplies methodology lenses or authors server-owned trust and exit fields.
+- Use `audit_mode`; never supply lenses or trust fields, query policy or roster, or claim exclusion.
 - Treat the external panel as one input, not a verdict. Keep the independent client contribution
   separate from panel convergence counts.
 - If the same vague idea appears within five turns without material change, re-render the existing

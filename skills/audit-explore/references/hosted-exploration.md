@@ -1,6 +1,6 @@
 # Hosted Exploration
 
-Read this file only after the user approves the P1 frame, explicitly authorizes external processing,
+Read this file only after the user approves the P1 frame, the P0 route is ready for hosted submission,
 and the host exposes a Decision Engine submit tool. It owns P2 and P3.
 
 ## Pre-flight
@@ -10,19 +10,21 @@ and the host exposes a Decision Engine submit tool. It owns P2 and P3.
 - The logical lifecycle operations are `audit_skill_submit`, `wait_audit`, `audit_skill_status`,
   `audit_skill_result`, `audit_skill_events`, and `audit_skill_cancel`. Use only the exact names and
   operations the current host exposes. Cancellation is user-directed and capability-dependent.
-- Preserve the user's selected mode. Use `deep` for high-stakes or irreversible decisions.
-- Self-identify the runtime model family from reliable host context so the server can compose an
-  independent panel that excludes the client model family. If the family cannot be determined or
-  exclusion cannot be confirmed, ask rather than silently default; continue client-only unless the
-  user supplies reliable identification and the server contract can enforce exclusion. Never invent
-  an unsupported request field.
+- Preserve the selected `audit_mode` through P2, P3, and P4. Use `deep` for high-stakes or
+  irreversible decisions and `standard` for ordinary exploration unless the user chose another
+  supported mode.
+- No model-family exclusion preflight is required. Use the server-configured panel without a local
+  roster query. Do not claim that it excludes the client's model family or invent an unsupported
+  request field.
 - The server injects each vendor methodology lens. The client must not pass a methodology lens,
   framework, or replacement `artifact_intent`.
 
-Before every external submission, reclassify the exact payload and scrub it for secrets and
-credentials. Summarize any data-category or destination change. If the payload, sensitivity class,
-recipient category, metered status, or applicable protections changed after P0, renew authorization
-before sending. Regulated content always returns to the client-only route.
+Before each P2 and P3 external submission, classify the complete outgoing arguments under the P0
+rules in `consent-and-framing.md`. Routine payloads proceed directly. For sensitive but shareable
+content, show the complete exact user-derived payload, including repeated frame material and selected
+options, and obtain approval for that complete payload. Any change requires renewed approval. While
+approval is pending, do not submit or switch silently to local-only. Remove prohibited content or
+keep it local. P4 has the same gate in `convergence-and-result.md`.
 
 ## P2 Diverge Problem
 
@@ -36,7 +38,7 @@ SUBMIT_TOOL(
         "content": "<approved frame artifact>",
         "phase": "diverge_problem",
         "domain": "<subject domain>",
-        "mode": "fast" | "standard" | "deep",
+        "audit_mode": "fast" | "standard" | "deep",
     },
 ) -> envelope {run_id, status="queued", ...}
 ```
@@ -57,7 +59,7 @@ SUBMIT_TOOL(
         "content": "<selected HMW reframe and approved frame>",
         "phase": "diverge_solution",
         "domain": "<subject domain>",
-        "mode": "fast" | "standard" | "deep",
+        "audit_mode": "fast" | "standard" | "deep",
         "upstream_run_id": "<P2 run_id>",
         "upstream_canonical_sha": "<P2 envelope canonical_sha>",
     },

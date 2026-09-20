@@ -1,13 +1,17 @@
 # Convergence And Result
 
-Read this file only on an authorized external path when entering P4, interpreting its terminal
+Read this file only on a hosted path when entering P4, interpreting its terminal
 result, or rendering the hosted final envelope. The client-only route remains entirely in
 `consent-and-framing.md` and must not follow submission or polling instructions here.
 
 ## P4 Converge And Falsify
 
 Draft a hypothesis from the approved frame, selected HMW reframe, and selected solution directions.
-Submit it once with the P3 trust-chain pointers:
+Reclassify the complete P4 outgoing arguments under the P0 routing rules. Routine content proceeds.
+For sensitive but shareable content, show the complete exact user-derived payload, including the
+repeated frame and selected directions, and obtain approval for that complete payload before
+submission. If approval is pending, do not submit or switch silently to local-only. Remove prohibited
+content or keep it local. Submit once with the selected `audit_mode` and P3 trust-chain pointers:
 
 ```text
 SUBMIT_TOOL(
@@ -15,6 +19,7 @@ SUBMIT_TOOL(
     args={
         "title": "<idea slug> - converge and falsify",
         "content": "<hypothesis draft with approved frame and selections>",
+        "audit_mode": "fast" | "standard" | "deep",
         "premortem": true,
         "upstream_run_id": "<P3 run_id>",
         "upstream_canonical_sha": "<P3 envelope canonical_sha>",
@@ -29,8 +34,10 @@ critique, Klein premortem, and Goldilocks gate. It returns the formed hypothesis
 The Goldilocks gate expects at least three falsification criteria, at least three explicit
 assumptions, a null hypothesis or default outcome, and a base rate or reference class. If the gate
 fails, show the critique and revise the draft with the user. Only after the user approves the revised
-draft may the client resubmit to `skill_name="audit-explore-converge"`, using the latest run ID and
-`canonical_sha` as `upstream_run_id` and `upstream_canonical_sha`. Count the initial call as round one
+draft may the client resubmit to `skill_name="audit-explore-converge"`, using the same `audit_mode`
+and the latest run ID and `canonical_sha` as `upstream_run_id` and `upstream_canonical_sha`. Recheck
+the complete revised payload under P0; any change to sensitive content needs a new exact-payload
+approval before resubmission. Count the initial call as round one
 and allow a maximum of three critique rounds in total. After the cap, stop with `exit_ready:false`
 and explain what remains missing; do not loop indefinitely.
 

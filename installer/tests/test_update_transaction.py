@@ -565,7 +565,7 @@ class UpdateTransactionTests(unittest.TestCase):
             self.state_path.parent.chmod(0o700)
             self.state_path.chmod(0o600)
 
-    def _spawn_lease_holder(self):
+    def _spawn_lease_holder(self, running_commit=None):
         ready = self.root / "foreign-lease.ready"
         script = (
             "import pathlib,sys; from installer import update_coordination as c; "
@@ -579,7 +579,10 @@ class UpdateTransactionTests(unittest.TestCase):
         existing = environment.get("PYTHONPATH")
         environment["PYTHONPATH"] = source_root + (os.pathsep + existing if existing else "")
         process = subprocess.Popen(
-            [sys.executable, "-c", script, str(self.root), str(ready), self.old_commit],
+            [
+                sys.executable, "-c", script, str(self.root), str(ready),
+                running_commit or self.old_commit,
+            ],
             env=environment,
             stdin=subprocess.PIPE,
             stdout=subprocess.DEVNULL,
@@ -996,6 +999,19 @@ class UpdateTransactionTests(unittest.TestCase):
         self.assertEqual(second_state["transaction_id"], first_state["transaction_id"])
         self.assertIsNone(second_state["running_commit"])
 
+    def test_unconfirmed_candidate_with_old_live_shim_still_defers(self):
+        applied = self._apply()
+        self.assertEqual(applied.status, "candidate_ready")
+        _holder, _lease_path = self._spawn_lease_holder()
+
+        deferred = self._apply()
+
+        self.assertEqual(deferred.status, "deferred_active_session")
+        self.assertEqual(deferred.transaction_id, applied.transaction_id)
+        state = updater._read_update_state(self.root)
+        self.assertEqual(state.last_result, "candidate_ready")
+        self.assertEqual(state.transaction_id, applied.transaction_id)
+
     def test_missing_protocol_ready_marker_refuses_before_git_mutation(self):
         (self.root / update_transaction.PROTOCOL_READY_RELATIVE_PATH).unlink()
         before = self._git("rev-parse", "HEAD").stdout.strip()
@@ -1142,6 +1158,66 @@ class UpdateTransactionTests(unittest.TestCase):
         fetch.assert_not_called()
         stage.assert_not_called()
 
+    def test_updated_release_with_transaction_id_and_live_shim_is_up_to_date(self):
+        self.manifest = replace(self.manifest, key_id="test-release-key")
+        self.verified = release_contract.VerifiedRelease(
+            self.manifest, "test-release-key"
+        )
+        applied = self._apply()
+        self.assertEqual(applied.status, "candidate_ready")
+        self.assertEqual(self._git("rev-parse", "HEAD").stdout.strip(), self.new_commit)
+        with update_coordination.shim_session_lease(
+            self.root, self.new_commit, heartbeat_seconds=None
+        ):
+            confirmed = update_transaction.mark_running_release(
+                self.root, self.new_commit, "0.2.3"
+            )
+        self.assertEqual(confirmed.status, "updated")
+        self.assertEqual(confirmed.transaction_id, applied.transaction_id)
+        current_manifest = self.manifest
+        state = updater._read_update_state(self.root)
+        self.assertEqual(state.last_result, "updated")
+        self.assertEqual(state.running_commit, self.new_commit)
+        self.assertEqual(state.transaction_id, applied.transaction_id)
+        signature = _sign(current_manifest)
+        acquired = release_acquisition.AcquiredRelease(
+            release_acquisition.GITHUB_SOURCE, current_manifest, signature,
+        )
+        _holder, _lease_path = self._spawn_lease_holder(self.new_commit)
+        keys = {
+            "test-release-key": release_contract.RsaPublicKey(
+                key_id="test-release-key", modulus=_TEST_N, exponent=_TEST_E,
+            )
+        }
+        before_invalid = self.state_path.read_bytes()
+        with self.assertRaises(release_contract.ReleaseContractError):
+            update_transaction.apply_present_update(
+                self.root, current_manifest, replace(signature, signature="AA=="), keys
+            )
+        self.assertEqual(self.state_path.read_bytes(), before_invalid)
+        with (
+            mock.patch.object(release_acquisition, "discover_release", return_value=acquired),
+            mock.patch.object(release_acquisition, "fetch_release_objects") as fetch,
+            mock.patch.object(update_staging, "stage_release") as stage,
+            mock.patch.object(doctor.config, "managed_component_root", return_value=self.root),
+            mock.patch.object(release_acquisition, "load_trusted_release_keys", return_value=keys),
+            mock.patch.object(launcher, "load_trusted_release_keys", return_value=keys),
+            mock.patch.object(launcher, "_harden_config_with_diagnostics"),
+            mock.patch.object(launcher, "_serve_shim", return_value=0),
+            mock.patch.object(update_transaction, "_reset_to_commit") as reset,
+        ):
+            self.assertTrue(update_coordination.live_shim_sessions(self.root))
+            self.assertEqual(launcher.launch(self.root), 0)
+            attempt = update_staging.read_attempt(self.root)
+            diagnosis = doctor.check_managed_update()
+        self.assertIsNotNone(attempt)
+        self.assertEqual(attempt[1], "up_to_date")
+        self.assertEqual(diagnosis.status, "PASS")
+        self.assertIsNone(updater._read_update_state(self.root).transaction_id)
+        fetch.assert_not_called()
+        stage.assert_not_called()
+        reset.assert_not_called()
+
     def test_current_release_does_not_ignore_a_mismatched_live_shim(self):
         self.manifest = replace(
             self.manifest,
@@ -1151,27 +1227,32 @@ class UpdateTransactionTests(unittest.TestCase):
             commit=self.old_commit,
         )
         self.verified = release_contract.VerifiedRelease(self.manifest, "test-key")
-        self._write_state(
-            last_manifest_sha256=release_contract.manifest_sha256(self.manifest),
-            source="github",
-            last_attempt_at="2026-09-19T00:00:00Z",
-            last_result="up_to_date",
-            previous_commit=self.old_commit,
-            target_commit=self.old_commit,
-            running_commit=self.old_commit,
-            running_version="0.2.2",
-            error_code=None,
-            transaction_id=None,
-        )
         other_session = update_coordination.LiveShimSession(
             self.root / "other-lease", None, None, self.new_commit, None,
         )
-        with mock.patch.object(
-            update_coordination, "live_shim_sessions", return_value=(other_session,)
+        for last_result, transaction_id in (
+            ("up_to_date", None),
+            ("updated", "a" * 32),
         ):
-            result = self._apply()
-        self.assertEqual(result.status, "deferred_active_session")
-        self.assertEqual(result.blockers, (other_session,))
+            with self.subTest(last_result=last_result):
+                self._write_state(
+                    last_manifest_sha256=release_contract.manifest_sha256(self.manifest),
+                    source="github",
+                    last_attempt_at="2026-09-19T00:00:00Z",
+                    last_result=last_result,
+                    previous_commit=self.old_commit,
+                    target_commit=self.old_commit,
+                    running_commit=self.old_commit,
+                    running_version="0.2.2",
+                    error_code=None,
+                    transaction_id=transaction_id,
+                )
+                with mock.patch.object(
+                    update_coordination, "live_shim_sessions", return_value=(other_session,)
+                ):
+                    result = self._apply()
+                self.assertEqual(result.status, "deferred_active_session")
+                self.assertEqual(result.blockers, (other_session,))
 
     def test_current_release_with_pending_state_still_defers_live_shim(self):
         self.manifest = replace(
@@ -1214,18 +1295,16 @@ class UpdateTransactionTests(unittest.TestCase):
             commit=self.old_commit,
         )
         self.verified = release_contract.VerifiedRelease(self.manifest, "test-key")
-        self._write_state(
-            last_manifest_sha256=release_contract.manifest_sha256(self.manifest),
-            source="github",
-            last_attempt_at="2026-09-19T00:00:00Z",
-            last_result="up_to_date",
-            previous_commit=self.old_commit,
-            target_commit=self.old_commit,
-            running_commit=self.old_commit,
-            running_version="0.2.2",
-            error_code=None,
-            transaction_id=None,
-        )
+        settled_state = {
+            "last_manifest_sha256": release_contract.manifest_sha256(self.manifest),
+            "source": "github",
+            "last_attempt_at": "2026-09-19T00:00:00Z",
+            "previous_commit": self.old_commit,
+            "target_commit": self.old_commit,
+            "running_commit": self.old_commit,
+            "running_version": "0.2.2",
+            "error_code": None,
+        }
         _holder, _lease_path = self._spawn_lease_holder()
         inspect = updater.inspect_update
 
@@ -1245,9 +1324,21 @@ class UpdateTransactionTests(unittest.TestCase):
             )
             return result
 
-        with mock.patch.object(updater, "inspect_update", side_effect=interrupted_inspection):
-            result = self._apply()
-        self.assertEqual(result.status, "deferred_active_session")
+        for last_result, transaction_id in (
+            ("up_to_date", None),
+            ("updated", "a" * 32),
+        ):
+            with self.subTest(last_result=last_result):
+                self._write_state(
+                    **settled_state,
+                    last_result=last_result,
+                    transaction_id=transaction_id,
+                )
+                with mock.patch.object(
+                    updater, "inspect_update", side_effect=interrupted_inspection
+                ):
+                    result = self._apply()
+                self.assertEqual(result.status, "deferred_active_session")
 
     def test_staged_release_installs_offline_after_live_session_exits(self):
         acquired = release_acquisition.AcquiredRelease(

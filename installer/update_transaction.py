@@ -2408,7 +2408,8 @@ def apply_present_update(
                 and state.running_version == state.last_version
                 and state.target_commit == state.last_release_commit
                 and state.error_code is None
-                and state.transaction_id is None
+                # A successful running-release confirmation retains its transaction ID.
+                and (state.transaction_id is None or state.last_result == "updated")
                 and manifest.commit == state.last_release_commit
                 and manifest.release_sequence == state.last_release_sequence
                 and manifest.version == state.last_version
