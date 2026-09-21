@@ -52,6 +52,12 @@ def _claude_skills_path() -> Path:
     return config.claude_skills_dir()
 
 
+def _claude_code_skills_in_use() -> bool:
+    from installer import mcp_config
+
+    return mcp_config.client_present("claude-code")
+
+
 CLAUDE_CODE = AgentHostSpec(
     id="claude-code",
     transport="stdio",
@@ -80,8 +86,8 @@ CLAUDE_CODE = AgentHostSpec(
     skills_global_path=_claude_skills_path,
     skill_delivery_mode="managed-copy",
     routing_kind="skill",
-    skills_in_use=lambda: True,
-    skills_check_in_use=lambda: True,
+    skills_in_use=_claude_code_skills_in_use,
+    skills_check_in_use=_claude_code_skills_in_use,
     skill_route_name="claude",
     repair_skills_on_setup=True,
     client_name_patterns=(

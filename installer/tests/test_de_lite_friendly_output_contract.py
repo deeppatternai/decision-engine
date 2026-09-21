@@ -11,6 +11,9 @@ RESULT = ROOT / "skills" / "audit" / "references" / "result-contract.md"
 ROUTING = ROOT / "skills" / "audit" / "references" / "de-lite-routing.md"
 RESPONSES = ROOT / "skills" / "audit" / "references" / "localized-responses.md"
 GRAPHIC = ROOT / "skills" / "graphic-explanation" / "SKILL.md"
+GRAPHIC_CAPABILITY = (
+    ROOT / "skills" / "graphic-explanation" / "references" / "capability-boundary.md"
+)
 BOARD = ROOT / "skills" / "discussion-board" / "SKILL.md"
 
 UNACTIVATED_FINAL = (
@@ -31,6 +34,20 @@ UNACTIVATED_BOARD_EN = (
     "DE Lite does not support discussion boards. If you activate this device first, "
     "I can continue."
 )
+UNACTIVATED_GRAPHIC = (
+    "我这边现在没法直接图解：Decision Engine 尚未激活，DE Lite 暂不具备图解能力。"
+    "如果您愿意先激活这台设备，我就能继续为您调用图解功能。"
+)
+UNACTIVATED_GRAPHIC_EN = (
+    "I can't create the visual explanation right now because Decision Engine is not "
+    "activated and DE Lite does not provide visual explanations. If you activate this "
+    "device, I can continue with the visual explanation."
+)
+UNACTIVATED_COMIC_EN = (
+    "I can't create the comic explanation right now because Decision Engine is not "
+    "activated and DE Lite does not provide comic explanations. If you activate this "
+    "device, I can continue with the comic explanation."
+)
 
 
 class DeLiteFriendlyOutputContractTests(unittest.TestCase):
@@ -47,7 +64,7 @@ class DeLiteFriendlyOutputContractTests(unittest.TestCase):
             "不能关闭 AQG gate",
         ):
             self.assertIn(required, audit)
-        for path in (GRAPHIC, BOARD):
+        for path in (GRAPHIC_CAPABILITY, BOARD):
             text = path.read_text(encoding="utf-8")
             self.assertIn("DE Lite unsupported-capability response", text)
             self.assertIn("不得启动 DE Lite 本地审核", text)
@@ -222,7 +239,7 @@ class DeLiteFriendlyOutputContractTests(unittest.TestCase):
         )
 
     def test_graphic_lite_failure_is_friendly_and_never_audit_fallback(self):
-        text = GRAPHIC.read_text(encoding="utf-8")
+        text = GRAPHIC_CAPABILITY.read_text(encoding="utf-8")
         for required in (
             "de_lite_capability_status.py",
             "status=unactivated",
@@ -235,6 +252,20 @@ class DeLiteFriendlyOutputContractTests(unittest.TestCase):
             "不得调用 audit_skill_submit",
         ):
             self.assertIn(required, text)
+
+    def test_graphic_unactivated_templates_are_fixed_and_language_pure(self):
+        text = GRAPHIC_CAPABILITY.read_text(encoding="utf-8")
+        self.assertIn(f"> {UNACTIVATED_GRAPHIC}", text)
+        self.assertIn(f"> {UNACTIVATED_GRAPHIC_EN}", text)
+        self.assertIn(f"> {UNACTIVATED_COMIC_EN}", text)
+        self.assertNotRegex(UNACTIVATED_GRAPHIC_EN, r"[\u3400-\u9fff]")
+        self.assertNotRegex(UNACTIVATED_COMIC_EN, r"[\u3400-\u9fff]")
+        self.assertIn("unsupported conversation language", text)
+
+    def test_graphic_entry_retains_fail_closed_audit_guard(self):
+        text = GRAPHIC.read_text(encoding="utf-8")
+        self.assertIn("A failed display request is not an audit request", text)
+        self.assertIn("Never open an audit or Stopper as fallback", text)
 
     def test_board_lite_failure_is_friendly_and_never_audit_fallback(self):
         text = BOARD.read_text(encoding="utf-8")
@@ -286,8 +317,8 @@ class DeLiteFriendlyOutputContractTests(unittest.TestCase):
             gate.index("do not inspect the tool list"),
         )
 
-    def test_capability_preflight_is_in_each_display_skill(self):
-        for path in (GRAPHIC, BOARD):
+    def test_capability_preflight_is_in_each_display_skill_contract(self):
+        for path in (GRAPHIC_CAPABILITY, BOARD):
             text = path.read_text(encoding="utf-8")
             normalized = " ".join(text.split())
             for required in (

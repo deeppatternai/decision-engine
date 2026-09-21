@@ -1,6 +1,6 @@
 # Decision Engine
 
-**English** · [简体中文](README.zh-CN.md) · **v0.2.97**
+**English** · [简体中文](README.zh-CN.md) · **v0.2.98**
 
 > **A second opinion you can actually trust — because it comes from many
 > independent minds, not one model agreeing with itself.**
@@ -287,6 +287,30 @@ bash ./dp-install.sh
 
 The script does not accept command-line arguments.
 
+#### Linux desktop
+
+The same [dp-install.sh](dp-install.sh) entrypoint supports glibc desktop
+installations on Ubuntu 22.04/24.04 LTS, Debian 12, and Fedora 44, on both
+`x86_64` and `aarch64` where the selected runtime is available:
+
+```bash
+bash ./dp-install.sh
+```
+
+The installer must be run as the intended non-root desktop user. It may offer
+to install an explicit allowlist of missing dependencies through APT or DNF
+after `[Y/N]` confirmation and sudo authorization. It does not add repositories
+or run a full system/distribution upgrade. Decision Engine uses a verified
+private Python runtime and does not replace the system Python.
+
+Native diagram, comic, and discussion-board windows were acceptance-tested on
+Ubuntu 24.04 ARM64, Debian 12 ARM64 and x86_64, and Fedora 44 ARM64. Debian 12
+ARM64 uses GTK/WebKit; compatible Ubuntu, Debian x86_64, and Fedora targets use
+the pinned Qt/WebEngine runtime. Ubuntu 22.04 ARM64 retains core MCP and Stop
+Panel support but does not receive automatic native visual-window provisioning.
+Headless Linux, WSL, musl distributions, and other releases are not supported
+by this entrypoint.
+
 #### Native Windows
 
 Download [dp-install.ps1](dp-install.ps1), then run it in 64-bit Windows
@@ -301,6 +325,18 @@ already exists or an earlier installation was interrupted, preserve the existing
 files and follow the recovery instructions reported by the installer; do not
 manually overwrite or delete the installation directory.
 
+### Uninstall
+
+macOS and Linux share the reviewed uninstall entrypoint. It removes only owned
+host integration and quarantines managed state with a SHA-256 manifest:
+
+```bash
+bash ./dp-uninstall.sh --scope both --apply
+```
+
+Quit each listed Agent application first. The uninstaller never closes the
+Agent applications itself and does not contact a remote service.
+
 ## Activate & use
 
 Decision Engine binds per device. Both supported installation methods register
@@ -311,7 +347,9 @@ commands by hand.
 On macOS, permanent setup opens a masked pywebview desktop window and uses Tk
 only as a fallback when pywebview is unavailable before native registration.
 Windows uses the same default, except WorkBuddy opens the supported masked Tk
-form directly. Enter the owner endpoint and secret once. The per-user config
+form directly. Linux uses the verified GTK or Qt native backend selected by the
+installer and the signed in-process Stopper fallback; it installs no system
+service. Enter the owner endpoint and secret once. The per-user config
 stores only the endpoint and server-issued device credentials, so future Agent
 or machine restarts need no repeated input. The activation key does not enter
 chat, command arguments, environment variables, or persistent config.

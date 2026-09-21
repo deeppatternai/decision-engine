@@ -28,9 +28,32 @@ class PublicInstallEntryPointTests(unittest.TestCase):
         repo_root = Path(__file__).resolve().parents[2]
         expected = {
             "dp-install.sh": [
-                ("secret:bearer-hex-token", 348),
-                ("secret:bearer-hex-token", 353),
-                ("ipv6:::dec", 1363),
+                # APT's namespace syntax, fixed public download checksums, and
+                # the existing approval-key separator are scanner false positives.
+                ("ipv6:::a", 636),
+                *(
+                    ("secret:bearer-hex-token", line)
+                    for line in (
+                        859,
+                        864,
+                        875,
+                        881,
+                    )
+                ),
+                ("ipv6:::dec", 1914),
+                *(
+                    ("secret:bearer-hex-token", line)
+                    for line in (
+                        2556,
+                        2558,
+                        2565,
+                        2567,
+                        2705,
+                        2706,
+                        2707,
+                        2834,
+                    )
+                ),
             ],
             "dp-install.ps1": [
                 ("ipv6:::e", 59),

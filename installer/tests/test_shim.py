@@ -5047,6 +5047,41 @@ class OpenGeDisplayTestCase(unittest.TestCase):
         self.assertEqual(out.get("run_id"), "ge_run_f")
         self.assertEqual(self.spawned, [])
 
+    def test_open_ge_retries_one_transient_artifact_fetch_failure(self):
+        fwd = _GeFakeForwarder(statuses=["completed"], submit_run_id="ge_run_retry")
+        fwd.get_ge_artifact = mock.Mock(
+            side_effect=[
+                config.ShellError("temporary artifact visibility delay"),
+                {"kind": "svg", "data": "<svg/>"},
+            ]
+        )
+        with mock.patch.object(shim, "_GE_RENDER_POLL_DEADLINE_S", 5.0), \
+                mock.patch.object(shim.time, "sleep"):
+            out = shim._handle_display_call(
+                fwd, "open_ge", {"mode": "diagram", "spec": {"x": 1}}
+            )
+
+        self.assertEqual(out.get("status"), "opened")
+        self.assertEqual(fwd.get_ge_artifact.call_count, 2)
+        self.assertEqual(len(self.spawned), 1)
+
+    def test_artifact_fetch_retries_share_one_total_timeout_budget(self):
+        forwarder = mock.Mock()
+        forwarder.get_ge_artifact.side_effect = config.ShellError("temporary")
+        with mock.patch.object(
+            shim.time, "monotonic", side_effect=[0.0, 0.0, 1.0, 1.5, 2.1]
+        ), mock.patch.object(shim.time, "sleep"):
+            with self.assertRaises(config.ShellError):
+                shim._get_ge_artifact_with_retry(
+                    forwarder, "ge_budget", timeout_s=2.0
+                )
+
+        self.assertEqual(forwarder.get_ge_artifact.call_count, 2)
+        first = forwarder.get_ge_artifact.call_args_list[0].kwargs["timeout_s"]
+        second = forwarder.get_ge_artifact.call_args_list[1].kwargs["timeout_s"]
+        self.assertEqual(first, 2.0)
+        self.assertEqual(second, 0.5)
+
     def test_open_ge_popup_fetch_failure_keeps_supplied_run_id(self):
         fwd = _GeFakeForwarder(statuses=[], raise_on_fetch=True)
 

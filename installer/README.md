@@ -146,6 +146,22 @@ commit or paste anywhere.
 
 ## Activate
 
+The public `dp-install.sh` entrypoint is shared by macOS and supported glibc
+Linux desktops. Linux support is bounded to Ubuntu 22.04/24.04 LTS, Debian 12,
+and Fedora 44 on `x86_64`/`aarch64`. The entrypoint verifies the distribution,
+architecture, non-root desktop session, Git 2.36+, system CA bundle, and its
+private Python 3.13 runtime before wiring hosts. Missing allowlisted APT/DNF
+packages require interactive consent and sudo; repository configuration and
+full system upgrades are outside its authority.
+
+Linux native popup provisioning uses fixed GTK bindings on Debian 12 ARM64 and
+fixed Qt/WebEngine packages on compatible targets. Fedora's non-system
+`libminizip.so.1` compatibility file is downloaded by fixed URL, size, and
+SHA-256 into the private runtime. Linux uses the in-process Stopper fallback and
+does not install a system service. `dp-uninstall.sh --scope both --apply` is the
+shared macOS/Linux removal path and records quarantined files in a SHA-256
+manifest before reporting success.
+
 For normal managed onboarding, ask the Agent to open permanent setup:
 
 ```bash

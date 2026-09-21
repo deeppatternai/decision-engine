@@ -203,7 +203,11 @@ def test_dp_install_trusted_git_selection_delegates_to_source_updater():
 
 def test_dp_install_git_bootstrap_prefers_installed_capabilities_before_clt_install():
     source = (ROOT / "dp-install.sh").read_text(encoding="utf-8")
-    match = re.search(r"^bootstrap_git_prerequisite\(\) \{\n.*?^\}$", source, re.M | re.S)
+    match = re.search(
+        r"^bootstrap_git_prerequisite_macos\(\) \{\n.*?^\}$",
+        source,
+        re.M | re.S,
+    )
     assert match is not None
     body = match.group()
 
@@ -230,9 +234,18 @@ def test_dp_install_clt_request_explicitly_presents_an_apple_ui():
     assert '"$CLT_INSTALLER_BUNDLE_ID"' in body
     assert 'clean_exec /usr/bin/open "$CLT_INSTALLER_APP"' in body
     assert 'clean_exec /usr/bin/open "$SOFTWARE_UPDATE_URL"' in body
-    request = re.search(r"^bootstrap_git_prerequisite\(\) \{\n.*?^\}$", source, re.M | re.S)
+    request = re.search(
+        r"^bootstrap_git_prerequisite_macos\(\) \{\n.*?^\}$",
+        source,
+        re.M | re.S,
+    )
     assert request is not None
     assert "present_clt_install_ui" in request.group()
+    dispatcher = re.search(
+        r"^bootstrap_git_prerequisite\(\) \{\n.*?^\}$", source, re.M | re.S
+    )
+    assert dispatcher is not None
+    assert "bootstrap_git_prerequisite_macos" in dispatcher.group()
 
 
 def test_dp_install_trusted_git_selection_uses_source_result(tmp_path):

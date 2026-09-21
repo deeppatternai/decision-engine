@@ -103,6 +103,44 @@ class WinAfterShow(unittest.TestCase):
         native_shell._win_after_show(win)
         self.assertEqual(win.show_calls, 1)
 
+    def test_linux_popup_marks_ready_from_shown_instead_of_loaded(self):
+        class StopAfterShown(Exception):
+            pass
+
+        win = _FakeWin()
+        win.events = SimpleNamespace(
+            shown=_EventHook(),
+            loaded=_EventHook(),
+            maximized=_EventHook(),
+            restored=_EventHook(),
+        )
+
+        class FakeWebview:
+            @staticmethod
+            def create_window(**_kwargs):
+                return win
+
+            @staticmethod
+            def start():
+                self.assertEqual(len(win.events.shown.handlers), 1)
+                self.assertEqual(win.events.loaded.handlers, [])
+                win.events.shown.handlers[0]()
+                raise StopAfterShown()
+
+        with mock.patch.dict(sys.modules, {"webview": FakeWebview}), \
+                mock.patch.object(native_shell.sys, "platform", "linux"), \
+                mock.patch.object(native_shell, "_IS_MAC", False), \
+                mock.patch.object(native_shell, "_IS_WINDOWS", False), \
+                mock.patch.object(native_shell, "_claim_app_identity"), \
+                mock.patch.object(native_shell, "_wire_window_chrome"), \
+                mock.patch.object(native_shell, "_mark_popup_shown_ready") as mark_shown:
+            with self.assertRaises(StopAfterShown):
+                native_shell.open_window(
+                    "popup.html", "Popup", "result.json", ready_path="ready.json"
+                )
+
+        mark_shown.assert_called_once_with("ready.json")
+
     def test_windows_chrome_uses_stable_contract_and_native_drag(self):
         win = _FakeWin()
         native_shell._install_windows_chrome(win)

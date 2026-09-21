@@ -4267,21 +4267,34 @@ def _mark_popup_ready(win: Any, ready_path: Optional[str]) -> None:
     path = Path(ready_path)
     if path.exists():
         return
-    probe = (
-        "(function(){"
-        "if(!document||document.readyState!=='complete'||!document.body)return false;"
-        "if(document.getElementById('close-btn'))return true;"
-        "if(document.querySelector('.artifact'))return true;"
-        "return document.body.children&&document.body.children.length>0;"
-        "})()"
-    )
     try:
+        probe = (
+            "(function(){"
+            "if(!document||document.readyState!=='complete'||!document.body)return false;"
+            "if(document.getElementById('close-btn'))return true;"
+            "if(document.querySelector('.artifact'))return true;"
+            "return document.body.children&&document.body.children.length>0;"
+            "})()"
+        )
         if win.evaluate_js(probe) is True:
             _write_json_atomic(str(path), {"ok": True, "state": "ready"})
         else:
             _write_ready_diagnostic(ready_path, "dom-not-ready")
     except Exception as exc:  # aqg: top-level boundary — startup readiness is reported by parent
         _write_ready_diagnostic(ready_path, "dom-probe-failed", type(exc).__name__)
+
+
+def _mark_popup_shown_ready(ready_path: Optional[str]) -> None:
+    """Linux shown hook: stop startup cleanup while the local page finishes loading."""
+    if not ready_path:
+        return
+    path = Path(ready_path)
+    if path.exists():
+        return
+    try:
+        _write_json_atomic(str(path), {"ok": True, "state": "shown"})
+    except Exception as exc:  # aqg: top-level boundary - readiness diagnostics cannot break the popup
+        _write_ready_diagnostic(ready_path, "shown-marker-failed", type(exc).__name__)
 
 
 def _windows_hwnd(win) -> int:
@@ -4549,7 +4562,10 @@ def open_window(html_path: str, title: str, result_path: str,
         win.events.loaded += lambda *a: _install_windows_chrome(win)
         win.events.loaded += lambda *a: _install_windows_taskbar_icon(win)   # …and stop being Python
     if ready_path and not cursor_profile:
-        win.events.loaded += lambda *a: _mark_popup_ready(win, ready_path)
+        if sys.platform.startswith("linux"):
+            win.events.shown += lambda *a: _mark_popup_shown_ready(ready_path)
+        else:
+            win.events.loaded += lambda *a: _mark_popup_ready(win, ready_path)
     if cursor_profile:
         cursor_policy_started = threading.Event()
 

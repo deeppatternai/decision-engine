@@ -98,9 +98,16 @@ class _Process:
 
 class SessionBridgeHandoffTests(unittest.TestCase):
     def _spawn(self, process, root, **kwargs):
+        popup_root = _popup_test_root(root)
+        popup_root.mkdir(parents=True, mode=0o700)
         with (
             mock.patch.object(session.backend, "ensure_webview", return_value=True),
-            mock.patch.object(session, "_POPUP_ROOT", _popup_test_root(root)),
+            mock.patch.object(session, "_POPUP_ROOT", popup_root),
+            mock.patch.object(session, "_ensure_private_popup_root", return_value=True),
+            mock.patch.object(
+                session, "_trusted_private_popup_root", return_value=popup_root
+            ),
+            mock.patch.object(session, "_is_private_popup_directory", return_value=True),
             mock.patch.object(
                 session, "_validate_windows_private_mutation_acl", return_value=True
             ),
@@ -754,7 +761,7 @@ class SessionBridgeHandoffTests(unittest.TestCase):
         self.assertEqual(result, {"status": "open", "popup_id": "pop_bridge"})
         self.assertEqual(pipe.events, ["write", "flush", "close"])
         self.assertEqual(json.loads(pipe.payload.decode("utf-8")), _bridge())
-        self.assertEqual(files, ["popup.html"])
+        self.assertEqual(files, ["popup.html", "popup.log"])
         self.assertTrue(build.call_args.kwargs["chat_bridge_stdin"])
         self.assertIs(popen.call_args.kwargs["stdin"], subprocess.PIPE)
         self.assertNotIn(_bridge()["device_token"], " ".join(popen.call_args.args[0]))
@@ -777,6 +784,40 @@ class SessionBridgeHandoffTests(unittest.TestCase):
             },
         )
         self.assertEqual(pipe.events, [])
+
+    def test_native_shell_exit_logs_bounded_redacted_stderr_before_cleanup(self):
+        secret = "sk-abcdefghijklmnop"
+        with tempfile.TemporaryDirectory() as root:
+            popup_root = _popup_test_root(root)
+            workdir = popup_root / "pop_failed"
+            workdir.mkdir(parents=True, mode=0o700)
+            (workdir / "popup.log").write_text(
+                "prefix\n" + ("x" * 9000) + "\nRuntimeError: " + secret,
+                encoding="utf-8",
+            )
+
+            result = session._native_shell_exit_response(
+                workdir, "pop_failed", 1
+            )
+            diagnostic = json.loads(
+                (popup_root / "popup-ready.log").read_text(encoding="utf-8")
+            )
+
+            self.assertFalse(workdir.exists())
+
+        self.assertEqual(
+            result,
+            {
+                "status": "failed",
+                "reason": "native-shell-exited",
+                "returncode": 1,
+            },
+        )
+        self.assertEqual(diagnostic["reason"], "native-shell-exited")
+        self.assertEqual(diagnostic["returncode"], 1)
+        self.assertIn("RuntimeError: [redacted]", diagnostic["detail"])
+        self.assertNotIn(secret, diagnostic["detail"])
+        self.assertLessEqual(len(diagnostic["detail"]), 200)
 
     def test_server_bridge_reports_exit_during_handoff(self):
         class ExitPipe(_RecordingPipe):
@@ -926,15 +967,50 @@ class SessionBridgeHandoffTests(unittest.TestCase):
             popup_root = _popup_test_root(root)
             workdir = popup_root / "pop_white"
             workdir.mkdir(parents=True, mode=0o700)
+            (workdir / "popup.log").write_text(
+                "Qt WebEngine startup is still pending\n", encoding="utf-8"
+            )
             result = session._wait_for_popup_ready(
                 process, workdir, "pop_white", timeout_s=0.0
             )
             log_path = popup_root / "popup-ready.log"
             self.assertTrue(log_path.is_file())
+            diagnostic = json.loads(log_path.read_text(encoding="utf-8"))
             self.assertFalse(workdir.exists())
 
         self.assertEqual(result, {"status": "failed", "reason": "popup-not-ready"})
+        self.assertEqual(
+            diagnostic["detail"], "Qt WebEngine startup is still pending"
+        )
         process.terminate.assert_called_once()
+
+    def test_linux_qt_gets_an_extended_native_startup_window(self):
+        with (
+            mock.patch.object(session.sys, "platform", "linux"),
+            mock.patch.dict(os.environ, {"PYWEBVIEW_GUI": "qt"}),
+        ):
+            self.assertEqual(
+                session._popup_ready_timeout_s(),
+                session._LINUX_QT_POPUP_READY_TIMEOUT_S,
+            )
+
+        with (
+            mock.patch.object(session.sys, "platform", "linux"),
+            mock.patch.dict(os.environ, {"PYWEBVIEW_GUI": "gtk"}),
+        ):
+            self.assertEqual(
+                session._popup_ready_timeout_s(), session._POPUP_READY_TIMEOUT_S
+            )
+
+    def test_linux_shown_marker_does_not_wait_for_large_artifact_to_finish_loading(self):
+        with tempfile.TemporaryDirectory() as root:
+            ready_path = Path(root) / "ready.json"
+            native_shell._mark_popup_shown_ready(str(ready_path))
+
+            self.assertEqual(
+                json.loads(ready_path.read_text(encoding="utf-8")),
+                {"ok": True, "state": "shown"},
+            )
 
     def test_nonserializable_chat_context_removes_private_workdir(self):
         with tempfile.TemporaryDirectory() as root:

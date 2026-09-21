@@ -517,6 +517,7 @@ class ClaudeThirdPartyInstallerContractTestCase(unittest.TestCase):
                     [bash, "--noprofile", "--norc", "-c", (
                         'CLAUDE_3P_ROOT="$HOME/Library/Application Support/Claude-3p"\n'
                         'CLAUDE_3P_CONFIG="$CLAUDE_3P_ROOT/claude_desktop_config.json"\n'
+                        'PLATFORM_FAMILY=macos\n'
                         'blocked() { exit 3; }\n'
                         f"{guard}\n"
                         'printf "%s\\n" "$claude_3p_profile_detected"\n'

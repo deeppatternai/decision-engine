@@ -60,7 +60,11 @@ _CHAT_BRIDGE_HANDOFF_TIMEOUT_S = 3.0
 _NATIVE_SHELL_EXIT_GRACE_S = 0.25
 _NATIVE_SHELL_EXIT_POLL_S = 0.005
 _POPUP_READY_TIMEOUT_S = 20.0
+_LINUX_QT_POPUP_READY_TIMEOUT_S = 90.0
 _POPUP_READY_POLL_S = 0.05
+_NATIVE_SHELL_STDERR_NAME = "popup.log"
+_NATIVE_SHELL_STDERR_TAIL_BYTES = 8192
+_NATIVE_SHELL_DIAGNOSTIC_CHARS = 200
 _CHAT_BRIDGE_FIELDS = frozenset(
     {"schema_version", "kind", "route", "endpoint", "device_token", "run_id"}
 )
@@ -530,12 +534,75 @@ def _native_shell_exit_response(
         "dismissed",
     }:
         return {"status": "open", "popup_id": popup_id}
+    detail = _native_shell_stderr_detail(workdir)
+    _append_ready_diagnostic(
+        workdir.parent,
+        popup_id,
+        reason="native-shell-exited",
+        detail=detail,
+        returncode=returncode,
+    )
     _remove_private_workdir(workdir)
     return {
         "status": "failed",
         "reason": "native-shell-exited",
         "returncode": returncode,
     }
+
+
+def _open_native_shell_stderr(workdir: Path):
+    """Create the child stderr target inside its already-private popup directory."""
+    path = workdir / _NATIVE_SHELL_STDERR_NAME
+    flags = os.O_WRONLY | os.O_CREAT | os.O_EXCL
+    if hasattr(os, "O_BINARY"):
+        flags |= os.O_BINARY
+    descriptor = os.open(path, flags, 0o600)
+    try:
+        stream = os.fdopen(descriptor, "wb", buffering=0)
+    except (OSError, ValueError):
+        os.close(descriptor)
+        raise
+    if not _harden_windows_private_data_acl(path):
+        stream.close()
+        try:
+            path.unlink()
+        except OSError:
+            pass
+        raise OSError("native shell diagnostic ACL could not be secured")
+    return stream
+
+
+def _native_shell_stderr_detail(workdir: Path) -> str:
+    """Return a bounded, redacted tail suitable for the privacy-safe summary log."""
+    path = workdir / _NATIVE_SHELL_STDERR_NAME
+    try:
+        with open(path, "rb") as handle:
+            handle.seek(0, os.SEEK_END)
+            size = handle.tell()
+            handle.seek(max(0, size - _NATIVE_SHELL_STDERR_TAIL_BYTES))
+            raw = handle.read(_NATIVE_SHELL_STDERR_TAIL_BYTES)
+    except OSError:
+        return ""
+    text = raw.decode("utf-8", errors="replace")
+    if chat_backend is not None:
+        text = chat_backend.redact_secrets(text)
+    text = " ".join(
+        part.strip()
+        for part in text.splitlines()
+        if part.strip()
+    )
+    text = "".join(char if ord(char) >= 0x20 else " " for char in text)
+    return text[-_NATIVE_SHELL_DIAGNOSTIC_CHARS:]
+
+
+def _popup_ready_timeout_s() -> float:
+    """Allow the heavier Linux Qt/WebEngine process to realise its first window."""
+    if (
+        sys.platform.startswith("linux")
+        and os.environ.get("PYWEBVIEW_GUI") == "qt"
+    ):
+        return _LINUX_QT_POPUP_READY_TIMEOUT_S
+    return _POPUP_READY_TIMEOUT_S
 
 
 def _read_json_file(path: Path) -> Optional[Dict[str, Any]]:
@@ -576,9 +643,11 @@ def _wait_for_popup_ready(
     workdir: Path,
     popup_id: str,
     *,
-    timeout_s: float = _POPUP_READY_TIMEOUT_S,
+    timeout_s: Optional[float] = None,
 ) -> Dict[str, Any]:
     """Wait for the child to prove pywebview loaded and the DOM is reachable."""
+    if timeout_s is None:
+        timeout_s = _popup_ready_timeout_s()
     ready_path = workdir / "ready.json"
     diagnostic_path = workdir / "ready-diagnostic.json"
     deadline = time.monotonic() + max(0.0, timeout_s)
@@ -597,6 +666,8 @@ def _wait_for_popup_ready(
             child_diagnostic = _read_json_file(diagnostic_path) or {}
             reason = str(child_diagnostic.get("reason") or "ready-timeout")
             detail = str(child_diagnostic.get("detail") or "")
+            if not detail:
+                detail = _native_shell_stderr_detail(workdir)
             _append_ready_diagnostic(
                 workdir.parent,
                 popup_id,
@@ -821,6 +892,7 @@ def spawn(html_body: str, title: str, *, python: Optional[str] = None,
     try:
         # stdin=DEVNULL: the detached child MUST NOT inherit the shim's stdin (the MCP JSON-RPC
         # pipe) or a GUI toolkit reading stdin would steal host messages.
+        stderr_stream = _open_native_shell_stderr(workdir)
         popen_kwargs = {
             "stdin": (
                 subprocess.PIPE
@@ -828,14 +900,17 @@ def spawn(html_body: str, title: str, *, python: Optional[str] = None,
                 else subprocess.DEVNULL
             ),
             "stdout": subprocess.DEVNULL,
-            "stderr": subprocess.DEVNULL,
+            "stderr": stderr_stream,
             **_detach_kwargs(),
         }
         if api_profile in ("cursor-ge", "cursor-db"):
             child_env = os.environ.copy()
             child_env["WEBVIEW2_USER_DATA_FOLDER"] = str(workdir / "webview2-data")
             popen_kwargs["env"] = child_env
-        process = subprocess.Popen(cmd, **popen_kwargs)
+        try:
+            process = subprocess.Popen(cmd, **popen_kwargs)
+        finally:
+            stderr_stream.close()
         if chat_bridge_bytes is not None:
             # GE delivery plus the post-handoff grace provide the bounded startup
             # observation; retain a zero-wait check so a process already known

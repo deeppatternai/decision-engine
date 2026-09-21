@@ -22,14 +22,21 @@ class CodexSkillRoutingContractTests(unittest.TestCase):
         text = self._skill("graphic-explanation")
         frontmatter = text.split("---", 2)[1]
         for phrase in (
-            "must trigger this Skill",
-            "open_ge once",
-            "built-in visualizer",
-            "show_widget",
-            "inline SVG",
+            "Decision Engine native popup",
+            "/graphic-explanation",
+            "Use this skill",
+            "generated visual explanation to view",
+            "equivalent intent in any language",
+            "interactive artifact the user must edit and submit",
+            "inline visual",
+            "another renderer",
         ):
             self.assertIn(phrase, frontmatter)
-        self.assertIn("Do NOT\n> satisfy it with a built-in", text)
+        self.assertTrue(frontmatter.isascii())
+        self.assertIn("native popup only", text)
+        self.assertIn("Never use a built-in visualizer", text)
+        self.assertIn("Use `audit` when the primary intent is defect review", text)
+        self.assertIn("Use `audit-market-research` when the primary intent is commercial", text)
 
     def test_board_skill_owns_interactive_adjustment_and_never_falls_back(self):
         text = self._skill("discussion-board")

@@ -1768,6 +1768,8 @@ _GE_RENDER_POLL_DEADLINE_S = _GE_OPEN_TOTAL_BUDGET_S - _GE_MIN_FETCH_RESERVE_S
 _GE_RENDER_POLL_INTERVAL_S = 1.5   # status poll cadence
 _GE_STATUS_CALL_TIMEOUT_S = 8.0    # per visual_status POST — bounds a hung/slow status read
 _GE_SUBMIT_TIMEOUT_S = 15.0        # per visual_render submit POST
+_GE_ARTIFACT_FETCH_ATTEMPTS = 3
+_GE_ARTIFACT_FETCH_RETRY_INTERVAL_S = 0.5
 _GE_AUTO_OPEN_DEADLINE_S = 15 * 60.0  # best-effort ceiling while the MCP host process stays alive
 _GE_AUTO_OPEN_POLL_INTERVAL_S = 5.0   # slower cadence for the long-lived background path
 _GE_AUTO_OPEN_SLOTS = threading.BoundedSemaphore(_MAX_DISPLAY_WORKERS)
@@ -1934,6 +1936,32 @@ def _claim_ge_popup(run_id: str, *, cancel_background: bool) -> bool:
 def _release_ge_popup(run_id: str) -> None:
     with _GE_AUTO_OPEN_LOCK:
         _GE_POPUP_IN_FLIGHT.discard(run_id)
+
+
+def _get_ge_artifact_with_retry(
+    forwarder: "Forwarder",
+    run_id: str,
+    *,
+    timeout_s: Optional[float] = None,
+) -> Dict[str, Any]:
+    """Retry the idempotent artifact GET within one existing display-fetch budget."""
+    budget_s = _DISPLAY_FETCH_TIMEOUT_S
+    if timeout_s is not None:
+        budget_s = min(budget_s, max(0.0, timeout_s))
+    deadline = time.monotonic() + budget_s
+    for attempt in range(1, _GE_ARTIFACT_FETCH_ATTEMPTS + 1):
+        try:
+            return forwarder.get_ge_artifact(
+                run_id,
+                timeout_s=max(0.0, deadline - time.monotonic()),
+            )
+        except ShellError:
+            if attempt >= _GE_ARTIFACT_FETCH_ATTEMPTS:
+                raise
+            remaining = deadline - time.monotonic()
+            if remaining <= 0:
+                raise
+            time.sleep(min(_GE_ARTIFACT_FETCH_RETRY_INTERVAL_S, remaining))
 
 
 def _run_ge_auto_open(
@@ -2103,7 +2131,9 @@ def _handle_display_call(
                     "hint": "popup open already in progress"}
         try:
             try:
-                artifact = forwarder.get_ge_artifact(run_id)   # {kind, data} — client-side only
+                artifact = _get_ge_artifact_with_retry(
+                    forwarder, run_id
+                )   # {kind, data} - client-side only
             except ShellError as exc:
                 _log("open_ge_popup fetch failed: %s" % exc)
                 return {"status": "failed", "reason": "artifact-fetch-failed", "run_id": run_id}
@@ -2223,7 +2253,9 @@ def _handle_display_call(
             return {"status": "pending", "run_id": run_id,
                     "hint": "auto-open unavailable; call open_ge_popup with this run_id"}
         try:
-            artifact = forwarder.get_ge_artifact(run_id, timeout_s=remaining)
+            artifact = _get_ge_artifact_with_retry(
+                forwarder, run_id, timeout_s=remaining
+            )
         except ShellError as exc:
             _log("open_ge artifact fetch failed: %s" % exc)
             return {"status": "failed", "reason": "artifact-fetch-failed", "run_id": run_id}

@@ -1,6 +1,6 @@
 ---
 name: audit-adjudication
-description: "Combine 1-N prior audit results into a unified user-facing accept, reject, or needs-user-decision table. Supports findings, hypothesis, and mixed schemas from single or multi-auditor panels across sessions; the client decides each row while the hub validates the ledger and trust signals. Use for \"audit 结果整合\", \"把 audit 结果做 adjudication\", \"整合审计结果\", \"审计结果汇总\", \"决定接受哪些 findings\", \"decide on audit results\", \"synthesize prior audits\", \"adjudicate audit results\", \"merge audit findings\", or /audit-adjudication. This is the user-facing Decision Engine skill, not AQG internal build-session adjudication. Use /audit, /audit-brainstorming, /audit-market-research, /audit-writing-plans, or another audit-* producer to run a new audit."
+description: "Consolidate multiple completed audit results into one traceable decision record, whether they came from the same or different reviewers, rounds, or sessions. Also use for a single result when the user explicitly asks for adjudication. Deduplicate overlapping findings, classify each as accepted, rejected, or needs-user-decision, and preserve source references. Keep hypothesis perspectives as context rather than treating them as defect findings. Do not use to start a new audit."
 ---
 
 # /audit-adjudication — Synthesize prior audits into unified accept/reject table

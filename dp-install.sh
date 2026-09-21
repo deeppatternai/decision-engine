@@ -1,6 +1,6 @@
 #!/usr/bin/env bash
 #
-# Deep Pattern (DP) first-time installer for macOS.
+# Deep Pattern (DP) first-time installer for macOS and Linux.
 #
 # This is the thin public entrypoint intended for:
 #
@@ -39,9 +39,23 @@ XCODE_SELECT_BIN="/usr/bin/xcode-select"
 CLT_INSTALLER_APP="/System/Library/CoreServices/Install Command Line Developer Tools.app"
 CLT_INSTALLER_BUNDLE_ID="com.apple.dt.CommandLineTools.installondemand"
 SOFTWARE_UPDATE_URL="x-apple.systempreferences:com.apple.Software-Update-Settings.extension"
+APT_GET_BIN="/usr/bin/apt-get"
+DPKG_BIN="/usr/bin/dpkg"
+DPKG_QUERY_BIN="/usr/bin/dpkg-query"
+DNF_BIN=""
+RPM_BIN="/usr/bin/rpm"
+SUDO_BIN="/usr/bin/sudo"
 EXIT_USAGE=2
 EXIT_BLOCKED=3
 EXIT_PARTIAL=4
+PLATFORM_KERNEL=""
+PLATFORM_FAMILY=""
+PLATFORM_DISPLAY_NAME=""
+LINUX_DISTRO_ID=""
+LINUX_VERSION_ID=""
+LINUX_MACHINE_ARCH=""
+PRIVATE_RUNTIME_DOWNLOAD_LABEL=""
+LINUX_PACKAGEKIT_NOTICE_SHOWN=0
 
 fail() {
   printf '%s: ERROR: %s\n' "$PROGRAM_NAME" "$*" >&2
@@ -62,15 +76,93 @@ if [ "$#" -ne 0 ]; then
   fail "this first-time installer does not accept arguments; run it without arguments"
 fi
 
-if [ "$(uname -s)" != "Darwin" ]; then
-  fail "this entrypoint currently supports macOS only"
+[ -x /usr/bin/uname ] \
+  || fail "the trusted /usr/bin/uname tool is unavailable; platform identity cannot be verified"
+PLATFORM_KERNEL="$(/usr/bin/uname -s 2>/dev/null || true)"
+case "$PLATFORM_KERNEL" in
+  Darwin) PLATFORM_FAMILY="macos"; PLATFORM_DISPLAY_NAME="this Mac" ;;
+  Linux) PLATFORM_FAMILY="linux"; PLATFORM_DISPLAY_NAME="this Linux desktop" ;;
+  *) fail "unsupported platform: ${PLATFORM_KERNEL:-unknown}; supported platforms are macOS and supported Ubuntu, Debian, or Fedora desktops" ;;
+esac
+
+read_linux_os_release() {
+  local key value
+  [ -r /etc/os-release ] \
+    || fail "Linux installation requires a readable /etc/os-release; supported families are Ubuntu 22.04+, Debian 12+, and Fedora 44+"
+  while IFS='=' read -r key value; do
+    case "$key" in
+      ID)
+        value="${value#\"}"
+        value="${value%\"}"
+        LINUX_DISTRO_ID="$value"
+        ;;
+      VERSION_ID)
+        value="${value#\"}"
+        value="${value%\"}"
+        LINUX_VERSION_ID="$value"
+        ;;
+    esac
+  done </etc/os-release
+}
+
+linux_release_at_least() {
+  local minimum="$1" major minor minimum_major minimum_minor
+  case "$LINUX_VERSION_ID" in
+    ''|*[!0-9.]*|*.*.*|.*|*.) return 1 ;;
+  esac
+  major="${LINUX_VERSION_ID%%.*}"
+  minor="${LINUX_VERSION_ID#*.}"
+  [ "$minor" != "$LINUX_VERSION_ID" ] || minor=0
+  [ "${#major}" -le 3 ] && [ "${#minor}" -le 2 ] || return 1
+  minimum_major="${minimum%%.*}"
+  minimum_minor="${minimum#*.}"
+  [ "$minimum_minor" != "$minimum" ] || minimum_minor=0
+  [ "$major" -gt "$minimum_major" ] 2>/dev/null \
+    || { [ "$major" -eq "$minimum_major" ] 2>/dev/null \
+      && [ "$minor" -ge "$minimum_minor" ] 2>/dev/null; }
+}
+
+preflight_linux_platform() {
+  local libc_version machine_arch user_id
+  read_linux_os_release
+  case "$LINUX_DISTRO_ID" in
+    ubuntu) linux_release_at_least 22.04 || fail "unsupported Ubuntu release: ${LINUX_VERSION_ID:-unknown}; Ubuntu 22.04 or newer is required" ;;
+    debian) linux_release_at_least 12 || fail "unsupported Debian release: ${LINUX_VERSION_ID:-unknown}; Debian 12 or newer is required" ;;
+    fedora) linux_release_at_least 44 || fail "unsupported Fedora release: ${LINUX_VERSION_ID:-unknown}; Fedora 44 or newer is required" ;;
+    *) fail "unsupported Linux distribution: ${LINUX_DISTRO_ID:-unknown}; supported families are Ubuntu, Debian, and Fedora" ;;
+  esac
+  [ -x /usr/bin/id ] \
+    || fail "the trusted /usr/bin/id tool is unavailable; the desktop user identity cannot be verified"
+  user_id="$(/usr/bin/id -u 2>/dev/null || true)"
+  [ -n "$user_id" ] && [ "$user_id" != "0" ] \
+    || fail "do not run the entire installer with sudo or as root; run it as the intended desktop user and approve only the displayed system dependency step"
+  [ -x /usr/bin/getconf ] \
+    || fail "the trusted /usr/bin/getconf tool is unavailable; glibc compatibility cannot be verified"
+  libc_version="$(/usr/bin/getconf GNU_LIBC_VERSION 2>/dev/null || true)"
+  case "$libc_version" in
+    glibc\ *) ;;
+    *) fail "unsupported Linux C library: ${libc_version:-unknown}; this prototype requires glibc" ;;
+  esac
+  machine_arch="$(/usr/bin/uname -m 2>/dev/null || true)"
+  case "$machine_arch" in
+    x86_64|amd64|aarch64|arm64) ;;
+    *) fail "unsupported Linux architecture: ${machine_arch:-unknown}; expected x86_64 or aarch64" ;;
+  esac
+  LINUX_MACHINE_ARCH="$machine_arch"
+  if [ -z "${DISPLAY:-}" ] && [ -z "${WAYLAND_DISPLAY:-}" ]; then
+    fail "a Linux desktop session is required for masked activation; DISPLAY and WAYLAND_DISPLAY are both unset"
+  fi
+}
+
+if [ "$PLATFORM_FAMILY" = "linux" ]; then
+  preflight_linux_platform
 fi
 
 # curl | bash has a pipe on stdin. Read all interactive decisions from the
 # controlling terminal so the pipe never becomes an accidental prompt source.
 # The activation window is the only product decision made during this command.
 if [ ! -r /dev/tty ] || [ ! -w /dev/tty ] || ! ( : </dev/tty ) 2>/dev/null; then
-  fail "an interactive macOS Terminal is required for activation"
+  fail "an interactive terminal is required for activation"
 fi
 
 tty_print() {
@@ -82,9 +174,19 @@ clean_exec() {
   # git -C does not override inherited repository/configuration redirection.
   # Use a subshell so failures cannot alter the caller's environment.
   local git_env_name
-  for git_env_name in "${!GIT_@}"; do
-    unset "$git_env_name" || exit 1
-  done
+  if [ -n "${BASH_VERSION:-}" ]; then
+    for git_env_name in "${!GIT_@}"; do
+      unset "$git_env_name" || exit 1
+    done
+  elif [ -n "${ZSH_VERSION:-}" ]; then
+    eval 'for git_env_name in ${(k)parameters}; do
+      case "$git_env_name" in
+        GIT_*) unset "$git_env_name" || exit 1 ;;
+      esac
+    done'
+  else
+    fail "run this installer with Bash or Zsh so inherited Git redirection can be cleared safely"
+  fi
   env -u DE_ENDPOINT -u DE_ACTIVATION_SECRET -u PYTHONPATH \
     -u CLAUDE_DESKTOP_CONFIG -u CLAUDE_DESKTOP_3P_CONFIG -u WORKBUDDY_APP_ROOT \
     -u WORKBUDDY_CONFIG -u WORKBUDDY_SKILLS_DIR \
@@ -153,11 +255,13 @@ regular_app_has_bundle_id() {
 }
 
 workbuddy_variant="none"
-if [ -x "$WORKBUDDY_STANDARD_APP/Contents/MacOS/Electron" ] \
+if [ "$PLATFORM_FAMILY" = "macos" ] \
+    && [ -x "$WORKBUDDY_STANDARD_APP/Contents/MacOS/Electron" ] \
     && [ ! -L "$WORKBUDDY_STANDARD_APP" ] \
     && [ ! -L "$WORKBUDDY_STANDARD_APP/Contents/MacOS/Electron" ]; then
   workbuddy_variant="standard"
-elif [ -e "$WORKBUDDY_AI_APP" ] || [ -L "$WORKBUDDY_AI_APP" ]; then
+elif [ "$PLATFORM_FAMILY" = "macos" ] \
+    && { [ -e "$WORKBUDDY_AI_APP" ] || [ -L "$WORKBUDDY_AI_APP" ]; }; then
   [ -d "$WORKBUDDY_AI_APP" ] && [ ! -L "$WORKBUDDY_AI_APP" ] \
     || blocked "$WORKBUDDY_AI_APP is not a regular application bundle; preserve it and stop"
   [ -f "$WORKBUDDY_AI_APP/Contents/MacOS/Electron" ] \
@@ -178,6 +282,9 @@ elif [ -e "$WORKBUDDY_AI_APP" ] || [ -L "$WORKBUDDY_AI_APP" ]; then
 fi
 
 de_exec() {
+  if [ "${absent_claude_route:-0}" -eq 1 ]; then
+    set -- env CLAUDE_SKILLS_DIR="$tmp_root/absent-claude-skills" "$@"
+  fi
   if [ "$workbuddy_variant" = "ai" ]; then
     clean_exec env \
       WORKBUDDY_APP_ROOT="$WORKBUDDY_AI_APP" \
@@ -249,7 +356,7 @@ present_clt_install_ui() {
   return 1
 }
 
-bootstrap_git_prerequisite() {
+bootstrap_git_prerequisite_macos() {
   local clt_ready=0
   if [ -x "$XCODE_SELECT_BIN" ] \
       && clean_exec "$XCODE_SELECT_BIN" -p >/dev/null 2>&1; then
@@ -279,8 +386,411 @@ bootstrap_git_prerequisite() {
   fail "Git 2.36 or newer is required. Update or repair Apple Command Line Tools, or make a trusted Git 2.36 or newer installation available, then retry."
 }
 
-try_git "$(command -v git 2>/dev/null || true)" \
-  || bootstrap_git_prerequisite
+linux_native_popup_supported() {
+  case "$LINUX_DISTRO_ID:$LINUX_VERSION_ID" in
+    ubuntu:24.04|ubuntu:26.04|fedora:44) return 0 ;;
+    ubuntu:22.04|debian:12)
+      case "$LINUX_MACHINE_ARCH" in
+        x86_64|amd64) return 0 ;;
+        *) return 1 ;;
+      esac
+      ;;
+    *) return 1 ;;
+  esac
+}
+
+linux_debian_arm64_gtk_supported() {
+  [ "$LINUX_DISTRO_ID:$LINUX_VERSION_ID" = "debian:12" ] || return 1
+  case "$LINUX_MACHINE_ARCH" in
+    aarch64|arm64) return 0 ;;
+    *) return 1 ;;
+  esac
+}
+
+linux_debian_package_installed() {
+  local package="$1" status=""
+  [ -x "$DPKG_QUERY_BIN" ] || return 1
+  status="$(clean_exec "$DPKG_QUERY_BIN" -W -f='${Status}' "$package" 2>/dev/null || true)"
+  [ "$status" = "install ok installed" ]
+}
+
+linux_debian_arm64_gtk_dependency_packages() {
+  local packages="" package
+  linux_debian_arm64_gtk_supported || return 0
+  for package in \
+      build-essential \
+      pkg-config \
+      libcairo2-dev \
+      libgirepository1.0-dev \
+      gir1.2-gtk-3.0 \
+      gir1.2-webkit2-4.1; do
+    linux_debian_package_installed "$package" || packages="$packages $package"
+  done
+  printf '%s' "${packages# }"
+}
+
+linux_debian_arm64_gtk_dependencies_ready() {
+  [ -z "$(linux_debian_arm64_gtk_dependency_packages)" ]
+}
+
+linux_ca_bundle_available() {
+  local ca_bundle
+  for ca_bundle in \
+      /etc/ssl/certs/ca-certificates.crt \
+      /etc/pki/tls/certs/ca-bundle.crt; do
+    [ -s "$ca_bundle" ] && return 0
+  done
+  if [ "$LINUX_DISTRO_ID" = "fedora" ] \
+      && [ -x "$RPM_BIN" ] \
+      && clean_exec "$RPM_BIN" -q --quiet ca-certificates \
+        </dev/null >/dev/null 2>&1; then
+    return 0
+  fi
+  return 1
+}
+
+linux_shared_library_available() {
+  local library="$1" ldconfig_bin="" line
+  for ldconfig_bin in /usr/sbin/ldconfig /sbin/ldconfig; do
+    [ -x "$ldconfig_bin" ] || continue
+    while IFS= read -r line; do
+      case "$line" in
+        *"$library "*) return 0 ;;
+      esac
+    done < <(clean_exec "$ldconfig_bin" -p 2>/dev/null || true)
+    return 1
+  done
+  return 1
+}
+
+linux_apt_dependency_packages() {
+  local packages="" minizip_package="" gtk_packages=""
+
+  if ! try_git "/usr/bin/git"; then
+    packages="$packages git"
+  fi
+  [ -x /usr/bin/curl ] || packages="$packages curl"
+  linux_ca_bundle_available || packages="$packages ca-certificates"
+
+  if linux_native_popup_supported; then
+    case "$LINUX_DISTRO_ID:$LINUX_VERSION_ID" in
+      ubuntu:24.04|ubuntu:26.04) minizip_package="libminizip1t64" ;;
+      ubuntu:22.04|debian:12) minizip_package="libminizip1" ;;
+    esac
+    linux_shared_library_available "libminizip.so.1" \
+      || packages="$packages $minizip_package"
+    linux_shared_library_available "libxcb-cursor.so.0" \
+      || packages="$packages libxcb-cursor0"
+  fi
+  gtk_packages="$(linux_debian_arm64_gtk_dependency_packages)"
+  [ -z "$gtk_packages" ] || packages="$packages $gtk_packages"
+
+  printf '%s' "${packages# }"
+}
+
+linux_dnf_dependency_packages() {
+  local packages=""
+
+  if ! try_git "/usr/bin/git"; then
+    packages="$packages git"
+  fi
+  [ -x /usr/bin/curl ] || packages="$packages curl"
+  linux_ca_bundle_available || packages="$packages ca-certificates"
+  if linux_native_popup_supported; then
+    [ -x /usr/bin/ar ] || packages="$packages binutils"
+    [ -x /usr/bin/zstd ] || packages="$packages zstd"
+    linux_shared_library_available "libxcb-cursor.so.0" \
+      || packages="$packages xcb-util-cursor"
+  fi
+
+  printf '%s' "${packages# }"
+}
+
+select_linux_dnf_bin() {
+  local candidate
+  DNF_BIN=""
+  for candidate in /usr/bin/dnf5 /usr/bin/dnf; do
+    [ -x "$candidate" ] || continue
+    DNF_BIN="$candidate"
+    return 0
+  done
+  return 1
+}
+
+print_linux_apt_manual_command() {
+  local packages="$1"
+  tty_print "Run these commands with your system administrator's approval, then rerun this installer:"
+  tty_print "  sudo apt-get update"
+  tty_print "  sudo apt-get install --no-install-recommends $packages"
+}
+
+linux_dpkg_state_ready() {
+  local audit_output=""
+
+  [ -x "$DPKG_BIN" ] || {
+    tty_print "The trusted dpkg executable is unavailable at $DPKG_BIN."
+    return 1
+  }
+  if ! audit_output="$(clean_exec "$DPKG_BIN" --audit 2>&1)"; then
+    tty_print "The Debian package database could not be audited safely."
+    [ -z "$audit_output" ] || printf '%s\n' "$audit_output" >/dev/tty
+    return 1
+  fi
+  if [ -n "$audit_output" ]; then
+    tty_print "The Debian package database has unfinished work from an earlier package operation:"
+    printf '%s\n' "$audit_output" >/dev/tty
+    return 1
+  fi
+  return 0
+}
+
+print_linux_dpkg_repair_commands() {
+  tty_print "No sudo or APT command was run by this installer."
+  tty_print "Finish the existing package transaction with your system administrator's approval, then rerun this installer:"
+  tty_print "  sudo dpkg --configure -a"
+  tty_print "  sudo apt-get -f install"
+}
+
+filter_linux_apt_stderr() {
+  local line="" packagekit_notice=0
+  while IFS= read -r line || [ -n "$line" ]; do
+    case "$line" in
+      'Error: GDBus.Error:org.freedesktop.systemd1.UnitMasked: Unit packagekit.service is masked.')
+        packagekit_notice=1
+        ;;
+      *) printf '%s\n' "$line" >&2 ;;
+    esac
+  done
+  if [ "$packagekit_notice" -eq 1 ] \
+      && [ "$LINUX_PACKAGEKIT_NOTICE_SHOWN" -eq 0 ]; then
+    tty_print "NOTE: PackageKit desktop cache refresh is disabled; APT package operations do not depend on this service."
+    LINUX_PACKAGEKIT_NOTICE_SHOWN=1
+  fi
+}
+
+run_linux_apt_command() {
+  local apt_stderr="" apt_status=0
+  apt_stderr="$(clean_exec /usr/bin/mktemp /tmp/dp-install-apt-stderr.XXXXXX)" \
+    || { tty_print "A secure temporary APT diagnostics file could not be created."; return 1; }
+  clean_exec "$@" 2>"$apt_stderr" || apt_status=$?
+  filter_linux_apt_stderr <"$apt_stderr"
+  clean_exec /bin/rm -f "$apt_stderr" || true
+  return "$apt_status"
+}
+
+install_linux_apt_packages() {
+  local packages="$1" prompt="Install these dependencies now?" package
+
+  [ -n "$packages" ] || return 0
+  tty_print "Deep Pattern requires the following $LINUX_DISTRO_ID $LINUX_VERSION_ID system package(s):"
+  for package in $packages; do
+    case "$package" in
+      git|curl|ca-certificates|libminizip1|libminizip1t64|libxcb-cursor0 \
+        |build-essential|pkg-config|libcairo2-dev|libgirepository1.0-dev \
+        |gir1.2-gtk-3.0|gir1.2-webkit2-4.1) ;;
+      *) fail "refusing an unrecognized Linux dependency package: $package" ;;
+    esac
+    tty_print "  $package"
+  done
+  tty_print "APT package metadata will be refreshed and sudo authorization is required."
+  tty_print "No repository configuration will be changed. No full system or distribution upgrade command will be used."
+  if ! linux_dpkg_state_ready; then
+    print_linux_dpkg_repair_commands
+    return 1
+  fi
+  if ! confirm_dependency_install "$prompt"; then
+    tty_print "Linux dependency installation was declined; no package manager was invoked."
+    print_linux_apt_manual_command "$packages"
+    return 1
+  fi
+
+  [ -x "$APT_GET_BIN" ] || {
+    tty_print "The trusted APT executable is unavailable at $APT_GET_BIN."
+    print_linux_apt_manual_command "$packages"
+    return 1
+  }
+  [ -x "$SUDO_BIN" ] || {
+    tty_print "The trusted sudo executable is unavailable at $SUDO_BIN."
+    print_linux_apt_manual_command "$packages"
+    return 1
+  }
+
+  tty_print "Requesting sudo authorization for the configured APT package installation..."
+  if ! clean_exec "$SUDO_BIN" -v </dev/tty; then
+    tty_print "Sudo authorization was not granted; no APT command was run."
+    print_linux_apt_manual_command "$packages"
+    return 1
+  fi
+  tty_print "Refreshing the configured APT package metadata..."
+  if ! run_linux_apt_command "$SUDO_BIN" "$APT_GET_BIN" update </dev/tty; then
+    tty_print "APT metadata refresh failed; no dependency installation was attempted."
+    print_linux_apt_manual_command "$packages"
+    return 1
+  fi
+
+  set --
+  for package in $packages; do
+    set -- "$@" "$package"
+  done
+  tty_print "Installing the approved Linux dependencies..."
+  if ! run_linux_apt_command "$SUDO_BIN" "$APT_GET_BIN" -o APT::Get::AllowUnauthenticated=false install --no-install-recommends -y "$@" </dev/tty; then
+    tty_print "APT did not complete successfully and may have made partial package changes."
+    print_linux_apt_manual_command "$packages"
+    return 1
+  fi
+  tty_print "The approved Linux system dependencies were installed."
+}
+
+print_linux_dnf_manual_command() {
+  local packages="$1" dnf_command="dnf"
+  select_linux_dnf_bin && dnf_command="$DNF_BIN"
+  tty_print "Run this command with your system administrator's approval, then rerun this installer:"
+  tty_print "  sudo $dnf_command --refresh --setopt=install_weak_deps=False install $packages"
+}
+
+linux_rpm_state_ready() {
+  [ -x "$RPM_BIN" ] || {
+    tty_print "The trusted RPM executable is unavailable at $RPM_BIN."
+    return 1
+  }
+  if ! clean_exec "$RPM_BIN" --verifydb </dev/null >/dev/null 2>&1; then
+    tty_print "The RPM package database did not pass its read-only integrity check."
+    tty_print "No sudo or DNF command was run by this installer."
+    return 1
+  fi
+  return 0
+}
+
+install_linux_dnf_packages() {
+  local packages="$1" prompt="Install these dependencies now?" package
+
+  [ -n "$packages" ] || return 0
+  tty_print "Deep Pattern requires the following Fedora 44 system package(s):"
+  for package in $packages; do
+    case "$package" in
+      git|curl|ca-certificates|binutils|zstd|xcb-util-cursor) ;;
+      *) fail "refusing an unrecognized Fedora dependency package: $package" ;;
+    esac
+    tty_print "  $package"
+  done
+  tty_print "DNF will use the system's configured repositories and sudo authorization is required."
+  tty_print "No repository configuration will be changed. No full system or distribution upgrade command will be used."
+  if ! linux_rpm_state_ready; then
+    tty_print "Repair the RPM database with your system administrator, then rerun this installer."
+    return 1
+  fi
+  if ! confirm_dependency_install "$prompt"; then
+    tty_print "Linux dependency installation was declined; no package manager was invoked."
+    print_linux_dnf_manual_command "$packages"
+    return 1
+  fi
+  if ! select_linux_dnf_bin; then
+    tty_print "A trusted DNF executable is unavailable at /usr/bin/dnf5 or /usr/bin/dnf."
+    print_linux_dnf_manual_command "$packages"
+    return 1
+  fi
+  [ -x "$SUDO_BIN" ] || {
+    tty_print "The trusted sudo executable is unavailable at $SUDO_BIN."
+    print_linux_dnf_manual_command "$packages"
+    return 1
+  }
+
+  tty_print "Requesting sudo authorization for the configured DNF package installation..."
+  if ! clean_exec "$SUDO_BIN" -v </dev/tty; then
+    tty_print "Sudo authorization was not granted; no DNF command was run."
+    print_linux_dnf_manual_command "$packages"
+    return 1
+  fi
+  tty_print "Refreshing the configured DNF package metadata..."
+  if ! clean_exec "$SUDO_BIN" "$DNF_BIN" makecache --refresh </dev/tty; then
+    tty_print "DNF metadata refresh failed; no dependency installation was attempted."
+    print_linux_dnf_manual_command "$packages"
+    return 1
+  fi
+
+  set --
+  for package in $packages; do
+    set -- "$@" "$package"
+  done
+  tty_print "Installing the approved Linux dependencies..."
+  if ! clean_exec "$SUDO_BIN" "$DNF_BIN" -y --setopt=install_weak_deps=False install "$@" </dev/tty; then
+    tty_print "DNF did not complete successfully and may have made partial package changes."
+    print_linux_dnf_manual_command "$packages"
+    return 1
+  fi
+  tty_print "The approved Linux system dependencies were installed."
+}
+
+linux_core_dependencies_ready() {
+  try_git "/usr/bin/git" \
+    && [ -x /usr/bin/curl ] \
+    && linux_ca_bundle_available
+}
+
+linux_git_prerequisite() {
+  local packages="" package_manager=""
+
+  if [ "$LINUX_DISTRO_ID:$LINUX_VERSION_ID" = "ubuntu:22.04" ] \
+      && ! try_git "/usr/bin/git"; then
+    fail "Ubuntu 22.04's default repository is older than the required Git 2.36; install Git 2.36 or newer from an approved source, then rerun this installer; no package manager or repository was changed automatically"
+  fi
+
+  case "$LINUX_DISTRO_ID" in
+    ubuntu|debian)
+      packages="$(linux_apt_dependency_packages)"
+      package_manager="APT"
+      if [ -n "$packages" ]; then
+        install_linux_apt_packages "$packages" || true
+      fi
+      ;;
+    fedora)
+      packages="$(linux_dnf_dependency_packages)"
+      package_manager="DNF"
+      if [ -n "$packages" ]; then
+        install_linux_dnf_packages "$packages" || true
+      fi
+      ;;
+  esac
+  if [ -n "$packages" ] && ! linux_core_dependencies_ready; then
+    linux_core_dependencies_ready \
+      || fail "required Linux dependencies are unavailable; install the packages shown above, then rerun this installer"
+  fi
+  if [ -n "$packages" ]; then
+    if [ "$LINUX_DISTRO_ID:$LINUX_VERSION_ID" = "fedora:44" ] \
+        && { [ ! -x /usr/bin/ar ] \
+          || [ ! -x /usr/bin/zstd ] \
+          || ! linux_shared_library_available "libxcb-cursor.so.0"; }; then
+      tty_print "Core Linux prerequisites are ready; optional native visual-window dependencies remain unavailable."
+    elif [ "$LINUX_DISTRO_ID:$LINUX_VERSION_ID" != "fedora:44" ] \
+        && linux_native_popup_supported \
+        && { ! linux_shared_library_available "libminizip.so.1" \
+          || ! linux_shared_library_available "libxcb-cursor.so.0"; }; then
+      tty_print "Core Linux prerequisites are ready; optional native visual-window dependencies remain unavailable."
+    elif linux_debian_arm64_gtk_supported \
+        && ! linux_debian_arm64_gtk_dependencies_ready; then
+      tty_print "Core Linux prerequisites are ready; optional Debian ARM64 GTK build dependencies remain unavailable."
+    fi
+  fi
+
+  linux_core_dependencies_ready \
+    || fail "$package_manager completed, but Git 2.36+, curl, or the system CA bundle is still unavailable"
+  tty_print "Linux Git prerequisite ready: $GIT_VERSION ($GIT_BIN)"
+}
+
+bootstrap_git_prerequisite() {
+  if [ "$PLATFORM_FAMILY" = "macos" ]; then
+    bootstrap_git_prerequisite_macos
+  else
+    linux_git_prerequisite
+  fi
+}
+
+if [ "$PLATFORM_FAMILY" = "macos" ]; then
+  try_git "$(command -v git 2>/dev/null || true)" \
+    || bootstrap_git_prerequisite_macos
+else
+  linux_git_prerequisite
+fi
 
 python_candidate_usable() {
   local candidate="$1"
@@ -335,30 +845,49 @@ ensure_deeppattern_runtime_directories() {
 select_private_runtime_spec() {
   local machine_arch translated="0"
   machine_arch="$(/usr/bin/uname -m)"
-  if [ -x /usr/sbin/sysctl ]; then
+  if [ "$PLATFORM_FAMILY" = "macos" ] && [ -x /usr/sbin/sysctl ]; then
     translated="$(/usr/sbin/sysctl -in sysctl.proc_translated 2>/dev/null || true)"
   fi
   if [ "$translated" = "1" ]; then
     machine_arch="arm64"
   fi
 
-  case "$machine_arch" in
-    arm64|aarch64)
-      PRIVATE_RUNTIME_ARCH="aarch64"
-      PRIVATE_RUNTIME_SHA256="b9054a9d3d54f4cb5573d44907fddb29874b08909bde73f29f2868cf872223ee"
-      PRIVATE_RUNTIME_ASSET_SIZE="25293188"
-      ;;
-    x86_64|amd64)
-      PRIVATE_RUNTIME_ARCH="x86_64"
-      PRIVATE_RUNTIME_SHA256="49f0d97f506b855eed60b74a8ac138595c5b39799a6aa5e0d7ca8abe1019a4d4"
-      PRIVATE_RUNTIME_ASSET_SIZE="25037769"
-      ;;
-    *)
-      fail "unsupported Mac architecture for the private Python runtime: $machine_arch"
-      ;;
-  esac
+  if [ "$PLATFORM_FAMILY" = "macos" ]; then
+    case "$machine_arch" in
+      arm64|aarch64)
+        PRIVATE_RUNTIME_ARCH="aarch64"
+        PRIVATE_RUNTIME_SHA256="b9054a9d3d54f4cb5573d44907fddb29874b08909bde73f29f2868cf872223ee"
+        PRIVATE_RUNTIME_ASSET_SIZE="25293188"
+        ;;
+      x86_64|amd64)
+        PRIVATE_RUNTIME_ARCH="x86_64"
+        PRIVATE_RUNTIME_SHA256="49f0d97f506b855eed60b74a8ac138595c5b39799a6aa5e0d7ca8abe1019a4d4"
+        PRIVATE_RUNTIME_ASSET_SIZE="25037769"
+        ;;
+      *) fail "unsupported Mac architecture for the private Python runtime: $machine_arch" ;;
+    esac
+    PRIVATE_RUNTIME_PLATFORM="apple-darwin"
+    PRIVATE_RUNTIME_DOWNLOAD_LABEL="about 25 MB"
+  else
+    case "$machine_arch" in
+      arm64|aarch64)
+        PRIVATE_RUNTIME_ARCH="aarch64"
+        PRIVATE_RUNTIME_SHA256="76ed18125286d7dc96ce24023d1e319dbd55a89a767102411b1ea23846113f69"
+        PRIVATE_RUNTIME_ASSET_SIZE="91086530"
+        PRIVATE_RUNTIME_DOWNLOAD_LABEL="about 91 MB"
+        ;;
+      x86_64|amd64)
+        PRIVATE_RUNTIME_ARCH="x86_64"
+        PRIVATE_RUNTIME_SHA256="0651dd7157d3debf769e15a52c1de9de7fbcdc36ba72faf79fde3c44f14d9461"
+        PRIVATE_RUNTIME_ASSET_SIZE="119758082"
+        PRIVATE_RUNTIME_DOWNLOAD_LABEL="about 120 MB"
+        ;;
+      *) fail "unsupported Linux architecture for the private Python runtime: $machine_arch" ;;
+    esac
+    PRIVATE_RUNTIME_PLATFORM="unknown-linux-gnu"
+  fi
 
-  PRIVATE_RUNTIME_ID="cpython-$PRIVATE_PYTHON_VERSION+$PRIVATE_PYTHON_BUILD-$PRIVATE_RUNTIME_ARCH-apple-darwin"
+  PRIVATE_RUNTIME_ID="cpython-$PRIVATE_PYTHON_VERSION+$PRIVATE_PYTHON_BUILD-$PRIVATE_RUNTIME_ARCH-$PRIVATE_RUNTIME_PLATFORM"
   PRIVATE_RUNTIME_ASSET="$PRIVATE_RUNTIME_ID-install_only.tar.gz"
   PRIVATE_RUNTIME_URL="$PRIVATE_PYTHON_BASE_URL/${PRIVATE_RUNTIME_ASSET/+/%2B}"
   PRIVATE_RUNTIME_DIR="$PRIVATE_RUNTIME_ROOT/$PRIVATE_RUNTIME_ID"
@@ -419,7 +948,7 @@ download_private_python_runtime() {
     quarantine_runtime_path "$PRIVATE_RUNTIME_DIR" "private-python-runtime"
   else
     tty_print "Deep Pattern requires its verified private Python $PRIVATE_PYTHON_VERSION runtime."
-    tty_print "Downloading about 25 MB into $PRIVATE_RUNTIME_ROOT without changing system Python."
+    tty_print "Downloading $PRIVATE_RUNTIME_DOWNLOAD_LABEL into $PRIVATE_RUNTIME_ROOT without changing system Python."
   fi
 
   [ -x /usr/bin/curl ] || {
@@ -452,7 +981,11 @@ download_private_python_runtime() {
     return 1
   fi
 
-  actual_size="$(/usr/bin/stat -f '%z' "$archive" 2>/dev/null || true)"
+  if [ "$PLATFORM_FAMILY" = "macos" ]; then
+    actual_size="$(/usr/bin/stat -f '%z' "$archive" 2>/dev/null || true)"
+  else
+    actual_size="$(/usr/bin/stat -c '%s' "$archive" 2>/dev/null || true)"
+  fi
   actual_sha="$(/usr/bin/openssl dgst -sha256 "$archive" 2>/dev/null | /usr/bin/awk '{print $NF}')"
   if [ "$actual_size" != "$PRIVATE_RUNTIME_ASSET_SIZE" ] \
       || [ "$actual_sha" != "$PRIVATE_RUNTIME_SHA256" ]; then
@@ -490,7 +1023,7 @@ download_private_python_runtime() {
       || [ -n "$(/usr/bin/find "$extract" -mindepth 1 -maxdepth 1 ! -name python -print -quit)" ] \
       || ! python_candidate_usable "$extract/python/bin/python3"; then
     clean_exec /bin/rm -rf "$stage"
-    tty_print "The verified private Python archive does not provide ssl, venv, tkinter, and pip on this Mac."
+    tty_print "The verified private Python archive does not provide ssl, venv, tkinter, and pip on this platform."
     return 1
   fi
 
@@ -527,11 +1060,17 @@ select_fallback_python() {
   try_python "${DE_PYTHON:-}" \
     || try_python "$(command -v python3 2>/dev/null || true)" \
     || try_python "$(command -v python 2>/dev/null || true)" \
-    || try_python "/opt/homebrew/bin/python3" \
     || try_python "/usr/local/bin/python3" \
     || try_python "/opt/anaconda3/bin/python" \
     || try_python "/opt/anaconda3/bin/python3" \
-    || bootstrap_python_with_homebrew
+    || {
+      if [ "$PLATFORM_FAMILY" = "macos" ]; then
+        try_python "/opt/homebrew/bin/python3" \
+          || bootstrap_python_with_homebrew
+      else
+        fail "the verified private Python runtime could not be used and no compatible Python 3.12+ with ssl, venv, tkinter, and pip is installed; repair the reported download prerequisite or provide DE_PYTHON explicitly"
+      fi
+    }
   PRIVATE_BASE_PYTHON="$PYTHON_BIN"
   tty_print "Using $PRIVATE_BASE_PYTHON only to prepare the private Deep Pattern environment."
 }
@@ -590,7 +1129,11 @@ else
     PRIVATE_BASE_PYTHON="$DE_PYTHON"
     tty_print "Using the explicitly selected DE_PYTHON only to prepare the private Deep Pattern environment."
   elif ! download_private_python_runtime; then
-    tty_print "A verified private Python runtime could not be used. An existing compatible Python or optional Homebrew fallback will be checked."
+    if [ "$PLATFORM_FAMILY" = "macos" ]; then
+      tty_print "A verified private Python runtime could not be used. An existing compatible Python or optional Homebrew fallback will be checked."
+    else
+      tty_print "A verified private Python runtime could not be used. An existing compatible Python will be checked; no package manager will be invoked automatically."
+    fi
     select_fallback_python
   fi
   create_managed_python_environment "$PRIVATE_BASE_PYTHON"
@@ -998,11 +1541,18 @@ if ! source_detected_clients="$(
 )"; then
   fail "could not inspect the current Decision Engine host adapter catalog"
 fi
+absent_claude_route=0
+if ! line_list_contains "$source_detected_clients" "claude-code"; then
+  # Older signed stable builds route Claude skills unconditionally. Keep that
+  # legacy route inside the install transaction until the stable fix lands.
+  absent_claude_route=1
+fi
 
 # These bundles are distinct products, not aliases for the supported Desktop
 # adapters with similar names. Report them explicitly when the current product
 # source does not recognize them so a partial install cannot look complete.
 unsupported_installed_hosts=""
+if [ "$PLATFORM_FAMILY" = "macos" ]; then
 if regular_app_has_bundle_id "/Applications/CodeBuddy Studio.app" "com.codebuddy.ride" \
     && ! line_list_contains "$source_detected_clients" "codebuddy-studio"; then
   unsupported_installed_hosts="$(append_client_line \
@@ -1026,6 +1576,7 @@ if regular_app_has_bundle_id "/Applications/Qoder CN IDE.app" "com.aliyun.lingma
   unsupported_installed_hosts="$(append_client_line \
     "$unsupported_installed_hosts" \
     "qoder-cn-ide (Qoder CN IDE.app): separate product; DE adapter unavailable")"
+fi
 fi
 
 AQG_LAYOUT=""
@@ -1383,6 +1934,7 @@ raise SystemExit({"complete": 0, "missing": 0, "stale": 10}.get(state, 11))' \
 
 converge_managed_claude_hooks() {
   local status=0
+  comma_list_contains "${aqg_selected_clients:-}" "claude-code" || return 0
   inspect_managed_claude_hooks || status=$?
   case "$status" in
     0) return 0 ;;
@@ -1493,8 +2045,59 @@ converge_managed_claude_hooks \
 tty_print "Verifying AQG multi-host configuration..."
 run_aqg_clients "verify" --verify \
   || fail "AQG multi-host verification failed; Decision Engine was not installed"
-if ! clean_exec env PATH="$PYTHON_DIR:$PATH" \
-    "$PYTHON_BIN" "$AQG_ROOT/scripts/aqg_doctor.py"; then
+run_aqg_install_doctor() {
+  if comma_list_contains "$aqg_selected_clients" "claude-code" \
+      && comma_list_contains "$aqg_selected_clients" "codex"; then
+    clean_exec env PATH="$PYTHON_DIR:$PATH" \
+      "$PYTHON_BIN" "$AQG_ROOT/scripts/aqg_doctor.py"
+    return $?
+  fi
+  # Keep the signed Doctor's verdict; only its presentation of absent hosts
+  # needs adjustment until the upstream Doctor becomes presence-aware.
+  clean_exec env PATH="$PYTHON_DIR:$PATH" "$PYTHON_BIN" -c '
+import json
+import subprocess
+import sys
+
+doctor, clients = sys.argv[1:]
+proc = subprocess.run([sys.executable, doctor, "--json"], capture_output=True, text=True)
+if proc.stderr:
+    print(proc.stderr, end="", file=sys.stderr)
+try:
+    payload = json.loads(proc.stdout)
+    results = payload["results"]
+    if not isinstance(results, list):
+        raise ValueError("missing Doctor results")
+except (ValueError, KeyError, TypeError):
+    print("AQG Doctor returned an unreadable report", file=sys.stderr)
+    raise SystemExit(proc.returncode or 1)
+
+detected = set(clients.split(","))
+absent = {name for client, name in (("claude-code", "claude_skill_root"),
+                                      ("codex", "codex_skill_root")) if client not in detected}
+counts = {"PASS": 0, "WARN": 0, "FAIL": 0, "SKIP": 0}
+for result in results:
+    status = result["status"]
+    name = result["name"]
+    detail = result["detail"]
+    if status not in ("PASS", "WARN", "FAIL"):
+        print("AQG Doctor returned an unknown status", file=sys.stderr)
+        raise SystemExit(1)
+    if name in absent and status == "WARN" and detail.endswith(
+        "does not exist (skills not installed for this agent)"
+    ):
+        status, detail = "SKIP", "agent not detected; skills not required"
+    counts[status] += 1
+    marker = {"PASS": "+", "WARN": "!", "FAIL": "x", "SKIP": "-"}[status]
+    print(f"  [{marker}] {status:4s} {name}: {detail}")
+    if status in ("WARN", "FAIL") and result.get("fix"):
+        print("        fix: " + result["fix"])
+print()
+print("Summary: " + " ".join(f"{key}={value}" for key, value in counts.items()))
+raise SystemExit(proc.returncode)
+' "$AQG_ROOT/scripts/aqg_doctor.py" "$aqg_selected_clients"
+}
+if ! run_aqg_install_doctor; then
   fail "AQG Doctor failed after multi-host configuration; Decision Engine was not installed"
 fi
 verify_aqg_checkout
@@ -1622,7 +2225,9 @@ print(result.get("status", "unknown"))' \
 # it must refuse before any host write, and it protects a product-owned file
 # rather than a Decision Engine one.
 claude_3p_profile_detected=0
-if [ -e "$CLAUDE_3P_CONFIG" ] || [ -L "$CLAUDE_3P_CONFIG" ]; then
+if [ "$PLATFORM_FAMILY" = "macos" ] && {
+    [ -e "$CLAUDE_3P_CONFIG" ] || [ -L "$CLAUDE_3P_CONFIG" ];
+}; then
   if [ -L "$CLAUDE_3P_CONFIG" ] || [ ! -f "$CLAUDE_3P_CONFIG" ]; then
     blocked \
       "$CLAUDE_3P_CONFIG is not a regular configuration file; preserve it and repair the Claude third-party profile before continuing"
@@ -1715,7 +2320,7 @@ if [ -z "$detected_clients" ]; then
     "no Agent host accepted by Decision Engine $managed_version passed its non-mutating wiring preflight"
 fi
 
-tty_print "Detected all supported Decision Engine hosts present on this Mac for signed stable $managed_version:"
+tty_print "Detected all supported Decision Engine hosts present on $PLATFORM_DISPLAY_NAME for signed stable $managed_version:"
 tty_print "Every listed host will be configured; each passed the stable release's wiring preflight."
 printf '%s\n' "$detected_clients" >/dev/tty
 if line_list_contains "$detected_clients" "claude-desktop-3p"; then
@@ -1769,6 +2374,500 @@ verify_managed_mcp_wiring() {
   done <<<"$detected_clients"
 }
 
+verify_managed_mcp_runtime() {
+  local allow_unactivated="${1:-0}" client
+  [ "$PLATFORM_FAMILY" = "linux" ] || return 0
+  [ "$allow_unactivated" = "1" ] || return 0
+
+  while IFS= read -r client; do
+    [ -n "$client" ] || continue
+    if ! run_managed_python - "$client" "$MANAGED_ROOT" <<'PY'
+import json
+import os
+import subprocess
+import sys
+
+client, root = sys.argv[1:]
+environment = os.environ.copy()
+environment["DE_MCP_CLIENT_HOST"] = client
+messages = (
+    {
+        "jsonrpc": "2.0",
+        "id": 1,
+        "method": "initialize",
+        "params": {
+            "protocolVersion": "2025-11-25",
+            "capabilities": {},
+            "clientInfo": {"name": "dp-install-smoke", "version": "1"},
+        },
+    },
+    {"jsonrpc": "2.0", "method": "notifications/initialized"},
+    {"jsonrpc": "2.0", "id": 2, "method": "tools/list", "params": {}},
+)
+payload = "\n".join(json.dumps(message, separators=(",", ":")) for message in messages) + "\n"
+try:
+    process = subprocess.run(
+        [
+            sys.executable,
+            "-m",
+            "installer.launcher",
+            "--managed-root",
+            root,
+            "--serve-only",
+        ],
+        input=payload,
+        text=True,
+        cwd=root,
+        env=environment,
+        stdout=subprocess.PIPE,
+        stderr=subprocess.PIPE,
+        timeout=30,
+        check=False,
+    )
+except subprocess.TimeoutExpired:
+    print(f"MCP launcher smoke timed out for {client}", file=sys.stderr)
+    raise SystemExit(1)
+
+if process.returncode != 0:
+    detail = process.stderr.strip().splitlines()
+    suffix = f": {detail[-1]}" if detail else ""
+    print(
+        f"MCP launcher smoke exited {process.returncode} for {client}{suffix}",
+        file=sys.stderr,
+    )
+    raise SystemExit(1)
+
+responses = {}
+for line in process.stdout.splitlines():
+    if not line.strip():
+        continue
+    try:
+        response = json.loads(line)
+    except json.JSONDecodeError:
+        print(f"MCP launcher emitted non-JSON stdout for {client}", file=sys.stderr)
+        raise SystemExit(1)
+    if isinstance(response, dict) and response.get("id") in (1, 2):
+        responses[response["id"]] = response
+
+initialize = responses.get(1)
+tools_list = responses.get(2)
+if not isinstance(initialize, dict) or "error" in initialize:
+    print(f"MCP initialize failed for {client}", file=sys.stderr)
+    raise SystemExit(1)
+if not isinstance(initialize.get("result"), dict):
+    print(f"MCP initialize returned no result for {client}", file=sys.stderr)
+    raise SystemExit(1)
+if not isinstance(tools_list, dict) or "error" in tools_list:
+    print(f"MCP tools/list failed for {client}", file=sys.stderr)
+    raise SystemExit(1)
+tools_result = tools_list.get("result")
+if not isinstance(tools_result, dict) or not isinstance(tools_result.get("tools"), list):
+    print(f"MCP tools/list returned an invalid result for {client}", file=sys.stderr)
+    raise SystemExit(1)
+PY
+    then
+      printf '%s: ERROR: managed MCP launcher verification failed for %s\n' \
+        "$PROGRAM_NAME" "$client" >&2
+      return 1
+    fi
+  done <<<"$detected_clients"
+}
+
+ensure_linux_codex_gui_environment() {
+  local allow_unactivated="${1:-0}"
+  [ "$PLATFORM_FAMILY" = "linux" ] || return 0
+  line_list_contains "$detected_clients" "codex" || return 0
+
+  run_managed_python -c \
+    'import sys
+from installer import mcp_config
+
+server_name = mcp_config.DEFAULT_SERVER_NAME
+allow_unactivated = sys.argv[1] == "1"
+entry = mcp_config.render_codex_entry(
+    server_name, allow_unactivated=allow_unactivated
+)
+entry["env_vars"] = [
+    "DISPLAY",
+    "WAYLAND_DISPLAY",
+    "XDG_RUNTIME_DIR",
+    "DBUS_SESSION_BUS_ADDRESS",
+    "XAUTHORITY",
+]
+lines = ["[mcp_servers.%s]" % mcp_config._toml_key(server_name)]
+key_order = (
+    "command",
+    "args",
+    "cwd",
+    "env",
+    "env_vars",
+    "startup_timeout_sec",
+    "tool_timeout_sec",
+)
+unknown_keys = set(entry).difference(key_order)
+if unknown_keys:
+    raise SystemExit("unsupported Codex MCP entry field(s): %s" % sorted(unknown_keys))
+for key in key_order:
+    if key in entry:
+        lines.append("%s = %s" % (key, mcp_config._toml_value(entry[key])))
+block = "\n".join(lines) + "\n"
+desired = mcp_config._tomllib().loads(block)["mcp_servers"][server_name]
+mcp_config._write_codex_client(
+    "codex",
+    mcp_config.agent_config_path("codex"),
+    server_name,
+    block,
+    desired,
+    False,
+)
+actual = mcp_config.read_entry("codex", server_name)
+if not isinstance(actual, dict) or actual.get("env_vars") != entry["env_vars"]:
+    raise SystemExit("Linux Codex GUI environment forwarding did not persist")' \
+    "$allow_unactivated" \
+    </dev/null >/dev/null \
+    || {
+      printf '%s: ERROR: Linux Codex MCP GUI-session forwarding could not be configured\n' \
+        "$PROGRAM_NAME" >&2
+      return 1
+    }
+  tty_print "Linux Codex MCP will inherit the active desktop display session after Codex restarts."
+}
+
+cmp_verified_file() {
+  local path="$1" expected_size="$2" expected_sha="$3" actual_size actual_sha
+  [ -f "$path" ] && [ ! -L "$path" ] || return 1
+  actual_size="$(/usr/bin/stat -c '%s' "$path" 2>/dev/null || true)"
+  [ "$actual_size" = "$expected_size" ] || return 1
+  actual_sha="$(/usr/bin/openssl dgst -sha256 "$path" 2>/dev/null | /usr/bin/awk '{print $NF}')"
+  [ "$actual_sha" = "$expected_sha" ]
+}
+
+install_fedora_minizip_compat() {
+  local asset_url="" asset_size="" asset_sha="" library_size="" library_sha=""
+  local library_member="" copyright_member="./usr/share/doc/libminizip1t64/copyright"
+  local runtime_id="" runtime_dir="" runtime_marker="" runtime_library=""
+  local qt_lib_dir="" target="" stage="" archive="" data_archive="" candidate=""
+
+  [ "$LINUX_DISTRO_ID:$LINUX_VERSION_ID" = "fedora:44" ] || return 0
+  case "$LINUX_MACHINE_ARCH" in
+    arm64|aarch64)
+      asset_url="https://ports.ubuntu.com/ubuntu-ports/pool/universe/z/zlib/libminizip1t64_1.3.dfsg-3.1ubuntu2_arm64.deb"
+      asset_size="22732"
+      asset_sha="1d76d40ef8319bb09f64f4c993982c55b5da8d5d479ccaa928c87b3140eb2ca9"
+      library_size="67680"
+      library_sha="c91f42d8c87a8b11d72958e42a53da55a2b6048b175a4f99e9860be3fcc22c2c"
+      library_member="./usr/lib/aarch64-linux-gnu/libminizip.so.1.0.0"
+      runtime_id="linux-gui-minizip-1.3-noble-aarch64"
+      ;;
+    x86_64|amd64)
+      asset_url="https://archive.ubuntu.com/ubuntu/pool/universe/z/zlib/libminizip1t64_1.3.dfsg-3.1ubuntu2_amd64.deb"
+      asset_size="22210"
+      asset_sha="97616c0c808c10fc2d4016250b9df2af35e5eb84a1120d70d2159fa66cbe45f2"
+      library_size="51504"
+      library_sha="3c794f65f282da69c0286957e5b564b51a3e13381e30564a5f5b4454f9ca385c"
+      library_member="./usr/lib/x86_64-linux-gnu/libminizip.so.1.0.0"
+      runtime_id="linux-gui-minizip-1.3-noble-x86_64"
+      ;;
+    *) return 1 ;;
+  esac
+
+  [ -x /usr/bin/curl ] && [ -x /usr/bin/openssl ] \
+    && [ -x /usr/bin/ar ] && [ -x /usr/bin/tar ] && [ -x /usr/bin/zstd ] \
+    || { tty_print "Fedora GUI compatibility setup requires curl, OpenSSL, binutils, tar, and zstd."; return 1; }
+
+  qt_lib_dir="$(run_managed_python -c \
+    'from pathlib import Path
+import PyQt6
+print(Path(PyQt6.__file__).resolve().parent / "Qt6" / "lib")' \
+    </dev/null 2>/dev/null || true)"
+  case "$qt_lib_dir" in
+    "$MANAGED_PYTHON_ROOT"/*/site-packages/PyQt6/Qt6/lib) ;;
+    *) tty_print "The pinned Qt private library directory could not be verified; visual setup was not changed."; return 1 ;;
+  esac
+  [ -d "$qt_lib_dir" ] && [ ! -L "$qt_lib_dir" ] \
+    || { tty_print "The pinned Qt private library directory is not a regular directory; visual setup was not changed."; return 1; }
+
+  runtime_dir="$PRIVATE_RUNTIME_ROOT/$runtime_id"
+  runtime_marker="$runtime_dir/.deeppattern-linux-gui-runtime"
+  runtime_library="$runtime_dir/lib/libminizip.so.1"
+  target="$qt_lib_dir/libminizip.so.1"
+
+  if [ -e "$runtime_dir" ] || [ -L "$runtime_dir" ]; then
+    if [ -d "$runtime_dir" ] && [ ! -L "$runtime_dir" ] \
+        && [ -f "$runtime_marker" ] && [ ! -L "$runtime_marker" ] \
+        && /usr/bin/grep -Fxq "schema=1" "$runtime_marker" \
+        && /usr/bin/grep -Fxq "runtime_id=$runtime_id" "$runtime_marker" \
+        && /usr/bin/grep -Fxq "package_sha256=$asset_sha" "$runtime_marker" \
+        && cmp_verified_file "$runtime_library" "$library_size" "$library_sha"; then
+      tty_print "Reusing the verified Fedora 44 GUI compatibility runtime."
+    else
+      tty_print "$runtime_dir is not the expected verified GUI compatibility runtime; preserve it; visual setup was not changed."
+      return 1
+    fi
+  else
+    ensure_deeppattern_runtime_directories
+    stage="$(clean_exec /usr/bin/mktemp -d "$PRIVATE_RUNTIME_ROOT/.linux-gui-stage.XXXXXX")" \
+      || { tty_print "A private GUI compatibility staging directory could not be created."; return 1; }
+    archive="$stage/libminizip.deb"
+    data_archive="$stage/data.tar.zst"
+    candidate="$stage/libminizip.so.1"
+    tty_print "Downloading the hash-pinned Fedora 44 GUI compatibility library..."
+    if ! clean_exec /usr/bin/curl --fail --location --show-error --progress-bar \
+        --proto '=https' --tlsv1.2 --connect-timeout 20 --retry 2 \
+        --output "$archive" "$asset_url" \
+        || ! cmp_verified_file "$archive" "$asset_size" "$asset_sha" \
+        || ! clean_exec /usr/bin/ar p "$archive" data.tar.zst >"$data_archive" \
+        || ! clean_exec env PATH=/usr/bin:/bin /usr/bin/tar --zstd -xOf \
+          "$data_archive" "$library_member" >"$candidate" \
+        || ! cmp_verified_file "$candidate" "$library_size" "$library_sha"; then
+      clean_exec /bin/rm -rf "$stage"
+      tty_print "The Fedora GUI compatibility asset failed download, archive, size, or SHA-256 verification; nothing was installed."
+      return 1
+    fi
+    clean_exec /bin/mkdir -m 700 "$stage/runtime" "$stage/runtime/lib" \
+      || { clean_exec /bin/rm -rf "$stage"; tty_print "The private GUI runtime could not be staged."; return 1; }
+    clean_exec /bin/mv "$candidate" "$stage/runtime/lib/libminizip.so.1" \
+      || { clean_exec /bin/rm -rf "$stage"; tty_print "The verified GUI library could not be staged."; return 1; }
+    clean_exec env PATH=/usr/bin:/bin /usr/bin/tar --zstd -xOf \
+      "$data_archive" "$copyright_member" >"$stage/runtime/COPYRIGHT-libminizip" \
+      || { clean_exec /bin/rm -rf "$stage"; tty_print "The GUI compatibility license could not be preserved."; return 1; }
+    /bin/chmod 755 "$stage/runtime/lib/libminizip.so.1" \
+      || { clean_exec /bin/rm -rf "$stage"; tty_print "The verified GUI library permissions could not be set."; return 1; }
+    printf '%s\n' \
+      "schema=1" \
+      "runtime_id=$runtime_id" \
+      "package_url=$asset_url" \
+      "package_sha256=$asset_sha" \
+      "library_sha256=$library_sha" \
+      >"$stage/runtime/.deeppattern-linux-gui-runtime" \
+      || { clean_exec /bin/rm -rf "$stage"; tty_print "The GUI runtime ownership marker could not be written."; return 1; }
+    /bin/chmod 600 "$stage/runtime/.deeppattern-linux-gui-runtime" \
+      "$stage/runtime/COPYRIGHT-libminizip" \
+      || { clean_exec /bin/rm -rf "$stage"; tty_print "The GUI runtime metadata could not be protected."; return 1; }
+    if [ -e "$runtime_dir" ] || [ -L "$runtime_dir" ] \
+        || ! clean_exec /bin/mv "$stage/runtime" "$runtime_dir"; then
+      clean_exec /bin/rm -rf "$stage"
+      tty_print "$runtime_dir appeared during setup; preserve it; visual setup was not changed."
+      return 1
+    fi
+    clean_exec /bin/rm -rf "$stage"
+    cmp_verified_file "$runtime_library" "$library_size" "$library_sha" \
+      || { tty_print "The installed GUI compatibility runtime failed final verification."; return 1; }
+    tty_print "Fedora 44 GUI compatibility runtime is ready at $runtime_dir."
+  fi
+
+  if [ -e "$target" ] || [ -L "$target" ]; then
+    if cmp_verified_file "$target" "$library_size" "$library_sha"; then
+      return 0
+    fi
+    tty_print "$target is not the expected verified compatibility library; preserve it; visual setup was not changed."
+    return 1
+  fi
+  clean_exec /bin/ln "$runtime_library" "$target" \
+    || { tty_print "The verified compatibility library could not be linked into the private Qt runtime."; return 1; }
+  cmp_verified_file "$target" "$library_size" "$library_sha" \
+    || { tty_print "The private Qt compatibility library failed final verification."; return 1; }
+}
+
+prepare_debian12_arm64_gtk_popup_backend() {
+  local missing_packages=""
+
+  linux_debian_arm64_gtk_supported || return 2
+  tty_print "Preparing the Debian 12 ARM64 GTK/WebKit popup backend."
+
+  missing_packages="$(linux_debian_arm64_gtk_dependency_packages)"
+  if [ -n "$missing_packages" ]; then
+    tty_print "Debian 12 ARM64 native visual windows still require system package(s): $missing_packages"
+    tty_print "Rerun this installer and approve the displayed APT dependency step, or install them with your system administrator's approval:"
+    tty_print "  sudo apt-get install --no-install-recommends $missing_packages"
+    return 1
+  fi
+
+  if run_managed_python -c \
+      'import importlib.metadata as metadata
+expected = {"pycairo": "1.27.0", "PyGObject": "3.50.0", "pywebview": "6.2.1"}
+raise SystemExit(0 if all(metadata.version(name) == version for name, version in expected.items()) else 1)' \
+      </dev/null >/dev/null 2>&1 \
+      && (
+        export PYWEBVIEW_GUI=gtk
+        run_managed_python -c \
+          'from client.popup import backend; import sys; raise SystemExit(0 if backend.inspect_webview(sys.executable).ready else 1)' \
+          </dev/null >/dev/null 2>&1
+      ); then
+    tty_print "Reusing the verified Debian 12 ARM64 GTK popup backend."
+    return 0
+  fi
+
+  tty_print "Installing fixed GTK bindings for the private Python 3.13 runtime; native code will be compiled against Debian's official development packages..."
+  if ! run_managed_python -m pip install \
+      --no-input \
+      --progress-bar on \
+      'pycairo @ https://files.pythonhosted.org/packages/07/4a/42b26390181a7517718600fa7d98b951da20be982a50cd4afb3d46c2e603/pycairo-1.27.0.tar.gz#sha256=5cb21e7a00a2afcafea7f14390235be33497a2cce53a98a19389492a60628430' \
+      'PyGObject @ https://files.pythonhosted.org/packages/2b/58/d34e67a79631177e3c08e7d02b5165147f590171f2cae6769502af5f7f7e/pygobject-3.50.0.tar.gz#sha256=4500ad3dbf331773d8dedf7212544c999a76fc96b63a91b3dcac1e5925a1d103' \
+      'pywebview @ https://files.pythonhosted.org/packages/3d/25/9491695c22c4842c5b3903b4dc172e0eecf67a27c0af34a71512c9b76a0a/pywebview-6.2.1-py3-none-any.whl#sha256=9d07275f53894ab4d5e2e0e996227193e7187dec276d9b624dccbce029216b46'; then
+    tty_print "Warning: the Debian ARM64 GTK Python bindings could not be built; core MCP remains available, but visual windows will not open."
+    return 1
+  fi
+
+  if ! run_managed_python -c \
+      'import importlib.metadata as metadata
+expected = {"pycairo": "1.27.0", "PyGObject": "3.50.0", "pywebview": "6.2.1"}
+raise SystemExit(0 if all(metadata.version(name) == version for name, version in expected.items()) else 1)' \
+      </dev/null >/dev/null 2>&1; then
+    tty_print "Warning: the installed Debian ARM64 GTK package versions failed final verification."
+    return 1
+  fi
+  if ! (
+    export PYWEBVIEW_GUI=gtk
+    run_managed_python -c \
+      'from client.popup import backend; import sys; result = backend.inspect_webview(sys.executable); print("de-linux-popup: pywebview=%s" % result.state.value); raise SystemExit(0 if result.ready else 1)' \
+      </dev/null
+  ); then
+    tty_print "Warning: the Debian ARM64 GTK packages were installed but the WebKit desktop backend could not initialize; core MCP remains available."
+    return 1
+  fi
+  tty_print "Debian 12 ARM64 GTK popup backend is ready."
+}
+
+prepare_linux_popup_backend() {
+  local missing_packages="" minizip_package="" xcb_cursor_package=""
+
+  [ "$PLATFORM_FAMILY" = "linux" ] || return 0
+
+  if linux_debian_arm64_gtk_supported; then
+    prepare_debian12_arm64_gtk_popup_backend
+    return $?
+  fi
+
+  if ! linux_native_popup_supported; then
+    if run_managed_python -c \
+        'from client.popup import backend; import sys; raise SystemExit(0 if backend.inspect_webview(sys.executable).ready else 1)' \
+        </dev/null >/dev/null 2>&1; then
+      tty_print "Reusing the existing Linux native popup backend."
+      return 0
+    fi
+    case "$LINUX_DISTRO_ID:$LINUX_VERSION_ID" in
+      ubuntu:22.04)
+        tty_print "Ubuntu 22.04 core MCP support is installed, but automatic native visual-window provisioning is not supported."
+        tty_print "PyQt6 6.11 ARM64 requires manylinux_2_39_aarch64, which Ubuntu 22.04 does not provide."
+        ;;
+      *) tty_print "No compatible native visual-window runtime is available for this Linux platform." ;;
+    esac
+    tty_print "Diagram, comic, and discussion-board windows require a supported native popup backend."
+    return 2
+  fi
+
+  if run_managed_python -c \
+      'import importlib.metadata as metadata
+expected = {
+    "pywebview": "6.2.1",
+    "QtPy": "2.4.3",
+    "PyQt6": "6.11.0",
+    "PyQt6-Qt6": "6.11.2",
+    "PyQt6-sip": "13.12.0",
+    "PyQt6-WebEngine": "6.11.0",
+    "PyQt6-WebEngine-Qt6": "6.11.2",
+}
+raise SystemExit(0 if all(metadata.version(name) == version for name, version in expected.items()) else 1)' \
+      </dev/null >/dev/null 2>&1 \
+      && run_managed_python -c \
+        'from client.popup import backend; import sys; raise SystemExit(0 if backend.inspect_webview(sys.executable).ready else 1)' \
+        </dev/null >/dev/null 2>&1; then
+    if [ "$LINUX_DISTRO_ID:$LINUX_VERSION_ID" = "fedora:44" ] \
+        && ! install_fedora_minizip_compat; then
+      tty_print "Warning: the active Fedora GUI backend does not match the verified compatibility runtime; visual setup was not changed."
+      return 1
+    fi
+    tty_print "Reusing the verified Linux native popup backend."
+    return 0
+  fi
+
+  case "$LINUX_DISTRO_ID:$LINUX_VERSION_ID" in
+    ubuntu:24.04|ubuntu:26.04)
+      minizip_package="libminizip1t64"
+      xcb_cursor_package="libxcb-cursor0"
+      ;;
+    ubuntu:22.04|debian:12)
+      minizip_package="libminizip1"
+      xcb_cursor_package="libxcb-cursor0"
+      ;;
+    fedora:44)
+      [ -x /usr/bin/ar ] || missing_packages="$missing_packages binutils"
+      [ -x /usr/bin/zstd ] || missing_packages="$missing_packages zstd"
+      xcb_cursor_package="xcb-util-cursor"
+      ;;
+    *)
+      tty_print "Warning: no native visual-window package mapping exists for $LINUX_DISTRO_ID $LINUX_VERSION_ID."
+      return 1
+      ;;
+  esac
+  if [ -n "$minizip_package" ] && ! run_managed_python -c \
+      'import ctypes, sys; ctypes.CDLL(sys.argv[1])' \
+      'libminizip.so.1' </dev/null >/dev/null 2>&1; then
+    missing_packages="$missing_packages $minizip_package"
+  fi
+  if ! run_managed_python -c \
+      'import ctypes, sys; ctypes.CDLL(sys.argv[1])' \
+      'libxcb-cursor.so.0' </dev/null >/dev/null 2>&1; then
+    missing_packages="$missing_packages $xcb_cursor_package"
+  fi
+  if [ -n "$missing_packages" ]; then
+    tty_print "$LINUX_DISTRO_ID $LINUX_VERSION_ID native visual windows require missing system package(s):$missing_packages"
+    tty_print "Install them with your system administrator's approval, then rerun:"
+    if [ "$LINUX_DISTRO_ID" = "fedora" ]; then
+      tty_print "  sudo dnf --refresh --setopt=install_weak_deps=False install$missing_packages"
+    else
+      tty_print "  sudo apt-get install --no-install-recommends$missing_packages"
+    fi
+    tty_print "The earlier system dependency step did not complete these optional packages; core MCP setup will continue."
+    return 1
+  fi
+
+  tty_print "Deep Pattern visual windows require a Linux WebView backend."
+  if ! run_managed_python -c \
+      'import importlib.metadata as metadata; import proxy_tools; raise SystemExit(0 if metadata.version("proxy_tools") == "0.1.0" else 1)' \
+      </dev/null >/dev/null 2>&1; then
+    tty_print "Installing a hash-pinned pure-Python compatibility package; no compiler is required..."
+    if ! run_managed_python -m pip install \
+        --no-input \
+        --no-deps \
+        'proxy_tools @ https://files.pythonhosted.org/packages/f2/cf/77d3e19b7fabd03895caca7857ef51e4c409e0ca6b37ee6e9f7daa50b642/proxy_tools-0.1.0.tar.gz#sha256=ccb3751f529c047e2d8a58440d86b205303cf0fe8146f784d1cbcd94f0a28010'; then
+      tty_print "Warning: the hash-pinned pywebview compatibility package could not be installed; core MCP remains available, but visual windows will not open."
+      return 1
+    fi
+  fi
+
+  tty_print "Installing about 210 MB of pinned prebuilt GUI wheels without compiling native code or using a system package manager..."
+  if ! run_managed_python -m pip install \
+      --only-binary=:all: \
+      --no-input \
+      --progress-bar on \
+      'pywebview==6.2.1' \
+      'QtPy==2.4.3' \
+      'PyQt6==6.11.0' \
+      'PyQt6-Qt6==6.11.2' \
+      'PyQt6-sip==13.12.0' \
+      'PyQt6-WebEngine==6.11.0' \
+      'PyQt6-WebEngine-Qt6==6.11.2'; then
+    tty_print "Warning: the binary Linux WebView backend could not be installed; core MCP remains available, but diagram, comic, and discussion-board windows will not open."
+    return 1
+  fi
+
+  if [ "$LINUX_DISTRO_ID:$LINUX_VERSION_ID" = "fedora:44" ] \
+      && ! install_fedora_minizip_compat; then
+    tty_print "Warning: the Fedora GUI compatibility runtime could not be installed; core MCP remains available, but visual windows will not open."
+    return 1
+  fi
+
+  if ! run_managed_python -c \
+      'from client.popup import backend; import sys; result = backend.inspect_webview(sys.executable); print("de-linux-popup: pywebview=%s" % result.state.value); raise SystemExit(0 if result.ready else 1)' \
+      </dev/null; then
+    tty_print "Warning: the binary Linux WebView packages were installed but the desktop backend could not initialize; core MCP remains available."
+    return 1
+  fi
+  tty_print "Linux native popup backend is ready."
+}
+
 repair_managed_skill_routes() {
   # The core body is installed before activation, so its initial skill-route
   # pass sees no DE MCP entries. Re-run the existing setup-only repair after
@@ -1812,7 +2911,10 @@ wire_all_detected_hosts() {
     printf '%s: ERROR: managed skill routing failed for one or more hosts\n' "$PROGRAM_NAME" >&2
     return 1
   }
-  verify_managed_mcp_wiring "$allow_unactivated"
+  verify_managed_mcp_wiring "$allow_unactivated" || return 1
+  ensure_linux_codex_gui_environment "$allow_unactivated" || return 1
+  verify_managed_mcp_wiring "$allow_unactivated" || return 1
+  verify_managed_mcp_runtime "$allow_unactivated"
 }
 
 wire_unactivated_mcp() {
@@ -1885,22 +2987,64 @@ print(f"skills={skills}; routing={spec.routing_kind}")' \
   fi
 }
 
+filter_linux_activation_stderr() {
+  local line="" virtual_gpu_notice=0
+  while IFS= read -r line || [ -n "$line" ]; do
+    case "$line" in
+      'EGL: EGL_EXT_image_dma_buf_import extension is not supported.' \
+        | 'Release of profile requested but WebEnginePage still not deleted. Expect troubles !' \
+        | libva\ error:\ */dri/virtio_gpu_drv_video.so\ init\ failed)
+        virtual_gpu_notice=1
+        ;;
+      *) printf '%s\n' "$line" >&2 ;;
+    esac
+  done
+  if [ "$virtual_gpu_notice" -eq 1 ]; then
+    tty_print "NOTE: Virtual GPU acceleration is unavailable; Qt used software rendering for the activation window."
+  fi
+}
+
 run_selected_permanent_setup() {
-  local client
+  local client activation_stderr="" activation_status=0
   set --
   while IFS= read -r client; do
     [ -n "$client" ] || continue
     set -- "$@" --client "$client"
   done <<<"$detected_clients"
-  run_managed_python -m installer.permanent_setup "$@"
+  if [ "$PLATFORM_FAMILY" = "linux" ] && linux_native_popup_supported; then
+    activation_stderr="$tmp_root/permanent-setup.stderr"
+    : >"$activation_stderr"
+    (
+      export PYWEBVIEW_GUI=qt
+      run_managed_python -m installer.permanent_setup "$@"
+    ) 2>"$activation_stderr" || activation_status=$?
+    filter_linux_activation_stderr <"$activation_stderr"
+    clean_exec /bin/rm -f "$activation_stderr" || true
+    return "$activation_status"
+  else
+    run_managed_python -m installer.permanent_setup "$@"
+  fi
 }
 
 ensure_managed_runtime_git_excludes \
   || fail "the managed runtime Git exclusion could not be installed safely; no activation attempt was made"
-ensure_macos_stopper_host \
-  || fail "the managed core is complete, but the owned macOS Stopper host bridge could not be installed and verified; the existing activation state was preserved"
+if [ "$PLATFORM_FAMILY" = "macos" ]; then
+  ensure_macos_stopper_host \
+    || fail "the managed core is complete, but the owned macOS Stopper host bridge could not be installed and verified; the existing activation state was preserved"
+else
+  tty_print "Linux uses the signed Decision Engine in-process Stopper fallback; no system service or root privilege was installed."
+fi
 validate_complete_managed_root \
   || fail "the managed stable install changed while preparing the Stopper host bridge"
+
+linux_popup_status=0
+linux_popup_incomplete=0
+final_mcp_allow_unactivated=0
+prepare_linux_popup_backend || linux_popup_status=$?
+case "$linux_popup_status" in
+  0|2) ;;
+  *) linux_popup_incomplete=1; tty_print "Rerun this installer after correcting the reported WebView prerequisite." ;;
+esac
 
 if [ "$activated_repair_mode" -eq 1 ]; then
   if ! wire_all_detected_hosts; then
@@ -1936,6 +3080,7 @@ else
       if ! wire_unactivated_mcp; then
         fail "core installation is complete, but unactivated host wiring failed"
       fi
+      final_mcp_allow_unactivated=1
       tty_print "activation was cancelled; core installation is complete in the unactivated state."
       tty_print "Restart the configured host applications to use the DE Lite path."
       ;;
@@ -1958,6 +3103,8 @@ fi
 tty_print "Running final Decision Engine Doctor..."
 run_managed_python -m installer.doctor \
   || fail "Decision Engine Doctor still reports a blocking failure after installation or repair"
+verify_managed_mcp_wiring "$final_mcp_allow_unactivated" \
+  || fail "a detected host MCP entry changed after wiring; close the affected Agent, then rerun this installer to repair it"
 
 print_host_capability_report
 
@@ -1998,6 +3145,7 @@ if [ -n "$catalog_missing_clients" ] \
     || [ -n "$unwritable_clients" ] \
     || [ -n "$unsupported_installed_hosts" ] \
     || [ "$capability_report_incomplete" -ne 0 ] \
+    || [ "$linux_popup_incomplete" -ne 0 ] \
     || [ "$manual_host_action_pending" -ne 0 ]; then
   printf '%s: PARTIAL: supported components were installed, but one or more detected hosts are unsupported, unconfigured, unverifiable, or awaiting in-app approval.\n' \
     "$PROGRAM_NAME" >&2

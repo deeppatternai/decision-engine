@@ -1,32 +1,48 @@
-#!/bin/zsh
+#!/usr/bin/env bash
 # Deep Pattern (DP) managed-install cleanup tool.
-# macOS is implemented first; Linux and Windows remain fail-closed until their
-# host integration contracts are added.
+# macOS and Linux share this entrypoint. Platform-specific host/process
+# contracts remain isolated inside the embedded helper.
 # Repository hosting is deliberately irrelevant here: ownership is proven from
 # managed local roots and host entries, so an organization migration can never
 # broaden what this tool is allowed to remove.
 set -euo pipefail
 
 # Clear inherited Git redirection before the helper or any descendant starts.
-for git_env_name in ${(k)parameters}; do
-  case "$git_env_name" in
-    GIT_*) unset "$git_env_name" ;;
-  esac
-done
-
-python_bin="${DE_AQG_PYTHON:-}"
-if [[ -z "${python_bin}" ]]; then
-  python_bin="$(command -v python3 2>/dev/null || true)"
-fi
-if [[ -z "${python_bin}" ]]; then
-  python_bin="$(command -v python 2>/dev/null || true)"
-fi
-if [[ -z "${python_bin}" || ! -x "${python_bin}" ]]; then
-  print -u2 'dp-uninstall: Python 3 is required.'
+if [ -n "${BASH_VERSION:-}" ]; then
+  for git_env_name in "${!GIT_@}"; do
+    unset "$git_env_name"
+  done
+elif [ -n "${ZSH_VERSION:-}" ]; then
+  eval 'for git_env_name in ${(k)parameters}; do
+    case "$git_env_name" in
+      GIT_*) unset "$git_env_name" ;;
+    esac
+  done'
+else
+  printf '%s\n' 'dp-uninstall: run this tool with Bash or Zsh.' >&2
   exit 2
 fi
 
-exec "${python_bin}" - "$@" <<'PY'
+python_bin="${DE_AQG_PYTHON:-}"
+if [ -z "${python_bin}" ]; then
+  for python_candidate in \
+      /usr/bin/python3 \
+      /opt/homebrew/bin/python3 \
+      /usr/local/bin/python3 \
+      /opt/anaconda3/bin/python \
+      "$HOME/.deeppattern/de-python/bin/python3"; do
+    if [ -x "$python_candidate" ]; then
+      python_bin="$python_candidate"
+      break
+    fi
+  done
+fi
+if [ -z "${python_bin}" ] || [ ! -x "${python_bin}" ]; then
+  printf '%s\n' 'dp-uninstall: Python 3 is required.' >&2
+  exit 2
+fi
+
+exec "${python_bin}" -I - "$@" <<'PY'
 from __future__ import annotations
 
 import argparse
@@ -52,8 +68,11 @@ EXIT_USAGE = 2
 EXIT_BLOCKED = 3
 EXIT_UNSUPPORTED = 4
 EXIT_PENDING = 5
+EXIT_INTERRUPTED = 130
 MAX_JSON_CONFIG_BYTES = 8 * 1024 * 1024
 MAX_UNINSTALL_BACKUPS = 5
+MANIFEST_PROGRESS_ENTRY_INTERVAL = 250
+MANIFEST_PROGRESS_SECONDS = 5.0
 UNINSTALL_BACKUP_NAME = re.compile(
     r"^(?P<stamp>\d{8}-\d{6})(?:-(?P<suffix>\d+))?-dp-uninstall-(?P<scope>de|aqg|both)$"
 )
@@ -1205,6 +1224,7 @@ class Inventory:
             ".devin/mcp.json",
             ".pi/mcp.json",
             ".config/zed/settings.json",
+            ".config/Claude/claude_desktop_config.json",
             "Library/Application Support/Claude/claude_desktop_config.json",
             "Library/Application Support/Claude-3p/claude_desktop_config.json",
             "Library/Application Support/Qoder/User/mcp.json",
@@ -2054,6 +2074,28 @@ class Inventory:
             or not os.access(executable, os.X_OK)
         ):
             return None
+        if sys.platform == "linux":
+            try:
+                entries = (Path("/proc") / pid / "environ").read_bytes().split(b"\0")
+            except OSError:
+                return None
+            environment: dict[str, str] = {}
+            for entry in entries:
+                if not entry or b"=" not in entry:
+                    continue
+                name, value = entry.split(b"=", 1)
+                try:
+                    environment[os.fsdecode(name)] = os.fsdecode(value)
+                except UnicodeError:
+                    return None
+            host = environment.get("DE_MCP_CLIENT_HOST")
+            if (
+                environment.get("PYTHONPATH") != str(self.de)
+                or host not in REGISTERED_DE_HOST_LABELS
+            ):
+                return None
+            return host
+
         ps = trusted_system_tool("/bin/ps", "/usr/bin/ps")
         if not ps:
             return None
@@ -2139,6 +2181,16 @@ class Inventory:
         for markers, label in PROCESS_HOST_MARKERS:
             if any(marker in normalized for marker in markers):
                 return label
+        try:
+            executable_name = Path(shlex.split(command_line, posix=True)[0]).name.lower()
+        except (IndexError, ValueError):
+            executable_name = ""
+        if executable_name in {"codex", "codex-cli"}:
+            return "Codex"
+        if executable_name in {"claude", "claude-code"}:
+            return "Claude Code"
+        if executable_name in {"cursor", "cursor-agent"}:
+            return "Cursor"
         return "Unknown Agent"
 
     @staticmethod
@@ -2195,33 +2247,56 @@ class Inventory:
         return context
 
     def inspect_processes(self) -> None:
-        command = self.process_command()
-        if not command:
-            self.blockers.append("live process state is unknown: ps is unavailable")
-            return
-        try:
-            result = subprocess.run(
-                [command, "-axo", "pid=,ppid=,command="],
-                text=True,
-                stdout=subprocess.PIPE,
-                stderr=subprocess.STDOUT,
-                check=False,
-            )
-        except OSError as exc:
-            self.blockers.append(f"live process state is unknown: ps failed ({exc.__class__.__name__})")
-            return
-        if result.returncode != 0:
-            self.blockers.append("live process state is unknown: ps returned a non-zero status")
-            return
         components = ("de",) if self.scope == "de" else ("aqg",) if self.scope == "aqg" else ("de", "aqg")
         rows: list[tuple[str, str, str]] = []
         unverified_launchers: list[dict[str, str]] = []
-        for raw_line in result.stdout.splitlines():
-            line = raw_line.strip()
-            match = re.match(r"^(\d+)\s+(\d+)\s+(.+)$", line)
-            if not match:
-                continue
-            rows.append((match.group(1), match.group(2), match.group(3)))
+        if sys.platform == "linux":
+            proc = Path("/proc")
+            try:
+                proc_entries = tuple(proc.iterdir())
+            except OSError as exc:
+                self.blockers.append(
+                    f"live process state is unknown: /proc cannot be read ({exc.__class__.__name__})"
+                )
+                return
+            for entry in proc_entries:
+                if not entry.name.isdigit():
+                    continue
+                identity = linux_process_identity(entry.name)
+                if identity is None:
+                    continue
+                rows.append(
+                    (
+                        identity["pid"],
+                        identity["ppid"],
+                        identity["command_line"],
+                    )
+                )
+        else:
+            command = self.process_command()
+            if not command:
+                self.blockers.append("live process state is unknown: ps is unavailable")
+                return
+            try:
+                result = subprocess.run(
+                    [command, "-axo", "pid=,ppid=,command="],
+                    text=True,
+                    stdout=subprocess.PIPE,
+                    stderr=subprocess.STDOUT,
+                    check=False,
+                )
+            except OSError as exc:
+                self.blockers.append(f"live process state is unknown: ps failed ({exc.__class__.__name__})")
+                return
+            if result.returncode != 0:
+                self.blockers.append("live process state is unknown: ps returned a non-zero status")
+                return
+            for raw_line in result.stdout.splitlines():
+                line = raw_line.strip()
+                match = re.match(r"^(\d+)\s+(\d+)\s+(.+)$", line)
+                if not match:
+                    continue
+                rows.append((match.group(1), match.group(2), match.group(3)))
         commands_by_pid = {pid: command_line for pid, _ppid, command_line in rows}
         parents_by_pid = {pid: ppid for pid, ppid, _command_line in rows}
         for pid, ppid, command_line in rows:
@@ -2325,6 +2400,9 @@ class Inventory:
                         and identity.get("command_line") == command_line
                     ):
                         process["start_time"] = identity["start_time"]
+                        if identity.get("executable"):
+                            process["identity_executable"] = identity["executable"]
+                            process["executable"] = identity["executable"]
                         process["term_eligible"] = "true"
                 term_eligible = process_term_eligible(process)
                 self.processes.append(process)
@@ -2715,7 +2793,52 @@ def process_term_eligible(process: dict[str, str]) -> bool:
     return process.get("term_eligible") in (True, "true")
 
 
+def linux_process_identity(pid: str) -> dict[str, str] | None:
+    if not re.fullmatch(r"\d+", pid):
+        return None
+    root = Path("/proc") / pid
+    try:
+        stat_text = (root / "stat").read_text(encoding="utf-8")
+        close_paren = stat_text.rfind(")")
+        if close_paren < 0:
+            return None
+        stat_fields = stat_text[close_paren + 2 :].split()
+        if len(stat_fields) < 20:
+            return None
+        ppid = stat_fields[1]
+        start_time = stat_fields[19]
+
+        uid = ""
+        for line in (root / "status").read_text(encoding="utf-8").splitlines():
+            if line.startswith("Uid:"):
+                values = line.split()
+                if len(values) >= 2:
+                    uid = values[1]
+                break
+        if not uid.isdigit() or not ppid.isdigit() or not start_time.isdigit():
+            return None
+
+        raw_args = (root / "cmdline").read_bytes().split(b"\0")
+        args = [os.fsdecode(item) for item in raw_args if item]
+        if not args:
+            return None
+        command_line = " ".join(shlex.quote(item) for item in args)
+        executable = os.readlink(root / "exe")
+    except (OSError, UnicodeError):
+        return None
+    return {
+        "pid": pid,
+        "ppid": ppid,
+        "uid": uid,
+        "start_time": f"proc:{start_time}",
+        "command_line": command_line,
+        "executable": executable,
+    }
+
+
 def read_process_identity(inv: Inventory, process: dict[str, str]) -> dict[str, str] | None:
+    if sys.platform == "linux":
+        return linux_process_identity(process["pid"])
     command = trusted_system_tool("/bin/ps", "/usr/bin/ps")
     if not command:
         return None
@@ -2769,12 +2892,14 @@ def revalidate_term_target(inv: Inventory, process: dict[str, str]) -> tuple[boo
         process.get("ppid"),
         process.get("start_time"),
         process.get("command_line"),
+        process.get("identity_executable", ""),
     )
     current = (
         identity.get("pid"),
         identity.get("ppid"),
         identity.get("start_time"),
         identity.get("command_line"),
+        identity.get("executable", ""),
     )
     if current != frozen:
         return False, "process identity changed before TERM"
@@ -3134,6 +3259,7 @@ class Manifest:
     def __init__(self, root: Path, home: Path, scope: str) -> None:
         self.root = root
         self.path = root / "manifest.json"
+        self.progress_path = root / ".manifest-progress.json"
         self.data: dict[str, Any] = {
             "schema": 1,
             "scope": scope,
@@ -3145,12 +3271,34 @@ class Manifest:
         self.flush()
 
     def flush(self) -> None:
-        self.path.write_text(json.dumps(self.data, ensure_ascii=False, indent=2) + "\n", encoding="utf-8")
-        self.path.chmod(0o600)
+        if not lexists(self.path):
+            self.path.touch(mode=0o600)
+        if self.path.is_symlink() or not self.path.is_file():
+            raise RuntimeError(f"uninstall manifest is not a safe regular file: {self.path}")
+        atomic_write(
+            self.path,
+            json.dumps(self.data, ensure_ascii=False, indent=2) + "\n",
+        )
 
     def add(self, entry: dict[str, Any]) -> None:
         self.data["entries"].append(entry)
         self.flush()
+
+    def add_many(self, entries: list[dict[str, Any]]) -> None:
+        self.data["entries"].extend(entries)
+        self.flush()
+
+    def write_progress(self, state: dict[str, Any]) -> None:
+        if not lexists(self.progress_path):
+            self.progress_path.touch(mode=0o600)
+        if self.progress_path.is_symlink() or not self.progress_path.is_file():
+            raise RuntimeError(
+                f"uninstall manifest progress is not a safe regular file: {self.progress_path}"
+            )
+        atomic_write(
+            self.progress_path,
+            json.dumps(state, ensure_ascii=False, indent=2) + "\n",
+        )
 
     def record(self, source: Path, destination: Path, *, operation: str) -> None:
         item: dict[str, Any] = {
@@ -3181,12 +3329,41 @@ class Manifest:
         self.add(item)
 
     def record_tree_moved(self, original_root: Path, destination_root: Path) -> None:
-        self.record_moved(original_root, destination_root, operation="quarantine-root")
-        for path in sorted(destination_root.rglob("*"), key=lambda item: item.as_posix()):
-            original = original_root / path.relative_to(destination_root)
-            if path.is_symlink():
-                self.add(
-                    {
+        state: dict[str, Any] = {
+            "schema": 1,
+            "status": "indexing",
+            "source": str(original_root),
+            "destination": str(destination_root),
+            "processed_entries": 0,
+            "total_entries": None,
+        }
+        self.write_progress(state)
+        print(
+            f"QUARANTINE INTEGRITY: indexing {destination_root}",
+            flush=True,
+        )
+        entries: list[dict[str, Any]] = []
+        processed = 0
+        try:
+            paths = [
+                path
+                for path in sorted(
+                    destination_root.rglob("*"), key=lambda item: item.as_posix()
+                )
+                if path.is_symlink() or path.is_file()
+            ]
+            total = len(paths)
+            state.update(status="hashing", total_entries=total)
+            self.write_progress(state)
+            print(
+                f"QUARANTINE INTEGRITY: hashing and recording {total} entries",
+                flush=True,
+            )
+            last_report = time.monotonic()
+            for path in paths:
+                original = original_root / path.relative_to(destination_root)
+                if path.is_symlink():
+                    entry = {
                         "operation": "quarantine-entry",
                         "source": str(original),
                         "destination": str(path),
@@ -3195,10 +3372,8 @@ class Manifest:
                         "size": safe_size(path),
                         "target": os.readlink(path),
                     }
-                )
-            elif path.is_file():
-                self.add(
-                    {
+                else:
+                    entry = {
                         "operation": "quarantine-entry",
                         "source": str(original),
                         "destination": str(path),
@@ -3207,7 +3382,53 @@ class Manifest:
                         "size": safe_size(path),
                         "sha256": sha256_file(path),
                     }
-                )
+                entries.append(entry)
+                processed += 1
+                now = time.monotonic()
+                if processed < total and (
+                    processed % MANIFEST_PROGRESS_ENTRY_INTERVAL == 0
+                    or now - last_report >= MANIFEST_PROGRESS_SECONDS
+                ):
+                    state.update(
+                        processed_entries=processed,
+                        last_destination=str(path),
+                    )
+                    self.write_progress(state)
+                    print(
+                        f"QUARANTINE INTEGRITY: {processed}/{total} entries",
+                        flush=True,
+                    )
+                    last_report = now
+
+            root_entry: dict[str, Any] = {
+                "operation": "quarantine-root",
+                "source": str(original_root),
+                "destination": str(destination_root),
+                "type": "directory" if destination_root.is_dir() else "file",
+                "mode": mode_text(destination_root),
+                "size": safe_size(destination_root),
+            }
+            if destination_root.is_file():
+                root_entry["sha256"] = sha256_file(destination_root)
+            state.update(status="committing", processed_entries=processed)
+            self.write_progress(state)
+            self.add_many([root_entry, *entries])
+            self.progress_path.unlink()
+            print(
+                f"QUARANTINE INTEGRITY: complete ({processed}/{total} entries)",
+                flush=True,
+            )
+        except BaseException as exc:
+            state.update(
+                status="interrupted" if isinstance(exc, KeyboardInterrupt) else "failed",
+                processed_entries=processed,
+                error_type=exc.__class__.__name__,
+            )
+            try:
+                self.write_progress(state)
+            except (OSError, RuntimeError):
+                pass
+            raise
 
 
 def backup_file(manifest: Manifest, source: Path, label: str, index: int) -> Path:
@@ -3733,8 +3954,11 @@ def main(argv: list[str]) -> int:
         args = parse_args(argv)
     except SystemExit as exc:
         return int(exc.code)
-    if sys.platform != "darwin":
-        print(f"unsupported platform: {sys.platform}; macOS cleanup is the only implemented target")
+    if sys.platform not in {"darwin", "linux"}:
+        print(
+            f"unsupported platform: {sys.platform}; supported cleanup targets are "
+            "macOS and Linux"
+        )
         return EXIT_UNSUPPORTED
     home = lex(Path(args.home)) if args.home else lex(Path.home())
     if not home.is_dir():
@@ -3782,6 +4006,12 @@ def main(argv: list[str]) -> int:
         return EXIT_OK
     try:
         backup = apply_inventory(inventory)
+    except KeyboardInterrupt:
+        print(
+            "\nUNINSTALL_INTERRUPTED: quarantine integrity recording was interrupted. "
+            "No success was reported; preserve the newest uninstall backup for diagnosis."
+        )
+        return EXIT_INTERRUPTED
     except Exception as exc:
         print(f"ERROR: uninstall stopped without a clean verification: {exc}", file=sys.stderr)
         return EXIT_BLOCKED

@@ -69,6 +69,7 @@ class InstallerTestCase(unittest.TestCase):
         self._env = {
             "DEEPPATTERN_HOME": str(self.deeppattern),
             "CLAUDE_SKILLS_DIR": str(self.skills),
+            "CLAUDE_CODE_CONFIG": str(base / ".claude.json"),
             "CODEX_SKILLS_DIR": str(self.codex_skills),
             "CURSOR_CONFIG": str(base / "cursor-home" / "mcp.json"),
             "QODER_CONFIG": str(base / "no-qoder" / "mcp.json"),
@@ -136,6 +137,7 @@ class InstallerTestCase(unittest.TestCase):
         }
         self._saved = {k: os.environ.get(k) for k in self._env}
         os.environ.update(self._env)
+        (base / ".claude.json").touch()
 
     def _seed_component(self, comp: str, skill: str) -> None:
         skill_dir = self.bundle / comp / "skills" / skill
@@ -1139,6 +1141,24 @@ class InstallerTestCase(unittest.TestCase):
         component = summary["components"][0]
         self.assertEqual(set(component["routed_skill_clients"]), {"claude"})
         self.assertFalse(self.codex_skills.exists())
+
+    def test_absent_hosts_do_not_get_agent_configuration_roots(self):
+        Path(os.environ["CLAUDE_CODE_CONFIG"]).unlink()
+        with (
+            mock.patch.dict(os.environ, {"CODEX_SKILLS_DIR": ""}),
+            mock.patch.object(
+                config, "DEFAULT_CODEX_SKILLS_DIR", Path(self.tmp.name) / ".codex" / "skills"
+            ),
+        ):
+            summary = self._run("de")
+
+        self.assertEqual(summary["components"][0]["routed_skill_clients"], {})
+        self.assertFalse(self.skills.exists())
+        self.assertFalse(self.codex_skills.exists())
+        self.assertFalse((Path(self.tmp.name) / ".codex").exists())
+        for name in (".claude", ".cursor", ".trae", ".qoder", ".workbuddy"):
+            self.assertFalse((Path(self.tmp.name) / name).exists(), name)
+        self.assertFalse(Path(os.environ["CLAUDE_CODE_CONFIG"]).exists())
 
     def test_empty_codex_skills_override_never_routes_into_cwd(self):
         os.environ["CODEX_SKILLS_DIR"] = ""

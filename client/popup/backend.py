@@ -15,6 +15,8 @@ from __future__ import annotations
 
 import ctypes
 import os
+import shutil
+import stat
 import subprocess
 import sys
 from dataclasses import dataclass
@@ -26,6 +28,38 @@ from typing import Optional
 # it) without dumping a multi-hundred-line build log.
 _INSTALL_ERROR_TAIL_LINES = 25
 _OWNER_ENV_KEYS = ("DE_ENDPOINT", "DE_ACTIVATION_SECRET")
+_LINUX_GRAPHICAL_ENV_KEYS = (
+    "DISPLAY",
+    "WAYLAND_DISPLAY",
+    "XAUTHORITY",
+    "XDG_RUNTIME_DIR",
+    "DBUS_SESSION_BUS_ADDRESS",
+    "XDG_SESSION_TYPE",
+)
+_LINUX_GRAPHICAL_ENV_MAX_CHARS = 4096
+_LINUX_GRAPHICAL_ENV_TIMEOUT_S = 3
+
+_LINUX_BACKEND_PROBES = {
+    "gtk": "\n".join(
+        (
+            "import webview",
+            "webview.initialize()",
+            "import gi",
+            "gi.require_version('Gdk', '3.0')",
+            "from gi.repository import Gdk",
+            "raise SystemExit(0 if Gdk.Display.get_default() is not None else 1)",
+        )
+    ),
+    "qt": "\n".join(
+        (
+            "import webview",
+            "webview.initialize()",
+            "from qtpy.QtWidgets import QApplication",
+            "app = QApplication.instance() or QApplication([])",
+            "raise SystemExit(0 if app.primaryScreen() is not None else 1)",
+        )
+    ),
+}
 
 
 def credential_free_environment():
@@ -34,6 +68,78 @@ def credential_free_environment():
     for key in _OWNER_ENV_KEYS:
         environment.pop(key, None)
     return environment
+
+
+def _linux_user_manager_environment() -> dict[str, str]:
+    """Read only graphical-session values exported by this user's systemd manager."""
+    if not sys.platform.startswith("linux"):
+        return {}
+    systemctl = shutil.which("systemctl", path="/usr/bin:/bin")
+    if systemctl is None:
+        return {}
+
+    environment = credential_free_environment()
+    runtime_dir = environment.get("XDG_RUNTIME_DIR")
+    if not runtime_dir and hasattr(os, "getuid"):
+        uid = os.getuid()
+        candidate = "/run/user/%d" % uid
+        try:
+            metadata = os.stat(candidate, follow_symlinks=False)
+        except OSError:
+            pass
+        else:
+            if stat.S_ISDIR(metadata.st_mode) and metadata.st_uid == uid:
+                runtime_dir = candidate
+                environment["XDG_RUNTIME_DIR"] = candidate
+    if runtime_dir and not environment.get("DBUS_SESSION_BUS_ADDRESS"):
+        bus = os.path.join(runtime_dir, "bus")
+        try:
+            metadata = os.stat(bus, follow_symlinks=False)
+        except OSError:
+            pass
+        else:
+            if stat.S_ISSOCK(metadata.st_mode) and metadata.st_uid == os.getuid():
+                environment["DBUS_SESSION_BUS_ADDRESS"] = "unix:path=" + bus
+
+    try:
+        result = subprocess.run(
+            [systemctl, "--user", "show-environment"],
+            stdin=subprocess.DEVNULL,
+            stdout=subprocess.PIPE,
+            stderr=subprocess.DEVNULL,
+            text=True,
+            timeout=_LINUX_GRAPHICAL_ENV_TIMEOUT_S,
+            env=environment,
+        )
+    except (OSError, subprocess.SubprocessError):
+        return {}
+    if result.returncode != 0:
+        return {}
+
+    allowed = set(_LINUX_GRAPHICAL_ENV_KEYS)
+    recovered = {}
+    for line in result.stdout.splitlines():
+        key, separator, value = line.partition("=")
+        if (
+            separator
+            and key in allowed
+            and value
+            and len(value) <= _LINUX_GRAPHICAL_ENV_MAX_CHARS
+            and all(ord(char) >= 0x20 and char != "\x7f" for char in value)
+        ):
+            recovered[key] = value
+    return recovered
+
+
+def _restore_linux_graphical_session_environment() -> bool:
+    """Fill graphical variables stripped by an Agent's MCP child policy."""
+    recovered = _linux_user_manager_environment()
+    changed = False
+    for key in _LINUX_GRAPHICAL_ENV_KEYS:
+        if not os.environ.get(key) and recovered.get(key):
+            os.environ[key] = recovered[key]
+            changed = True
+    return changed
 
 
 class WebviewState(str, Enum):
@@ -152,18 +258,28 @@ def tk_creation_blocked_reason() -> Optional[str]:
 
 
 def _ready_probe_state(
-    python: str, *, timeout_s: int = 30, avoid_gui_registration: bool = False
+    python: str,
+    *,
+    timeout_s: int = 30,
+    avoid_gui_registration: bool = False,
+    gui: Optional[str] = None,
 ) -> WebviewState:
     if avoid_gui_registration and gui_registration_blocked_reason() is not None:
         return WebviewState.NO_GUI_SESSION
     try:
+        environment = credential_free_environment()
+        if gui is not None:
+            environment["PYWEBVIEW_GUI"] = gui
+        probe_script = _LINUX_BACKEND_PROBES.get(
+            gui, "import webview; webview.initialize()"
+        )
         probe = subprocess.run(
-            [python, "-c", "import webview; webview.initialize()"],
+            [python, "-c", probe_script],
             stdin=subprocess.DEVNULL,
             stdout=subprocess.DEVNULL,
             stderr=subprocess.DEVNULL,
             timeout=timeout_s,
-            env=credential_free_environment(),
+            env=environment,
         )
     except Exception:  # aqg: top-level boundary — probe failures are classified, never raised
         return WebviewState.PROBE_FAILED
@@ -309,6 +425,22 @@ def prepare_webview(
 
 def ensure_webview(python: str, label: str = "de-popup", *, install_timeout_s: int = 300) -> bool:
     """Backward-compatible runtime helper returning only popup readiness."""
-    return prepare_webview(
+    if sys.platform.startswith("linux"):
+        _restore_linux_graphical_session_environment()
+    prepared = prepare_webview(
         python, label=label, install_timeout_s=install_timeout_s
-    ).ready
+    )
+    if not sys.platform.startswith("linux"):
+        return prepared.ready
+
+    requested = os.environ.get("PYWEBVIEW_GUI")
+    candidates = []
+    if requested in {"gtk", "qt"}:
+        candidates.append(requested)
+    candidates.extend(gui for gui in ("gtk", "qt") if gui not in candidates)
+    for gui in candidates:
+        if _ready_probe_state(python, gui=gui) is WebviewState.READY:
+            # The verified choice is inherited by the detached native shell.
+            os.environ["PYWEBVIEW_GUI"] = gui
+            return True
+    return False

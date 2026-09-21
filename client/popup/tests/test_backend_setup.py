@@ -16,6 +16,81 @@ class _Completed:
 
 
 class BackendSetupTests(unittest.TestCase):
+    def test_linux_restores_missing_graphical_environment_from_user_manager(self):
+        user_environment = _Completed(
+            0,
+            "DISPLAY=:1\n"
+            "WAYLAND_DISPLAY=wayland-0\n"
+            "XDG_RUNTIME_DIR=/run/user/1000\n"
+            "DE_ACTIVATION_SECRET=must-not-be-copied\n",
+        )
+        with (
+            mock.patch.object(backend.sys, "platform", "linux"),
+            mock.patch.object(backend.shutil, "which", return_value="/usr/bin/systemctl"),
+            mock.patch.object(backend.subprocess, "run", return_value=user_environment),
+            mock.patch.dict(os.environ, {}, clear=True),
+        ):
+            self.assertTrue(backend._restore_linux_graphical_session_environment())
+            self.assertEqual(os.environ.get("DISPLAY"), ":1")
+            self.assertEqual(os.environ.get("WAYLAND_DISPLAY"), "wayland-0")
+            self.assertEqual(os.environ.get("XDG_RUNTIME_DIR"), "/run/user/1000")
+            self.assertNotIn("DE_ACTIVATION_SECRET", os.environ)
+
+    def test_linux_backend_probe_requires_a_real_display_connection(self):
+        with mock.patch.object(
+            backend.subprocess, "run", return_value=_Completed(1)
+        ) as run:
+            result = backend._ready_probe_state("mcp-python", gui="gtk")
+
+        self.assertEqual(result, backend.WebviewState.BACKEND_UNAVAILABLE)
+        probe_script = run.call_args.args[0][2]
+        self.assertIn("Gdk.Display.get_default()", probe_script)
+
+    def test_linux_ensure_selects_a_verified_backend_for_the_popup_child(self):
+        ready = backend.WebviewResult(backend.WebviewState.READY)
+        selected = []
+
+        def probe(_python, *, timeout_s=30, avoid_gui_registration=False, gui=None):
+            del timeout_s, avoid_gui_registration
+            selected.append(gui)
+            return (
+                backend.WebviewState.READY
+                if gui == "qt"
+                else backend.WebviewState.BACKEND_UNAVAILABLE
+            )
+
+        with (
+            mock.patch.object(backend.sys, "platform", "linux"),
+            mock.patch.object(
+                backend, "_restore_linux_graphical_session_environment"
+            ),
+            mock.patch.object(backend, "prepare_webview", return_value=ready),
+            mock.patch.object(backend, "_ready_probe_state", side_effect=probe),
+            mock.patch.dict(os.environ, {}, clear=True),
+        ):
+            self.assertTrue(backend.ensure_webview("mcp-python"))
+            self.assertEqual(os.environ.get("PYWEBVIEW_GUI"), "qt")
+
+        self.assertEqual(selected, ["gtk", "qt"])
+
+    def test_linux_ensure_refuses_when_no_supported_backend_is_verified(self):
+        ready = backend.WebviewResult(backend.WebviewState.READY)
+        with (
+            mock.patch.object(backend.sys, "platform", "linux"),
+            mock.patch.object(
+                backend, "_restore_linux_graphical_session_environment"
+            ),
+            mock.patch.object(backend, "prepare_webview", return_value=ready),
+            mock.patch.object(
+                backend,
+                "_ready_probe_state",
+                return_value=backend.WebviewState.BACKEND_UNAVAILABLE,
+            ),
+            mock.patch.dict(os.environ, {}, clear=True),
+        ):
+            self.assertFalse(backend.ensure_webview("mcp-python"))
+            self.assertNotIn("PYWEBVIEW_GUI", os.environ)
+
     def test_all_webview_probes_strip_owner_credentials_from_children(self):
         secret = "owner_process_value"
         with (

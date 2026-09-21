@@ -34,9 +34,10 @@ class SkillFrontmatterCompatibilityTests(unittest.TestCase):
     def test_semantically_rewritten_descriptions_keep_canonical_routing_phrases(self):
         expected_phrases = {
             "audit-adjudication": (
-                "audit 结果整合",
-                "decide on audit results",
-                "synthesize prior audits",
+                "multiple completed audit results",
+                "same or different reviewers, rounds, or sessions",
+                "single result",
+                "needs-user-decision",
             ),
             "audit-explore": (
                 "vague, unformed idea",
@@ -55,7 +56,13 @@ class SkillFrontmatterCompatibilityTests(unittest.TestCase):
                 "TAM/SAM/SOM",
             ),
             "discussion-board": ("interactive discussion board", "board-based rearrangement"),
-            "graphic-explanation": ("用图解释一下", "draw a diagram to explain"),
+            "graphic-explanation": (
+                "/graphic-explanation",
+                "Use this skill",
+                "generated visual explanation to view",
+                "equivalent intent in any language",
+                "interactive artifact the user must edit and submit",
+            ),
             "layer-check": ("竞品层级", "layer check"),
         }
         for name, phrases in expected_phrases.items():
@@ -69,6 +76,21 @@ class SkillFrontmatterCompatibilityTests(unittest.TestCase):
 
     def test_audit_forecast_description_is_english_only(self):
         line = (ROOT / "skills" / "audit-forecast" / "SKILL.md").read_text(
+            encoding="utf-8"
+        ).splitlines()[2]
+        description = json.loads(line.removeprefix("description: "))
+        self.assertTrue(description.isascii())
+
+    def test_audit_adjudication_description_is_english_and_multi_result_first(self):
+        line = (ROOT / "skills" / "audit-adjudication" / "SKILL.md").read_text(
+            encoding="utf-8"
+        ).splitlines()[2]
+        description = json.loads(line.removeprefix("description: "))
+        self.assertTrue(description.isascii())
+        self.assertTrue(description.startswith("Consolidate multiple completed audit results"))
+
+    def test_graphic_explanation_description_is_english_only(self):
+        line = (ROOT / "skills" / "graphic-explanation" / "SKILL.md").read_text(
             encoding="utf-8"
         ).splitlines()[2]
         description = json.loads(line.removeprefix("description: "))

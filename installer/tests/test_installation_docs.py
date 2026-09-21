@@ -171,8 +171,14 @@ class InstallationDocsTestCase(unittest.TestCase):
                 "git clone https://github.com/deeppatternai/decision-engine.git",
                 body,
             )
-            self.assertNotIn("Linux", body)
-            self.assertNotIn("WSL", body)
+            self.assertIn("Linux", body)
+            self.assertIn("WSL", body)
+        self.assertIn("### Option 1:", english)
+        self.assertIn("### Option 2:", english)
+        self.assertIn("#### Linux desktop", english)
+        self.assertIn("### 方式一：", chinese)
+        self.assertIn("### 方式二：", chinese)
+        self.assertIn("#### Linux 桌面", chinese)
         self.assertNotIn("Expand all 16 products", english)
         self.assertNotIn("展开查看全部 16 个产品", chinese)
 

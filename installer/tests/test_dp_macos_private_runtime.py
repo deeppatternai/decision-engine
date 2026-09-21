@@ -29,8 +29,16 @@ class MacPrivateRuntimeContractTests(unittest.TestCase):
         self.assertIn('PRIVATE_RUNTIME_ARCH="aarch64"', self.source)
         self.assertIn('PRIVATE_RUNTIME_ARCH="x86_64"', self.source)
 
-        digests = re.findall(r'PRIVATE_RUNTIME_SHA256="([0-9a-f]{64})"', self.source)
-        sizes = re.findall(r'PRIVATE_RUNTIME_ASSET_SIZE="([0-9]+)"', self.source)
+        spec = shell_function(
+            self.source,
+            "select_private_runtime_spec",
+            "private_runtime_is_usable",
+        )
+        mac_spec = spec.split('if [ "$PLATFORM_FAMILY" = "macos" ]; then', 1)[1].split(
+            "\n  else\n", 1
+        )[0]
+        digests = re.findall(r'PRIVATE_RUNTIME_SHA256="([0-9a-f]{64})"', mac_spec)
+        sizes = re.findall(r'PRIVATE_RUNTIME_ASSET_SIZE="([0-9]+)"', mac_spec)
         self.assertEqual(len(digests), 2)
         self.assertEqual(len(set(digests)), 2)
         self.assertEqual(len(sizes), 2)
@@ -80,9 +88,10 @@ class MacPrivateRuntimeContractTests(unittest.TestCase):
             "The Deep Pattern private Python runtime is incomplete or invalid.", body
         )
         self.assertIn(
-            "Downloading about 25 MB into $PRIVATE_RUNTIME_ROOT without changing system Python.",
+            "Downloading $PRIVATE_RUNTIME_DOWNLOAD_LABEL into $PRIVATE_RUNTIME_ROOT without changing system Python.",
             body,
         )
+        self.assertIn('PRIVATE_RUNTIME_DOWNLOAD_LABEL="about 25 MB"', self.source)
 
     def test_every_install_uses_the_managed_python_entrypoint(self) -> None:
         selection_start = self.source.index('PYTHON_BIN=""\nif try_python "$MANAGED_PYTHON_BIN"')

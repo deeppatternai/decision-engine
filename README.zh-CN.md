@@ -1,6 +1,6 @@
 # Decision Engine
 
-[English](README.md) · **简体中文** · **v0.2.97**
+[English](README.md) · **简体中文** · **v0.2.98**
 
 > **一个你真正敢信的第二意见 —— 因为它来自许多个彼此独立的头脑，而不是一个模型在自我认同。**
 
@@ -232,6 +232,27 @@ bash ./dp-install.sh
 
 该脚本不接受命令行参数。
 
+#### Linux 桌面
+
+同一份 [dp-install.sh](dp-install.sh) 支持采用 glibc 的 Ubuntu 22.04/24.04
+LTS、Debian 12 和 Fedora 44 桌面系统；在所选 Runtime 可用时同时覆盖
+`x86_64` 与 `aarch64`：
+
+```bash
+bash ./dp-install.sh
+```
+
+必须以目标桌面普通用户运行安装器，不能整体使用 root。缺少系统依赖时，安装器会列出固定
+白名单，并在用户明确确认 `[Y/N]` 和 sudo 授权后使用 APT 或 DNF；不会添加软件源，也不会
+执行完整系统或发行版升级。Decision Engine 使用经过校验的私有 Python Runtime，不会替换
+系统 Python。
+
+原生图解、漫解和讨论板窗口已在 Ubuntu 24.04 ARM64、Debian 12 ARM64/x86_64、
+Fedora 44 ARM64 完成人工验收。Debian 12 ARM64 使用 GTK/WebKit；兼容的 Ubuntu、
+Debian x86_64 和 Fedora 使用固定版本的 Qt/WebEngine Runtime。Ubuntu 22.04 ARM64
+保留核心 MCP 与审核 Stop Panel，但不会自动配置原生可视窗口。该入口不支持无桌面 Linux、
+WSL、musl 发行版或其它发行版版本。
+
 #### 原生 Windows
 
 下载 [dp-install.ps1](dp-install.ps1)，然后在 64 位 Windows PowerShell 中运行：
@@ -243,13 +264,25 @@ powershell.exe -NoProfile -ExecutionPolicy Bypass -File .\dp-install.ps1
 两种方式都用于首次安装。若固定安装目录已经存在或安装曾经中断，请保留现有文件，按照安装器
 报告的恢复提示处理，不要手工覆盖或删除安装目录。
 
+### 卸载
+
+macOS 与 Linux 共用经过审查的卸载入口。它只删除可证明归属的宿主接线，并将受管状态隔离到
+带 SHA-256 清单的备份目录：
+
+```bash
+bash ./dp-uninstall.sh --scope both --apply
+```
+
+请先完全退出终端列出的 Agent 应用。卸载器不会自行关闭 Agent，也不会访问远程服务。
+
 ## 激活并使用
 
 Decision Engine 按设备绑定。上面的两种正式安装方式都会注册 MCP、配置 Skills、运行 Doctor，
 并在安装流程中处理永久配置；无需手工修改宿主配置或另外执行底层安装命令。
 
 macOS 上的永久配置会打开掩码 pywebview 桌面窗口；只有 pywebview 在原生注册前不可用时才回退 Tk。
-Windows 默认采用相同路径，但 WorkBuddy 会直接打开受支持的掩码 Tk 表单。用户只输入一次 owner
+Windows 默认采用相同路径，但 WorkBuddy 会直接打开受支持的掩码 Tk 表单。Linux 使用安装器选定并
+验证的 GTK 或 Qt 原生后端，以及签名源码内置的 Stopper fallback，不安装系统服务。用户只输入一次 owner
 endpoint 和 secret；每用户配置只保存 endpoint 和服务端签发的设备凭据，以后关闭终端、重启 Agent
 或重启电脑都无需重复输入。设备激活密钥不进入聊天、命令参数、环境变量或持久配置。
 

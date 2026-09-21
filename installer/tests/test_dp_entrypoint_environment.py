@@ -70,29 +70,38 @@ test "$code" = 17 || exit 98
 test "$GIT_DIR" = "$EXPECTED_GIT_DIR" || exit 99
 clean_exec env GIT_TERMINAL_PROMPT=0 /bin/sh -c 'test "$GIT_TERMINAL_PROMPT" = 0'
 '''
-        result = subprocess.run(['/bin/bash', '-c', script, 'test', sys.executable, '-I',
-                                 str(probe), self.git, str(self.root / 'actual')],
-                                env={**self.clean, **self.poison,
-                                     'EXPECTED_GIT_DIR': self.poison['GIT_DIR']},
-                                text=True, capture_output=True, timeout=20)
-        self.assertEqual(result.returncode, 0, result.stdout + result.stderr)
-        data = json.loads(result.stdout)
-        self.assertEqual(data['keys'], [])
-        self.assertEqual(data['origin'], 'https://example.invalid/actual')
+        for shell in ('/bin/bash', '/bin/zsh'):
+            with self.subTest(shell=shell):
+                result = subprocess.run(
+                    [shell, '-c', script, 'test', sys.executable, '-I',
+                     str(probe), self.git, str(self.root / 'actual')],
+                    env={**self.clean, **self.poison,
+                         'EXPECTED_GIT_DIR': self.poison['GIT_DIR']},
+                    text=True, capture_output=True, timeout=20,
+                )
+                self.assertEqual(result.returncode, 0, result.stdout + result.stderr)
+                data = json.loads(result.stdout)
+                self.assertEqual(data['keys'], [])
+                self.assertEqual(data['origin'], 'https://example.invalid/actual')
 
     @unittest.skipUnless(sys.platform == 'darwin', 'macOS shell entrypoint')
     def test_mac_uninstall_bootstrap_cleans_helper_and_descendant_git(self):
         source = (ROOT / 'dp-uninstall.sh').read_text()
         bootstrap = source.split("<<'PY'\n", 1)[0]
         harness = bootstrap + "<<'PY'\n" + self.probe() + '\nPY\n'
-        result = subprocess.run(['/bin/zsh', '-c', harness, 'test', self.git,
-                                 str(self.root / 'actual')],
-                                env={**self.clean, **self.poison, 'DE_AQG_PYTHON': sys.executable},
-                                text=True, capture_output=True, timeout=20)
-        self.assertEqual(result.returncode, 0, result.stdout + result.stderr)
-        data = json.loads(result.stdout)
-        self.assertEqual(data['keys'], [])
-        self.assertEqual(data['origin'], 'https://example.invalid/actual')
+        for shell in ('/bin/bash', '/bin/zsh'):
+            with self.subTest(shell=shell):
+                result = subprocess.run(
+                    [shell, '-c', harness, 'test', self.git,
+                     str(self.root / 'actual')],
+                    env={**self.clean, **self.poison,
+                         'DE_AQG_PYTHON': sys.executable},
+                    text=True, capture_output=True, timeout=20,
+                )
+                self.assertEqual(result.returncode, 0, result.stdout + result.stderr)
+                data = json.loads(result.stdout)
+                self.assertEqual(data['keys'], [])
+                self.assertEqual(data['origin'], 'https://example.invalid/actual')
 
     def test_powershell_boundaries_execute_against_real_git(self):
         pwsh = os.environ.get('DP_TEST_PWSH') or shutil.which('pwsh') or shutil.which('powershell.exe')
