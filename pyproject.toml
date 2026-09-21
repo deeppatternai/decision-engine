@@ -4,7 +4,7 @@ build-backend = "setuptools.build_meta"
 
 [project]
 name = "decision-engine-client"
-version = "0.2.98"
+version = "0.2.99"
 description = "Decision Engine thin client"
 requires-python = ">=3.12"
 license = "MIT"
