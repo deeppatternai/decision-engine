@@ -282,6 +282,8 @@ class LinuxInstallContractTests(unittest.TestCase):
             )
         )
         environment = os.environ.copy()
+        environment["LC_ALL"] = "C.UTF-8"
+        environment["DE_TEST_UTF8"] = "编码检查"
         if os.name == "nt":
             environment["PATH"] = (
                 str(Path(self.bash).parent) + os.pathsep + environment.get("PATH", "")
@@ -291,9 +293,11 @@ class LinuxInstallContractTests(unittest.TestCase):
             capture_output=True,
             env=environment,
             text=True,
+            encoding="utf-8",
             check=True,
         )
         self.assertIn("CLAUDE_SKILLS_DIR=/tmp/de-route-test/absent-claude-skills", result.stdout)
+        self.assertIn("DE_TEST_UTF8=编码检查", result.stdout)
 
     def test_linux_uses_in_process_stopper_without_installing_a_service(self) -> None:
         self.assertIn(

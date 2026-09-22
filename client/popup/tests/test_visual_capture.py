@@ -1225,11 +1225,169 @@ class VisualCaptureCapabilityTests(unittest.TestCase):
     @mock.patch.object(ns, "_IS_MAC", False)
     @mock.patch.object(ns, "_IS_WINDOWS", False)
     @mock.patch.object(ns, "_IS_LINUX", True)
+    def test_linux_native_snapshot_region_returns_bounded_data_url(self):
+        api = ns.PopupApi("/tmp/de-popup-test-result.json")
+        api._win = object()
+        request = [10, 20, 100, 50, 900, 640]
+        with (
+            mock.patch.object(ns, "_visual_capture_supported", return_value=True),
+            mock.patch.object(ns, "_snapshot_linux_png", return_value=self._png_bytes()) as capture,
+        ):
+            result = api.snapshot_region(request)
+        self.assertTrue(result["ok"])
+        self.assertTrue(result["image"].startswith("data:image/png;base64,"))
+        capture.assert_called_once_with(
+            api._win,
+            ((10.0, 20.0, 100.0, 50.0), (900.0, 640.0)),
+            strict_rect=True,
+        )
+
+    @mock.patch.object(ns, "_IS_MAC", False)
+    @mock.patch.object(ns, "_IS_WINDOWS", False)
+    @mock.patch.object(ns, "_IS_LINUX", True)
+    def test_linux_native_copy_and_share_use_the_same_viewport_crop(self):
+        api = ns.PopupApi("/tmp/de-popup-test-result.json")
+        api._win = object()
+        request = [10, 20, 100, 50, 900, 640]
+        with (
+            mock.patch.object(ns, "_visual_capture_supported", return_value=True),
+            mock.patch.object(ns, "_snapshot_linux_png", return_value=self._png_bytes()) as capture,
+            mock.patch.object(ns, "_copy_linux_png_to_clipboard", return_value=True) as copy,
+            mock.patch.object(ns, "_present_linux_share", return_value=True) as share,
+        ):
+            self.assertEqual(api.copy_visual_image(request), {"ok": True})
+            self.assertEqual(api.share_visual_image(request), {"ok": True})
+        self.assertEqual(capture.call_count, 2)
+        self.assertEqual(capture.call_args_list[0].args, (api._win, ((10.0, 20.0, 100.0, 50.0), (900.0, 640.0))))
+        self.assertEqual(capture.call_args_list[1].args, (api._win, ((10.0, 20.0, 100.0, 50.0), (900.0, 640.0))))
+        copy.assert_called_once()
+        share.assert_called_once()
+
+    @mock.patch.object(ns, "_IS_LINUX", True)
+    def test_linux_native_snapshot_rechecks_live_visual_geometry(self):
+        win = object()
+        request = ((10, 20, 100, 50), (900, 640))
+        visual = (10, 20, 100, 50, 10, 20, 100, 50, 900, 640)
+        changed = (11, 20, 100, 50, 11, 20, 100, 50, 900, 640)
+        with (
+            mock.patch.object(ns, "_linux_capture_geometry", side_effect=[visual, changed]),
+            mock.patch.object(ns, "_snapshot_linux_qt_png", return_value=self._png_bytes()),
+        ):
+            self.assertIsNone(ns._snapshot_linux_png(win, request))
+
+    def test_linux_region_rejects_crop_outside_visible_artifact(self):
+        win = object()
+        geometry = [0, 0, 200, 100, 10, 10, 180, 80, 900, 640]
+        with mock.patch.object(ns, "_evaluate_windows_js_bounded", return_value=geometry):
+            self.assertIsNone(ns._linux_capture_geometry(win, ((0, 0, 50, 50), (900, 640)), True))
+            self.assertEqual(
+                ns._linux_capture_geometry(win, ((20, 20, 50, 50), (900, 640)), True),
+                tuple(geometry),
+            )
+
+    def test_linux_capture_request_requires_exact_viewport_shape(self):
+        self.assertIsNone(ns._norm_linux_capture_request([10, 20, 100, 50]))
+        self.assertIsNone(ns._norm_linux_capture_request([10, 20, 100, 50, 900, 640, 1]))
+        self.assertEqual(
+            ns._norm_linux_capture_request([10, 20, 100, 50, 900, 640]),
+            ((10.0, 20.0, 100.0, 50.0), (900.0, 640.0)),
+        )
+
+    def test_linux_gui_call_times_out_and_late_callback_is_one_shot(self):
+        scheduled = []
+        result = ns._run_linux_gui_call(
+            lambda callback: scheduled.append(callback), lambda: True, timeout=0.1
+        )
+        self.assertIsNone(result)
+        self.assertEqual(len(scheduled), 1)
+        self.assertFalse(scheduled[0]())
+
+    def test_linux_gtk_capture_requires_native_window_binding(self):
+        from types import SimpleNamespace
+
+        win = SimpleNamespace(uid="popup-1", native=None)
+        with mock.patch.dict(sys.modules, {"gi": None}):
+            self.assertIsNone(ns._snapshot_linux_gtk_png(win, ((10, 20, 100, 50), (900, 640))))
+
+    @mock.patch.object(ns, "_IS_LINUX", True)
+    def test_linux_copy_requires_rect_to_avoid_full_popup_capture(self):
+        api = ns.PopupApi("/tmp/de-popup-test-result.json")
+        with mock.patch.object(ns, "_visual_capture_supported", return_value=True):
+            self.assertEqual(api.copy_visual_image(), {"ok": False})
+            self.assertEqual(api.share_visual_image(), {"ok": False})
+
+    @mock.patch.object(ns, "_IS_MAC", False)
+    @mock.patch.object(ns, "_IS_WINDOWS", False)
+    @mock.patch.object(ns, "_IS_LINUX", True)
     def test_linux_copy_visual_image_data_url_dispatches_to_clipboard_helper(self):
         api = ns.PopupApi("/tmp/de-popup-test-result.json")
         with mock.patch.object(ns, "_copy_linux_png_to_clipboard", return_value=True) as copy:
             self.assertEqual(api.copy_visual_image_data_url(self._png_data_url()), {"ok": True})
         self.assertTrue(copy.call_args.args[0].startswith(b"\x89PNG\r\n\x1a\n"))
+
+    @mock.patch.object(ns, "_IS_LINUX", True)
+    def test_linux_clipboard_prefers_qt_before_gtk(self):
+        with (
+            mock.patch.object(ns, "_copy_linux_qt_png_to_clipboard", return_value=True) as qt_copy,
+            mock.patch.dict(sys.modules, {"gi": None}),
+        ):
+            self.assertTrue(ns._copy_linux_png_to_clipboard(self._png_bytes()))
+        qt_copy.assert_called_once()
+
+    def test_linux_gtk_capture_resolves_webview_from_browser_instances(self):
+        from types import SimpleNamespace
+
+        native = object()
+        win = SimpleNamespace(uid="popup-1", native=native)
+        pixbuf = mock.Mock()
+        pixbuf.get_width.return_value = 900
+        pixbuf.get_height.return_value = 640
+        pixbuf.new_subpixbuf.return_value = pixbuf
+        pixbuf.save_to_bufferv.return_value = (True, self._png_bytes())
+        widget = mock.Mock()
+        widget.get_allocated_width.return_value = 900
+        widget.get_allocated_height.return_value = 640
+        browser = SimpleNamespace(window=native, webview=widget)
+        browser_module = SimpleNamespace(BrowserView=SimpleNamespace(instances={win.uid: browser}))
+        repository = SimpleNamespace(Gdk=SimpleNamespace(pixbuf_get_from_window=mock.Mock(return_value=pixbuf)), GLib=SimpleNamespace())
+        gi = SimpleNamespace(require_version=mock.Mock(), repository=repository)
+
+        def run(_schedule, callback, timeout):
+            return callback()
+
+        with (
+            mock.patch.dict(sys.modules, {"gi": gi, "gi.repository": repository, "webview.platforms.gtk": browser_module}),
+            mock.patch.object(ns, "_run_linux_gui_call", side_effect=run),
+        ):
+            png = ns._snapshot_linux_gtk_png(win, ((10, 20, 100, 50), (900, 640)))
+        self.assertEqual(png, self._png_bytes())
+        pixbuf.new_subpixbuf.assert_called_once_with(10, 20, 100, 50)
+        repository.Gdk.pixbuf_get_from_window.assert_called_once_with(widget.get_window.return_value, 0, 0, 900, 640)
+
+    @mock.patch.object(ns, "_IS_LINUX", True)
+    def test_linux_gtk_clipboard_runs_on_scheduled_gui_callback(self):
+        from types import SimpleNamespace
+
+        scheduled = []
+        pixbuf = object()
+        loader = mock.Mock()
+        loader.get_pixbuf.return_value = pixbuf
+        clipboard = mock.Mock()
+        repository = SimpleNamespace(
+            Gdk=SimpleNamespace(SELECTION_CLIPBOARD=object()),
+            GdkPixbuf=SimpleNamespace(PixbufLoader=SimpleNamespace(new_with_type=mock.Mock(return_value=loader))),
+            GLib=SimpleNamespace(idle_add=lambda callback: scheduled.append(callback)),
+            Gtk=SimpleNamespace(Clipboard=SimpleNamespace(get=mock.Mock(return_value=clipboard))),
+        )
+        gi = SimpleNamespace(require_version=mock.Mock(), repository=repository)
+        with (
+            mock.patch.object(ns, "_copy_linux_qt_png_to_clipboard", return_value=False),
+            mock.patch.dict(sys.modules, {"gi": gi, "gi.repository": repository}),
+            mock.patch.object(ns, "_run_linux_gui_call", side_effect=lambda schedule, callback: (schedule(callback), scheduled.pop()())[1]),
+        ):
+            self.assertTrue(ns._copy_linux_png_to_clipboard(self._png_bytes()))
+        clipboard.set_image.assert_called_once_with(pixbuf)
+        clipboard.store.assert_called_once_with()
 
     @mock.patch.object(ns, "_IS_MAC", False)
     @mock.patch.object(ns, "_IS_WINDOWS", False)

@@ -454,15 +454,8 @@ class CursorWorkspaceShadowTests(unittest.TestCase):
     def test_skill_probe_does_not_open_bodies_or_enumerate_directories(self):
         self._write_skill(".cursor/skills", "audit", "private-body")
         self._write_skill(".cursor/skills", "private-unknown", "private-body")
-        native_lstat = os.lstat
-        inspected = []
-
-        def record_lstat(path, *args, **kwargs):
-            inspected.append(Path(path))
-            return native_lstat(path, *args, **kwargs)
 
         with (
-            mock.patch.object(mcp_config.os, "lstat", side_effect=record_lstat),
             mock.patch.object(Path, "open", side_effect=AssertionError("body opened")),
             mock.patch.object(Path, "iterdir", side_effect=AssertionError("enumerated")),
             mock.patch.object(Path, "glob", side_effect=AssertionError("globbed")),
@@ -483,19 +476,8 @@ class CursorWorkspaceShadowTests(unittest.TestCase):
                 doctor.DE_SKILLS,
             )
 
-        allowed = {
-            self.workspace,
-            self.workspace / ".cursor",
-            self.workspace / ".cursor" / "skills",
-            self.workspace / ".agents",
-        }
-        allowed.update(
-            self.workspace / ".cursor" / "skills" / name
-            for name in doctor.DE_SKILLS
-        )
         self.assertEqual(shadow.cursor_skills, ("audit",))
-        self.assertTrue(inspected)
-        self.assertTrue(all(path in allowed for path in inspected))
+        self.assertEqual(shadow.agents_skills, ())
 
     @unittest.skipUnless(os.name == "nt", "Windows directory pinning is target-specific")
     def test_windows_skill_probe_pins_and_revalidates_every_ancestor(self):

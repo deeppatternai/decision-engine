@@ -40,6 +40,7 @@ import time
 from typing import Any, Dict, List, Optional
 
 from client import i18n, runner, tk_icon
+from client.tk_fonts import resolve_linux_tk_fonts
 
 # ── constants (mirror the Swift panel) ───────────────────────────────────────────────────────
 TERMINAL_STATUSES = {"completed", "partial", "failed", "cancelled"}
@@ -779,32 +780,87 @@ class _RoundedActionButton:
         self._paint()
 
 
-# ── the tkinter app ──────────────────────────────────────────────────────────────────────────
+class _NativeActionButton:
+    """Linux action button that delegates text painting and DPI handling to Tk.
+
+    Fedora's Tk/X11 stack has rendered the Canvas-backed control as an empty rectangle on real
+    desktops even though its hidden semantic button still existed. The native widget is less
+    decorative, but reliably paints its label and handles desktop scaling itself.
+    """
+
+    def __init__(
+        self, tk: Any, parent: Any, command: Any, *, font_family: str,
+    ) -> None:
+        self.button = tk.Button(
+            parent,
+            text="",
+            command=command,
+            width=11,
+            padx=10,
+            pady=7,
+            bg=BTN_FINISHED,
+            fg=FG_MUTED,
+            disabledforeground=FG_MUTED,
+            activebackground=BTN_FINISHED,
+            activeforeground=FG_MUTED,
+            relief="flat",
+            overrelief="flat",
+            bd=0,
+            highlightthickness=1,
+            highlightbackground=BG,
+            highlightcolor=FG_TEXT,
+            takefocus=False,
+            state="disabled",
+            font=(font_family, 11, "bold"),
+        )
+
+    def pack(self, **options: Any) -> None:
+        self.button.pack(**options)
+
+    def configure(self, **options: Any) -> None:
+        options.pop("showicon", None)
+        state = options.get("state", self.button.cget("state"))
+        options["takefocus"] = state != "disabled"
+        self.button.configure(**options)
+
+    config = configure
+
+    def cget(self, name: str) -> Any:
+        return self.button.cget(name)
+
+    def invoke(self) -> Any:
+        return self.button.invoke()
+
+
+# ── shared state + tkinter app ───────────────────────────────────────────────────────────────
+def initialize_panel_state(app: Any) -> None:
+    """Initialize renderer-independent audit state for Tk and Linux WebView hosts."""
+    app.runs = {}
+    app._frozen = {}
+    app._auditor_frozen = {}
+    app._polling = set()
+    app._cancel_inflight = set()
+    # Disk state is only a discovery seed. A queued row is cancellable only after this process
+    # has confirmed it with the hub, preventing stale registry data from re-enabling STOP.
+    app._server_verified = set()
+    # A cancel transition bumps this generation so older in-flight GETs cannot regress state.
+    app._state_epochs = {}
+    app._not_found_polls = {}   # run_id -> consecutive hub 404s (reap streak)
+    # Poll pacing is renderer-independent even though both frontends repaint once a second.
+    app._next_poll_at = {}
+    app._poll_failures = {}
+    app._auth_failures = {}
+    app._retired = set()
+    app._lock = threading.Lock()
+    app._no_runs_since = None
+
+
 class StopPanelApp:
     def __init__(self) -> None:
         import tkinter as tk  # lazy: keeps module import GUI-free
 
         self._tk = tk
-        self.runs: Dict[str, Dict[str, Any]] = {}
-        self._frozen: Dict[str, float] = {}
-        self._auditor_frozen: Dict[str, float] = {}
-        self._polling: set = set()
-        self._cancel_inflight: set = set()
-        # Disk state is only a discovery seed. A queued row is cancellable only after this process
-        # has confirmed it with the hub, preventing stale registry data from re-enabling STOP.
-        self._server_verified: set = set()
-        # A cancel transition bumps this generation so older in-flight GETs cannot regress state.
-        self._state_epochs: Dict[str, int] = {}
-        self._not_found_polls: Dict[str, int] = {}   # run_id → consecutive hub 404s (reap streak)
-        # Poll pacing, per run. The tick below stays at 1 Hz because it also draws the live
-        # elapsed clock; these gate the REQUEST so a hub suggestion, or a failing hub, can slow
-        # it down without freezing the display.
-        self._next_poll_at: Dict[str, float] = {}    # run_id → earliest next request time
-        self._poll_failures: Dict[str, int] = {}     # run_id → consecutive failed polls (backoff)
-        self._auth_failures: Dict[str, int] = {}     # run_id → consecutive 401/403 (stop streak)
-        self._retired: set = set()   # run_ids shown to completion + pruned — never re-seed from disk
-        self._lock = threading.Lock()
-        self._no_runs_since: Optional[float] = None
+        initialize_panel_state(self)
         self._rows: Dict[str, Dict[str, Any]] = {}
         self._row_order: List[str] = []
         self._empty_label = None
@@ -813,6 +869,10 @@ class StopPanelApp:
         # and without our own the taskbar button shows Python's icon rather than this window's.
         tk_icon.claim_app_identity()
         self.root = tk.Tk()
+        if sys.platform.startswith("linux"):
+            self._ui_font, self._mono_font = resolve_linux_tk_fonts(self.root)
+        else:
+            self._ui_font, self._mono_font = _UI, _MONO
         # Panel chrome → host locale (like the empty-state label at _create_row), not any single run.
         shell_titles = i18n.shell(i18n.resolve_locale(None)).get("surface_title", {})
         audit_title = shell_titles.get("audit", "Decision Engine") if isinstance(shell_titles, dict) else "Decision Engine"
@@ -1247,31 +1307,41 @@ class StopPanelApp:
         row = tk.Frame(self.body, bg=BG)
         # Build children while the row is still unpacked, then configure the real state before the
         # row becomes visible. This avoids the Windows default-button white flash on first paint.
-        button = _RoundedActionButton(
-            tk, row, command=lambda rid=row_key: self._stop(rid),
-        )
+        if sys.platform.startswith("linux"):
+            button = _NativeActionButton(
+                tk,
+                row,
+                command=lambda rid=row_key: self._stop(rid),
+                font_family=self._ui_font,
+            )
+        else:
+            button = _RoundedActionButton(
+                tk, row, command=lambda rid=row_key: self._stop(rid),
+            )
         button.pack(side="left", padx=(0, 12), anchor="n")
         text = tk.Frame(row, bg=BG)
         text.pack(side="left", fill="x", expand=True)
-        title = tk.Label(text, bg=BG, fg=FG_TEXT, font=(_UI, 15, "bold"),
+        title = tk.Label(text, bg=BG, fg=FG_TEXT, font=(self._ui_font, 15, "bold"),
                          anchor="w", justify="left")
         title.pack(anchor="w")
         audit_id_row = tk.Frame(text, bg=BG)
         audit_id_label = tk.Label(
             # Column label is fixed chrome (same for every row) → host locale, like the window title.
             audit_id_row, text=i18n.panel(i18n.resolve_locale(None))["id_label"],
-            bg=BG, fg=FG_MUTED, font=(_UI, 10),
+            bg=BG, fg=FG_MUTED, font=(self._ui_font, 10),
             anchor="w", justify="left",
         )
         audit_id_label.pack(side="left", padx=(0, 7))
         audit_id = tk.Entry(
             audit_id_row, bg=BG, readonlybackground=BG, fg=FG_MUTED,
-            font=(_MONO, 10), relief="flat", bd=0, highlightthickness=0,
+            font=(self._mono_font, 10), relief="flat", bd=0, highlightthickness=0,
             selectbackground="#5B5A55", selectforeground=FG_TEXT,
             insertbackground=FG_TEXT, cursor="xterm", takefocus=True,
         )
         audit_id.pack(side="left", fill="x", expand=True)
-        detail = tk.Label(text, bg=BG, font=(_UI, 12), anchor="w", justify="left")
+        detail = tk.Label(
+            text, bg=BG, font=(self._ui_font, 12), anchor="w", justify="left",
+        )
         detail.pack(anchor="w")
         auditor_details = tk.Frame(text, bg=BG)
         return {
@@ -1349,7 +1419,7 @@ class StopPanelApp:
         for index, detail in enumerate(details):
             if index >= len(labels):
                 label = self._tk.Label(
-                    frame, bg=BG, font=(_UI, 12), anchor="w", justify="left",
+                    frame, bg=BG, font=(self._ui_font, 12), anchor="w", justify="left",
                 )
                 label.pack(anchor="w")
                 labels.append(label)
@@ -1375,7 +1445,12 @@ class StopPanelApp:
                 # decision point, with no explicit run tag) instead of a hardcoded language.
                 empty_text = i18n.panel(i18n.resolve_locale(None))["empty"]
                 self._empty_label = tk.Label(
-                    self.body, text=empty_text, bg=BG, fg=FG_MUTED, font=(_UI, 13))
+                    self.body,
+                    text=empty_text,
+                    bg=BG,
+                    fg=FG_MUTED,
+                    font=(self._ui_font, 13),
+                )
                 self._empty_label.pack(anchor="w")
             self.body.after_idle(self._sync_scroll_region)
             return
@@ -1498,5 +1573,3 @@ def _auditor_display_text(
 
 if __name__ == "__main__":
     raise SystemExit(main())
-
-

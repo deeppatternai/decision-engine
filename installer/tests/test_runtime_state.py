@@ -640,7 +640,11 @@ class RuntimeGitCleanTests(unittest.TestCase):
                 path = root / relative
                 path.parent.mkdir(parents=True, exist_ok=True)
                 path.write_text("generated", encoding="utf-8")
-            (root / "unknown.keep").write_text("user data", encoding="utf-8")
+            unknown_files = ("unknown.keep", "nested/unknown.keep")
+            for relative in unknown_files:
+                path = root / relative
+                path.parent.mkdir(parents=True, exist_ok=True)
+                path.write_text("user data", encoding="utf-8")
             nested_metadata = (
                 "nested/Thumbs.db",
                 "nested/desktop.ini",
@@ -652,7 +656,7 @@ class RuntimeGitCleanTests(unittest.TestCase):
             for relative in nested_metadata:
                 path = root / relative
                 path.parent.mkdir(parents=True, exist_ok=True)
-                path.write_text("user-authored or nested", encoding="utf-8")
+                path.write_text("generated", encoding="utf-8")
 
             result = subprocess.run(
                 ["git", "-C", str(root), "status", "--porcelain", "--untracked-files=all"],
@@ -663,11 +667,12 @@ class RuntimeGitCleanTests(unittest.TestCase):
             )
 
         reported = {line[3:] for line in result.stdout.splitlines() if line.startswith("?? ")}
-        self.assertIn("unknown.keep", reported)
+        for relative in unknown_files:
+            self.assertIn(relative, reported)
         for relative in generated:
             self.assertNotIn(relative, reported)
         for relative in nested_metadata:
-            self.assertIn(relative, reported)
+            self.assertNotIn(relative, reported)
 
 
 if __name__ == "__main__":

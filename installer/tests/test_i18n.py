@@ -140,7 +140,8 @@ class DetectSystemLocaleTests(unittest.TestCase):
     def test_windows_ui_language_beats_posix_lang(self):
         # REGRESSION: zh-CN Windows + Git Bash LANG=en_US.UTF-8 must resolve zh-CN, not en-US.
         self._clear_env()
-        with mock.patch.object(i18n.os, "name", "nt"), \
+        with mock.patch.object(i18n.sys, "platform", "win32"), \
+             mock.patch.object(i18n.os, "name", "nt"), \
              mock.patch.dict("os.environ", {"LANG": "en_US.UTF-8"}), \
              mock.patch.object(i18n, "_detect_windows_ui_language", return_value="zh-CN"):
             self.assertEqual(i18n.detect_system_locale(), "zh-CN")
@@ -148,7 +149,8 @@ class DetectSystemLocaleTests(unittest.TestCase):
     def test_windows_falls_back_to_env_when_ui_probe_none(self):
         # Windows probe unreadable (returns None) → the POSIX env group is still honored.
         self._clear_env()
-        with mock.patch.object(i18n.os, "name", "nt"), \
+        with mock.patch.object(i18n.sys, "platform", "win32"), \
+             mock.patch.object(i18n.os, "name", "nt"), \
              mock.patch.dict("os.environ", {"LANG": "zh_CN.UTF-8"}), \
              mock.patch.object(i18n, "_detect_windows_ui_language", return_value=None):
             self.assertEqual(i18n.detect_system_locale(), "zh-CN")
@@ -156,7 +158,8 @@ class DetectSystemLocaleTests(unittest.TestCase):
     def test_detect_other_windows_lang_falls_through_to_env(self):
         # A ja-JP Windows (probe returns None for non-zh/non-en) must not swallow a usable env tag.
         self._clear_env()
-        with mock.patch.object(i18n.os, "name", "nt"), \
+        with mock.patch.object(i18n.sys, "platform", "win32"), \
+             mock.patch.object(i18n.os, "name", "nt"), \
              mock.patch.dict("os.environ", {"LANG": "en_US.UTF-8"}), \
              mock.patch.object(i18n, "_detect_windows_ui_language", return_value=None):
             self.assertEqual(i18n.detect_system_locale(), "en-US")
@@ -164,7 +167,8 @@ class DetectSystemLocaleTests(unittest.TestCase):
     def test_detect_non_windows_keeps_env_first(self):
         # Off Windows the Windows probe is never consulted; POSIX env stays authoritative.
         self._clear_env()
-        with mock.patch.object(i18n.os, "name", "posix"), \
+        with mock.patch.object(i18n.sys, "platform", "linux"), \
+             mock.patch.object(i18n.os, "name", "posix"), \
              mock.patch.dict("os.environ", {"LANG": "en_US.UTF-8"}):
             self.assertEqual(i18n.detect_system_locale(), "en-US")
 
@@ -172,7 +176,8 @@ class DetectSystemLocaleTests(unittest.TestCase):
         # Linux / WSL: C.UTF-8 is still "no language signal", so if every locale env is C-like the
         # resolver must stop before the stdlib fallback can manufacture English.
         self._clear_env()
-        with mock.patch.object(i18n.os, "name", "posix"), \
+        with mock.patch.object(i18n.sys, "platform", "linux"), \
+             mock.patch.object(i18n.os, "name", "posix"), \
              mock.patch.dict("os.environ", {
                  "LC_ALL": "C.UTF-8",
                  "LC_CTYPE": "C.UTF-8",
@@ -186,7 +191,8 @@ class DetectSystemLocaleTests(unittest.TestCase):
     def test_linux_language_list_skips_a_c_like_lead_in(self):
         # LANGUAGE is a priority list; a C-like first entry must not block a later supported tag.
         self._clear_env()
-        with mock.patch.object(i18n.os, "name", "posix"), \
+        with mock.patch.object(i18n.sys, "platform", "linux"), \
+             mock.patch.object(i18n.os, "name", "posix"), \
              mock.patch.dict("os.environ", {"LANGUAGE": "C.UTF-8:zh_CN.UTF-8"}):
             self.assertEqual(i18n.detect_system_locale(), "zh-CN")
 
@@ -194,7 +200,8 @@ class DetectSystemLocaleTests(unittest.TestCase):
         # LC_ALL is the deliberate "override everything" hammer (Git Bash never injects it) and must
         # beat the Windows UI probe, so an operator can still force English on a zh-CN Windows.
         self._clear_env()
-        with mock.patch.object(i18n.os, "name", "nt"), \
+        with mock.patch.object(i18n.sys, "platform", "win32"), \
+             mock.patch.object(i18n.os, "name", "nt"), \
              mock.patch.dict("os.environ", {"LC_ALL": "en_US.UTF-8"}), \
              mock.patch.object(i18n, "_detect_windows_ui_language", return_value="zh-CN"):
             self.assertEqual(i18n.detect_system_locale(), "en-US")
@@ -203,7 +210,8 @@ class DetectSystemLocaleTests(unittest.TestCase):
         # LC_CTYPE is injectable (Git Bash sets it), so it must NOT beat the Windows UI probe —
         # otherwise the injected-tag bug this reorder fixes would reappear via LC_CTYPE.
         self._clear_env()
-        with mock.patch.object(i18n.os, "name", "nt"), \
+        with mock.patch.object(i18n.sys, "platform", "win32"), \
+             mock.patch.object(i18n.os, "name", "nt"), \
              mock.patch.dict("os.environ", {"LC_CTYPE": "en_US.UTF-8"}), \
              mock.patch.object(i18n, "_detect_windows_ui_language", return_value="zh-CN"):
             self.assertEqual(i18n.detect_system_locale(), "zh-CN")
@@ -216,7 +224,8 @@ class DetectSystemLocaleTests(unittest.TestCase):
         self._clear_env()
         import os
         os.environ.pop("DE_UI_LOCALE", None)
-        with mock.patch.object(i18n.os, "name", "nt"), \
+        with mock.patch.object(i18n.sys, "platform", "win32"), \
+             mock.patch.object(i18n.os, "name", "nt"), \
              mock.patch.dict("os.environ", {"LANG": "en_US.UTF-8"}), \
              mock.patch.object(i18n, "_detect_windows_ui_language", return_value="zh-CN"):
             self.assertEqual(i18n.accept_language(), "zh-CN")

@@ -24,6 +24,7 @@ import html
 import json
 import os
 import re
+import subprocess
 import sys
 import threading
 from dataclasses import dataclass
@@ -1211,9 +1212,12 @@ def _show_gui_message(title: str, message: str, *, error: bool = False) -> None:
         # took the exit code with it, so even a SUCCESSFUL activation looked like a failed
         # install, and a failed one lost its error dialog on top of the real error.
         return
+    if sys.platform.startswith("linux") and _show_linux_webview_message(
+        title, message, error=error
+    ):
+        return
     try:
         import tkinter as tk
-        from tkinter import messagebox
     except ImportError:
         return
     _claim_app_identity()
@@ -1221,15 +1225,142 @@ def _show_gui_message(title: str, message: str, *, error: bool = False) -> None:
         root = tk.Tk()
     except tk.TclError:
         return
-    root.withdraw()
     _apply_window_icon(root, title)
     try:
-        if error:
-            messagebox.showerror(title, message, parent=root)
+        if sys.platform.startswith("linux"):
+            _show_linux_gui_message(root, tk, title, message, error=error)
         else:
-            messagebox.showinfo(title, message, parent=root)
+            from tkinter import messagebox
+
+            root.withdraw()
+            if error:
+                messagebox.showerror(title, message, parent=root)
+            else:
+                messagebox.showinfo(title, message, parent=root)
     finally:
-        root.destroy()
+        try:
+            root.destroy()
+        except tk.TclError:
+            pass
+
+
+def _show_linux_webview_message(title: str, message: str, *, error: bool) -> bool:
+    """Render Linux result copy in a fresh WebView process; return whether it opened."""
+    try:
+        from client.popup import backend as popup_backend
+
+        environment = popup_backend.credential_free_environment()
+        for key, value in popup_backend._linux_user_manager_environment().items():
+            if not environment.get(key):
+                environment[key] = value
+        strings = _setup_strings()
+        payload = json.dumps(
+            {
+                "title": title,
+                "message": message,
+                "error": bool(error),
+                "button": "确定" if strings.get("html_lang") == "zh-Hans" else "OK",
+                "lang": strings.get("html_lang", "en"),
+            },
+            ensure_ascii=True,
+        )
+        result = subprocess.run(
+            [sys.executable, "-m", "installer.linux_gui_message"],
+            cwd=str(Path(__file__).resolve().parents[1]),
+            input=payload,
+            text=True,
+            stdout=subprocess.DEVNULL,
+            stderr=subprocess.PIPE,
+            env=environment,
+            check=False,
+        )
+    except (OSError, TypeError, ValueError, subprocess.SubprocessError):
+        return False
+    if result.returncode != 0:
+        print(
+            "de-permanent-setup: Linux result WebView exited with status %d; "
+            "using the Tk fallback" % result.returncode,
+            file=sys.stderr,
+        )
+        return False
+    return True
+
+
+def _show_linux_gui_message(root, tk, title: str, message: str, *, error: bool) -> None:
+    """Show a predictable Linux result dialog with a Tk-enumerated CJK font."""
+    from client.tk_fonts import resolve_linux_tk_fonts
+
+    ui_font, _mono_font = resolve_linux_tk_fonts(root)
+    background = "#F4F6FA"
+    surface = "#FFFFFF"
+    text_color = "#172B4D"
+    muted_color = "#526174"
+    accent = "#B42318" if error else "#238636"
+    button_text = "确定" if _setup_strings().get("html_lang") == "zh-Hans" else "OK"
+
+    root.withdraw()
+    root.title(title)
+    root.configure(bg=background)
+    root.resizable(False, False)
+    root.protocol("WM_DELETE_WINDOW", root.destroy)
+
+    header = tk.Frame(root, bg=accent, width=6)
+    header.pack(side="left", fill="y")
+    content = tk.Frame(root, bg=surface, padx=26, pady=22)
+    content.pack(side="left", fill="both", expand=True)
+
+    tk.Label(
+        content,
+        text=title,
+        bg=surface,
+        fg=text_color,
+        font=(ui_font, 15, "bold"),
+        anchor="w",
+        justify="left",
+    ).pack(fill="x", anchor="w")
+    tk.Label(
+        content,
+        text=message,
+        bg=surface,
+        fg=muted_color,
+        font=(ui_font, 11),
+        anchor="w",
+        justify="left",
+        wraplength=430,
+    ).pack(fill="x", anchor="w", pady=(12, 20))
+    button = tk.Button(
+        content,
+        text=button_text,
+        command=root.destroy,
+        width=10,
+        padx=12,
+        pady=6,
+        bg="#2F6FEB",
+        fg="#FFFFFF",
+        activebackground="#2459BD",
+        activeforeground="#FFFFFF",
+        relief="flat",
+        bd=0,
+        highlightthickness=1,
+        highlightbackground="#2F6FEB",
+        highlightcolor="#173F86",
+        font=(ui_font, 11, "bold"),
+        cursor="hand2",
+    )
+    button.pack(anchor="e")
+
+    root.bind("<Escape>", lambda _event: root.destroy())
+    root.bind("<Return>", lambda _event: button.invoke())
+    root.update_idletasks()
+    width = max(460, root.winfo_reqwidth())
+    height = max(210, root.winfo_reqheight())
+    left = max(0, (root.winfo_screenwidth() - width) // 2)
+    top = max(0, (root.winfo_screenheight() - height) // 2)
+    root.geometry(f"{width}x{height}+{left}+{top}")
+    root.deiconify()
+    root.lift()
+    button.focus_set()
+    root.mainloop()
 
 
 def run_permanent_setup(

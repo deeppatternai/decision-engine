@@ -1913,6 +1913,10 @@ pid_path = Path(sys.argv[3])
 pid_temp = pid_path.with_suffix('.tmp')
 pid_temp.write_text(str(os.getpid()), encoding='ascii')
 os.replace(pid_temp, pid_path)
+ready_path = Path(sys.argv[5])
+ready_temp = ready_path.with_suffix('.tmp')
+ready_temp.write_text(json.dumps({'ok': True}), encoding='utf-8')
+os.replace(ready_temp, ready_path)
 
 def watchdog():
     time.sleep(15)
@@ -1994,7 +1998,8 @@ os.replace(temp_result, result_path)
                     "child_command.append(str(os.getpid()))",
                     f"child_command.append({str(child_pid_path)!r})",
                     f"child_command.append({str(child_ack_path)!r})",
-                    "with mock.patch.object(backend,'ensure_webview',return_value=True), mock.patch.object(launcher,'build_shell_command',return_value=child_command):",
+                    "def build_shell_command(*args,**kwargs): return child_command + [kwargs['ready_path']]",
+                    "with mock.patch.object(backend,'ensure_webview',return_value=True), mock.patch.object(launcher,'build_shell_command',side_effect=build_shell_command):",
                     "    outcome=session.spawn('<html>safe</html>','Synthetic',chat_bootstrap={'schema_version':1,'kind':'ge-chat','route':'server','endpoint':sys.argv[1],'device_token':token,'run_id':'run_detached'})",
                     "print(json.dumps(outcome))",
                 )

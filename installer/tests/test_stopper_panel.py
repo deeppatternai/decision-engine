@@ -187,6 +187,8 @@ class RenderReconciliationTests(unittest.TestCase):
     def _app(self):
         app = object.__new__(panel.StopPanelApp)
         app._tk = _FakeTk
+        app._ui_font = panel._UI
+        app._mono_font = panel._MONO
         app.body = _FakeWidget()
         app.runs = {
             "registry-real": {
@@ -733,6 +735,10 @@ class RealTkTaskScrollTests(unittest.TestCase):
         self.assertTrue(app._empty_label.winfo_ismapped())
 
 
+@unittest.skipUnless(
+    os.environ.get("DE_RUN_VISIBLE_GUI_TESTS") == "1",
+    "real Tk window requires DE_RUN_VISIBLE_GUI_TESTS=1 on an isolated test desktop",
+)
 class RealTkActionButtonSmokeTests(unittest.TestCase):
     def test_real_tk_accepts_draw_options_and_all_labels_fit(self):
         try:
@@ -815,6 +821,10 @@ class AlwaysOnTopTests(unittest.TestCase):
                 root = self._FakeRoot(error=error)
                 self.assertFalse(panel.apply_always_on_top(root, _FakeTk))
 
+    @unittest.skipUnless(
+        os.environ.get("DE_RUN_VISIBLE_GUI_TESTS") == "1",
+        "real Tk window requires DE_RUN_VISIBLE_GUI_TESTS=1 on an isolated test desktop",
+    )
     def test_real_tk_panel_window_reports_topmost(self):
         try:
             import tkinter as tk
@@ -1568,6 +1578,43 @@ class LaunchWiringTests(unittest.TestCase):
         # when the client is not pip-installed. The first entry must be that root (it holds client/).
         first_pp = env["PYTHONPATH"].split(runner.os.pathsep)[0]
         self.assertTrue((runner.Path(first_pp) / "client" / "stopper" / "panel.py").exists(), first_pp)
+
+    def test_linux_panel_subprocess_uses_webview_and_recovers_graphical_environment(self):
+        captured = {}
+
+        def fake_popen(argv, **kwargs):
+            captured["argv"] = argv
+            captured["env"] = kwargs["env"]
+            return mock.Mock()
+
+        recovered = {
+            "DISPLAY": ":0",
+            "WAYLAND_DISPLAY": "wayland-0",
+            "XDG_RUNTIME_DIR": "/run/user/1000",
+        }
+        with tempfile.TemporaryDirectory() as tmp, \
+             mock.patch.object(runner.sys, "platform", "linux"), \
+             mock.patch.object(
+                 runner, "stopper_log_path", return_value=Path(tmp) / "stopper.log"
+             ), \
+             mock.patch.object(runner.subprocess, "Popen", side_effect=fake_popen), \
+             mock.patch(
+                 "client.popup.backend._linux_user_manager_environment",
+                 return_value=recovered,
+             ), \
+             mock.patch.dict(
+                 runner.os.environ,
+                 {"DISPLAY": ":9", "DE_CONFIG_PATH": str(Path(tmp) / "config.json")},
+                 clear=True,
+             ):
+            runner._launch_stopper_panel_subprocess()
+
+        self.assertEqual(
+            captured["argv"][1:], ["-m", "client.stopper.webview_panel"]
+        )
+        self.assertEqual(captured["env"]["DISPLAY"], ":9")
+        self.assertEqual(captured["env"]["WAYLAND_DISPLAY"], "wayland-0")
+        self.assertEqual(captured["env"]["XDG_RUNTIME_DIR"], "/run/user/1000")
 
     def test_non_darwin_dispatches_to_panel(self):
         with mock.patch.object(runner.platform, "system", return_value="Windows"), \

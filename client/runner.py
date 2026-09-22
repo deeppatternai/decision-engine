@@ -1767,8 +1767,21 @@ def _stopper_runtime_env() -> Dict[str, str]:
 
     Export the exact lock path selected by the runner instead of asking the native
     process to independently reimplement Python path normalization and branch logic.
+    Linux Agent hosts may strip desktop variables from MCP children even though the
+    user's graphical systemd manager still has them. Recover only the allowlisted
+    graphical values used by the popup backend before spawning the Linux panel.
     """
     env = os.environ.copy()
+    if sys.platform.startswith("linux"):
+        try:
+            from client.popup import backend as popup_backend
+
+            recovered = popup_backend._linux_user_manager_environment()
+        except Exception:
+            recovered = {}
+        for key, value in recovered.items():
+            if not env.get(key):
+                env[key] = value
     env.setdefault("DE_CONFIG_PATH", str(config_path()))
     env.setdefault("DE_ACTIVE_RUN", str(active_run_path()))
     env.setdefault("DE_ACTIVE_RUNS", str(active_runs_path()))
@@ -1809,8 +1822,13 @@ def _launch_stopper_panel_subprocess(*, de_lite: bool = False) -> None:
         _note_stopper_miss("panel log unavailable: %r" % exc)
         log = None
     try:
+        panel_module = (
+            "client.stopper.webview_panel"
+            if sys.platform.startswith("linux")
+            else "client.stopper.panel"
+        )
         subprocess.Popen(
-            [_gui_python(), "-m", "client.stopper.panel"],
+            [_gui_python(), "-m", panel_module],
             cwd=str(body_root),
             stdin=subprocess.DEVNULL,
             stdout=(log or subprocess.DEVNULL),

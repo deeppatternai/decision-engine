@@ -63,7 +63,12 @@ class SkillFrontmatterCompatibilityTests(unittest.TestCase):
                 "equivalent intent in any language",
                 "interactive artifact the user must edit and submit",
             ),
-            "layer-check": ("竞品层级", "layer check"),
+            "layer-check": (
+                "true substitutes",
+                "job-to-be-done",
+                "comparison is valid",
+                "market-size or revenue estimate based on comparables",
+            ),
         }
         for name, phrases in expected_phrases.items():
             with self.subTest(skill=name):
@@ -91,6 +96,13 @@ class SkillFrontmatterCompatibilityTests(unittest.TestCase):
 
     def test_graphic_explanation_description_is_english_only(self):
         line = (ROOT / "skills" / "graphic-explanation" / "SKILL.md").read_text(
+            encoding="utf-8"
+        ).splitlines()[2]
+        description = json.loads(line.removeprefix("description: "))
+        self.assertTrue(description.isascii())
+
+    def test_layer_check_description_is_english_only(self):
+        line = (ROOT / "skills" / "layer-check" / "SKILL.md").read_text(
             encoding="utf-8"
         ).splitlines()[2]
         description = json.loads(line.removeprefix("description: "))

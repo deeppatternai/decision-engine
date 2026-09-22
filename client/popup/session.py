@@ -127,6 +127,16 @@ def _harden_windows_private_data_acl(path: Path) -> bool:
     return True
 
 
+def _harden_windows_private_data_file_acl(path: Path) -> bool:
+    if os.name != "nt":
+        return True
+    try:
+        windows_security.harden_private_data_file_acl(path)
+    except (OSError, windows_security.WindowsSecurityError):
+        return False
+    return True
+
+
 @contextmanager
 def _pin_windows_popup_directories(*paths: Path):
     """Keep checked Windows directory identities stable during path-based I/O."""
@@ -562,7 +572,7 @@ def _open_native_shell_stderr(workdir: Path):
     except (OSError, ValueError):
         os.close(descriptor)
         raise
-    if not _harden_windows_private_data_acl(path):
+    if not _harden_windows_private_data_file_acl(path):
         stream.close()
         try:
             path.unlink()

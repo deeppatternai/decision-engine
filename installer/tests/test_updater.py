@@ -186,7 +186,10 @@ class UpdateInspectionTests(unittest.TestCase):
     )
     def test_state_reader_uses_nofollow_dir_fd_when_supported(self):
         native_open = os.open
-        with mock.patch.object(updater.os, "open", wraps=native_open) as opened:
+        with (
+            mock.patch.object(updater, "_supports_safe_dir_fd", return_value=True),
+            mock.patch.object(updater.os, "open", wraps=native_open) as opened,
+        ):
             state = updater._read_update_state(self.root)
         self.assertEqual(state.last_release_commit, self.old_commit)
         self.assertTrue(any("dir_fd" in call.kwargs for call in opened.call_args_list))
@@ -527,6 +530,8 @@ class UpdateInspectionTests(unittest.TestCase):
                 marker = self.root / managed_install.MARKER_FILENAME
                 if not marker.exists():
                     marker.write_bytes(self.marker_bytes)
+                    if os.name != "nt":
+                        marker.chmod(0o600)
                 with mock.patch.object(
                     updater.release_contract, "authorize_release", return_value=verified
                 ):
@@ -1039,7 +1044,10 @@ class CollisionClassificationTests(unittest.TestCase):
             (root / "parent").mkdir()
             (root / "parent" / "collision.txt").write_bytes(b"keep")
             native_open = os.open
-            with mock.patch.object(updater.os, "open", wraps=native_open) as opened:
+            with (
+                mock.patch.object(updater, "_supports_safe_dir_fd", return_value=True),
+                mock.patch.object(updater.os, "open", wraps=native_open) as opened,
+            ):
                 updater._reject_collision_links(root, ("parent/collision.txt",))
         self.assertTrue(any("dir_fd" in call.kwargs for call in opened.call_args_list))
         directory_flags = os.O_NOFOLLOW | os.O_DIRECTORY

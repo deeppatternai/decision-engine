@@ -1081,9 +1081,11 @@ class PopupApi:
         return {"ok": True, "supported": False, "reason": "unsupported"}
 
     def copy_visual_image(self, rect: Any = None) -> Dict[str, Any]:
-        """Screenshot the LEFT visual region → PNG → clipboard AS AN IMAGE. Windows requires the strict
-        artifact rect + viewport; macOS preserves its existing optional full-view fallback. Other platforms
-        return ``reason='unsupported'`` so the page shows an honest toast."""
+        """Screenshot the requested visual region → PNG → clipboard AS AN IMAGE.
+
+        Windows and Linux use the native WebView compositor/widget and crop the six-value viewport
+        request; macOS keeps its existing WKWebView path. Linux requires a viewport-bound visual rect.
+        """
         if self._closed:
             return {"ok": False}
         if not _visual_capture_supported():
@@ -1097,6 +1099,14 @@ class PopupApi:
             if png is None:
                 return {"ok": False}
             return {"ok": _copy_windows_png_to_clipboard(self._win, png)}
+        if _IS_LINUX:
+            request = _norm_linux_capture_request(rect)
+            if request is None:
+                return {"ok": False}
+            png = _snapshot_linux_png(self._win, request)
+            if png is None:
+                return {"ok": False}
+            return {"ok": _copy_linux_png_to_clipboard(png)}
         png = _snapshot_png_data(_main_webview, rect=_norm_rect(rect))
         if png is None:
             return {"ok": False}
@@ -1161,6 +1171,14 @@ class PopupApi:
             if png is None:
                 return {"ok": False}
             return {"ok": _present_windows_share(self._win, png)}
+        if _IS_LINUX:
+            request = _norm_linux_capture_request(rect)
+            if request is None:
+                return {"ok": False}
+            png = _snapshot_linux_png(self._win, request)
+            if png is None:
+                return {"ok": False}
+            return {"ok": _present_linux_share(png)}
         png = _snapshot_png_data(_main_webview, rect=_norm_rect(rect))
         if png is None:
             return {"ok": False}
@@ -1202,6 +1220,11 @@ class PopupApi:
             png = _snapshot_windows_region_png(
                 self._win, request, self._window_action_lock
             )
+        elif _IS_LINUX:
+            request = _norm_linux_capture_request(rect)
+            if request is None:
+                return {"ok": False}
+            png = _snapshot_linux_png(self._win, request, strict_rect=True)
         else:
             norm = _norm_rect(rect)
             if norm is None:             # region capture demands a real rect — do NOT degrade to a full-view shot
@@ -1211,6 +1234,12 @@ class PopupApi:
             return {"ok": False}
         try:
             if _IS_WINDOWS:
+                if len(png) > (_MAX_CAPTURE_IMAGE_B64 * 3 // 4):
+                    return {"ok": False}
+                b64 = base64.b64encode(png).decode("ascii")
+                if len(b64) > _MAX_CAPTURE_IMAGE_B64:
+                    return {"ok": False}
+            elif _IS_LINUX:
                 if len(png) > (_MAX_CAPTURE_IMAGE_B64 * 3 // 4):
                     return {"ok": False}
                 b64 = base64.b64encode(png).decode("ascii")
@@ -2340,11 +2369,30 @@ def _visual_capture_supported() -> bool:
         except Exception:  # aqg: top-level boundary — no pywebview means no WinForms/WebView2 capture
             return False
     if not _IS_MAC:
-        return False
+        return _IS_LINUX and _linux_capture_backend_available()
     try:
         import WebKit  # noqa: F401
         return True
     except Exception:  # aqg: top-level boundary — no WebKit → no native capture
+        return False
+
+
+def _linux_capture_backend_available() -> bool:
+    """Probe the two Linux pywebview backends without creating a second GUI application."""
+    if not _IS_LINUX:
+        return False
+    try:
+        from qtpy import QtCore, QtWidgets  # noqa: F401
+        return True
+    except Exception:  # aqg: top-level boundary — Qt is optional on GTK installations
+        pass
+    try:
+        import gi
+        gi.require_version("Gdk", "3.0")
+        gi.require_version("Gtk", "3.0")
+        from gi.repository import Gdk, Gtk  # noqa: F401
+        return True
+    except Exception:  # aqg: top-level boundary — GTK is optional on Qt installations
         return False
 
 
@@ -2356,6 +2404,23 @@ def _norm_rect(rect):
     except (TypeError, ValueError, IndexError, KeyError):
         return None
     return (x, y, w, h) if w > 0 and h > 0 else None
+
+
+def _norm_linux_capture_request(rect):
+    """Normalize a Linux WebView crop request as ``(css_rect, viewport)`` or ``None``.
+
+    New popup templates send ``[x, y, w, h, viewport_w, viewport_h]`` so the compositor's device-pixel
+    scale is derived from the captured PNG. A supplied request without viewport dimensions is rejected
+    rather than guessing a scale and risking a crop outside the requested visual.
+    """
+    if rect is None:
+        return None
+    try:
+        if len(rect) == 6:
+            return _norm_windows_capture_request(rect)
+    except (TypeError, ValueError):
+        pass
+    return None
 
 
 def _norm_windows_capture_request(rect):
@@ -2481,29 +2546,269 @@ def _png_container_is_complete(png) -> bool:
     return False
 
 
+def _run_linux_gui_call(schedule, callback, timeout=3.0):
+    """Run one GUI-backend operation on its event-loop thread and return its result boundedly."""
+    done = threading.Event()
+    state = {"result": None}
+
+    def run() -> None:
+        try:
+            state["result"] = callback()
+        except BaseException as exc:  # aqg: top-level boundary — GUI callback must not unwind into Qt/GTK
+            state["result"] = None
+            try:
+                print("native_shell: Linux capture callback failed: %r" % (exc,), file=sys.stderr)
+            except BaseException:  # aqg: top-level boundary — callback diagnostics must not escape the GUI runtime
+                pass
+        finally:
+            done.set()
+        return False
+
+    try:
+        schedule(run)
+    except BaseException:  # aqg: top-level boundary — a missing event loop fails closed
+        return None
+    return state["result"] if done.wait(timeout=max(0.1, float(timeout))) else None
+
+
+def _snapshot_linux_qt_png(win, request, strict_rect=False, timeout=3.0):
+    """Capture a Qt WebEngine widget, then crop its device-pixel PNG to the CSS request."""
+    try:
+        from qtpy import QtCore, QtWidgets
+    except Exception:  # aqg: top-level boundary — Qt is not the active Linux backend
+        return None
+    native = getattr(win, "native", None)
+    widget = getattr(native, "webview", None)
+    app = QtWidgets.QApplication.instance()
+    if widget is None or app is None or not callable(getattr(widget, "grab", None)):
+        return None
+
+    def capture():
+        pixmap = widget.grab()
+        if pixmap is None or pixmap.isNull():
+            return None
+        if request is not None:
+            rect, viewport = request
+            if viewport is not None:
+                box = _windows_crop_box(rect, viewport, (pixmap.width(), pixmap.height()))
+                if box is None:
+                    return None
+                left, top, right, bottom = box
+                pixmap = pixmap.copy(left, top, right - left, bottom - top)
+            elif strict_rect:
+                return None
+        buffer = QtCore.QBuffer()
+        write_only = getattr(QtCore.QIODevice, "OpenModeFlag", QtCore.QIODevice)
+        mode = getattr(write_only, "WriteOnly", None)
+        if mode is None:
+            mode = getattr(QtCore.QIODevice, "WriteOnly", 2)
+        if not buffer.open(mode) or not pixmap.save(buffer, "PNG"):
+            return None
+        png = bytes(buffer.data())
+        return png if _png_dimensions(png) is not None else None
+
+    return _run_linux_gui_call(
+        lambda callback: _schedule_linux_qt_call(QtCore, app, callback),
+        capture,
+        timeout=timeout,
+    )
+
+
+def _snapshot_linux_gtk_png(win, request, strict_rect=False, timeout=3.0):
+    """Capture a GTK/WebKit widget through its Gdk window, with the same strict crop contract as Qt."""
+    try:
+        import gi
+        gi.require_version("Gdk", "3.0")
+        gi.require_version("Gtk", "3.0")
+        from gi.repository import Gdk, GLib  # noqa: F401
+        from webview.platforms.gtk import BrowserView
+    except Exception:  # aqg: top-level boundary — GTK is not the active Linux backend
+        return None
+    native = getattr(win, "native", None)
+    if native is None:
+        return None
+    browser = BrowserView.instances.get(getattr(win, "uid", None))
+    widget = getattr(browser, "webview", None) if getattr(browser, "window", None) is native else None
+    if widget is None or not callable(getattr(widget, "get_window", None)):
+        return None
+
+    def capture():
+        width = int(widget.get_allocated_width())
+        height = int(widget.get_allocated_height())
+        window = widget.get_window()
+        if width <= 0 or height <= 0 or window is None:
+            return None
+        pixbuf = Gdk.pixbuf_get_from_window(window, 0, 0, width, height)
+        if pixbuf is None:
+            return None
+        if request is not None:
+            rect, viewport = request
+            if viewport is not None:
+                box = _windows_crop_box(rect, viewport, (pixbuf.get_width(), pixbuf.get_height()))
+                if box is None:
+                    return None
+                left, top, right, bottom = box
+                pixbuf = pixbuf.new_subpixbuf(left, top, right - left, bottom - top)
+            elif strict_rect:
+                return None
+        saved = pixbuf.save_to_bufferv("png", [], [])
+        data = saved[-1] if isinstance(saved, tuple) else saved
+        png = bytes(data) if data is not None else None
+        return png if _png_dimensions(png) is not None else None
+
+    def schedule(callback):
+        GLib.idle_add(callback)
+
+    return _run_linux_gui_call(schedule, capture, timeout=timeout)
+
+
+def _snapshot_linux_png(win, request=None, strict_rect=False, timeout=3.0):
+    """Capture the active Linux pywebview widget, preferring Qt and falling back to GTK."""
+    if not _IS_LINUX or win is None or request is None:
+        return None
+    before = _linux_capture_geometry(win, request, strict_rect)
+    if before is None:
+        return None
+    png = _snapshot_linux_qt_png(win, request, strict_rect=strict_rect, timeout=timeout)
+    if png is None:
+        png = _snapshot_linux_gtk_png(win, request, strict_rect=strict_rect, timeout=timeout)
+    if png is None or _linux_capture_geometry(win, request, strict_rect) != before:
+        return None
+    return png
+
+
+def _linux_capture_geometry(win, request, strict_rect):
+    """Bind a page-supplied crop to the live, visible visual area before and after capture."""
+    script = """(function(){try{var a=document.querySelector('.artifact');if(!a)return null;
+var r=a.getBoundingClientRect(),left=Math.max(0,r.left),top=Math.max(0,r.top),
+right=Math.min(innerWidth,r.right),bottom=Math.min(innerHeight,r.bottom);
+for(var p=a.parentElement;p;p=p.parentElement){var cs=getComputedStyle(p),b=p.getBoundingClientRect();
+if(cs.overflowX!=='visible'){left=Math.max(left,b.left);right=Math.min(right,b.right);}
+if(cs.overflowY!=='visible'){top=Math.max(top,b.top);bottom=Math.min(bottom,b.bottom);}}
+if(document.fullscreenElement||document.querySelector('dialog[open]'))return null;
+for(var o of document.querySelectorAll('[popover]'))if(o.matches(':popover-open'))return null;
+return [r.x,r.y,r.width,r.height,left,top,Math.max(0,right-left),Math.max(0,bottom-top),
+innerWidth,innerHeight];}catch(e){return null;}})()"""
+    try:
+        current = _evaluate_windows_js_bounded(win, script)
+        geometry = tuple(float(current[i]) for i in range(10))
+        rect, viewport = request
+    except Exception:  # aqg: top-level boundary — an unavailable page must fail closed
+        return None
+    if not all(math.isfinite(value) for value in geometry):
+        return None
+    artifact, visible, live_viewport = geometry[:4], geometry[4:8], geometry[8:]
+    if any(abs(live_viewport[i] - viewport[i]) > 0.5 for i in range(2)):
+        return None
+    if visible[2] <= 0 or visible[3] <= 0:
+        return None
+    if strict_rect:
+        if (rect[0] < visible[0] - 0.5 or rect[1] < visible[1] - 0.5 or
+                rect[0] + rect[2] > visible[0] + visible[2] + 0.5 or
+                rect[1] + rect[3] > visible[1] + visible[3] + 0.5):
+            return None
+    elif any(abs(artifact[i] - rect[i]) > 0.5 for i in range(4)):
+        return None
+    return geometry
+
+
+_LINUX_QT_INVOKERS = []
+
+
+def _schedule_linux_qt_call(QtCore, app, callback):
+    """Queue a callback onto a Qt application's GUI thread, including PyQt6's no-receiver API."""
+    current = QtCore.QThread.currentThread()
+    if current == app.thread():
+        callback()
+        return
+    # The receiver overload binds the callback to QApplication's GUI thread; the one-argument
+    # overload would otherwise bind to the bridge worker and never run when that thread has no loop.
+    try:
+        QtCore.QTimer.singleShot(0, app, callback)
+        return
+    except TypeError:
+        pass
+    signal_type = getattr(QtCore, "Signal", None) or getattr(QtCore, "pyqtSignal", None)
+    if signal_type is None:
+        return
+
+    class _Invoker(QtCore.QObject):
+        trigger = signal_type(object)
+
+        def invoke(self, fn):
+            try:
+                fn()
+            finally:
+                try:
+                    _LINUX_QT_INVOKERS.remove(self)
+                except ValueError:
+                    pass
+
+    invoker = _Invoker()
+    invoker.moveToThread(app.thread())
+    qt = getattr(QtCore, "Qt", None)
+    connection_type = getattr(qt, "ConnectionType", qt)
+    queued = getattr(connection_type, "QueuedConnection", None)
+    if queued is not None:
+        invoker.trigger.connect(invoker.invoke, queued)
+    else:
+        invoker.trigger.connect(invoker.invoke)
+    _LINUX_QT_INVOKERS.append(invoker)
+    invoker.trigger.emit(callback)
+
+
+def _copy_linux_qt_png_to_clipboard(png, timeout=3.0) -> bool:
+    """Put PNG bytes on a Qt desktop clipboard when the active popup uses Qt WebEngine."""
+    try:
+        from qtpy import QtCore, QtGui, QtWidgets
+    except Exception:  # aqg: top-level boundary — Qt is optional on GTK installations
+        return False
+    app = QtWidgets.QApplication.instance()
+    if app is None:
+        return False
+
+    def copy():
+        image = QtGui.QImage.fromData(png, "PNG")
+        if image.isNull():
+            return False
+        clipboard = app.clipboard()
+        clipboard.setImage(image)
+        return not clipboard.image().isNull()
+
+    result = _run_linux_gui_call(
+        lambda callback: _schedule_linux_qt_call(QtCore, app, callback),
+        copy,
+        timeout=timeout,
+    )
+    return result is True
+
+
 def _copy_linux_png_to_clipboard(png) -> bool:
-    """Copy PNG bytes to the Linux image clipboard through GTK when the GTK backend is available."""
+    """Copy PNG bytes to the active Qt or GTK image clipboard on its GUI thread."""
     if not _IS_LINUX or _png_dimensions(png) is None:
         return False
+    if _copy_linux_qt_png_to_clipboard(png):
+        return True
     try:
         import gi
         gi.require_version("Gtk", "3.0")
         gi.require_version("Gdk", "3.0")
         gi.require_version("GdkPixbuf", "2.0")
-        from gi.repository import Gdk, GdkPixbuf, Gtk
+        from gi.repository import Gdk, GdkPixbuf, GLib, Gtk
 
-        loader = GdkPixbuf.PixbufLoader.new_with_type("png")
-        loader.write(png)
-        loader.close()
-        pixbuf = loader.get_pixbuf()
-        if pixbuf is None:
-            return False
-        clipboard = Gtk.Clipboard.get(Gdk.SELECTION_CLIPBOARD)
-        clipboard.set_image(pixbuf)
-        clipboard.store()
-        while Gtk.events_pending():
-            Gtk.main_iteration_do(False)
-        return True
+        def copy():
+            loader = GdkPixbuf.PixbufLoader.new_with_type("png")
+            loader.write(png)
+            loader.close()
+            pixbuf = loader.get_pixbuf()
+            if pixbuf is None:
+                return False
+            clipboard = Gtk.Clipboard.get(Gdk.SELECTION_CLIPBOARD)
+            clipboard.set_image(pixbuf)
+            clipboard.store()
+            return True
+
+        return _run_linux_gui_call(lambda callback: GLib.idle_add(callback), copy) is True
     except Exception:  # aqg: top-level boundary — Linux clipboard availability varies by desktop/session
         return False
 

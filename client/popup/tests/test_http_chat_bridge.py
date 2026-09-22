@@ -819,6 +819,38 @@ class SessionBridgeHandoffTests(unittest.TestCase):
         self.assertNotIn(secret, diagnostic["detail"])
         self.assertLessEqual(len(diagnostic["detail"]), 200)
 
+    @unittest.skipUnless(os.name == "nt", "Windows DACL integration")
+    def test_native_shell_stderr_uses_file_acl_hardening(self):
+        with tempfile.TemporaryDirectory() as root:
+            workdir = Path(root)
+            with (
+                mock.patch.object(windows_security, "harden_private_data_acl")
+                as harden_directory,
+                mock.patch.object(windows_security, "harden_private_data_file_acl")
+                as harden_file,
+            ):
+                session._open_native_shell_stderr(workdir).close()
+
+        harden_file.assert_called_once_with(workdir / "popup.log")
+        harden_directory.assert_not_called()
+
+    @unittest.skipUnless(os.name == "nt", "Windows DACL integration")
+    def test_native_shell_stderr_acl_failure_closes_and_removes_file(self):
+        for error in (
+            OSError("synthetic ACL failure"),
+            windows_security.WindowsSecurityError("synthetic unsafe ACL"),
+        ):
+            with self.subTest(error=type(error).__name__), tempfile.TemporaryDirectory() as root:
+                workdir = Path(root)
+                with mock.patch.object(
+                    windows_security,
+                    "harden_private_data_file_acl",
+                    side_effect=error,
+                ):
+                    with self.assertRaisesRegex(OSError, "ACL could not be secured"):
+                        session._open_native_shell_stderr(workdir)
+                self.assertFalse((workdir / "popup.log").exists())
+
     def test_server_bridge_reports_exit_during_handoff(self):
         class ExitPipe(_RecordingPipe):
             started = False
