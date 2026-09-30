@@ -1,6 +1,5 @@
 """Execute only the native bootstrapper's AQG guard, without downloading or activation."""
 import os
-import re
 import shutil
 import subprocess
 import sys
@@ -21,11 +20,78 @@ from installer.tests.test_de_aqg_install import (
 ROOT = Path(__file__).resolve().parents[2]
 pytestmark = pytest.mark.skipif(os.name != "nt", reason="native Windows bootstrapper")
 
+GUARD_FUNCTIONS = (
+    "Stop-Install",
+    "Invoke-WithCleanEnvironment",
+    "Invoke-PythonScript",
+    "Test-ReparsePoint",
+    "Test-AqgManagedTargetName",
+    "Get-VerifiedAqgLayout",
+)
+
+
+def _ast_function_loader(names):
+    quoted_names = ", ".join(f'"{name}"' for name in names)
+    return f"""
+$tokens = $null
+$errors = $null
+$ast = [System.Management.Automation.Language.Parser]::ParseFile(
+    $env:FIXTURE_FUNCTION_SOURCE, [ref]$tokens, [ref]$errors
+)
+if ($errors.Count -ne 0) {{ throw ($errors | Out-String) }}
+foreach ($name in @({quoted_names})) {{
+    $nodes = @($ast.FindAll({{
+        param($node)
+        $node -is [System.Management.Automation.Language.FunctionDefinitionAst] -and
+            $node.Name -eq $name
+    }}, $true))
+    if ($nodes.Count -ne 1) {{ throw "Expected exactly one function: $name" }}
+    Invoke-Expression $nodes[0].Extent.Text
+}}
+""".strip()
+
+
+def _run_powershell(script, *, function_source, extra_env=None):
+    return subprocess.run(
+        [shutil.which("powershell.exe"), "-NoProfile", "-NonInteractive",
+         "-ExecutionPolicy", "Bypass", "-File", str(script)],
+        env={
+            **os.environ,
+            "FIXTURE_FUNCTION_SOURCE": str(function_source),
+            **(extra_env or {}),
+        },
+        capture_output=True, text=True, encoding="utf-8", errors="replace", timeout=20,
+    )
+
+
+def test_ast_loader_preserves_column_zero_braces_in_here_string(tmp_path):
+    source = tmp_path / "here-string.ps1"
+    source.write_text("""\
+function Test-HereStringBoundary {
+    $payload = @'
+{
+}
+}))
+'@
+    [Console]::Out.Write($payload)
+}
+""", encoding="utf-8")
+    script = tmp_path / "here-string-guard.ps1"
+    script.write_text("\n".join([
+        "$ErrorActionPreference = 'Stop'", "Set-StrictMode -Version Latest",
+        _ast_function_loader(("Test-HereStringBoundary",)),
+        "Test-HereStringBoundary",
+    ]), encoding="utf-8-sig")
+
+    result = _run_powershell(script, function_source=source)
+
+    assert result.returncode == 0, result.stderr
+    assert result.stdout.splitlines() == ["{", "}", "}))"]
+
 
 @pytest.fixture
 def verify(tmp_path):
-    source = (ROOT / "dp-install.ps1").read_text(encoding="utf-8")
-    functions = re.findall(r"^function .*?^\}", source, re.M | re.S)
+    source = ROOT / "dp-install.ps1"
     script = tmp_path / "guard.ps1"
     script.write_text("\n".join([
         "$ErrorActionPreference = 'Stop'", "Set-StrictMode -Version Latest",
@@ -33,20 +99,18 @@ def verify(tmp_path):
         "$AqgRoot = $env:FIXTURE_AQG_ROOT", f"$AqgRepository = '{AQG_REPO}'",
         "$GitPath = $env:FIXTURE_GIT", "$script:PythonPath = $env:FIXTURE_PYTHON",
         "$script:Utf8NoBom = New-Object System.Text.UTF8Encoding($false)",
-        *functions, "$null = Get-VerifiedAqgLayout",
+        _ast_function_loader(GUARD_FUNCTIONS), "$null = Get-VerifiedAqgLayout",
     ]), encoding="utf-8-sig")
 
     def run(root):
-        return subprocess.run(
-            [shutil.which("powershell.exe"), "-NoProfile", "-NonInteractive",
-             "-ExecutionPolicy", "Bypass", "-File", str(script)],
-            env={
-                **os.environ,
+        return _run_powershell(
+            script,
+            function_source=source,
+            extra_env={
                 "FIXTURE_AQG_ROOT": str(root),
                 "FIXTURE_GIT": shutil.which("git.exe"),
                 "FIXTURE_PYTHON": sys.executable,
             },
-            capture_output=True, text=True, encoding="utf-8", errors="replace", timeout=20,
         )
     return run
 

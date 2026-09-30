@@ -247,9 +247,17 @@ class CursorApiProfileTestCase(unittest.TestCase):
         process = SimpleNamespace(stdin=pipe, poll=mock.Mock(return_value=None))
         with tempfile.TemporaryDirectory() as root:
             popup_root = _popup_test_root(root)
+            popup_root.mkdir(mode=0o700)
             with (
                 mock.patch.object(session.backend, "ensure_webview", return_value=True),
                 mock.patch.object(session, "_POPUP_ROOT", popup_root),
+                mock.patch.object(session, "_ensure_private_popup_root", return_value=True),
+                mock.patch.object(
+                    session, "_trusted_private_popup_root", return_value=popup_root
+                ),
+                mock.patch.object(
+                    session, "_is_private_popup_directory", return_value=True
+                ),
                 mock.patch.object(
                     session, "_validate_windows_private_mutation_acl", return_value=True
                 ),
@@ -281,7 +289,7 @@ class CursorApiProfileTestCase(unittest.TestCase):
                 )
 
         self.assertEqual(result, {"status": "open", "popup_id": "pop_a1"})
-        self.assertEqual(files, ["popup.html"])
+        self.assertEqual(files, ["popup.html", "popup.log"])
         command = popen.call_args.args[0]
         self.assertIn("--bridge-state-stdin", command)
         self.assertNotIn("synthetic-device-token", " ".join(command))
@@ -299,13 +307,63 @@ class CursorApiProfileTestCase(unittest.TestCase):
         )
         pipe.close.assert_called_once()
 
+    def test_every_windows_popup_gets_a_private_webview2_profile(self):
+        process = SimpleNamespace(stdin=None, poll=mock.Mock(return_value=None))
+        with tempfile.TemporaryDirectory() as root:
+            popup_root = _popup_test_root(root)
+            popup_root.mkdir(mode=0o700)
+            with (
+                mock.patch.object(session.backend, "ensure_webview", return_value=True),
+                mock.patch.object(session, "_POPUP_ROOT", popup_root),
+                mock.patch.object(session.sys, "platform", "win32"),
+                mock.patch.object(session, "_ensure_private_popup_root", return_value=True),
+                mock.patch.object(
+                    session, "_trusted_private_popup_root", return_value=popup_root
+                ),
+                mock.patch.object(
+                    session, "_is_private_popup_directory", return_value=True
+                ),
+                mock.patch.object(
+                    session, "_validate_windows_private_mutation_acl", return_value=True
+                ),
+                mock.patch.object(
+                    session, "_validate_windows_private_data_acl", return_value=True
+                ),
+                mock.patch.object(session, "_new_popup_id", return_value="pop_windows"),
+                mock.patch.object(
+                    session.subprocess, "Popen", return_value=process
+                ) as popen,
+                mock.patch.object(
+                    session,
+                    "_wait_for_popup_ready",
+                    return_value={"status": "open", "popup_id": "pop_windows"},
+                ),
+            ):
+                result = session.spawn(
+                    "<html><body>trusted diagram</body></html>", "Windows diagram"
+                )
+
+        self.assertEqual(result, {"status": "open", "popup_id": "pop_windows"})
+        self.assertEqual(
+            popen.call_args.kwargs["env"]["WEBVIEW2_USER_DATA_FOLDER"],
+            str(popup_root / "pop_windows" / "webview2-data"),
+        )
+
     def test_spawn_does_not_report_open_when_native_shell_exits_immediately(self):
         process = SimpleNamespace(stdin=None, poll=mock.Mock(return_value=134))
         with tempfile.TemporaryDirectory() as root:
             popup_root = _popup_test_root(root)
+            popup_root.mkdir(mode=0o700)
             with (
                 mock.patch.object(session.backend, "ensure_webview", return_value=True),
                 mock.patch.object(session, "_POPUP_ROOT", popup_root),
+                mock.patch.object(session, "_ensure_private_popup_root", return_value=True),
+                mock.patch.object(
+                    session, "_trusted_private_popup_root", return_value=popup_root
+                ),
+                mock.patch.object(
+                    session, "_is_private_popup_directory", return_value=True
+                ),
                 mock.patch.object(
                     session, "_validate_windows_private_mutation_acl", return_value=True
                 ),
@@ -341,9 +399,17 @@ class CursorApiProfileTestCase(unittest.TestCase):
         )
         with tempfile.TemporaryDirectory() as root:
             popup_root = _popup_test_root(root)
+            popup_root.mkdir(mode=0o700)
             with (
                 mock.patch.object(session.backend, "ensure_webview", return_value=True),
                 mock.patch.object(session, "_POPUP_ROOT", popup_root),
+                mock.patch.object(session, "_ensure_private_popup_root", return_value=True),
+                mock.patch.object(
+                    session, "_trusted_private_popup_root", return_value=popup_root
+                ),
+                mock.patch.object(
+                    session, "_is_private_popup_directory", return_value=True
+                ),
                 mock.patch.object(
                     session, "_validate_windows_private_mutation_acl", return_value=True
                 ),
@@ -377,9 +443,17 @@ class CursorApiProfileTestCase(unittest.TestCase):
         )
         with tempfile.TemporaryDirectory() as root:
             popup_root = _popup_test_root(root)
+            popup_root.mkdir(mode=0o700)
             with (
                 mock.patch.object(session.backend, "ensure_webview", return_value=True),
                 mock.patch.object(session, "_POPUP_ROOT", popup_root),
+                mock.patch.object(session, "_ensure_private_popup_root", return_value=True),
+                mock.patch.object(
+                    session, "_trusted_private_popup_root", return_value=popup_root
+                ),
+                mock.patch.object(
+                    session, "_is_private_popup_directory", return_value=True
+                ),
                 mock.patch.object(
                     session, "_validate_windows_private_mutation_acl", return_value=True
                 ),
@@ -431,9 +505,17 @@ class CursorApiProfileTestCase(unittest.TestCase):
         )
         with tempfile.TemporaryDirectory() as root:
             popup_root = _popup_test_root(root)
+            popup_root.mkdir(mode=0o700)
             with (
                 mock.patch.object(session.backend, "ensure_webview", return_value=True),
                 mock.patch.object(session, "_POPUP_ROOT", popup_root),
+                mock.patch.object(session, "_ensure_private_popup_root", return_value=True),
+                mock.patch.object(
+                    session, "_trusted_private_popup_root", return_value=popup_root
+                ),
+                mock.patch.object(
+                    session, "_is_private_popup_directory", return_value=True
+                ),
                 mock.patch.object(
                     session, "_validate_windows_private_mutation_acl", return_value=True
                 ),

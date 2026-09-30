@@ -33,6 +33,13 @@ $ErrorActionPreference = "Stop"
 $ProgramName = "dp-uninstall"
 $ExitProcessBlocked = 5
 $script:PrivateBootstrapRoot = $null
+$script:FastEmptyUninstallReason = $null
+$script:FastEmptyUninstallActiveProcess = $false
+$script:FastOwnedSkillJunctions = @()
+$PrivatePythonVersion = "3.13.15"
+$PrivatePythonBuild = "20260901"
+$PrivatePythonRelease = "20260901"
+$PrivatePythonBaseUrl = "https://github.com/astral-sh/python-build-standalone/releases/download/$PrivatePythonRelease"
 
 function Stop-Uninstall {
     param([Parameter(Mandatory = $true)][string]$Message)
@@ -165,7 +172,7 @@ function Test-Python {
         $verified = (Get-Item -LiteralPath $Candidate -Force).FullName
     }
     $probe = Invoke-Clean -FilePath $verified -ArgumentList @(
-        "-I", "-c", "import sys; raise SystemExit(0 if sys.version_info[:2] >= (3, 12) else 1)"
+            "-I", "-X", "utf8", "-c", "import sys; raise SystemExit(0 if sys.version_info[:2] >= (3, 12) else 1)"
     ) -Capture
     if ($probe.ExitCode -ne 0) {
         return $false
@@ -208,31 +215,142 @@ function New-PrivateUninstallBootstrap {
         Stop-Uninstall "The private Python base runtime marker cannot be verified."
     }
 
-    $script:PrivateBootstrapRoot = Join-Path (
-        [IO.Path]::GetTempPath()
-    ) ("dp-uninstall-python-" + [Guid]::NewGuid().ToString("N"))
-    $bootstrapDirectory = Join-Path $script:PrivateBootstrapRoot "python"
     Write-Host "Preparing a temporary verified Deep Pattern Python runtime for uninstall."
     Write-Host "This copies the private runtime before it is removed and may take a moment; no input is required."
     $bootstrapTimer = [System.Diagnostics.Stopwatch]::StartNew()
+    $lastCopyError = $null
+    foreach ($attempt in 1..2) {
+        $script:PrivateBootstrapRoot = Join-Path (
+            [IO.Path]::GetTempPath()
+        ) ("dp-uninstall-python-" + [Guid]::NewGuid().ToString("N"))
+        $bootstrapDirectory = Join-Path $script:PrivateBootstrapRoot "python"
+        try {
+            New-Item -ItemType Directory -Path $script:PrivateBootstrapRoot | Out-Null
+            Copy-Item -LiteralPath $pythonDirectory -Destination $bootstrapDirectory -Recurse -Force
+            $bootstrapPython = Join-Path $bootstrapDirectory "python.exe"
+            $probe = Invoke-Clean -FilePath $bootstrapPython -ArgumentList @(
+                "-I", "-X", "utf8", "-c", "import ssl, sys, tkinter; raise SystemExit(0 if sys.version_info[:2] >= (3, 12) else 1)"
+            ) -Capture
+            if ($probe.ExitCode -ne 0) {
+                throw "temporary private Python verification failed"
+            }
+            $bootstrapTimer.Stop()
+            Write-Host ("Temporary uninstall runtime ready in {0:N1} seconds." -f $bootstrapTimer.Elapsed.TotalSeconds)
+            return $bootstrapPython
+        }
+        catch {
+            $lastCopyError = $_.Exception
+            Remove-Item -LiteralPath $script:PrivateBootstrapRoot -Recurse -Force -ErrorAction SilentlyContinue
+            $script:PrivateBootstrapRoot = $null
+            if ($attempt -lt 2) {
+                Start-Sleep -Seconds 1
+            }
+        }
+    }
+    $errorType = if ($null -eq $lastCopyError) { "UnknownError" } else { $lastCopyError.GetType().Name }
+    $errorMessage = if ($null -eq $lastCopyError) { "no additional detail" } else { $lastCopyError.Message }
+    Write-Warning ("The installed private Python runtime could not be copied after two attempts ({0}: {1}). Checking another trusted Python before considering a verified download." -f $errorType, $errorMessage)
+    return $null
+}
+
+function New-DownloadedPrivateUninstallBootstrap {
+    $architecture = [string]$env:PROCESSOR_ARCHITEW6432
+    if ([string]::IsNullOrWhiteSpace($architecture)) {
+        $architecture = [string]$env:PROCESSOR_ARCHITECTURE
+    }
+    if ([string]::IsNullOrWhiteSpace($architecture)) {
+        $architecture = [string]$env:PROCESSOR_IDENTIFIER
+    }
+    if ($architecture -match "^(?i:AMD64|x86_64)") {
+        $runtimeArchitecture = "x86_64"
+        $expectedSha256 = "9bcc038a0bf180612ed56dec93d4977d035e80b8d9320ef51a38c287baf134b7"
+        $expectedSize = 47042104L
+    }
+    elseif ($architecture -match "^(?i:ARM64|aarch64)") {
+        $runtimeArchitecture = "aarch64"
+        $expectedSha256 = "ce87247378f43f88e0202a0fa6d3cdb5f5fb246a3bc61b2fb604bd49b7862508"
+        $expectedSize = 43801216L
+    }
+    else {
+        Stop-Uninstall "Unsupported Windows architecture for the temporary uninstall runtime: $architecture"
+    }
+
+    $curlPath = Join-Path $env:WINDIR "System32\curl.exe"
+    $tarPath = Join-Path $env:WINDIR "System32\tar.exe"
+    $curl = Get-VerifiedAuthenticodePath `
+        -Path $curlPath -PublisherPattern "(?i:Microsoft Corporation|Microsoft Windows)"
+    $tar = Get-VerifiedAuthenticodePath `
+        -Path $tarPath -PublisherPattern "(?i:Microsoft Corporation|Microsoft Windows)"
+    if ($null -eq $curl -or $null -eq $tar) {
+        Stop-Uninstall "Trusted Windows curl.exe and tar.exe are required to prepare the temporary uninstall runtime."
+    }
+
+    $runtimeId = "cpython-$PrivatePythonVersion+$PrivatePythonBuild-$runtimeArchitecture-pc-windows-msvc"
+    $asset = "$runtimeId-install_only.tar.gz"
+    $url = "$PrivatePythonBaseUrl/$($asset.Replace('+', '%2B'))"
+    $script:PrivateBootstrapRoot = Join-Path (
+        [IO.Path]::GetTempPath()
+    ) ("dp-uninstall-python-" + [Guid]::NewGuid().ToString("N"))
+    $archive = Join-Path $script:PrivateBootstrapRoot $asset
+    $extract = Join-Path $script:PrivateBootstrapRoot "extract"
+    Write-Host ("No usable installed Python was found; downloading about {0:N0} MB for a temporary verified uninstall runtime." -f ($expectedSize / 1MB))
+    Write-Host "The runtime is removed when uninstall exits and does not change system Python."
     try {
-        New-Item -ItemType Directory -Path $script:PrivateBootstrapRoot | Out-Null
-        Copy-Item -LiteralPath $pythonDirectory -Destination $bootstrapDirectory -Recurse -Force
-        $bootstrapPython = Join-Path $bootstrapDirectory "python.exe"
-        $probe = Invoke-Clean -FilePath $bootstrapPython -ArgumentList @(
-            "-I", "-c", "import ssl, sys, tkinter; raise SystemExit(0 if sys.version_info[:2] >= (3, 12) else 1)"
+        New-Item -ItemType Directory -Path $extract -Force | Out-Null
+        $download = Invoke-Clean -FilePath $curl -ArgumentList @(
+            "--fail", "--location", "--show-error", "--progress-bar",
+            "--proto", "=https", "--tlsv1.2", "--connect-timeout", "20", "--retry", "2",
+            "--output", $archive, $url
+        )
+        if ($download -ne 0 -or -not (Test-Path -LiteralPath $archive -PathType Leaf)) {
+            throw "temporary Python download failed"
+        }
+        $actualSize = (Get-Item -LiteralPath $archive -Force).Length
+        $actualSha256 = (Get-FileHash -LiteralPath $archive -Algorithm SHA256).Hash.ToLowerInvariant()
+        if ($actualSize -ne $expectedSize -or $actualSha256 -ne $expectedSha256) {
+            throw "temporary Python archive failed its fixed size or SHA-256 check"
+        }
+        $listing = Invoke-Clean -FilePath $tar -ArgumentList @("-tzf", $archive) -Capture
+        if ($listing.ExitCode -ne 0 -or $listing.Output.Count -eq 0) {
+            throw "temporary Python archive could not be inspected"
+        }
+        foreach ($rawMember in $listing.Output) {
+            $member = ([string]$rawMember).Trim().Replace("\", "/")
+            $segments = @($member.Split("/") | Where-Object { $_ -ne "" })
+            if ([string]::IsNullOrWhiteSpace($member) -or
+                ($member -ne "python" -and -not $member.StartsWith("python/")) -or
+                $member.StartsWith("/") -or
+                $member -match "^[A-Za-z]:" -or
+                $segments -contains "..") {
+                throw "temporary Python archive has an unexpected path layout"
+            }
+        }
+        if ((Invoke-Clean -FilePath $tar -ArgumentList @("-xzf", $archive, "-C", $extract)) -ne 0) {
+            throw "temporary Python archive extraction failed"
+        }
+        $topLevel = @(Get-ChildItem -LiteralPath $extract -Force)
+        $pythonDirectory = Join-Path $extract "python"
+        $python = Join-Path $pythonDirectory "python.exe"
+        if ($topLevel.Count -ne 1 -or $topLevel[0].Name -ne "python" -or
+            -not (Test-Path -LiteralPath $python -PathType Leaf) -or
+            (Test-ReparsePoint -Path $pythonDirectory) -or
+            @(Get-ChildItem -LiteralPath $pythonDirectory -Recurse -Force | Where-Object {
+                ($_.Attributes -band [IO.FileAttributes]::ReparsePoint) -ne 0
+            }).Count -ne 0) {
+            throw "temporary Python archive has an invalid extracted layout"
+        }
+        $probe = Invoke-Clean -FilePath $python -ArgumentList @(
+            "-I", "-X", "utf8", "-c", "import ssl, sys; raise SystemExit(0 if sys.version_info[:2] >= (3, 12) else 1)"
         ) -Capture
         if ($probe.ExitCode -ne 0) {
-            throw "temporary private Python verification failed"
+            throw "temporary Python runtime verification failed"
         }
-        $bootstrapTimer.Stop()
-        Write-Host ("Temporary uninstall runtime ready in {0:N1} seconds." -f $bootstrapTimer.Elapsed.TotalSeconds)
-        return $bootstrapPython
+        return $python
     }
     catch {
         Remove-Item -LiteralPath $script:PrivateBootstrapRoot -Recurse -Force -ErrorAction SilentlyContinue
         $script:PrivateBootstrapRoot = $null
-        Stop-Uninstall "The temporary private Python uninstall runtime could not be prepared."
+        Stop-Uninstall ("The temporary verified Python uninstall runtime could not be prepared: {0}" -f $_.Exception.Message)
     }
 }
 
@@ -268,7 +386,7 @@ function Resolve-Python {
         }
         foreach ($selector in @("-3.14", "-3.13", "-3.12", "-3")) {
             $probe = Invoke-Clean -FilePath $py -ArgumentList @(
-                $selector, "-I", "-c", "import sys; print(sys.executable)"
+                $selector, "-I", "-X", "utf8", "-c", "import sys; print(sys.executable)"
             ) -Capture
             if ($probe.ExitCode -eq 0 -and $probe.Output.Count -gt 0) {
                 $resolved = $probe.Output
@@ -298,12 +416,16 @@ function Resolve-Python {
         if (Test-Python -Candidate $candidate) {
             $resolved = (Get-Item -LiteralPath $candidate).FullName
             if (Test-ManagedPrivatePythonCandidate -Candidate $resolved) {
-                return New-PrivateUninstallBootstrap
+                $bootstrap = New-PrivateUninstallBootstrap
+                if (-not [string]::IsNullOrWhiteSpace([string]$bootstrap)) {
+                    return $bootstrap
+                }
+                continue
             }
             return $resolved
         }
     }
-    Stop-Uninstall "Python 3.12 or newer is required."
+    return New-DownloadedPrivateUninstallBootstrap
 }
 
 function Get-GitCandidates {
@@ -343,6 +465,35 @@ function Resolve-Git {
             -PublisherPattern "(?i:Johannes Schindelin|Git for Windows)"
         if ($null -ne $verified) {
             return $verified
+        }
+    }
+    return $null
+}
+
+function Resolve-GitBash {
+    param([Parameter(Mandatory = $true)][string]$GitPath)
+
+    $gitDirectory = Split-Path -Parent $GitPath
+    $gitRoot = Split-Path -Parent $gitDirectory
+    if ((Test-ReparsePoint -Path $gitDirectory) -or
+        (Test-ReparsePoint -Path $gitRoot)) {
+        return $null
+    }
+    $candidates = @(
+        (Join-Path $gitRoot "bin\bash.exe"),
+        (Join-Path $gitRoot "usr\bin\bash.exe")
+    ) | Select-Object -Unique
+    foreach ($candidate in $candidates) {
+        if (-not (Test-Path -LiteralPath $candidate -PathType Leaf) -or
+            (Test-ReparsePoint -Path $candidate)) {
+            continue
+        }
+        $probe = Invoke-Clean -FilePath $candidate -ArgumentList @(
+            "--noprofile", "--norc", "-c",
+            "case `$(uname -s) in MINGW*|MSYS*|CYGWIN*) exit 0;; *) exit 9;; esac"
+        )
+        if ($probe -eq 0) {
+            return (Get-Item -LiteralPath $candidate -Force).FullName
         }
     }
     return $null
@@ -391,6 +542,357 @@ function Test-ReparsePoint {
     return ($item.Attributes -band [IO.FileAttributes]::ReparsePoint) -ne 0
 }
 
+function Require-FullUninstallVerification {
+    param([Parameter(Mandatory = $true)][string]$Reason)
+    $script:FastEmptyUninstallReason = $Reason
+    return $false
+}
+
+function Test-FastHostConfigReference {
+    param(
+        [Parameter(Mandatory = $true)][string]$Path,
+        [Parameter(Mandatory = $true)][string]$Content
+    )
+
+    if ([IO.Path]::GetExtension($Path) -ieq ".toml") {
+        return (
+            $Scope -in @("de", "both") -and
+            $Content -match "(?m)^\s*\[\s*mcp_servers\.decision-engine(?:\.|\s*\])"
+        )
+    }
+
+    $data = ConvertFrom-Json -InputObject $Content -ErrorAction Stop
+    if ($null -eq $data -or $data -isnot [psobject]) {
+        throw "configuration root is not a JSON object"
+    }
+    if ($Scope -in @("de", "both")) {
+        $mcpProperty = $data.PSObject.Properties["mcpServers"]
+        if ($null -ne $mcpProperty -and $null -ne $mcpProperty.Value -and
+            $null -ne $mcpProperty.Value.PSObject.Properties["decision-engine"]) {
+            return $true
+        }
+    }
+
+    $hooksProperty = $data.PSObject.Properties["hooks"]
+    if ($null -eq $hooksProperty -or $null -eq $hooksProperty.Value) {
+        return $false
+    }
+    $hooksText = ConvertTo-Json -InputObject $hooksProperty.Value -Compress -Depth 32
+    $hookMarkers = @()
+    if ($Scope -in @("de", "both")) {
+        $hookMarkers += @(
+            ".deeppattern\\decision-engine",
+            ".deeppattern/decision-engine"
+        )
+    }
+    if ($Scope -in @("aqg", "both")) {
+        $hookMarkers += @(
+            ".deeppattern\\agent-quality-gates",
+            ".deeppattern/agent-quality-gates"
+        )
+    }
+    foreach ($marker in $hookMarkers) {
+        if ($hooksText.IndexOf($marker, [StringComparison]::OrdinalIgnoreCase) -ge 0) {
+            return $true
+        }
+    }
+    return $false
+}
+
+function Test-FastOwnedSkillJunction {
+    param(
+        [Parameter(Mandatory = $true)]$Route,
+        [Parameter(Mandatory = $true)][string[]]$ManagedRoots
+    )
+
+    if (($Route.Attributes -band [IO.FileAttributes]::ReparsePoint) -eq 0) {
+        return $false
+    }
+    $targets = @($Route.Target | Where-Object {
+        -not [string]::IsNullOrWhiteSpace([string]$_)
+    })
+    if ($targets.Count -ne 1) {
+        return $false
+    }
+    $target = [string]$targets[0]
+    if ($target.StartsWith("\??\", [StringComparison]::Ordinal)) {
+        $target = $target.Substring(4)
+    }
+    elseif ($target.StartsWith("\\?\", [StringComparison]::Ordinal)) {
+        $target = $target.Substring(4)
+    }
+    try {
+        if (-not [IO.Path]::IsPathRooted($target)) {
+            $target = Join-Path $Route.Parent.FullName $target
+        }
+        $target = [IO.Path]::GetFullPath($target).TrimEnd("\", "/")
+        foreach ($managedRoot in $ManagedRoots) {
+            $root = [IO.Path]::GetFullPath($managedRoot).TrimEnd("\", "/")
+            if ($target.Equals($root, [StringComparison]::OrdinalIgnoreCase) -or
+                $target.StartsWith(
+                    $root + [IO.Path]::DirectorySeparatorChar,
+                    [StringComparison]::OrdinalIgnoreCase
+                )) {
+                return $true
+            }
+        }
+    }
+    catch {
+        return $false
+    }
+    return $false
+}
+
+function Remove-FastOwnedSkillJunctions {
+    $removed = 0
+    foreach ($path in @($script:FastOwnedSkillJunctions | Select-Object -Unique)) {
+        $parent = Split-Path -Parent $path
+        $name = Split-Path -Leaf $path
+        $route = Get-Item -LiteralPath $path -Force -ErrorAction Stop
+        $dp = Join-Path $HomePath ".deeppattern"
+        $managedRoots = @(
+            (Join-Path $dp "decision-engine"),
+            (Join-Path $dp "decision-engine-root"),
+            (Join-Path $dp "agent-quality-gates"),
+            (Join-Path $dp "versions")
+        )
+        if (-not (Test-FastOwnedSkillJunction -Route $route -ManagedRoots $managedRoots)) {
+            Stop-Uninstall "Managed skill junction changed during fast uninstall: $path"
+        }
+        [IO.Directory]::Delete($route.FullName, $false)
+        $stillPresent = @(
+            Get-ChildItem -LiteralPath $parent -Force -ErrorAction Stop |
+                Where-Object { $_.Name -eq $name }
+        )
+        if ($stillPresent.Count -ne 0) {
+            Stop-Uninstall "Managed skill junction could not be removed: $path"
+        }
+        Write-Host "Removed orphaned managed skill junction: $path"
+        $removed += 1
+    }
+    return $removed
+}
+
+function Test-FastEmptyUninstallState {
+    $script:FastEmptyUninstallReason = $null
+    $script:FastEmptyUninstallActiveProcess = $false
+    $script:FastOwnedSkillJunctions = @()
+    $deStateNames = @(
+        "decision-engine",
+        "de-python",
+        "runtimes",
+        "runtime-backups",
+        "popup-sessions",
+        "installations",
+        ".install.lock"
+    )
+    $aqgStateNames = @(
+        "agent-quality-gates",
+        "versions",
+        "aqg-state",
+        "aqg-backups"
+    )
+    $retainedNames = @("decision-engine-root", "uninstall-backups")
+    $relevantStateNames = @()
+    $outOfScopeStateNames = @()
+    if ($Scope -in @("de", "both")) {
+        $relevantStateNames += $deStateNames
+    }
+    else {
+        $outOfScopeStateNames += $deStateNames
+    }
+    if ($Scope -in @("aqg", "both")) {
+        $relevantStateNames += $aqgStateNames
+    }
+    else {
+        $outOfScopeStateNames += $aqgStateNames
+    }
+
+    try {
+        $dp = Join-Path $HomePath ".deeppattern"
+        if (Test-Path -LiteralPath $dp -ErrorAction Stop) {
+            $dpItem = Get-Item -LiteralPath $dp -Force -ErrorAction Stop
+            if (-not $dpItem.PSIsContainer -or
+                ($dpItem.Attributes -band [IO.FileAttributes]::ReparsePoint) -ne 0) {
+                return (Require-FullUninstallVerification `
+                    -Reason "the .deeppattern root is not a regular private directory")
+            }
+            foreach ($item in @(Get-ChildItem -LiteralPath $dp -Force -ErrorAction Stop)) {
+                if ($retainedNames -contains $item.Name) {
+                    if (($item.Attributes -band [IO.FileAttributes]::ReparsePoint) -ne 0) {
+                        return (Require-FullUninstallVerification `
+                            -Reason ("retained state is a reparse point: {0}" -f $item.FullName))
+                    }
+                    continue
+                }
+                if ($relevantStateNames -contains $item.Name) {
+                    return (Require-FullUninstallVerification `
+                        -Reason ("managed state still exists: {0}" -f $item.FullName))
+                }
+                if ($outOfScopeStateNames -contains $item.Name) {
+                    continue
+                }
+                # Unknown content may be legacy managed state; let the full inventory decide.
+                return (Require-FullUninstallVerification `
+                    -Reason ("unrecognized .deeppattern state requires ownership inspection: {0}" -f $item.FullName))
+            }
+        }
+    }
+    catch {
+        return (Require-FullUninstallVerification `
+            -Reason "the .deeppattern root could not be inspected safely")
+    }
+
+    $appData = [string]$env:APPDATA
+    if ([string]::IsNullOrWhiteSpace($appData)) {
+        $appData = Join-Path $HomePath "AppData\Roaming"
+    }
+    $configPaths = @(
+        (Join-Path $HomePath ".claude.json"),
+        (Join-Path $HomePath ".claude\settings.json"),
+        (Join-Path $HomePath ".claude\settings.local.json"),
+        (Join-Path $appData "Claude\claude_desktop_config.json"),
+        (Join-Path $HomePath ".codex\config.toml"),
+        (Join-Path $HomePath ".cursor\mcp.json"),
+        (Join-Path $HomePath ".codebuddy\mcp.json"),
+        (Join-Path $HomePath ".qoder\mcp.json"),
+        (Join-Path $HomePath ".qoder\settings.json"),
+        (Join-Path $HomePath ".qoder-cn\mcp.json"),
+        (Join-Path $HomePath ".qoder-cn\settings.json"),
+        (Join-Path $HomePath ".trae\hooks.json"),
+        (Join-Path $HomePath ".trae-cn\hooks.json"),
+        (Join-Path $appData "TRAE SOLO\User\mcp.json"),
+        (Join-Path $appData "TRAE SOLO CN\User\mcp.json"),
+        (Join-Path $appData "Trae\User\mcp.json"),
+        (Join-Path $appData "Trae CN\User\mcp.json"),
+        (Join-Path $HomePath ".workbuddy\mcp.json"),
+        (Join-Path $HomePath ".workbuddy-ai\mcp.json"),
+        (Join-Path $HomePath ".workbuddy-ai\settings.json")
+    )
+    foreach ($configPath in ($configPaths | Select-Object -Unique)) {
+        try {
+            if (-not (Test-Path -LiteralPath $configPath -ErrorAction Stop)) {
+                continue
+            }
+            $configItem = Get-Item -LiteralPath $configPath -Force -ErrorAction Stop
+            if ($configItem.PSIsContainer -or
+                ($configItem.Attributes -band [IO.FileAttributes]::ReparsePoint) -ne 0 -or
+                $configItem.Length -gt 4MB) {
+                return (Require-FullUninstallVerification `
+                    -Reason ("host configuration is not a small regular file: {0}" -f $configPath))
+            }
+            $content = Get-Content -LiteralPath $configPath -Raw -ErrorAction Stop
+            if (Test-FastHostConfigReference -Path $configPath -Content $content) {
+                return (Require-FullUninstallVerification `
+                    -Reason ("host configuration still references DE/AQG: {0}" -f $configPath))
+            }
+        }
+        catch {
+            return (Require-FullUninstallVerification `
+                -Reason ("host configuration could not be inspected safely: {0}" -f $configPath))
+        }
+    }
+
+    $deSkillNames = @(
+        "audit",
+        "audit-adjudication",
+        "audit-brainstorming",
+        "audit-explore",
+        "audit-forecast",
+        "audit-market-research",
+        "audit-writing-plans",
+        "discussion-board",
+        "graphic-explanation",
+        "layer-check"
+    )
+    $skillRoots = @(
+        (Join-Path $HomePath ".claude\skills"),
+        (Join-Path $HomePath ".codex\skills"),
+        (Join-Path $HomePath ".cursor\skills"),
+        (Join-Path $HomePath ".codebuddy\skills"),
+        (Join-Path $HomePath ".qoder\skills"),
+        (Join-Path $HomePath ".qoder-cn\skills"),
+        (Join-Path $HomePath ".trae\skills"),
+        (Join-Path $HomePath ".trae-cn\skills"),
+        (Join-Path $HomePath ".workbuddy\skills")
+    )
+    $dp = Join-Path $HomePath ".deeppattern"
+    $managedSkillRoots = @(
+        (Join-Path $dp "decision-engine"),
+        (Join-Path $dp "decision-engine-root"),
+        (Join-Path $dp "agent-quality-gates"),
+        (Join-Path $dp "versions")
+    )
+    foreach ($skillRoot in $skillRoots) {
+        try {
+            if (-not (Test-Path -LiteralPath $skillRoot -ErrorAction Stop)) {
+                continue
+            }
+            $rootItem = Get-Item -LiteralPath $skillRoot -Force -ErrorAction Stop
+            if (-not $rootItem.PSIsContainer -or
+                ($rootItem.Attributes -band [IO.FileAttributes]::ReparsePoint) -ne 0) {
+                return (Require-FullUninstallVerification `
+                    -Reason ("skill root is not a regular directory: {0}" -f $skillRoot))
+            }
+            foreach ($route in @(Get-ChildItem -LiteralPath $skillRoot -Force -ErrorAction Stop)) {
+                if (($route.Attributes -band [IO.FileAttributes]::ReparsePoint) -eq 0) {
+                    continue
+                }
+                if (($Scope -in @("de", "both") -and $deSkillNames -contains $route.Name) -or
+                    ($Scope -in @("aqg", "both") -and $route.Name -like "aqg-*")) {
+                    if (-not (Test-FastOwnedSkillJunction `
+                        -Route $route `
+                        -ManagedRoots $managedSkillRoots)) {
+                        return (Require-FullUninstallVerification `
+                            -Reason ("skill junction target requires ownership inspection: {0}" -f $route.FullName))
+                    }
+                    $script:FastOwnedSkillJunctions += $route.FullName
+                }
+            }
+        }
+        catch {
+            return (Require-FullUninstallVerification `
+                -Reason ("skill root could not be inspected safely: {0}" -f $skillRoot))
+        }
+    }
+
+    try {
+        $processMarkers = @()
+        if ($Scope -in @("de", "both")) {
+            $processMarkers += @(
+                ".deeppattern\decision-engine\",
+                ".deeppattern/decision-engine/",
+                "installer.launcher"
+            )
+        }
+        if ($Scope -in @("aqg", "both")) {
+            $processMarkers += @(
+                ".deeppattern\agent-quality-gates\",
+                ".deeppattern/agent-quality-gates/"
+            )
+        }
+        foreach ($process in @(Get-CimInstance -ClassName Win32_Process -ErrorAction Stop)) {
+            $commandLine = [string]$process.CommandLine
+            foreach ($marker in $processMarkers) {
+                if ($commandLine.IndexOf($marker, [StringComparison]::OrdinalIgnoreCase) -ge 0) {
+                    $script:FastEmptyUninstallActiveProcess = $true
+                    return (Require-FullUninstallVerification `
+                        -Reason "an active process still references the DE/AQG runtime")
+                }
+            }
+        }
+    }
+    catch {
+        return (Require-FullUninstallVerification `
+            -Reason "the Windows process inventory could not be inspected safely")
+    }
+    if ($script:FastOwnedSkillJunctions.Count -gt 0) {
+        return (Require-FullUninstallVerification `
+            -Reason ("orphaned managed skill junctions remain: {0}" -f $script:FastOwnedSkillJunctions.Count))
+    }
+    return $true
+}
+
 function Invoke-ManagedPython {
     param(
         [Parameter(Mandatory = $true)][string[]]$Arguments,
@@ -404,7 +906,11 @@ function Invoke-ManagedPython {
     }
     Push-Location -LiteralPath $managedRoot
     try {
-        return Invoke-Clean -FilePath $PythonPath -ArgumentList $Arguments -Capture:$Capture
+        [string[]]$pythonArguments = @("-X", "utf8") + @($Arguments)
+        return Invoke-Clean `
+            -FilePath $PythonPath `
+            -ArgumentList $pythonArguments `
+            -Capture:$Capture
     }
     finally {
         Pop-Location
@@ -412,6 +918,13 @@ function Invoke-ManagedPython {
 }
 
 function Get-LiveManagedLeasePids {
+    $pythonVariable = Get-Variable -Name PythonPath -Scope Script -ErrorAction SilentlyContinue
+    if ($null -eq $pythonVariable -or
+        [string]::IsNullOrWhiteSpace([string]$pythonVariable.Value)) {
+        # The fast preflight can offer process cleanup before resolving or
+        # downloading Python. Command-line ownership evidence remains available.
+        return @()
+    }
     $managedRoot = Join-Path $HomePath ".deeppattern\decision-engine"
     $script = @'
 from pathlib import Path
@@ -740,9 +1253,70 @@ if ([System.Environment]::OSVersion.Platform -ne [System.PlatformID]::Win32NT) {
     Stop-Uninstall "This entrypoint supports native Windows only."
 }
 
+$fastEmptyUninstall = Test-FastEmptyUninstallState
+if ($fastEmptyUninstall) {
+    $mode = if ($Apply) { "APPLY" } else { "DRY-RUN" }
+    Write-Host "Deep Pattern uninstall plan"
+    Write-Host ("platform=win32 scope={0} mode={1}" -f $Scope, $mode)
+    Write-Host "PASS: uninstall verified; no in-scope installation found"
+    exit 0
+}
+
+if ($script:FastOwnedSkillJunctions.Count -gt 0) {
+    $mode = if ($Apply) { "APPLY" } else { "DRY-RUN" }
+    Write-Host "Deep Pattern uninstall plan"
+    Write-Host ("platform=win32 scope={0} mode={1}" -f $Scope, $mode)
+    foreach ($path in @($script:FastOwnedSkillJunctions | Select-Object -Unique)) {
+        Write-Host "REMOVE orphaned managed skill junction $path"
+    }
+    if (-not $Apply) {
+        Write-Host "DRY-RUN only: rerun with -Apply to remove these proven orphaned junctions without downloading Python."
+        exit 0
+    }
+    $removedJunctions = Remove-FastOwnedSkillJunctions
+    Write-Host ("Removed {0} orphaned managed skill junction(s). Rechecking uninstall state..." -f $removedJunctions)
+    if (Test-FastEmptyUninstallState) {
+        Write-Host "PASS: uninstall verified; no in-scope installation found"
+        exit 0
+    }
+    Stop-Uninstall ("Fast orphan cleanup did not reach an empty uninstall state: {0}" -f $script:FastEmptyUninstallReason)
+}
+
+if ($script:FastEmptyUninstallActiveProcess) {
+    if (-not $Apply) {
+        Write-Host "UNINSTALL_PENDING: active Deep Pattern processes were found; rerun with -Apply to review and confirm managed process termination."
+        exit 3
+    }
+    Write-Host "Active Deep Pattern processes must stop before uninstall can modify files."
+    if (-not (Resolve-ActiveManagedSessions)) {
+        Write-Host "UNINSTALL_PENDING: managed process termination was not completed; no files or settings were changed."
+        exit 3
+    }
+    if (@(Get-ManagedProcessCandidatePids).Count -gt 0) {
+        Write-Host "UNINSTALL_PENDING: an affected Agent recreated a Deep Pattern process. Fully exit that Agent, then rerun the uninstaller."
+        exit 3
+    }
+    Write-Host "Managed processes stopped. Rechecking uninstall state without restarting the command..."
+    if (Test-FastEmptyUninstallState) {
+        $mode = if ($Apply) { "APPLY" } else { "DRY-RUN" }
+        Write-Host "Deep Pattern uninstall plan"
+        Write-Host ("platform=win32 scope={0} mode={1}" -f $Scope, $mode)
+        Write-Host "PASS: uninstall verified; no in-scope installation found"
+        exit 0
+    }
+}
+if (-not [string]::IsNullOrWhiteSpace($script:FastEmptyUninstallReason)) {
+    Write-Host ("Full uninstall verification required: {0}" -f $script:FastEmptyUninstallReason)
+}
 Write-Host "Preparing the verified Deep Pattern uninstall environment..."
 $PythonPath = Resolve-Python
 $GitPath = Resolve-Git
+$BashPath = if ([string]::IsNullOrWhiteSpace($GitPath)) {
+    $null
+}
+else {
+    Resolve-GitBash -GitPath $GitPath
+}
 $temporaryRoot = Join-Path ([IO.Path]::GetTempPath()) ("dp-uninstall-" + [Guid]::NewGuid().ToString("N"))
 New-Item -ItemType Directory -Path $temporaryRoot | Out-Null
 $helperPath = Join-Path $temporaryRoot "dp_windows_uninstall.py"
@@ -752,6 +1326,7 @@ $helperSource = @'
 from __future__ import annotations
 
 import argparse
+import errno
 import hashlib
 import json
 import os
@@ -776,6 +1351,7 @@ SERVER_NAME = "decision-engine"
 MAX_CONFIG_BYTES = 4 * 1024 * 1024
 MAX_UNINSTALL_BACKUPS = 5
 GIT_EXE = ""
+BASH_EXE = ""
 PROCESS_INVENTORY_PATH: Path | None = None
 PROCESS_INVENTORY_SHA256 = ""
 GUIDABLE_PROCESS_BLOCKER_PREFIXES = (
@@ -894,6 +1470,62 @@ def is_reparse(path: Path) -> bool:
     )
 
 
+def prepare_tree_for_quarantine(path: Path, home: Path) -> None:
+    """Validate a managed tree without following links and clear Windows read-only bits."""
+    if not lexists(path) or is_reparse(path) or not path.is_dir():
+        raise RuntimeError("managed quarantine root is not a regular directory: %s" % path)
+    if not is_under(path, home):
+        raise RuntimeError("managed quarantine root is outside the user profile: %s" % path)
+    stack = [path]
+    directories: list[Path] = []
+    while stack:
+        current = stack.pop()
+        if is_reparse(current) or not current.is_dir():
+            raise RuntimeError("managed quarantine tree contains an unsafe directory: %s" % current)
+        directories.append(current)
+        for child in current.iterdir():
+            if is_reparse(child):
+                raise RuntimeError("managed quarantine tree contains a reparse point: %s" % child)
+            if child.is_dir():
+                stack.append(child)
+            elif child.is_file():
+                os.chmod(child, child.stat().st_mode | stat.S_IWRITE)
+            else:
+                raise RuntimeError("managed quarantine tree contains an unsafe entry: %s" % child)
+    for directory in reversed(directories):
+        os.chmod(directory, directory.stat().st_mode | stat.S_IWRITE)
+
+
+def remove_tree(path: Path) -> None:
+    """Remove a validated private tree with bounded Windows filesystem retries."""
+    def retry_readonly(function, target, _error):
+        try:
+            mode = os.stat(target, follow_symlinks=False).st_mode
+        except FileNotFoundError:
+            return
+        os.chmod(target, mode | stat.S_IWRITE)
+        function(target)
+
+    last_error: OSError | None = None
+    for attempt in range(5):
+        try:
+            shutil.rmtree(path, onerror=retry_readonly)
+            return
+        except FileNotFoundError:
+            return
+        except OSError as exc:
+            last_error = exc
+            transient = (
+                getattr(exc, "winerror", None) in (5, 32, 145)
+                or exc.errno in (errno.EACCES, errno.EBUSY, errno.ENOTEMPTY)
+            )
+            if not transient or attempt == 4:
+                raise
+            time.sleep(0.1 * (attempt + 1))
+    if last_error is not None:
+        raise last_error
+
+
 def reject_reparse_components(path: Path, floor: Path) -> Path | None:
     path = lex(path)
     floor = lex(floor)
@@ -981,12 +1613,11 @@ def checkout_is_clean(root: Path) -> bool:
 def de_checkout_has_product_remotes(root: Path) -> bool:
     try:
         names = tuple(line for line in git_output(root, "remote").splitlines() if line)
-        if set(names) != set(DE_PRODUCT_REMOTES):
+        if not names:
             return False
-        return all(
-            git_output(root, "remote", "get-url", name) == url
-            for name, url in DE_PRODUCT_REMOTES.items()
-        )
+        urls = tuple(git_output(root, "remote", "get-url", name) for name in names)
+        approved = set(DE_PRODUCT_REMOTES.values())
+        return all(url in approved for url in urls) and DE_PRODUCT_REMOTES["github"] in urls
     except (OSError, subprocess.SubprocessError, ValueError):
         return False
 
@@ -1293,15 +1924,37 @@ def prune_uninstall_backups(home: Path, dp: Path, current: Path | None = None) -
     roots = managed_uninstall_backups(home, dp)
     if current is not None and current not in roots:
         raise RuntimeError("current uninstall backup cannot be revalidated: %s" % current)
-    obsolete = roots[:-MAX_UNINSTALL_BACKUPS]
+    if current is None:
+        obsolete = roots[:-MAX_UNINSTALL_BACKUPS]
+    else:
+        other_roots = [path for path in roots if path != current]
+        keep_other = max(0, MAX_UNINSTALL_BACKUPS - 1)
+        obsolete = other_roots[:-keep_other] if keep_other else other_roots
     for path in obsolete:
-        shutil.rmtree(path)
+        remove_tree(path)
     if obsolete:
         print(
             "PRUNED %d old uninstall backup(s); retained latest %d"
             % (len(obsolete), MAX_UNINSTALL_BACKUPS)
         )
     return len(obsolete)
+
+
+def prune_uninstall_backups_best_effort(
+    home: Path, dp: Path, current: Path | None = None
+) -> int:
+    """Defer only transient filesystem cleanup of old, already-managed backups."""
+    try:
+        return prune_uninstall_backups(home, dp, current)
+    except OSError as exc:
+        winerror = getattr(exc, "winerror", None)
+        detail = "winerror=%s" % winerror if winerror is not None else type(exc).__name__
+        print(
+            "WARNING: old uninstall backup retention was deferred (%s); "
+            "the verified product uninstall remains valid" % detail,
+            file=sys.stderr,
+        )
+        return 0
 
 
 @dataclass
@@ -1473,11 +2126,19 @@ class Inventory:
         if not all(path.exists() and not is_reparse(path) for path in required):
             self.blockers.append("%s root has unexpected layout; ownership is unknown: %s" % (component, root))
             return
-        if component == "de" and (
-            not de_checkout_has_product_remotes(root) or not checkout_is_clean(root)
-        ):
-            self.blockers.append("DE managed checkout source identity is unknown or dirty: %s" % root)
-            return
+        if component == "de":
+            if not de_checkout_has_product_remotes(root):
+                self.blockers.append("DE managed checkout source identity is unknown: %s" % root)
+                return
+            if not checkout_is_clean(root):
+                self.notes.append(
+                    "PRESERVE modified official DE checkout in uninstall quarantine: %s" % root
+                )
+                self.add(
+                    "quarantine-root", root,
+                    "modified official Decision Engine checkout preserved without importing its code",
+                )
+                return
         if component == "aqg" and (
             not aqg_checkout_has_product_remote(root) or not checkout_is_clean(root)
         ):
@@ -1724,6 +2385,118 @@ class Inventory:
         if not found:
             self.notes.append("PRESERVE no provable DE integration residue without a managed root")
 
+    def inspect_aqg_skill_routes(self) -> None:
+        if self.aqg_uninstaller is None:
+            return
+        target = self.aqg_target or self.aqg_root
+        skills_root = target / "skills"
+        if not skills_root.is_dir() or is_reparse(skills_root):
+            self.blockers.append("AQG skill source is unavailable or link-like: %s" % skills_root)
+            return
+        skill_names = tuple(
+            path.name
+            for path in skills_root.iterdir()
+            if path.name.startswith("aqg-") and path.is_dir() and not is_reparse(path)
+        )
+        for destination in known_windows_skill_roots(self.home):
+            if not lexists(destination):
+                continue
+            if not destination.is_dir() or is_reparse(destination):
+                self.blockers.append("AQG skill root is not a regular directory: %s" % destination)
+                continue
+            if reject_reparse_components(destination.parent, self.home) is not None:
+                self.blockers.append("AQG skill root parent contains a reparse point: %s" % destination)
+                continue
+            for name in skill_names:
+                route = destination / name
+                if not lexists(route):
+                    continue
+                if not is_reparse(route):
+                    self.notes.append("PRESERVE foreign real AQG skill directory %s" % route)
+                    continue
+                try:
+                    route_target = Path(os.readlink(route))
+                    if not route_target.is_absolute():
+                        route_target = route.parent / route_target
+                    route_target = lex(route_target)
+                except OSError:
+                    self.blockers.append("AQG skill reparse target cannot be read: %s" % route)
+                    continue
+                expected_targets = {
+                    path_key(lex(skills_root / name)),
+                    path_key(lex(self.aqg_root / "skills" / name)),
+                    path_key(
+                        lex(
+                            target
+                            / "agent-packs"
+                            / "claude-code"
+                            / "skills"
+                            / name
+                        )
+                    ),
+                    path_key(
+                        lex(
+                            self.aqg_root
+                            / "agent-packs"
+                            / "claude-code"
+                            / "skills"
+                            / name
+                        )
+                    ),
+                }
+                if path_key(route_target) in expected_targets:
+                    self.add("remove-skill-route", route, "owned AQG skill junction")
+                    continue
+
+                # AQG updates atomically swap the managed entrance to a new
+                # versions/<release> checkout. An older adapter may have made
+                # a physical skill junction to the previous version, which can
+                # later be retained or already absent. The exact reserved
+                # versions/<name>/skills/<same-skill> shape is still owned
+                # residue; no arbitrary path under .deeppattern is accepted.
+                versions = lex(self.dp / "versions")
+                historical_owned = False
+                try:
+                    relative = lex(route_target).relative_to(versions)
+                except ValueError:
+                    relative = None
+                generic_shape = (
+                    relative is not None
+                    and len(relative.parts) == 3
+                    and relative.parts[1].lower() == "skills"
+                    and relative.parts[2].lower() == name.lower()
+                )
+                claude_shape = (
+                    relative is not None
+                    and len(relative.parts) == 5
+                    and tuple(part.lower() for part in relative.parts[1:4])
+                    == ("agent-packs", "claude-code", "skills")
+                    and relative.parts[4].lower() == name.lower()
+                )
+                if (
+                    relative is not None
+                    and (generic_shape or claude_shape)
+                    and re.fullmatch(r"[0-9A-Za-z.+-]{1,40}", relative.parts[0])
+                ):
+                    historical_root = versions / relative.parts[0]
+                    historical_owned = (
+                        not lexists(historical_root)
+                        or self.proven_aqg_version_target(historical_root)
+                    )
+                if historical_owned:
+                    self.add(
+                        "remove-skill-route",
+                        route,
+                        "owned historical AQG skill junction",
+                    )
+                    continue
+                if is_under(route_target, self.dp):
+                    self.blockers.append(
+                        "AQG skill route points to unproven managed state: %s" % route
+                    )
+                    continue
+                self.notes.append("PRESERVE foreign AQG skill junction %s" % route)
+
     def proven_aqg_version_target(self, path: Path) -> bool:
         if not safe_managed_directory(path, self.home):
             return False
@@ -1823,10 +2596,24 @@ class Inventory:
                                 % child
                             )
 
+        popup_sessions = self.dp / "popup-sessions"
+        if self.scope in ("de", "both") and lexists(popup_sessions):
+            if safe_managed_directory(popup_sessions, self.home):
+                self.add(
+                    "remove-popup-sessions",
+                    popup_sessions,
+                    "remove transient popup session data",
+                )
+            else:
+                self.blockers.append(
+                    "popup session state is not a safe managed directory: %s"
+                    % popup_sessions
+                )
+
         planned = {path_key(action.path) for action in self.actions}
         directories: list[Path] = []
         if self.scope in ("de", "both"):
-            directories.extend((self.dp / "installations", self.dp / "popup-sessions"))
+            directories.append(self.dp / "installations")
         if self.scope in ("aqg", "both"):
             directories.append(self.dp / "versions")
         for directory in directories:
@@ -1869,6 +2656,7 @@ class Inventory:
             self.inspect_root(self.aqg_root, "aqg")
             if lexists(self.aqg_root) and self.aqg_uninstaller is None:
                 self.blockers.append("AQG official uninstaller ownership cannot be proven")
+            self.inspect_aqg_skill_routes()
         self.inspect_managed_state_cleanup()
         self.inspect_backup_retention()
 
@@ -2005,6 +2793,35 @@ def remove_skill_route(action: Action, manifest: Manifest) -> None:
     manifest.add(action.path, None, "remove-owned-skill-junction", hashlib.sha256(target.encode("utf-8")).hexdigest())
 
 
+def remove_popup_sessions(
+    action: Action,
+    backup: Path,
+    manifest: Manifest,
+    index: int,
+    home: Path,
+) -> None:
+    source = action.path
+    if not lexists(source):
+        return
+    if not safe_managed_directory(source, home):
+        raise RuntimeError("popup session directory changed before apply: %s" % source)
+    destination = backup / "transient" / ("%03d-%s" % (index, source.name))
+    destination.parent.mkdir(parents=True, exist_ok=True)
+    os.replace(source, destination)
+    for current, directories, files in os.walk(destination, topdown=True, followlinks=False):
+        current_path = Path(current)
+        if is_reparse(current_path) or not current_path.is_dir():
+            raise RuntimeError("popup session directory contains an unsafe path: %s" % current_path)
+        for name in (*directories, *files):
+            child = current_path / name
+            if is_reparse(child) or (not child.is_dir() and not child.is_file()):
+                raise RuntimeError("popup session directory contains an unsafe entry: %s" % child)
+    remove_tree(destination)
+    if lexists(destination):
+        raise RuntimeError("popup session directory removal could not be verified")
+    manifest.add(source, None, "remove-transient-popup-sessions")
+
+
 def quarantine_path(action: Action, backup: Path, manifest: Manifest, index: int) -> None:
     source = action.path
     if not lexists(source):
@@ -2019,8 +2836,31 @@ def quarantine_path(action: Action, backup: Path, manifest: Manifest, index: int
         os.rmdir(source)
         manifest.add(source, None, action.kind, hashlib.sha256(target.encode("utf-8")).hexdigest())
         return
+    if source.is_dir():
+        prepare_tree_for_quarantine(source, backup.parents[2])
     os.replace(source, destination)
     manifest.add(source, destination, action.kind, action.expected_sha256)
+
+
+def aqg_wrapper_bootstrap_source() -> str:
+    return (
+        "from pathlib import Path\n"
+        "import subprocess, sys\n"
+        "root = Path(sys.argv[1])\n"
+        "script = Path(sys.argv[2])\n"
+        "prefix = sys.argv[3]\n"
+        "bash = sys.argv[4]\n"
+        "sys.path[:0] = [str(root), str(script.parent)]\n"
+        "from scripts import install_aqg_clients as wrapper\n"
+        "if Path(wrapper.__file__).resolve() != script.resolve():\n"
+        "    raise RuntimeError('AQG wrapper identity mismatch')\n"
+        "def run_verified(command, env):\n"
+        "    if not bash:\n"
+        "        raise RuntimeError('verified Git for Windows Bash is unavailable')\n"
+        "    subprocess.run([bash, '--noprofile', '--norc', '-c', prefix + command], check=True, env=env)\n"
+        "wrapper._run_command = run_verified\n"
+        "raise SystemExit(wrapper.main(sys.argv[5:]))\n"
+    )
 
 
 def invoke_aqg_uninstaller(inv: Inventory) -> None:
@@ -2038,6 +2878,10 @@ def invoke_aqg_uninstaller(inv: Inventory) -> None:
             environment.pop(key, None)
     environment["AQG_ROOT"] = str(root)
     environment["HOME"] = str(inv.home)
+    if BASH_EXE:
+        environment["AQG_BASH"] = BASH_EXE
+    else:
+        environment.pop("AQG_BASH", None)
     environment.pop("PROJECT_ROOT", None)
     # AQG's registry intentionally expresses cross-platform adapter commands as
     # ``python3 ...`` shell snippets.  On Windows that name can resolve to a
@@ -2091,28 +2935,16 @@ def invoke_aqg_uninstaller(inv: Inventory) -> None:
             shlex.quote(msys_executable),
             shlex.quote(msys_relay),
         )
-        bootstrap = (
-            "from pathlib import Path\n"
-            "import sys\n"
-            "root = Path(sys.argv[1])\n"
-            "script = Path(sys.argv[2])\n"
-            "prefix = sys.argv[3]\n"
-            "sys.path[:0] = [str(root), str(script.parent)]\n"
-            "from scripts import install_aqg_clients as wrapper\n"
-            "if Path(wrapper.__file__).resolve() != script.resolve():\n"
-            "    raise RuntimeError('AQG wrapper identity mismatch')\n"
-            "original = wrapper._run_command\n"
-            "wrapper._run_command = lambda command, env: original(prefix + command, env)\n"
-            "raise SystemExit(wrapper.main(sys.argv[4:]))\n"
-        )
+        bootstrap = aqg_wrapper_bootstrap_source()
         command = [
             sys.executable,
-            "-I",
+            "-I", "-X", "utf8",
             "-c",
             bootstrap,
             str(root),
             str(script),
             shell_prefix,
+            BASH_EXE,
             "--installed-supported",
             "--uninstall",
             "--aqg-root",
@@ -2122,8 +2954,13 @@ def invoke_aqg_uninstaller(inv: Inventory) -> None:
         ]
         completed = subprocess.run(command, cwd=str(root), env=environment, check=False)
     finally:
-        shutil.rmtree(shim_root, ignore_errors=True)
-    if completed.returncode != 0:
+        try:
+            remove_tree(shim_root)
+        except OSError:
+            pass
+    # AQG uses exit 3 for the valid no-op case where no supported user-scope
+    # Agent integration exists. Product roots still need removal in that state.
+    if completed.returncode not in (0, 3):
         raise RuntimeError("AQG official user-scope uninstaller failed: exit %d" % completed.returncode)
 
 
@@ -2131,6 +2968,22 @@ def apply_inventory(inv: Inventory) -> Path:
     backup = create_backup_root(inv)
     manifest = Manifest(backup, inv.home, inv.scope)
     manifest.write()
+
+    # Move the proven DE runtime out of service before touching any Agent
+    # integration. If Windows refuses the move, the uninstall stops with every
+    # host route still intact and can be retried after the locking process exits.
+    pre_aqg_root_actions = [
+        action
+        for action in inv.actions
+        if action.kind in {"quarantine-root", "quarantine-root-link"}
+        and path_key(action.path) == path_key(inv.de_root)
+    ]
+    completed_keys: set[tuple[str, str, str | None]] = set()
+    for index, action in enumerate(pre_aqg_root_actions, 1):
+        quarantine_path(action, backup, manifest, index)
+        completed_keys.add((action.kind, path_key(action.path), action.client))
+        manifest.write()
+
     if inv.scope in ("aqg", "both"):
         invoke_aqg_uninstaller(inv)
 
@@ -2156,7 +3009,7 @@ def apply_inventory(inv: Inventory) -> Path:
     seen: set[tuple[str, str, str | None]] = set()
     for action in effective_actions:
         key = (action.kind, path_key(action.path), action.client)
-        if key not in seen:
+        if key not in seen and key not in completed_keys:
             seen.add(key)
             deduplicated.append(action)
     effective_actions = deduplicated
@@ -2164,6 +3017,7 @@ def apply_inventory(inv: Inventory) -> Path:
     config_actions = [a for a in effective_actions if a.kind in {"edit-json", "edit-toml"}]
     route_actions = [a for a in effective_actions if a.kind == "remove-skill-route"]
     record_actions = [a for a in effective_actions if a.kind == "quarantine-record"]
+    popup_actions = [a for a in effective_actions if a.kind == "remove-popup-sessions"]
     aux_actions = [
         a for a in effective_actions
         if a.kind in {"quarantine-aux", "quarantine-aqg-version"}
@@ -2183,6 +3037,9 @@ def apply_inventory(inv: Inventory) -> Path:
     for index, action in enumerate(record_actions, 1):
         quarantine_path(action, backup, manifest, index)
         manifest.write()
+    for index, action in enumerate(popup_actions, 1):
+        remove_popup_sessions(action, backup, manifest, index, inv.home)
+        manifest.write()
     for index, action in enumerate(aux_actions, 1):
         quarantine_path(action, backup, manifest, index)
         manifest.write()
@@ -2198,7 +3055,7 @@ def apply_inventory(inv: Inventory) -> Path:
         manifest.add(action.path, None, "remove-empty-dir")
         manifest.write()
 
-    prune_uninstall_backups(inv.home, inv.dp, backup)
+    prune_uninstall_backups_best_effort(inv.home, inv.dp, backup)
     manifest.write()
     return backup
 
@@ -2232,13 +3089,14 @@ def parse_args(argv: list[str]) -> argparse.Namespace:
     parser.add_argument("--apply", action="store_true")
     parser.add_argument("--home", type=Path, required=True)
     parser.add_argument("--git", type=Path)
+    parser.add_argument("--bash", type=Path)
     parser.add_argument("--process-inventory", type=Path, required=True)
     parser.add_argument("--process-inventory-sha256", required=True)
     return parser.parse_args(argv)
 
 
 def main(argv: list[str]) -> int:
-    global GIT_EXE, PROCESS_INVENTORY_PATH, PROCESS_INVENTORY_SHA256
+    global GIT_EXE, BASH_EXE, PROCESS_INVENTORY_PATH, PROCESS_INVENTORY_SHA256
     args = parse_args(argv)
     if os.name != "nt" or sys.platform != "win32":
         print("unsupported platform: native Windows is required", file=sys.stderr)
@@ -2246,19 +3104,34 @@ def main(argv: list[str]) -> int:
     try:
         process_inventory_path = args.process_inventory.resolve(strict=True)
         git_path = args.git.resolve(strict=True) if args.git is not None else None
+        bash_path = args.bash.resolve(strict=True) if args.bash is not None else None
     except OSError as exc:
         print("verified tool path is unavailable: %s" % exc, file=sys.stderr)
         return EXIT_USAGE
     if (
         not process_inventory_path.is_file()
         or (git_path is not None and not git_path.is_file())
+        or (bash_path is not None and (not bash_path.is_file() or is_reparse(bash_path)))
     ):
         print("verified tool path is not a regular file", file=sys.stderr)
         return EXIT_USAGE
+    if bash_path is not None:
+        if git_path is None:
+            print("verified Bash requires the paired Git for Windows path", file=sys.stderr)
+            return EXIT_USAGE
+        git_root = git_path.parent.parent
+        expected_bash = {
+            os.path.normcase(str((git_root / "bin" / "bash.exe").resolve(strict=False))),
+            os.path.normcase(str((git_root / "usr" / "bin" / "bash.exe").resolve(strict=False))),
+        }
+        if os.path.normcase(str(bash_path)) not in expected_bash:
+            print("verified Bash is not from the paired Git for Windows root", file=sys.stderr)
+            return EXIT_USAGE
     if re.fullmatch(r"[0-9a-f]{64}", args.process_inventory_sha256) is None:
         print("process inventory digest is invalid", file=sys.stderr)
         return EXIT_USAGE
     GIT_EXE = str(git_path) if git_path is not None else ""
+    BASH_EXE = str(bash_path) if bash_path is not None else ""
     PROCESS_INVENTORY_PATH = process_inventory_path
     PROCESS_INVENTORY_SHA256 = args.process_inventory_sha256
     inv = Inventory(args.home, args.scope)
@@ -2277,7 +3150,7 @@ def main(argv: list[str]) -> int:
     ]
     if not cleanup_actions:
         try:
-            prune_uninstall_backups(inv.home, inv.dp)
+            prune_uninstall_backups_best_effort(inv.home, inv.dp)
         except Exception as exc:
             print("ERROR: uninstall backup retention failed: %s" % exc, file=sys.stderr)
             return EXIT_BLOCKED
@@ -2310,7 +3183,7 @@ try {
     function Invoke-UninstallHelper {
         $inventoryDigest = Write-ProcessInventory -Path $processInventoryPath
         $arguments = @(
-            "-I", $helperPath,
+            "-I", "-X", "utf8", $helperPath,
             "--scope", $Scope,
             "--home", $HomePath,
             "--process-inventory", $processInventoryPath,
@@ -2318,6 +3191,9 @@ try {
         )
         if (-not [string]::IsNullOrWhiteSpace($GitPath)) {
             $arguments += @("--git", $GitPath)
+        }
+        if (-not [string]::IsNullOrWhiteSpace($BashPath)) {
+            $arguments += @("--bash", $BashPath)
         }
         if ($Apply) {
             $arguments += "--apply"

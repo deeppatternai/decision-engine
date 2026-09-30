@@ -263,6 +263,59 @@ class UninstallScriptTests(unittest.TestCase):
         self.assertTrue(de.exists())
         self.assertTrue((self.home / ".codex" / "skills" / "audit").is_symlink())
 
+    def test_de_uninstall_removes_transient_popup_sessions_and_is_idempotent(self) -> None:
+        popup_root = self.home / ".deeppattern" / "popup-sessions"
+        session = popup_root / "test-session"
+        session.mkdir(parents=True)
+        (session / "result.json").write_text('{"status":"done"}\n', encoding="utf-8")
+
+        result = self._run("--scope", "de", "--apply")
+
+        self.assertEqual(result.returncode, 0, result.stdout)
+        self.assertIn(f"REMOVE {popup_root} (remove transient popup session data)", result.stdout)
+        self.assertFalse(popup_root.exists())
+        manifests = list(
+            (self.home / ".deeppattern" / "uninstall-backups").glob(
+                "*-dp-uninstall-de/manifest.json"
+            )
+        )
+        self.assertEqual(len(manifests), 1)
+        manifest = json.loads(manifests[0].read_text(encoding="utf-8"))
+        self.assertIn(
+            "remove-transient-popup-sessions",
+            {entry["operation"] for entry in manifest["entries"]},
+        )
+
+        rerun = self._run("--scope", "de", "--apply")
+        self.assertEqual(rerun.returncode, 0, rerun.stdout)
+        self.assertNotIn("remove transient popup session data", rerun.stdout)
+        self.assertFalse(popup_root.exists())
+
+    def test_aqg_only_uninstall_preserves_popup_sessions(self) -> None:
+        popup_root = self.home / ".deeppattern" / "popup-sessions"
+        popup_root.mkdir(parents=True)
+        (popup_root / "state.json").write_text("{}\n", encoding="utf-8")
+
+        result = self._run("--scope", "aqg", "--apply")
+
+        self.assertEqual(result.returncode, 0, result.stdout)
+        self.assertTrue(popup_root.is_dir())
+        self.assertNotIn("remove transient popup session data", result.stdout)
+
+    def test_popup_sessions_with_symlink_are_blocked_and_preserved(self) -> None:
+        popup_root = self.home / ".deeppattern" / "popup-sessions"
+        popup_root.mkdir(parents=True)
+        outside = self.home / "user-data.txt"
+        outside.write_text("preserve\n", encoding="utf-8")
+        (popup_root / "unsafe-link").symlink_to(outside)
+
+        result = self._run("--scope", "de", "--apply")
+
+        self.assertNotEqual(result.returncode, 0, result.stdout)
+        self.assertIn("popup session state contains a symlink", result.stdout)
+        self.assertTrue((popup_root / "unsafe-link").is_symlink())
+        self.assertEqual(outside.read_text(encoding="utf-8"), "preserve\n")
+
     def test_unknown_host_entry_blocks_without_mutation(self) -> None:
         de, _ = self._install_fixture(unknown_de_entry=True)
         result = self._run("--scope", "de")

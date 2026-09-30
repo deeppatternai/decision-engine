@@ -386,8 +386,14 @@ def _activate_config(
     if not isinstance(api_key, str) or not api_key.strip():
         raise ShellError("owner-issued activation key is required")
 
+    configured_device_name = config.get("device_name")
+    device_name = (
+        configured_device_name
+        if isinstance(configured_device_name, str) and configured_device_name.strip()
+        else device_name_default()
+    )
     body = {
-        "device_name": config.get("device_name") or device_name_default(),
+        "device_name": device_name,
         "device_fingerprint": config.get("device_fingerprint") or device_fingerprint(),
         "activation_secret": api_key,
         # Report the RUNNING client's version, NOT a config value: the version is an intrinsic property
@@ -402,6 +408,7 @@ def _activate_config(
     config["server_endpoint"] = endpoint
     config["access_token"] = result["access_token"]
     config["device_id"] = result["device_id"]
+    config["device_name"] = body["device_name"]
     if result.get("refresh_token"):
         config["refresh_token"] = result["refresh_token"]
     else:

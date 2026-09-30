@@ -49,7 +49,6 @@ from .config import (
     de_config_path,
     deeppattern_home,
     device_fingerprint,
-    device_name_default,
     atomic_write_json,
     load_json,
     managed_component_root,
@@ -605,7 +604,13 @@ def write_de_config(
         config["api_key"] = api_key
     config.setdefault("device_id", "")
     config.setdefault("access_token", "")
-    config["device_name"] = device_name or config.get("device_name") or device_name_default()
+    existing_device_name = config.get("device_name")
+    if isinstance(device_name, str) and device_name.strip():
+        config["device_name"] = device_name
+    elif isinstance(existing_device_name, str) and existing_device_name.strip():
+        config["device_name"] = existing_device_name
+    else:
+        config["device_name"] = ""
     config["device_fingerprint"] = device_fingerprint()
     # Informational record of the client that last configured this device (force-set, not setdefault, so
     # a reinstall re-stamps it). NOTE: this config field does NOT drive the version reported at
@@ -730,7 +735,7 @@ def build_parser() -> argparse.ArgumentParser:
     parser.add_argument("--api-key", default="",
                         help="owner-issued API key (DE only; consumed at activation)")
     parser.add_argument("--device-name", default="",
-                        help="friendly device name (defaults to user-host)")
+                        help="friendly device name (defaults from OS metadata at activation)")
     parser.add_argument("--json", action="store_true", help="emit JSON summary")
     return parser
 

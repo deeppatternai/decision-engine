@@ -6,10 +6,13 @@
 #
 #   curl -fsSL <trusted-install-url> | bash
 #
-# It deliberately accepts no arguments. The Decision Engine repository supplies
-# the signed stable release installer; this wrapper prepares a private Python
-# runtime when needed, bootstraps that installer, then opens the existing masked
-# activation dialog.
+# With no arguments it runs the existing interactive installer. On macOS,
+# --agent-terminal hands that unchanged interactive flow to Terminal.app,
+# --agent-activate hands only an already-installed activation flow to it, and
+# --activate runs that activation-only flow in an existing visible terminal.
+# The Decision Engine repository supplies the signed stable release installer;
+# this wrapper prepares a private Python runtime when needed, bootstraps that
+# installer, then opens the existing masked activation dialog.
 #
 set -euo pipefail
 
@@ -56,6 +59,9 @@ LINUX_VERSION_ID=""
 LINUX_MACHINE_ARCH=""
 PRIVATE_RUNTIME_DOWNLOAD_LABEL=""
 LINUX_PACKAGEKIT_NOTICE_SHOWN=0
+AGENT_TERMINAL_MODE=0
+AGENT_ACTIVATION_MODE=0
+ACTIVATION_ONLY_MODE=0
 
 fail() {
   printf '%s: ERROR: %s\n' "$PROGRAM_NAME" "$*" >&2
@@ -72,9 +78,14 @@ dependency_pending() {
   exit "$EXIT_PARTIAL"
 }
 
-if [ "$#" -ne 0 ]; then
-  fail "this first-time installer does not accept arguments; run it without arguments"
-fi
+case "$#:${1:-}" in
+  0:) ;;
+  1:--agent-terminal) AGENT_TERMINAL_MODE=1 ;;
+  1:--agent-activate) AGENT_ACTIVATION_MODE=1 ;;
+  1:--activate) ACTIVATION_ONLY_MODE=1 ;;
+  1:--activation-only) ACTIVATION_ONLY_MODE=1 ;;
+  *) fail "unsupported arguments; run without arguments, use --agent-terminal, use --agent-activate, or use --activate in a visible terminal" ;;
+esac
 
 [ -x /usr/bin/uname ] \
   || fail "the trusted /usr/bin/uname tool is unavailable; platform identity cannot be verified"
@@ -84,6 +95,167 @@ case "$PLATFORM_KERNEL" in
   Linux) PLATFORM_FAMILY="linux"; PLATFORM_DISPLAY_NAME="this Linux desktop" ;;
   *) fail "unsupported platform: ${PLATFORM_KERNEL:-unknown}; supported platforms are macOS and supported Ubuntu, Debian, or Fedora desktops" ;;
 esac
+
+if [ "$AGENT_ACTIVATION_MODE" -eq 1 ]; then
+  if [ "$PLATFORM_FAMILY" = "macos" ]; then
+    AGENT_TERMINAL_MODE=1
+  else
+    ACTIVATION_ONLY_MODE=1
+  fi
+fi
+
+handoff_interactive_install_to_macos_terminal() {
+  local source_path handoff_root staged_script runner launcher close_script
+  local output_log started_file started_tmp child_status_file child_status_tmp
+  local status_file status_tmp elapsed child_status
+
+  [ "$PLATFORM_FAMILY" = "macos" ] \
+    || fail "--agent-terminal is supported only on macOS; use the normal interactive installer on this platform"
+  [ -x /usr/bin/open ] && [ -x /usr/bin/mktemp ] && [ -x /usr/bin/script ] \
+    || fail "macOS Agent terminal handoff requires the trusted open, mktemp, and script tools"
+
+  source_path="${BASH_SOURCE[0]:-}"
+  [ -n "$source_path" ] && [ -f "$source_path" ] \
+    || fail "--agent-terminal must run from a script file; download dp-install.sh before invoking it instead of piping it to bash"
+
+  handoff_root="$(/usr/bin/mktemp -d /tmp/dp-install-terminal.XXXXXX)" \
+    || fail "could not create the private macOS Terminal handoff directory"
+  /bin/chmod 700 "$handoff_root" \
+    || fail "could not protect the macOS Terminal handoff directory"
+  staged_script="$handoff_root/dp-install.sh"
+  runner="$handoff_root/run-installer"
+  launcher="$handoff_root/run.command"
+  close_script="$handoff_root/close-terminal-window.applescript"
+  output_log="$handoff_root/output.log"
+  started_file="$handoff_root/started"
+  started_tmp="$handoff_root/started.tmp"
+  child_status_file="$handoff_root/child-status"
+  child_status_tmp="$handoff_root/child-status.tmp"
+  status_file="$handoff_root/status"
+  status_tmp="$handoff_root/status.tmp"
+
+  /bin/cp "$source_path" "$staged_script" \
+    || fail "could not stage the installer for Terminal.app"
+  /bin/chmod 700 "$staged_script" \
+    || fail "could not make the staged installer executable"
+
+  {
+    printf '%s\n' '#!/bin/bash' 'set +e'
+    if [ "$AGENT_ACTIVATION_MODE" -eq 1 ]; then
+      printf '/bin/bash %q --activation-only\n' "$staged_script"
+    else
+      printf '/bin/bash %q\n' "$staged_script"
+    fi
+    printf 'child_status=$?\n'
+    printf 'printf "%%s\\n" "$child_status" > %q\n' "$child_status_tmp"
+    printf '/bin/mv -f %q %q\n' "$child_status_tmp" "$child_status_file"
+    printf 'exit "$child_status"\n'
+  } >"$runner" \
+    || fail "could not create the interactive installer runner"
+  /bin/chmod 700 "$runner" \
+    || fail "could not make the interactive installer runner executable"
+
+  {
+    printf '%s\n' \
+      'on run argv' \
+      '  delay 1' \
+      '  set targetTTY to item 1 of argv' \
+      '  tell application "Terminal"' \
+      '    repeat with candidateWindow in windows' \
+      '      try' \
+      '        if (count of tabs of candidateWindow) is 1 then' \
+      '          set candidateTab to item 1 of tabs of candidateWindow' \
+      '          if (tty of candidateTab as text) is targetTTY then' \
+      '            close candidateWindow' \
+      '            return' \
+      '          end if' \
+      '        end if' \
+      '      end try' \
+      '    end repeat' \
+      '  end tell' \
+      'end run'
+  } >"$close_script" \
+    || fail "could not create the scoped Terminal close helper"
+
+  {
+    printf '%s\n' '#!/bin/bash' 'set +e'
+    printf 'printf "started\\n" > %q\n' "$started_tmp"
+    printf '/bin/mv -f %q %q\n' "$started_tmp" "$started_file"
+    printf 'terminal_tty="$(/usr/bin/tty 2>/dev/null || true)"\n'
+    printf '/usr/bin/script -q %q %q\n' "$output_log" "$runner"
+    printf 'script_status=$?\n'
+    printf 'if [ -f %q ]; then\n' "$child_status_file"
+    printf '  child_status="$(/bin/cat %q 2>/dev/null || true)"\n' "$child_status_file"
+    printf 'else\n'
+    printf '  child_status="$script_status"\n'
+    printf 'fi\n'
+    printf 'printf "\\nDecision Engine installer exited with status %%s.\\n" "$child_status"\n'
+    printf 'if [ -n "$terminal_tty" ] && [ -x /usr/bin/osascript ]; then\n'
+    printf '  /usr/bin/osascript %q "$terminal_tty" >/dev/null 2>&1 &\n' "$close_script"
+    printf 'fi\n'
+    printf 'printf "%%s\\n" "$child_status" > %q\n' "$status_tmp"
+    printf '/bin/mv -f %q %q\n' "$status_tmp" "$status_file"
+    printf 'exit 0\n'
+  } >"$launcher" \
+    || fail "could not create the macOS Terminal handoff launcher"
+  /bin/chmod 700 "$launcher" \
+    || fail "could not make the macOS Terminal handoff launcher executable"
+
+  if [ "$AGENT_ACTIVATION_MODE" -eq 1 ]; then
+    printf '%s\n' \
+      "Opening Terminal.app for Decision Engine device activation..." >&2
+  else
+    printf '%s\n' \
+      "Opening Terminal.app for the interactive Decision Engine installer..." >&2
+  fi
+  if ! /usr/bin/open -a Terminal "$launcher"; then
+    blocked "the Agent host denied the Terminal.app handoff; a one-time macOS Automation approval may be insufficient, so manually enable the host's Full Access mode before one retry"
+  fi
+
+  elapsed=0
+  while [ ! -f "$started_file" ]; do
+    /bin/sleep 1
+    elapsed=$((elapsed + 1))
+    if [ "$elapsed" -ge 15 ]; then
+      blocked "the Agent host did not permit the installer to open and run in Terminal.app; manually enable the host's Full Access mode before one retry"
+    fi
+  done
+
+  elapsed=0
+  while [ ! -f "$status_file" ]; do
+    /bin/sleep 1
+    elapsed=$((elapsed + 1))
+    if [ "$elapsed" -ge 7200 ]; then
+      blocked "the interactive Terminal.app installation did not report completion within 120 minutes; preserve the visible terminal output"
+    fi
+  done
+
+  [ -f "$output_log" ] && /bin/cat "$output_log"
+  child_status="$(/bin/cat "$status_file" 2>/dev/null || true)"
+  case "$child_status" in
+    ''|*[!0-9]*)
+      fail "Terminal.app returned an invalid installer exit status"
+      ;;
+  esac
+  /bin/sleep 2
+  /bin/rm -rf "$handoff_root"
+  exit "$child_status"
+}
+
+if [ "$AGENT_TERMINAL_MODE" -eq 1 ]; then
+  if [ "$PLATFORM_FAMILY" = "macos" ] \
+      && { [ "${TERM_PROGRAM:-}" = "Apple_Terminal" ] \
+        || [ "${__CFBundleIdentifier:-}" = "com.apple.Terminal" ]; } \
+      && [ -n "${TERM_SESSION_ID:-}" ] && [ -t 0 ] \
+      && [ -r /dev/tty ] && [ -w /dev/tty ]; then
+    if [ "$AGENT_ACTIVATION_MODE" -eq 1 ]; then
+      blocked "--agent-activate was invoked inside Terminal.app; the Agent must invoke it through its normal local command runner so activation can open, wait, report, and close one managed terminal window"
+    fi
+    blocked "--agent-terminal was invoked inside Terminal.app; the Agent must invoke it through its normal local command runner so the installer can open, wait for, report, and close one managed terminal window; for a manual Terminal install, rerun without arguments"
+  else
+    handoff_interactive_install_to_macos_terminal
+  fi
+fi
 
 read_linux_os_release() {
   local key value
@@ -195,6 +367,157 @@ clean_exec() {
   )
 }
 
+validate_activation_only_install() {
+  local required_path status_output status_line
+  local git_bin="/usr/bin/git"
+
+  [ ! -L "$MANAGED_ROOT" ] && [ -d "$MANAGED_ROOT" ] \
+    || return 1
+  [ -x "$MANAGED_PYTHON_BIN" ] \
+    || return 1
+  [ -x "$git_bin" ] \
+    || return 1
+  for required_path in \
+      .git \
+      .managed-install.json \
+      .runtime/update-state.json \
+      .runtime/update-protocol.json \
+      config.json \
+      VERSION \
+      installer/activate.py \
+      installer/permanent_setup.py; do
+    [ -e "$MANAGED_ROOT/$required_path" ] \
+      && [ ! -L "$MANAGED_ROOT/$required_path" ] \
+      || return 1
+  done
+
+  status_output="$(
+    clean_exec "$git_bin" -C "$MANAGED_ROOT" \
+      status --porcelain=v1 --untracked-files=all
+  )" || return 1
+  while IFS= read -r status_line; do
+    [ -n "$status_line" ] || continue
+    if [ "$status_line" = "?? stopper-ui.json" ]; then
+      [ -f "$MANAGED_ROOT/stopper-ui.json" ] \
+        && [ ! -L "$MANAGED_ROOT/stopper-ui.json" ] \
+        || return 1
+      continue
+    fi
+    return 1
+  done <<<"$status_output"
+
+  (
+    cd "$MANAGED_ROOT"
+    clean_exec "$MANAGED_PYTHON_BIN" - "$MANAGED_ROOT" <<'PY'
+from pathlib import Path
+import sys
+
+from installer import managed_install, update_transaction, updater
+
+root = Path(sys.argv[1])
+reader = updater._GitReader(root)
+identity = managed_install.validate_managed_identity(
+    root, updater._read_remotes(reader)
+)
+state = updater._read_update_state(identity.canonical_root)
+update_transaction._require_protocol_ready(identity.canonical_root)
+_code, head_output = reader.run("head")
+head = updater._single_commit(head_output, "managed HEAD")
+version = (identity.canonical_root / "VERSION").read_text(encoding="utf-8").strip()
+if head != state.last_release_commit or version != state.last_version:
+    raise SystemExit(1)
+PY
+  ) </dev/null >/dev/null 2>&1
+}
+
+activation_only_state() {
+  (
+    cd "$MANAGED_ROOT"
+    clean_exec "$MANAGED_PYTHON_BIN" -c \
+      'from installer import activate, config
+path = config.de_config_path()
+data = config.load_json(path)
+if activate.activation_recovery_marker_path(path).exists():
+    print("recovery-required")
+else:
+    print("activated" if activate.is_permanently_activated(data) else "pending")' \
+      </dev/null
+  )
+}
+
+run_activation_only() {
+  local activation_state activation_status=0
+
+  validate_activation_only_install \
+    || blocked "device activation requires a complete, clean, verified managed Decision Engine install; run the normal installer instead"
+  activation_state="$(activation_only_state)" \
+    || blocked "the managed installation exists, but its activation state could not be verified"
+  case "$activation_state" in
+    activated)
+      printf '%s: PASS: the device is already activated; existing Agent configuration was preserved.\n' \
+        "$PROGRAM_NAME"
+      exit 0
+      ;;
+    recovery-required)
+      blocked "the managed installation has an activation recovery marker; do not retry automatically and preserve it for owner-guided recovery"
+      ;;
+    pending) ;;
+    *) blocked "the managed installation returned an unknown activation state" ;;
+  esac
+
+  printf '%s\n' "Opening the masked Decision Engine activation window..." >/dev/tty
+  (
+    cd "$MANAGED_ROOT"
+    clean_exec "$MANAGED_PYTHON_BIN" -c '
+import inspect
+from types import SimpleNamespace
+
+from installer import permanent_setup
+
+run_setup = getattr(permanent_setup, "run_permanent_setup", None)
+supports_activation_only = (
+    callable(run_setup)
+    and "configure_hosts" in inspect.signature(run_setup).parameters
+)
+if supports_activation_only:
+    arguments = ["--activation-only"]
+else:
+    permanent_setup._configure_agent_hosts = (
+        lambda *_args, **_kwargs: SimpleNamespace(failures=(), notices=())
+    )
+    permanent_setup._doctor_has_blocking_failure = lambda _failures: False
+    arguments = []
+
+raise SystemExit(permanent_setup.main(arguments))'
+  ) </dev/null || activation_status=$?
+
+  case "$activation_status" in
+    0)
+      activation_state="$(activation_only_state)" \
+        || blocked "activation returned success, but the saved device state could not be verified"
+      [ "$activation_state" = "activated" ] \
+        || blocked "activation returned success, but the device remains unactivated"
+      printf '%s: PASS: device activation completed; existing Agent configuration was preserved. Fully restart the configured Agent applications.\n' \
+        "$PROGRAM_NAME"
+      exit 0
+      ;;
+    2)
+      printf '%s: PARTIAL: device activation was cancelled; the existing installation and Agent configuration were preserved.\n' \
+        "$PROGRAM_NAME" >&2
+      exit "$EXIT_PARTIAL"
+      ;;
+    *)
+      printf '%s: ERROR: device activation failed with status %s; the existing installation and Agent configuration were preserved.\n' \
+        "$PROGRAM_NAME" "$activation_status" >&2
+      exit "$activation_status"
+      ;;
+  esac
+}
+
+if [ "$ACTIVATION_ONLY_MODE" -eq 1 ]; then
+  run_activation_only
+fi
+
 confirm_dependency_install() {
   local prompt="$1" answer=""
   printf '%s [Y/N] ' "$prompt" >/dev/tty
@@ -233,13 +556,220 @@ append_client_line() {
 }
 
 line_list_contains() {
-  local values="$1" expected="$2"
-  printf '%s\n' "$values" | grep -Fxq "$expected"
+  local values="$1" expected="$2" value
+  while IFS= read -r value; do
+    [ "$value" = "$expected" ] && return 0
+  done <<<"$values"
+  return 1
+}
+
+filter_client_lines_by_snapshot() {
+  local candidates="$1" snapshot="$2" filtered="" client
+  while IFS= read -r client; do
+    [ -n "$client" ] || continue
+    line_list_contains "$snapshot" "$client" || continue
+    filtered="$(append_client_line "$filtered" "$client")"
+  done <<<"$candidates"
+  printf '%s\n' "$filtered"
+}
+
+merge_client_lines_by_catalog() {
+  local catalog="$1" first="$2" second="$3" merged="" client
+  while IFS= read -r client; do
+    [ -n "$client" ] || continue
+    if line_list_contains "$first" "$client" \
+        || line_list_contains "$second" "$client"; then
+      merged="$(append_client_line "$merged" "$client")"
+    fi
+  done <<<"$catalog"
+  printf '%s\n' "$merged"
 }
 
 comma_list_contains() {
-  local values="$1" expected="$2"
-  printf '%s' "$values" | tr ',' '\n' | grep -Fxq "$expected"
+  local remaining="$1" expected="$2" value
+  [ -n "$remaining" ] || return 1
+  while true; do
+    case "$remaining" in
+      *,*)
+        value="${remaining%%,*}"
+        remaining="${remaining#*,}"
+        ;;
+      *)
+        value="$remaining"
+        remaining=""
+        ;;
+    esac
+    [ "$value" = "$expected" ] && return 0
+    [ -n "$remaining" ] || return 1
+  done
+}
+
+client_display_name() {
+  case "$1" in
+    claude-code) printf '%s' 'Claude Code [claude-code]' ;;
+    claude-desktop) printf '%s' 'Claude Desktop [claude-desktop]' ;;
+    claude-desktop-3p) printf '%s' 'Claude Desktop third-party provider profile [claude-desktop-3p]' ;;
+    codebuddy) printf '%s' 'CodeBuddy [codebuddy]' ;;
+    codex) printf '%s' 'Codex [codex]' ;;
+    cursor) printf '%s' 'Cursor [cursor]' ;;
+    qoder) printf '%s' 'Qoder Desktop [qoder]' ;;
+    qoder-cn) printf '%s' 'Qoder CN Desktop [qoder-cn]' ;;
+    qoder-ide) printf '%s' 'Qoder IDE [qoder-ide]' ;;
+    qoder-cn-ide) printf '%s' 'Qoder CN IDE [qoder-cn-ide]' ;;
+    trae) printf '%s' 'TraeCode [trae]' ;;
+    trae-work) printf '%s' 'TraeWork [trae-work]' ;;
+    trae-cn) printf '%s' 'TraeCode CN [trae-cn]' ;;
+    trae-work-cn) printf '%s' 'TraeWork CN [trae-work-cn]' ;;
+    workbuddy) printf '%s' 'WorkBuddy [workbuddy]' ;;
+    workbuddy-ai) printf '%s' 'WorkBuddy AI [workbuddy-ai]' ;;
+    *) printf '%s' "$1" ;;
+  esac
+}
+
+print_client_lines_for_user() {
+  local clients="$1" client
+  while IFS= read -r client; do
+    [ -n "$client" ] || continue
+    client_display_name "$client"
+    printf '\n'
+  done <<<"$clients"
+}
+
+shared_skill_pair_selection_valid() {
+  local available="$1" configured="$2" selected="$3"
+  local first second first_selected second_selected
+  while IFS='|' read -r first second; do
+    [ -n "$first" ] && [ -n "$second" ] || continue
+    line_list_contains "$available" "$first" \
+      && line_list_contains "$available" "$second" || continue
+    first_selected=0
+    second_selected=0
+    if line_list_contains "$configured" "$first" \
+        || line_list_contains "$selected" "$first"; then
+      first_selected=1
+    fi
+    if line_list_contains "$configured" "$second" \
+        || line_list_contains "$selected" "$second"; then
+      second_selected=1
+    fi
+    if [ "$first_selected" -ne "$second_selected" ]; then
+      tty_print "$(client_display_name "$first") and $(client_display_name "$second") share one Skills directory and must be selected together so neither product is left with Skills but no MCP."
+      return 1
+    fi
+  done <<'EOF'
+qoder|qoder-ide
+qoder-cn|qoder-cn-ide
+trae|trae-work
+trae-cn|trae-work-cn
+EOF
+  return 0
+}
+
+select_install_clients() {
+  local available="$1" configured="${2:-}" answer="" compact="" tokens="" token="" lower=""
+  local available_count=0 token_count=0 all_count=0 invalid=0 index=0 client=""
+  local selected_indices="" selected="" configured_indices="" display_name=""
+
+  tty_print "Detected supported Agent hosts installed on $PLATFORM_DISPLAY_NAME:"
+  while IFS= read -r client; do
+    [ -n "$client" ] || continue
+    available_count=$((available_count + 1))
+    display_name="$(client_display_name "$client")"
+    if line_list_contains "$configured" "$client"; then
+      if [ -n "$configured_indices" ]; then
+        configured_indices="$configured_indices,$available_count"
+      else
+        configured_indices="$available_count"
+      fi
+      if [ -z "${NO_COLOR:-}" ] && [ "${TERM:-dumb}" != "dumb" ]; then
+        printf '  %s) %s  \033[32m✓ configured\033[0m\n' \
+          "$available_count" "$display_name" >/dev/tty
+      else
+        printf '  %s) %s  [configured]\n' \
+          "$available_count" "$display_name" >/dev/tty
+      fi
+    else
+      printf '  %s) %s\n' "$available_count" "$display_name" >/dev/tty
+    fi
+  done <<<"$available"
+  [ "$available_count" -gt 0 ] || return 1
+  if [ -n "$configured_indices" ]; then
+    tty_print "Configured Agent integrations are retained automatically: $configured_indices"
+  fi
+
+  while true; do
+    printf 'Select Agent hosts to configure [all]: ' >/dev/tty
+    if ! IFS= read -r answer </dev/tty; then
+      tty_print "Agent selection was cancelled; no Agent host configuration was started."
+      return 2
+    fi
+
+    compact="$(printf '%s' "$answer" | /usr/bin/tr -d '[:space:]')"
+    if [ -z "$compact" ]; then
+      printf '%s\n' "$available"
+      return 0
+    fi
+
+    tokens="$({
+      printf '%s' "$answer" \
+        | /usr/bin/tr ',[:space:]' '\n' \
+        | /usr/bin/sed '/^$/d'
+    })"
+    token_count=0
+    all_count=0
+    invalid=0
+    selected_indices=""
+    while IFS= read -r token; do
+      [ -n "$token" ] || continue
+      token_count=$((token_count + 1))
+      lower="$(printf '%s' "$token" | /usr/bin/tr '[:upper:]' '[:lower:]')"
+      if [ "$lower" = "all" ]; then
+        all_count=$((all_count + 1))
+        continue
+      fi
+      case "$token" in
+        *[!0-9]*|??????*) invalid=1; continue ;;
+      esac
+      if ! [ "$token" -ge 1 ] 2>/dev/null \
+          || ! [ "$token" -le "$available_count" ] 2>/dev/null; then
+        invalid=1
+        continue
+      fi
+      if ! line_list_contains "$selected_indices" "$token"; then
+        selected_indices="$(append_client_line "$selected_indices" "$token")"
+      fi
+    done <<<"$tokens"
+
+    if [ "$token_count" -eq 1 ] && [ "$all_count" -eq 1 ]; then
+      printf '%s\n' "$available"
+      return 0
+    fi
+    if [ "$token_count" -eq 0 ] || [ "$all_count" -ne 0 ] \
+        || [ "$invalid" -ne 0 ] || [ -z "$selected_indices" ]; then
+      tty_print "Invalid selection. Enter all, press Enter, or enter one or more listed numbers separated by commas or spaces."
+      continue
+    fi
+
+    index=0
+    selected=""
+    while IFS= read -r client; do
+      [ -n "$client" ] || continue
+      index=$((index + 1))
+      line_list_contains "$selected_indices" "$index" || continue
+      selected="$(append_client_line "$selected" "$client")"
+    done <<<"$available"
+    [ -n "$selected" ] || {
+      tty_print "Invalid selection. No supported Agent host was selected."
+      continue
+    }
+    if ! shared_skill_pair_selection_valid \
+        "$available" "$configured" "$selected"; then
+      tty_print "Enter both listed numbers for that product pair, or select all."
+      continue
+    fi
+    printf '%s\n' "$selected"
+    return 0
+  done
 }
 
 regular_app_has_bundle_id() {
@@ -281,6 +811,21 @@ elif [ "$PLATFORM_FAMILY" = "macos" ] \
   workbuddy_variant="ai"
 fi
 
+normalize_detected_clients_for_variant() {
+  local clients="$1" normalized="" client
+  if [ "$workbuddy_variant" != "ai" ] \
+      || ! line_list_contains "$clients" "workbuddy-ai"; then
+    printf '%s\n' "$clients"
+    return 0
+  fi
+  while IFS= read -r client; do
+    [ -n "$client" ] || continue
+    [ "$client" = "workbuddy" ] && continue
+    normalized="$(append_client_line "$normalized" "$client")"
+  done <<<"$clients"
+  printf '%s\n' "$normalized"
+}
+
 de_exec() {
   if [ "${absent_claude_route:-0}" -eq 1 ]; then
     set -- env CLAUDE_SKILLS_DIR="$tmp_root/absent-claude-skills" "$@"
@@ -294,6 +839,153 @@ de_exec() {
   else
     clean_exec "$@"
   fi
+}
+
+detect_source_clients() {
+  (
+    cd "$catalog_root"
+    de_exec "$PYTHON_BIN" -c '
+import json
+import os
+import plistlib
+import shutil
+import sys
+import tomllib
+from pathlib import Path
+
+from installer import mcp_config
+
+
+def executable_present(*names):
+    if any(shutil.which(name) for name in names):
+        return True
+    for name in names:
+        candidate = Path.home() / ".local" / "bin" / name
+        if candidate.is_file() and os.access(candidate, os.X_OK):
+            return True
+    return False
+
+
+def json_config_has_non_de_content(client):
+    config_path = mcp_config.agent_config_path(client)
+    if not config_path.is_file() or config_path.is_symlink():
+        return False
+    try:
+        data = json.loads(config_path.read_text(encoding="utf-8-sig"))
+    except (OSError, UnicodeError, ValueError):
+        return True
+    if not isinstance(data, dict):
+        return True
+    remaining = dict(data)
+    servers = remaining.get("mcpServers")
+    if isinstance(servers, dict):
+        other_servers = dict(servers)
+        other_servers.pop("decision-engine", None)
+        if other_servers:
+            remaining["mcpServers"] = other_servers
+        else:
+            remaining.pop("mcpServers", None)
+    return bool(remaining)
+
+
+def toml_config_has_non_de_content(client):
+    config_path = mcp_config.agent_config_path(client)
+    if not config_path.is_file() or config_path.is_symlink():
+        return False
+    try:
+        data = tomllib.loads(config_path.read_text(encoding="utf-8-sig"))
+    except (OSError, UnicodeError, tomllib.TOMLDecodeError):
+        return True
+    if not isinstance(data, dict):
+        return True
+    remaining = dict(data)
+    servers = remaining.get("mcp_servers")
+    if isinstance(servers, dict):
+        other_servers = dict(servers)
+        other_servers.pop("decision-engine", None)
+        if other_servers:
+            remaining["mcp_servers"] = other_servers
+        else:
+            remaining.pop("mcp_servers", None)
+    return bool(remaining)
+
+
+def macos_bundle_present(names, bundle_id):
+    if sys.argv[1] != "macos":
+        return False
+    for app_root in (Path("/Applications"), Path.home() / "Applications"):
+        for name in names:
+            app = app_root / name
+            plist = app / "Contents" / "Info.plist"
+            if app.is_symlink() or not app.is_dir() or plist.is_symlink() or not plist.is_file():
+                continue
+            try:
+                with plist.open("rb") as handle:
+                    payload = plistlib.load(handle)
+            except (OSError, ValueError):
+                continue
+            identity = (
+                payload.get("CFBundleIdentifier") if isinstance(payload, dict) else None
+            )
+            if identity == bundle_id:
+                return True
+    return False
+
+
+def independently_installed(client):
+    if client == "claude-code":
+        return executable_present("claude") or json_config_has_non_de_content(client)
+    if client == "codex":
+        return (
+            executable_present("codex")
+            or macos_bundle_present(("ChatGPT.app", "Codex.app"), "com.openai.codex")
+            or toml_config_has_non_de_content(client)
+        )
+    if client == "cursor":
+        return (
+            executable_present("cursor")
+            or macos_bundle_present(("Cursor.app",), "com.todesktop.230313mzl4w4u92")
+            or json_config_has_non_de_content(client)
+        )
+    return True
+
+
+clients = tuple(
+    client
+    for client in mcp_config.detect_clients()
+    if independently_installed(client)
+)
+print("\n".join(clients))
+' "$PLATFORM_FAMILY"
+  )
+}
+
+detect_configured_clients() {
+  (
+    cd "$catalog_root"
+    de_exec "$PYTHON_BIN" -c '
+import inspect
+
+from installer import mcp_config
+
+
+status_probe = getattr(mcp_config, "entry_status", None)
+if callable(status_probe):
+    supports_allow_unactivated = (
+        "allow_unactivated" in inspect.signature(status_probe).parameters
+    )
+    for client in mcp_config.detect_clients():
+        try:
+            options = {"allow_unactivated": True} if supports_allow_unactivated else {}
+            status = status_probe(client, **options)
+        except Exception:
+            # A display-only probe must not make an unselected malformed host
+            # block configuration of a different selected host.
+            continue
+        if status == "ready":
+            print(client)
+'
+  )
 }
 
 GIT_BIN=""
@@ -1186,6 +1878,23 @@ if ! grep -Fq \
   fail "the Decision Engine product repository does not declare the approved signed-stable remote contract; no product state was changed"
 fi
 
+# Reuse the trusted host catalog before any AQG checkout, managed DE update,
+# core install, activation, or Agent configuration begins. Runtime and source
+# prerequisites are already ready because this is the single authoritative
+# detector; duplicating it in shell would let the two presence policies drift.
+catalog_root="$source_root"
+if ! preflight_detected_clients="$(detect_source_clients | tr -d '\r')"; then
+  fail "could not inspect installed Agent hosts through the current Decision Engine catalog"
+fi
+preflight_detected_clients="$(
+  normalize_detected_clients_for_variant "$preflight_detected_clients"
+)"
+if [ -z "$preflight_detected_clients" ]; then
+  tty_print "No installed Agent host supported by the current Decision Engine catalog was detected."
+  tty_print "Install a supported Agent host, then rerun this installer."
+  dependency_pending "Agent preflight found no supported installed host; AQG configuration, the DE core install, activation, and Agent configuration were not started"
+fi
+
 run_source_python() {
   (
     cd "$source_root"
@@ -1533,20 +2242,22 @@ catalog_root="$source_root"
 if [ "$de_update_deferred" -eq 1 ]; then
   catalog_root="$MANAGED_ROOT"
 fi
-if ! source_detected_clients="$(
-  cd "$catalog_root"
-  de_exec "$PYTHON_BIN" -c \
-    'from installer import mcp_config; print("\n".join(mcp_config.detect_clients()))' \
-    | tr -d '\r'
-)"; then
+if ! source_detected_clients="$(detect_source_clients | tr -d '\r')"; then
   fail "could not inspect the current Decision Engine host adapter catalog"
 fi
-absent_claude_route=0
-if ! line_list_contains "$source_detected_clients" "claude-code"; then
-  # Older signed stable builds route Claude skills unconditionally. Keep that
-  # legacy route inside the install transaction until the stable fix lands.
-  absent_claude_route=1
+source_detected_clients="$(
+  normalize_detected_clients_for_variant "$source_detected_clients"
+)"
+if ! source_configured_clients="$(detect_configured_clients | tr -d '\r')"; then
+  fail "could not inspect existing Decision Engine Agent integrations"
 fi
+source_configured_clients="$(
+  normalize_detected_clients_for_variant "$source_configured_clients"
+)"
+source_configured_clients="$(
+  filter_client_lines_by_snapshot \
+    "$source_configured_clients" "$source_detected_clients"
+)"
 
 # These bundles are distinct products, not aliases for the supported Desktop
 # adapters with similar names. Report them explicitly when the current product
@@ -1577,6 +2288,57 @@ if regular_app_has_bundle_id "/Applications/Qoder CN IDE.app" "com.aliyun.lingma
     "$unsupported_installed_hosts" \
     "qoder-cn-ide (Qoder CN IDE.app): separate product; DE adapter unavailable")"
 fi
+fi
+
+if [ -z "$source_detected_clients" ]; then
+  tty_print "No installed Agent host supported by the active Decision Engine catalog was detected."
+  tty_print "Install a supported Agent host, then rerun this installer."
+  dependency_pending "Agent preflight found no supported installed host; AQG configuration, the DE core install, activation, and Agent configuration were not started"
+fi
+
+selection_status=0
+requested_source_clients="$(
+  select_install_clients "$source_detected_clients" "$source_configured_clients"
+)" \
+  || selection_status=$?
+case "$selection_status" in
+  0) ;;
+  2) dependency_pending "Agent selection was cancelled; AQG configuration, the DE core install, activation, and Agent configuration were not started" ;;
+  *) fail "could not select from the detected supported Agent hosts" ;;
+esac
+[ -n "$requested_source_clients" ] \
+  || fail "Agent selection returned no supported host"
+new_selected_clients=""
+while IFS= read -r selected_client; do
+  [ -n "$selected_client" ] || continue
+  line_list_contains "$source_configured_clients" "$selected_client" && continue
+  new_selected_clients="$(append_client_line \
+    "$new_selected_clients" "$selected_client")"
+done <<<"$requested_source_clients"
+selected_source_clients="$(
+  merge_client_lines_by_catalog \
+    "$source_detected_clients" \
+    "$source_configured_clients" \
+    "$requested_source_clients"
+)"
+[ -n "$selected_source_clients" ] \
+  || fail "Agent selection and configured-host retention returned no supported host"
+tty_print "Agent hosts maintained by this installation run:"
+print_client_lines_for_user "$selected_source_clients" >/dev/tty
+tty_print "Configured integrations are retained automatically; other unselected hosts will not be configured or removed."
+tty_print "Orphaned skill links proven to point into this managed Decision Engine install may be pruned from unselected hosts; user-managed files and foreign links are preserved."
+if [ -z "$new_selected_clients" ]; then
+  tty_print "No new Agent integration was selected; this run will only update or repair Decision Engine and Agent Quality Gates for the configured hosts."
+else
+  tty_print "New Agent integrations selected for this run:"
+  print_client_lines_for_user "$new_selected_clients" >/dev/tty
+fi
+
+absent_claude_route=0
+if ! line_list_contains "$selected_source_clients" "claude-code"; then
+  # Older signed stable builds route Claude skills unconditionally. Keep that
+  # legacy route isolated unless Claude Code was explicitly selected.
+  absent_claude_route=1
 fi
 
 AQG_LAYOUT=""
@@ -2015,6 +2777,9 @@ fi
 aqg_selected_clients=""
 while IFS= read -r aqg_client; do
   [ -n "$aqg_client" ] || continue
+  # Freeze routing to the pre-configuration DE snapshot. AQG directory probes
+  # must not revive a host from residue or make a later DE probe self-fulfilling.
+  line_list_contains "$selected_source_clients" "$aqg_client" || continue
   # WorkBuddy AI is a separate macOS product identity whose real data root is
   # .workbuddy-ai. Do not let a leftover .workbuddy directory select the old
   # profile; AQG's registered workbuddy-ai profile owns this variant.
@@ -2031,10 +2796,10 @@ done <<<"$aqg_detected_clients"
 install_aqg_dependencies \
   || fail "AQG dependency installation failed; Decision Engine was not installed"
 
-tty_print "Planning AQG configuration for every supported host detected by AQG..."
+tty_print "Planning AQG configuration for every selected host supported by AQG..."
 run_aqg_clients "dry-run" \
   || fail "AQG multi-host dry-run failed; Decision Engine was not installed"
-tty_print "Applying AQG skills, rules, and only the lifecycle hooks supported by each detected host..."
+tty_print "Applying AQG skills, rules, and only the lifecycle hooks supported by each selected host..."
 run_aqg_clients "apply" --apply \
   || fail "AQG multi-host configuration failed; Decision Engine was not installed"
 ensure_aqg_update_layout
@@ -2052,8 +2817,8 @@ run_aqg_install_doctor() {
       "$PYTHON_BIN" "$AQG_ROOT/scripts/aqg_doctor.py"
     return $?
   fi
-  # Keep the signed Doctor's verdict; only its presentation of absent hosts
-  # needs adjustment until the upstream Doctor becomes presence-aware.
+  # Keep the signed Doctor's common and selected-host verdicts; unselected
+  # Claude/Codex findings are outside this installation run.
   clean_exec env PATH="$PYTHON_DIR:$PATH" "$PYTHON_BIN" -c '
 import json
 import subprocess
@@ -2072,9 +2837,18 @@ except (ValueError, KeyError, TypeError):
     print("AQG Doctor returned an unreadable report", file=sys.stderr)
     raise SystemExit(proc.returncode or 1)
 
-detected = set(clients.split(","))
-absent = {name for client, name in (("claude-code", "claude_skill_root"),
-                                      ("codex", "codex_skill_root")) if client not in detected}
+selected = {client for client in clients.split(",") if client}
+
+def result_client(name):
+    if name == "hook_env_guard" or name == "claude_hooks" \
+            or name == "rules_block:claude" \
+            or name == "claude_skill_root" or name.startswith("claude_skill:"):
+        return "claude-code"
+    if name == "codex_hooks" or name == "rules_block:codex" \
+            or name == "codex_skill_root" or name.startswith("codex_skill:"):
+        return "codex"
+    return None
+
 counts = {"PASS": 0, "WARN": 0, "FAIL": 0, "SKIP": 0}
 for result in results:
     status = result["status"]
@@ -2083,10 +2857,9 @@ for result in results:
     if status not in ("PASS", "WARN", "FAIL"):
         print("AQG Doctor returned an unknown status", file=sys.stderr)
         raise SystemExit(1)
-    if name in absent and status == "WARN" and detail.endswith(
-        "does not exist (skills not installed for this agent)"
-    ):
-        status, detail = "SKIP", "agent not detected; skills not required"
+    owner = result_client(name)
+    if owner is not None and owner not in selected:
+        status, detail = "SKIP", "Agent not selected for this installation run"
     counts[status] += 1
     marker = {"PASS": "+", "WARN": "!", "FAIL": "x", "SKIP": "-"}[status]
     print(f"  [{marker}] {status:4s} {name}: {detail}")
@@ -2094,7 +2867,7 @@ for result in results:
         print("        fix: " + result["fix"])
 print()
 print("Summary: " + " ".join(f"{key}={value}" for key, value in counts.items()))
-raise SystemExit(proc.returncode)
+raise SystemExit(1 if counts["FAIL"] else 0)
 ' "$AQG_ROOT/scripts/aqg_doctor.py" "$aqg_selected_clients"
 }
 if ! run_aqg_install_doctor; then
@@ -2107,9 +2880,10 @@ tty_print "Installing the signed Decision Engine stable release..."
 if [ "$resume_managed_root" -eq 1 ]; then
   tty_print "Reusing the existing signed Decision Engine stable checkout without cloning or replacing it."
 else
-  bootstrap_client="$(printf '%s\n' "$source_detected_clients" | sed -n '1p')"
-  [ -n "$bootstrap_client" ] \
-    || blocked "no supported Agent host was detected before the signed stable core install"
+  bootstrap_clients="$(printf '%s' "$selected_source_clients" | /usr/bin/tr '\n' ',')"
+  bootstrap_clients="${bootstrap_clients%,}"
+  [ -n "$bootstrap_clients" ] \
+    || blocked "no selected supported Agent host was available before the signed stable core install"
   core_install_status=0
   (
     cd "$source_root"
@@ -2118,13 +2892,37 @@ else
     # WITH_MCP=1 lets its newer host catalog flow into an older signed stable
     # release before that release can publish its own contract. It also opens
     # permanent setup inside the bootstrap, which would duplicate the dialog
-    # owned below. bootstrap_client satisfies the bootstrap's non-empty target
-    # invariant only; no external host entry is written in this phase.
+    # owned below. Freeze discovery and skill routing to the effective selection
+    # so an MCP-only host cannot route skills into unrelated Agents.
     de_exec env GIT_TERMINAL_PROMPT=0 "$PYTHON_BIN" -c \
-      'from installer import bootstrap_managed_install
-import sys
-bootstrap_managed_install.bootstrap_new_install(clients=(sys.argv[1],))' \
-      "$bootstrap_client"
+      'import sys
+
+from installer import bootstrap_managed_install, mcp_config
+
+clients = tuple(client for client in sys.argv[1].split(",") if client)
+if len(clients) != len(set(clients)) or any(
+    client not in mcp_config.CLIENT_SPECS for client in clients
+):
+    raise SystemExit("bootstrap client list is invalid")
+
+allowed_routes = {
+    mcp_config.CLIENT_SPECS[client].skill_route_name
+    for client in clients
+    if mcp_config.CLIENT_SPECS[client].skill_route_name is not None
+}
+original_active_skill_routes = mcp_config.active_skill_routes
+
+def scoped_active_skill_routes(*, for_doctor=False, setup_only=False):
+    routes = original_active_skill_routes(
+        for_doctor=for_doctor,
+        setup_only=setup_only,
+    )
+    return {name: value for name, value in routes.items() if name in allowed_routes}
+
+mcp_config.detect_clients = lambda: list(clients)
+mcp_config.active_skill_routes = scoped_active_skill_routes
+bootstrap_managed_install.bootstrap_new_install(clients=clients)' \
+      "$bootstrap_clients"
   ) || core_install_status=$?
   if [ "$core_install_status" -ne 0 ]; then
     if managed_activation_recovery_pending; then
@@ -2225,7 +3023,8 @@ print(result.get("status", "unknown"))' \
 # it must refuse before any host write, and it protects a product-owned file
 # rather than a Decision Engine one.
 claude_3p_profile_detected=0
-if [ "$PLATFORM_FAMILY" = "macos" ] && {
+if line_list_contains "$selected_source_clients" "claude-desktop-3p" \
+    && [ "$PLATFORM_FAMILY" = "macos" ] && {
     [ -e "$CLAUDE_3P_CONFIG" ] || [ -L "$CLAUDE_3P_CONFIG" ];
 }; then
   if [ -L "$CLAUDE_3P_CONFIG" ] || [ ! -f "$CLAUDE_3P_CONFIG" ]; then
@@ -2248,36 +3047,19 @@ if [ "$claude_3p_profile_detected" -eq 1 ]; then
     || blocked "Decision Engine $managed_version does not support the configured Claude third-party profile"
 fi
 
-normalize_managed_clients_for_variant() {
-  local clients="$1" normalized="" client
-  if [ "$workbuddy_variant" != "ai" ] \
-      || ! line_list_contains "$clients" "workbuddy-ai"; then
-    printf '%s\n' "$clients"
-    return 0
-  fi
-  while IFS= read -r client; do
-    [ -n "$client" ] || continue
-    [ "$client" = "workbuddy" ] && continue
-    normalized="$(append_client_line "$normalized" "$client")"
-  done <<<"$clients"
-  printf '%s\n' "$normalized"
-}
-
 if ! managed_detected_clients="$(detect_managed_clients)"; then
   fail "could not detect hosts through the signed Decision Engine stable release"
 fi
-managed_skill_route_exclusions=""
-if [ "$workbuddy_variant" = "ai" ] \
-    && line_list_contains "$managed_detected_clients" "workbuddy-ai"; then
-  managed_skill_route_exclusions="workbuddy"
-fi
 managed_detected_clients="$(
-  normalize_managed_clients_for_variant "$managed_detected_clients"
+  normalize_detected_clients_for_variant "$managed_detected_clients"
 )"
 source_clients_for_catalog="$(
-  normalize_managed_clients_for_variant "$source_detected_clients"
+  normalize_detected_clients_for_variant "$selected_source_clients"
 )"
-
+managed_detected_clients="$(
+  filter_client_lines_by_snapshot \
+    "$managed_detected_clients" "$source_clients_for_catalog"
+)"
 managed_mcp_supports_allow_unactivated() {
   run_managed_python -c \
     'import inspect
@@ -2320,13 +3102,13 @@ if [ -z "$detected_clients" ]; then
     "no Agent host accepted by Decision Engine $managed_version passed its non-mutating wiring preflight"
 fi
 
-tty_print "Detected all supported Decision Engine hosts present on $PLATFORM_DISPLAY_NAME for signed stable $managed_version:"
-tty_print "Every listed host will be configured; each passed the stable release's wiring preflight."
-printf '%s\n' "$detected_clients" >/dev/tty
+tty_print "Selected Decision Engine hosts accepted by signed stable $managed_version on $PLATFORM_DISPLAY_NAME:"
+tty_print "Only the listed selected hosts will be configured; each passed the stable release's wiring preflight."
+print_client_lines_for_user "$detected_clients" >/dev/tty
 if line_list_contains "$detected_clients" "claude-desktop-3p"; then
   tty_print "claude-desktop-3p is the third-party provider profile; it is configured independently of claude-desktop."
 fi
-tty_print "Running this command authorizes setup for every listed host."
+tty_print "Continuing authorizes setup for every listed selected host."
 
 catalog_missing_clients=""
 while IFS= read -r source_client; do
@@ -2869,21 +3651,95 @@ raise SystemExit(0 if all(metadata.version(name) == version for name, version in
 }
 
 repair_managed_skill_routes() {
-  # The core body is installed before activation, so its initial skill-route
-  # pass sees no DE MCP entries. Re-run the existing setup-only repair after
-  # publishing the entries so every skill-capable detected host is usable in
-  # both activated and unactivated installations.
+  # Route only the frozen, stable-approved target set. Remove only DE-owned
+  # routes from other destinations; user directories and foreign links remain.
   run_managed_python -c \
-    'import sys
-from installer import config, install
+    'import json
+import os
+import sys
 
-excluded = frozenset(client for client in sys.argv[1].split(",") if client)
-result = install.repair_detected_skill_routes(
-    config.managed_component_root("decision-engine"),
-    excluded_clients=excluded,
-)
-raise SystemExit(1 if result.failed else 0)' \
-    "$managed_skill_route_exclusions"
+from installer import config, install, mcp_config
+from installer.config import ShellError
+
+clients = tuple(client for client in sys.argv[1].split(",") if client)
+if len(clients) != len(set(clients)) or any(
+    client not in mcp_config.CLIENT_SPECS for client in clients
+):
+    raise SystemExit("managed skill client list is invalid")
+
+body_root = config.managed_component_root("decision-engine")
+routed = {}
+failed = {}
+pruned = {}
+with install.install_lock(blocking=False):
+    desired_destinations = set()
+    for client in clients:
+        spec = mcp_config.CLIENT_SPECS[client]
+        if (
+            spec.repair_skills_on_setup
+            and spec.skill_delivery_mode != "none"
+            and spec.skills_global_path is not None
+        ):
+            desired_destinations.add(
+                os.path.normcase(os.path.abspath(os.fspath(spec.skills_global_path())))
+            )
+
+    visited_destinations = set()
+    for spec in mcp_config.CLIENT_SPECS.values():
+        if (
+            not spec.repair_skills_on_setup
+            or spec.skill_delivery_mode == "none"
+            or spec.skills_global_path is None
+        ):
+            continue
+        destination = spec.skills_global_path()
+        destination_key = os.path.normcase(os.path.abspath(os.fspath(destination)))
+        if destination_key in visited_destinations:
+            continue
+        visited_destinations.add(destination_key)
+        if destination_key in desired_destinations or not destination.is_dir():
+            continue
+        removed = []
+        for skill in body_root.joinpath("skills").iterdir():
+            route = destination / skill.name
+            if (
+                skill.is_dir()
+                and install._is_skill_route(route)
+                and install._route_points_to(route, skill)
+            ):
+                install._remove_skill_route(route)
+                removed.append(skill.name)
+        if removed:
+            pruned[str(destination)] = sorted(removed)
+
+    for client in clients:
+        spec = mcp_config.CLIENT_SPECS[client]
+        if not spec.repair_skills_on_setup or spec.skill_delivery_mode == "none":
+            continue
+        if spec.skills_global_path is None:
+            failed[client] = "skill destination is unavailable"
+            continue
+        try:
+            destination = spec.skills_global_path()
+            install._preflight_skill_routes(
+                "decision-engine",
+                body_root / "skills",
+                body_root / "skills",
+                destination,
+                spec.excluded_skills,
+            )
+            routed[client] = install._route_skills(
+                "decision-engine",
+                body_root,
+                dest_root=destination,
+                excluded_skills=spec.excluded_skills,
+            )
+        except (ShellError, OSError) as exc:
+            failed[client] = install._skill_route_failure_reason(exc)
+
+print(json.dumps({"failed": failed, "pruned": pruned, "routed": routed}, sort_keys=True))
+raise SystemExit(1 if failed else 0)' \
+    "$(printf '%s' "$detected_clients" | /usr/bin/tr '\n' ',')"
 }
 
 wire_all_detected_hosts() {
@@ -2929,9 +3785,10 @@ print_host_capability_report() {
   tty_print "The MCP status below proves the configuration on disk. Restarting the host is still required before runtime use."
   while IFS= read -r client; do
     [ -n "$client" ] || continue
-    display_name="$client"
     if [ "$client" = "workbuddy" ] && [ "$workbuddy_variant" = "ai" ]; then
-      display_name="workbuddy-ai"
+      display_name="$(client_display_name workbuddy-ai)"
+    else
+      display_name="$(client_display_name "$client")"
     fi
     capability="$(run_managed_python -c \
       'from installer.client_hosts.registry import CLIENT_SPECS
@@ -2960,7 +3817,7 @@ print(f"skills={skills}; routing={spec.routing_kind}")' \
       if [ "$capability" != "skills=not-supported; routing=mcp-only" ]; then
         capability_report_incomplete=1
       fi
-      tty_print "claude-desktop-3p: DE MCP=connector-written; config=disk-ready; skills=not-supported; routing=mcp-only; AQG=unsupported-for-this-profile; runtime=unverified; runtime-verification=restart-required"
+      tty_print "$display_name: DE MCP=connector-written; config=disk-ready; skills=not-supported; routing=mcp-only; AQG=unsupported-for-this-profile; runtime=unverified; runtime-verification=restart-required"
       continue
     fi
     tty_print "$display_name: DE MCP=disk-ready; $capability; AQG=$aqg_state; runtime=restart-required"
@@ -2968,7 +3825,7 @@ print(f"skills={skills}; routing={spec.routing_kind}")' \
   tty_print "Agent Quality Gates host capability report:"
   while IFS= read -r client; do
     [ -n "$client" ] || continue
-    tty_print "$client: AQG=configured-and-verified"
+    tty_print "$(client_display_name "$client"): AQG=configured-and-verified"
   done <<<"$(printf '%s' "$aqg_selected_clients" | tr ',' '\n')"
   if [ -z "$aqg_selected_clients" ]; then
     tty_print "(no supported AQG host detected)"
@@ -3004,26 +3861,91 @@ filter_linux_activation_stderr() {
   fi
 }
 
+run_managed_activation_dialog() {
+  run_managed_python -c '
+import inspect
+from types import SimpleNamespace
+
+from installer import permanent_setup
+
+run_setup = getattr(permanent_setup, "run_permanent_setup", None)
+supports_activation_only = (
+    callable(run_setup)
+    and "configure_hosts" in inspect.signature(run_setup).parameters
+)
+if supports_activation_only:
+    arguments = ["--activation-only"]
+else:
+    # Older signed releases have no activation-only CLI. Keep their GUI and
+    # persistence behavior, but leave all host writes to the frozen outer flow.
+    permanent_setup._configure_agent_hosts = (
+        lambda *_args, **_kwargs: SimpleNamespace(failures=(), notices=())
+    )
+    permanent_setup._doctor_has_blocking_failure = lambda _failures: False
+    arguments = []
+
+raise SystemExit(permanent_setup.main(arguments))'
+}
+
 run_selected_permanent_setup() {
-  local client activation_stderr="" activation_status=0
-  set --
-  while IFS= read -r client; do
-    [ -n "$client" ] || continue
-    set -- "$@" --client "$client"
-  done <<<"$detected_clients"
+  local activation_stderr="" activation_status=0
   if [ "$PLATFORM_FAMILY" = "linux" ] && linux_native_popup_supported; then
     activation_stderr="$tmp_root/permanent-setup.stderr"
     : >"$activation_stderr"
     (
       export PYWEBVIEW_GUI=qt
-      run_managed_python -m installer.permanent_setup "$@"
+      run_managed_activation_dialog
     ) 2>"$activation_stderr" || activation_status=$?
     filter_linux_activation_stderr <"$activation_stderr"
     clean_exec /bin/rm -f "$activation_stderr" || true
     return "$activation_status"
   else
-    run_managed_python -m installer.permanent_setup "$@"
+    run_managed_activation_dialog
   fi
+}
+
+run_scoped_managed_doctor() {
+  run_managed_python -c '
+import sys
+
+from installer import doctor, mcp_config
+
+clients = tuple(client for client in sys.argv[1].split(",") if client)
+if len(clients) != len(set(clients)) or any(
+    client not in mcp_config.CLIENT_SPECS for client in clients
+):
+    raise SystemExit("Doctor client list is invalid")
+
+allowed_routes = {
+    mcp_config.CLIENT_SPECS[client].skill_route_name
+    for client in clients
+    if mcp_config.CLIENT_SPECS[client].skill_route_name is not None
+}
+original_active_skill_routes = mcp_config.active_skill_routes
+
+def scoped_active_skill_routes(*, for_doctor=False, setup_only=False):
+    routes = original_active_skill_routes(
+        for_doctor=for_doctor,
+        setup_only=setup_only,
+    )
+    return {name: value for name, value in routes.items() if name in allowed_routes}
+
+def mcp_only_skills_check():
+    return doctor.CheckResult(
+        "PASS",
+        "skills",
+        "not required for the selected MCP-only Agent hosts",
+    )
+
+mcp_config.detect_clients = lambda: list(clients)
+mcp_config.active_skill_routes = scoped_active_skill_routes
+if not allowed_routes:
+    doctor.CHECKS = tuple(
+        mcp_only_skills_check if check is doctor.check_skills else check
+        for check in doctor.CHECKS
+    )
+raise SystemExit(doctor.main([]))' \
+    "$(printf '%s' "$detected_clients" | /usr/bin/tr '\n' ',')"
 }
 
 ensure_managed_runtime_git_excludes \
@@ -3100,8 +4022,8 @@ else
   esac
 fi
 
-tty_print "Running final Decision Engine Doctor..."
-run_managed_python -m installer.doctor \
+tty_print "Running final Decision Engine Doctor for the maintained Agent hosts..."
+run_scoped_managed_doctor \
   || fail "Decision Engine Doctor still reports a blocking failure after installation or repair"
 verify_managed_mcp_wiring "$final_mcp_allow_unactivated" \
   || fail "a detected host MCP entry changed after wiring; close the affected Agent, then rerun this installer to repair it"
@@ -3109,7 +4031,9 @@ verify_managed_mcp_wiring "$final_mcp_allow_unactivated" \
 print_host_capability_report
 
 manual_host_action_pending=0
-if [ "$workbuddy_variant" = "ai" ]; then
+if [ "$workbuddy_variant" = "ai" ] \
+    && { line_list_contains "$detected_clients" "workbuddy-ai" \
+      || line_list_contains "$detected_clients" "workbuddy"; }; then
   if workbuddy_ai_de_is_approved; then
     tty_print "WorkBuddy AI has approved the Decision Engine MCP connector."
   else
@@ -3163,5 +4087,5 @@ if [ "$de_update_deferred" -eq 1 ]; then
   exit "$EXIT_PARTIAL"
 fi
 
-printf '%s: PASS: all detected supported hosts are configured on disk; restart the host applications before runtime verification.\n' \
+printf '%s: PASS: all selected supported hosts are configured on disk; restart the host applications before runtime verification.\n' \
   "$PROGRAM_NAME"

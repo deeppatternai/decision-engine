@@ -4443,20 +4443,97 @@ def _install_mac_status_item(title: str, win) -> None:
     _run_on_mac_main_queue(_install)
 
 
-def _win_after_show(win) -> None:
-    """`loaded` handler (Windows): re-issue a show on the detached frameless popup.
+def _windows_native_window_visible(hwnd: int) -> bool:
+    """Return true only when Win32 reports a visible window with non-zero bounds."""
+    if not _IS_WINDOWS or not hwnd:
+        return False
+    try:
+        from ctypes import wintypes
 
-    A DETACHED_PROCESS child's first FRAMELESS (WS_POPUP) window can come up hidden — the reported
-    symptom (a bordered window was force-shown, only the frameless popup regressed). Re-assert
-    visibility in-process via pywebview's public, thread-safe ``Window.show()`` (Show()+Activate()
-    on the WinForms form). Idempotent — a no-op when the window is already up, so it is harmless in
-    the paths where the popup already shows. NOTE: not reproduced in an interactive-desktop spawn
-    (the bug's trigger appears tied to the shim's launch window-station/desktop session), so this is
-    a directionally-correct remedy, not one verified against the original failure."""
+        class RECT(ctypes.Structure):
+            _fields_ = [
+                ("left", wintypes.LONG),
+                ("top", wintypes.LONG),
+                ("right", wintypes.LONG),
+                ("bottom", wintypes.LONG),
+            ]
+
+        user32 = ctypes.windll.user32
+        handle = wintypes.HWND(hwnd)
+        user32.IsWindow.argtypes = (wintypes.HWND,)
+        user32.IsWindow.restype = wintypes.BOOL
+        user32.IsWindowVisible.argtypes = (wintypes.HWND,)
+        user32.IsWindowVisible.restype = wintypes.BOOL
+        user32.GetWindowRect.argtypes = (wintypes.HWND, ctypes.POINTER(RECT))
+        user32.GetWindowRect.restype = wintypes.BOOL
+        bounds = RECT()
+        return bool(
+            user32.IsWindow(handle)
+            and user32.IsWindowVisible(handle)
+            and user32.GetWindowRect(handle, ctypes.byref(bounds))
+            and bounds.right > bounds.left
+            and bounds.bottom > bounds.top
+        )
+    except Exception:  # aqg: top-level boundary - native visibility is a readiness signal
+        return False
+
+
+def _recover_windows_native_window(hwnd: int) -> None:
+    """Best-effort Win32 recovery for a detached frameless window that stayed hidden."""
+    if not _IS_WINDOWS or not hwnd:
+        return
+    try:
+        from ctypes import wintypes
+
+        user32 = ctypes.windll.user32
+        handle = wintypes.HWND(hwnd)
+        user32.IsIconic.argtypes = (wintypes.HWND,)
+        user32.IsIconic.restype = wintypes.BOOL
+        user32.ShowWindow.argtypes = (wintypes.HWND, ctypes.c_int)
+        user32.ShowWindow.restype = wintypes.BOOL
+        user32.SetWindowPos.argtypes = (
+            wintypes.HWND, wintypes.HWND, ctypes.c_int, ctypes.c_int,
+            ctypes.c_int, ctypes.c_int, wintypes.UINT,
+        )
+        user32.SetWindowPos.restype = wintypes.BOOL
+        user32.BringWindowToTop.argtypes = (wintypes.HWND,)
+        user32.BringWindowToTop.restype = wintypes.BOOL
+        user32.SetForegroundWindow.argtypes = (wintypes.HWND,)
+        user32.SetForegroundWindow.restype = wintypes.BOOL
+        user32.ShowWindow(handle, 9 if user32.IsIconic(handle) else 5)  # SW_RESTORE / SW_SHOW
+        user32.SetWindowPos(
+            handle, wintypes.HWND(0), 0, 0, 0, 0,
+            0x0001 | 0x0002 | 0x0010 | 0x0040,  # NOSIZE|NOMOVE|NOACTIVATE|SHOWWINDOW
+        )
+        user32.BringWindowToTop(handle)
+        user32.SetForegroundWindow(handle)
+    except Exception as exc:  # aqg: top-level boundary - popup readiness reports final failure
+        print("native_shell: windows native show skipped (%s)" % exc, file=sys.stderr)
+
+
+def _win_after_show(win) -> bool:
+    """Show a Windows popup and confirm that its native window became visible."""
     try:
         win.show()
-    except Exception as exc:  # aqg: top-level boundary — a failed re-show must never crash the popup
+    except Exception as exc:  # aqg: top-level boundary - continue to native recovery when available
         print("native_shell: windows re-show skipped (%s)" % exc, file=sys.stderr)
+    if not _IS_WINDOWS:
+        return True
+    recovery_attempted = False
+    for attempt in range(4):
+        try:
+            hwnd = _windows_hwnd(win)
+        except Exception as exc:  # aqg: top-level boundary - readiness must fail closed
+            print("native_shell: windows handle unavailable (%s)" % exc, file=sys.stderr)
+            hwnd = 0
+        if _windows_native_window_visible(hwnd):
+            return True
+        if hwnd and not recovery_attempted:
+            _recover_windows_native_window(hwnd)
+            recovery_attempted = True
+        if attempt < 3:
+            time.sleep(0.05)
+    return False
 
 
 def _install_window_chrome(win) -> None:
@@ -4581,10 +4658,13 @@ def _mark_popup_ready(win: Any, ready_path: Optional[str]) -> None:
             "return document.body.children&&document.body.children.length>0;"
             "})()"
         )
-        if win.evaluate_js(probe) is True:
-            _write_json_atomic(str(path), {"ok": True, "state": "ready"})
-        else:
+        if win.evaluate_js(probe) is not True:
             _write_ready_diagnostic(ready_path, "dom-not-ready")
+            return
+        if _IS_WINDOWS and not _win_after_show(win):
+            _write_ready_diagnostic(ready_path, "window-not-visible")
+            return
+        _write_json_atomic(str(path), {"ok": True, "state": "ready"})
     except Exception as exc:  # aqg: top-level boundary — startup readiness is reported by parent
         _write_ready_diagnostic(ready_path, "dom-probe-failed", type(exc).__name__)
 

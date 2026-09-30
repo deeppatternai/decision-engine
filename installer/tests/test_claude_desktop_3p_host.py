@@ -450,11 +450,12 @@ class ClaudeThirdPartyInstallerContractTestCase(unittest.TestCase):
         )
 
     def test_capability_report_separates_connector_disk_and_runtime_state(self):
+        self.assertIn('if [ "$client" = "claude-desktop-3p" ]; then', self.body)
         line = next(
             (
                 candidate
                 for candidate in self.body.splitlines()
-                if "claude-desktop-3p: DE MCP=" in candidate
+                if "DE MCP=connector-written" in candidate
             ),
             None,
         )
@@ -515,9 +516,11 @@ class ClaudeThirdPartyInstallerContractTestCase(unittest.TestCase):
                 environment.update(HOME=home_for_bash)
                 return subprocess.run(
                     [bash, "--noprofile", "--norc", "-c", (
+                        'line_list_contains() { printf "%s\\n" "$1" | grep -Fxq "$2"; }\n'
                         'CLAUDE_3P_ROOT="$HOME/Library/Application Support/Claude-3p"\n'
                         'CLAUDE_3P_CONFIG="$CLAUDE_3P_ROOT/claude_desktop_config.json"\n'
                         'PLATFORM_FAMILY=macos\n'
+                        'selected_source_clients=claude-desktop-3p\n'
                         'blocked() { exit 3; }\n'
                         f"{guard}\n"
                         'printf "%s\\n" "$claude_3p_profile_detected"\n'

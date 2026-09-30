@@ -20,8 +20,10 @@ import json
 import shutil
 import subprocess
 import sys
+import tempfile
 import threading
 import unittest
+from pathlib import Path
 from types import SimpleNamespace
 from unittest import mock
 
@@ -102,6 +104,36 @@ class WinAfterShow(unittest.TestCase):
         win = _FakeWin(raise_on_show=True)
         native_shell._win_after_show(win)
         self.assertEqual(win.show_calls, 1)
+
+    def test_hidden_windows_popup_uses_native_recovery(self):
+        win = _FakeWin()
+        with mock.patch.object(native_shell, "_IS_WINDOWS", True), \
+                mock.patch.object(native_shell, "_windows_hwnd", return_value=712), \
+                mock.patch.object(
+                    native_shell,
+                    "_windows_native_window_visible",
+                    side_effect=[False, True],
+                ) as visible, \
+                mock.patch.object(native_shell, "_recover_windows_native_window") as recover:
+            self.assertTrue(native_shell._win_after_show(win))
+
+        recover.assert_called_once_with(712)
+        self.assertEqual(visible.call_count, 2)
+
+    def test_windows_ready_marker_requires_a_visible_native_window(self):
+        win = _FakeWin()
+        win.evaluate_js = mock.Mock(return_value=True)
+        with tempfile.TemporaryDirectory() as root, \
+                mock.patch.object(native_shell, "_IS_WINDOWS", True), \
+                mock.patch.object(native_shell, "_win_after_show", return_value=False):
+            ready = Path(root) / "ready.json"
+            native_shell._mark_popup_ready(win, str(ready))
+            diagnostic = json.loads(
+                (Path(root) / "ready-diagnostic.json").read_text(encoding="utf-8")
+            )
+
+        self.assertFalse(ready.exists())
+        self.assertEqual(diagnostic["reason"], "window-not-visible")
 
     def test_linux_popup_marks_ready_from_shown_instead_of_loaded(self):
         class StopAfterShown(Exception):

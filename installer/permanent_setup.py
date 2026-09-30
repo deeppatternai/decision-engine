@@ -1368,8 +1368,9 @@ def run_permanent_setup(
     prompt: Optional[CredentialPrompt] = None,
     from_env: bool = False,
     clients: Optional[Sequence[str]] = None,
+    configure_hosts: bool = True,
 ) -> PermanentSetupResult:
-    """Configure once, persist device credentials, wire MCP, and run Doctor."""
+    """Persist device activation and optionally wire Agent hosts and run Doctor."""
     config_path = _managed_config_path()
     environment_credentials = _credentials_from_env() if from_env else None
     current = _load_managed_config(config_path)
@@ -1447,6 +1448,12 @@ def run_permanent_setup(
         activate.clear_activation_recovery_marker(config_path, retry_must_be_safe=False)
         activate.scrub_staged_invitation(config_path)
 
+    if not configure_hosts:
+        return PermanentSetupResult(
+            permanent=True,
+            already_activated=already_activated,
+        )
+
     host_configuration = (
         _configure_agent_hosts(config_path)
         if clients is None
@@ -1484,10 +1491,19 @@ def main(argv: Optional[list] = None) -> int:
         choices=mcp_config.CLIENTS,
         help="wire this selected Agent client after activation (repeatable)",
     )
+    parser.add_argument(
+        "--activation-only",
+        action="store_true",
+        help=argparse.SUPPRESS,
+    )
     args = parser.parse_args(argv)
 
     try:
-        result = run_permanent_setup(from_env=args.from_env, clients=args.client)
+        result = run_permanent_setup(
+            from_env=args.from_env,
+            clients=args.client,
+            configure_hosts=not args.activation_only,
+        )
     except ActivationRecoveryRequiredError as exc:
         message = str(exc)
         print("de-permanent-setup: %s" % message, file=sys.stderr)
@@ -1519,6 +1535,12 @@ def main(argv: Optional[list] = None) -> int:
     if result.cancelled:
         print("Decision Engine permanent setup was cancelled; no credentials were changed.")
         return 2
+    if args.activation_only:
+        print(
+            "Decision Engine device activation is ready. "
+            "Host wiring and Doctor remain with the calling installer."
+        )
+        return 0
     if result.host_failures:
         failed_hosts = ", ".join(client for client, _reason in result.host_failures)
         message = (

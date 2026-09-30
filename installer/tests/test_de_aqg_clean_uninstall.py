@@ -30,55 +30,74 @@ class PublicInstallEntryPointTests(unittest.TestCase):
             "dp-install.sh": [
                 # APT's namespace syntax, fixed public download checksums, and
                 # the existing approval-key separator are scanner false positives.
-                ("ipv6:::a", 636),
+                ("ipv6:::a", 988),
                 *(
                     ("secret:bearer-hex-token", line)
                     for line in (
-                        859,
-                        864,
-                        875,
-                        881,
+                        1211,
+                        1216,
+                        1227,
+                        1233,
                     )
                 ),
-                ("ipv6:::dec", 1914),
+                ("ipv6:::dec", 2336),
                 *(
                     ("secret:bearer-hex-token", line)
                     for line in (
-                        2556,
-                        2558,
-                        2565,
-                        2567,
-                        2705,
-                        2706,
-                        2707,
-                        2834,
+                        2998,
+                        3000,
+                        3007,
+                        3009,
+                        3147,
+                        3148,
+                        3149,
+                        3276,
                     )
                 ),
             ],
             "dp-install.ps1": [
-                ("ipv6:::e", 59),
+                ("ipv6:::e", 76),
                 # Fixed public SHA-256 digests for the pinned private runtimes.
-                ("secret:bearer-hex-token", 515),
-                ("secret:bearer-hex-token", 520),
+                ("secret:bearer-hex-token", 1047),
+                ("secret:bearer-hex-token", 1053),
+                ("ipv6:::e", 1308),
+                ("ipv6:::e", 1336),
+                # The standard TLS server-auth OID is not an IPv4 address.
+                ("ipv4:" + "1.3"
+                 + ".6.1", 1468),
+                ("ipv4:" + "5.5"
+                 + ".7.3", 1468),
                 *(
                     ("ipv6:::e", line)
                     for line in (
-                        1644,
-                        1870,
-                        2044,
-                        2053,
-                        2063,
-                        2071,
-                        2091,
-                        2101,
-                        2166,
-                        2255,
-                        2263,
+                        2844,
+                        3080,
+                        3099,
+                        3277,
+                        3286,
+                        3296,
+                        3304,
+                        3324,
+                        3331,
+                        3344,
+                        3355,
+                        3442,
+                        3450,
+                        3594,
+                        3602,
                     )
                 ),
             ],
             "dp-uninstall.ps1": [
-                ("ipv6:::e", line) for line in (39, 139, 487, 2334, 2340)
+                ("ipv6:::e", 46),
+                ("ipv6:::e", 146),
+                ("secret:bearer-hex-token", 266),
+                ("secret:bearer-hex-token", 271),
+                ("ipv6:::d", 633),
+                ("ipv6:::de", 662),
+                ("ipv6:::e", 1000),
+                ("ipv6:::e", 3210),
+                ("ipv6:::e", 3216),
             ],
         }
 

@@ -214,6 +214,50 @@ class ActivateTestCase(unittest.TestCase):
         if os.name != "nt":
             self.assertEqual(stat.S_IMODE(self.cfg_path.stat().st_mode), 0o600)
 
+    def test_activate_generates_and_persists_default_name_when_config_name_is_blank(self):
+        server = _MockServer(
+            201,
+            {"device_id": "dev_abc", "access_token": "tok_live"},
+        )
+        self.addCleanup(server.close)
+        self._write_cfg(server_endpoint=server.base, device_name="")
+
+        with mock.patch.object(
+            activate,
+            "device_name_default",
+            return_value="macOS-27.0-arm-260924",
+        ):
+            activate.activate(timeout_s=5)
+
+        self.assertEqual(
+            server.httpd.last_request["device_name"],
+            "macOS-27.0-arm-260924",
+        )
+        cfg = json.loads(self.cfg_path.read_text(encoding="utf-8"))
+        self.assertEqual(cfg["device_name"], "macOS-27.0-arm-260924")
+
+    def test_activate_treats_whitespace_only_config_name_as_blank(self):
+        server = _MockServer(
+            201,
+            {"device_id": "dev_abc", "access_token": "tok_live"},
+        )
+        self.addCleanup(server.close)
+        self._write_cfg(server_endpoint=server.base, device_name="  \t ")
+
+        with mock.patch.object(
+            activate,
+            "device_name_default",
+            return_value="windows11-25H2-x64-260924",
+        ):
+            activate.activate(timeout_s=5)
+
+        self.assertEqual(
+            server.httpd.last_request["device_name"],
+            "windows11-25H2-x64-260924",
+        )
+        cfg = json.loads(self.cfg_path.read_text(encoding="utf-8"))
+        self.assertEqual(cfg["device_name"], "windows11-25H2-x64-260924")
+
     def test_server_success_with_local_write_failure_has_a_distinct_error(self):
         server = _MockServer(
             201,
@@ -399,13 +443,19 @@ class ActivateTestCase(unittest.TestCase):
     def test_already_activated_is_noop_without_force(self):
         server = _MockServer(201, {"device_id": "d2", "access_token": "tok_new"})
         self.addCleanup(server.close)
-        self._write_cfg(server_endpoint=server.base, access_token="tok_existing", device_id="d1")
+        self._write_cfg(
+            server_endpoint=server.base,
+            access_token="tok_existing",
+            device_id="d1",
+            device_name="macOS-27.0-arm-260923",
+        )
         summary = activate.activate(timeout_s=5)
         self.assertFalse(summary["activated"])
         self.assertTrue(summary["already_activated"])
         self.assertIsNone(server.httpd.last_request)  # never called the server
         cfg = json.loads(self.cfg_path.read_text(encoding="utf-8"))
         self.assertEqual(cfg["access_token"], "tok_existing")  # unchanged
+        self.assertEqual(cfg["device_name"], "macOS-27.0-arm-260923")
         self.assertNotIn("api_key", cfg)
 
     def test_already_activated_noop_is_structured_and_scrubs_staged_api_key(self):

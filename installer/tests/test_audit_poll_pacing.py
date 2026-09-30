@@ -430,6 +430,38 @@ class HostedCompletionSyncTests(_ActiveRunsHomeMixin, unittest.TestCase):
         self.assertEqual(row["title"], "Ledger review", "submit-time metadata must survive")
         self.assertIsNotNone(row.get("hidden_after"))
 
+    def test_terminal_sync_preserves_authorized_model_identity_and_duration(self):
+        cached_auditors = [
+            {
+                "status": "running", "model_id": "glm-5.2", "provider": "glm",
+                "duration_ms": 203_131, "started_at": 1_000.0,
+                "completed_at": 1_203.131,
+            },
+            {
+                "status": "running", "model_id": "kimi-k2.7-code", "provider": "kimi",
+                "duration_ms": 400_757, "started_at": 1_000.0,
+                "completed_at": 1_400.757,
+            },
+        ]
+        self._seed(status="running", debug_authorized=True, auditors=cached_auditors)
+
+        runner.sync_hosted_run_completion(
+            "r1",
+            {"run_id": "r1", "status": "completed",
+             "auditors": [{"status": "completed"}, {"status": "completed"}]},
+        )
+
+        row = self._row()
+        self.assertEqual(row["auditors"][0]["model_id"], "glm-5.2")
+        self.assertEqual(row["auditors"][0]["duration_ms"], 203_131)
+        self.assertEqual(
+            panel._debug_auditor_lines(row, 1_500.0, {}),
+            [
+                "glm-5.2 · 已完成 · 3m 23s ✓",
+                "kimi-k2.7-code · 已完成 · 6m 41s ✓",
+            ],
+        )
+
     def test_a_non_terminal_view_is_ignored(self):
         # Completion sync is not a general-purpose writer: a `running` view here would finish the
         # row (stamping hidden_after) while the run is still going, hiding a live run's stop button.
@@ -470,18 +502,114 @@ class HostedCompletionSyncTests(_ActiveRunsHomeMixin, unittest.TestCase):
         self.assertIsNone(row["completed_at"])
 
     def test_a_hostile_auditors_payload_cannot_bloat_or_poison_the_row(self):
-        # The view comes off an MCP result envelope that may carry the entire review. Only the
-        # per-voice STATUS is display state; everything else is dropped, and the list is bounded.
-        self._seed()
+        # The view comes off an MCP result envelope that may carry the entire review. Only bounded
+        # display metadata is retained; arbitrary prose is dropped and the list stays bounded.
+        self._seed(debug_authorized=True)
+        runner.sync_hosted_run_completion(
+            "r1",
+            {"run_id": "r1", "status": "completed", "debug_authorized": True,
+             "auditors": ["not-a-dict", {"no_status": 1}, {"status": []}]
+                         + [{"status": "completed", "voice": "v" * 4096,
+                             "model_id": "m" * 4096, "duration_ms": 10**400,
+                             "markdown": "x" * 4096}] * 100},
+        )
+        row = self._row()
+        self.assertEqual(len(row["auditors"]), 61)
+        self.assertTrue(all(set(auditor) == {"status", "voice", "model_id"}
+                            for auditor in row["auditors"]))
+        self.assertTrue(all(len(auditor["voice"]) == 256 for auditor in row["auditors"]))
+        self.assertTrue(all(len(auditor["model_id"]) == 256 for auditor in row["auditors"]))
+
+    def test_malformed_roster_does_not_shift_cached_identity_to_another_auditor(self):
+        self._seed(
+            debug_authorized=True,
+            auditors=[
+                {"status": "running", "model_id": "first-model"},
+                {"status": "running", "model_id": "second-model"},
+            ],
+        )
+
         runner.sync_hosted_run_completion(
             "r1",
             {"run_id": "r1", "status": "completed",
-             "auditors": [{"status": "completed", "markdown": "x" * 4096}] * 100
-                         + ["not-a-dict", {"no_status": 1}, {"status": "bogus"}]},
+             "auditors": [{"status": {}}, {"status": "completed"}]},
         )
+
+        self.assertEqual(self._row()["auditors"], [{"status": "completed"}])
+
+    def test_authorized_incoming_identity_survives_without_cached_roster_match(self):
+        self._seed(debug_authorized=False, auditors=[])
+
+        runner.sync_hosted_run_completion(
+            "r1",
+            {"run_id": "r1", "status": "completed", "debug_authorized": True,
+             "auditors": [{"status": "completed", "model_id": "incoming-model",
+                            "duration_ms": 1_234}]},
+        )
+
+        self.assertEqual(
+            self._row()["auditors"],
+            [{"status": "completed", "model_id": "incoming-model", "duration_ms": 1_234}],
+        )
+
+    def test_invalid_auditor_timing_values_are_dropped(self):
+        invalid_values = (True, -1, float("nan"), float("inf"), -float("inf"), 10**400)
+        for value in invalid_values:
+            with self.subTest(value=value):
+                self._seed(debug_authorized=True, auditors=[])
+                runner.sync_hosted_run_completion(
+                    "r1",
+                    {"run_id": "r1", "status": "completed",
+                     "auditors": [{"status": "completed", "duration_ms": value}]},
+                )
+                self.assertEqual(self._row()["auditors"], [{"status": "completed"}])
+
+    def test_unhashable_terminal_status_is_ignored(self):
+        self._seed()
+        for status in ([], {}):
+            with self.subTest(status=status):
+                runner.sync_hosted_run_completion("r1", {"run_id": "r1", "status": status})
+                self.assertEqual(self._row()["status"], "queued")
+
+    def test_non_debug_terminal_sync_drops_cached_and_incoming_model_identity(self):
+        self._seed(
+            status="running",
+            debug_authorized=True,
+            auditors=[{
+                "status": "running", "model_id": "glm-5.2", "provider": "glm",
+                "duration_ms": 12_000, "started_at": 1_000.0,
+            }],
+        )
+
+        runner.sync_hosted_run_completion(
+            "r1",
+            {"run_id": "r1", "status": "completed", "debug_authorized": False,
+             "auditors": [{"status": "completed", "voice": "Voice 1",
+                            "model_id": "must-not-survive", "duration_ms": 20_000}]},
+        )
+
         row = self._row()
-        self.assertEqual(len(row["auditors"]), 64)
-        self.assertEqual({tuple(a) for a in row["auditors"]}, {("status",)})
+        self.assertIs(row["debug_authorized"], False)
+        self.assertEqual(row["auditors"], [{"status": "completed", "voice": "Voice 1"}])
+
+    def test_explicit_debug_revocation_scrubs_cached_identity_without_auditors(self):
+        self._seed(
+            status="running",
+            debug_authorized=True,
+            auditors=[{
+                "status": "completed", "model_id": "glm-5.2", "provider": "glm",
+                "duration_ms": 12_000, "started_at": 1_000.0,
+            }],
+        )
+
+        runner.sync_hosted_run_completion(
+            "r1",
+            {"run_id": "r1", "status": "completed", "debug_authorized": False},
+        )
+
+        row = self._row()
+        self.assertIs(row["debug_authorized"], False)
+        self.assertEqual(row["auditors"], [{"status": "completed"}])
 
     def test_a_view_without_auditors_keeps_the_ones_the_row_already_had(self):
         self._seed()

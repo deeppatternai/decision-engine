@@ -14,11 +14,21 @@ from a verified Deep Pattern private runtime and managed environment, with an
 existing trusted Python or WinGet used only as a fallback. Active Agent MCP
 sessions defer a signed update without blocking activation or host repair.
 
-The script accepts no product options. The existing masked activation window is
-the only interactive product input surface.
+With no arguments the script preserves the existing interactive installer.
+-AgentTerminal opens that unchanged flow in one visible Windows PowerShell
+window for an Agent command runner, -AgentActivate opens only an already-
+installed activation flow there, and -Activate runs that activation-only flow
+in an existing visible terminal. The masked activation window remains the only
+interactive credential input surface.
 #>
 [CmdletBinding()]
-param()
+param(
+    [switch]$AgentTerminal,
+    [switch]$AgentActivate,
+    [switch]$Activate,
+    [Parameter(DontShow = $true)][switch]$ActivationOnly,
+    [Parameter(DontShow = $true)][switch]$AgentTerminalChild
+)
 
 Set-StrictMode -Version Latest
 $ErrorActionPreference = "Stop"
@@ -49,7 +59,22 @@ $ExitBlocked = 3
 $ExitPartial = 4
 $script:AqgUpdatePending = $false
 $script:UpdateDeferred = $false
+$script:PrivateRuntimeFallbackExpected = $false
 $script:DeferredSessionPids = @()
+$script:CodexConfigPath = $null
+$script:CodexHome = $null
+$script:CodexHooksPath = $null
+$script:CodexHooksDisabled = $false
+$script:CodexHooksBeforeSha256 = $null
+$script:CodexHooksAfterSha256 = $null
+$script:CodexHookReviewAvailable = $false
+$script:CodexHookReviewCommand = $null
+$script:CodexHookReviewUnavailable = $false
+$ValidClients = @(
+    "claude-code", "claude-desktop", "claude-desktop-3p", "codebuddy",
+    "codex", "cursor", "qoder", "qoder-cn", "qoder-ide", "qoder-cn-ide",
+    "trae", "trae-work", "trae-cn", "trae-work-cn", "workbuddy", "workbuddy-ai"
+)
 
 function Stop-Install {
     param(
@@ -62,6 +87,106 @@ function Stop-Install {
 
 function Test-NativeWindows {
     return [System.Environment]::OSVersion.Platform -eq [System.PlatformID]::Win32NT
+}
+
+function Invoke-AgentTerminalHandoff {
+    param([switch]$Activation)
+
+    if ([string]::IsNullOrWhiteSpace($PSCommandPath) -or
+        -not (Test-Path -LiteralPath $PSCommandPath -PathType Leaf)) {
+        Stop-Install "Agent terminal handoff requires dp-install.ps1 to be saved as a local file before it is invoked." $ExitBlocked
+    }
+    $sourceItem = Get-Item -LiteralPath $PSCommandPath -Force
+    if (($sourceItem.Attributes -band [IO.FileAttributes]::ReparsePoint) -ne 0) {
+        Stop-Install "Agent terminal handoff refused a link-like installer source." $ExitBlocked
+    }
+
+    $powerShellPath = Join-Path $PSHOME "powershell.exe"
+    if (-not (Test-Path -LiteralPath $powerShellPath -PathType Leaf)) {
+        Stop-Install "The trusted Windows PowerShell 5.1 executable is unavailable for visible terminal handoff." $ExitBlocked
+    }
+
+    $handoffRoot = Join-Path ([IO.Path]::GetTempPath()) (
+        "dp-install-agent-terminal-" + [Guid]::NewGuid().ToString("N")
+    )
+    $childStatus = $null
+    $handoffFailure = $null
+    try {
+        try {
+            New-Item -ItemType Directory -Path $handoffRoot -ErrorAction Stop | Out-Null
+            $stagedScript = Join-Path $handoffRoot "dp-install.ps1"
+            Copy-Item -LiteralPath $sourceItem.FullName -Destination $stagedScript -Force -ErrorAction Stop
+            $utilityModule = Join-Path $PSHOME "Modules\Microsoft.PowerShell.Utility\Microsoft.PowerShell.Utility.psd1"
+            Import-Module -Name $utilityModule -ErrorAction Stop
+            $sourceHash = (Microsoft.PowerShell.Utility\Get-FileHash -LiteralPath $sourceItem.FullName -Algorithm SHA256 -ErrorAction Stop).Hash
+            $stagedHash = (Microsoft.PowerShell.Utility\Get-FileHash -LiteralPath $stagedScript -Algorithm SHA256 -ErrorAction Stop).Hash
+        }
+        catch {
+            $handoffFailure = "The Agent host could not prepare a private temporary copy of the Windows installer."
+        }
+        if ($null -eq $handoffFailure -and $sourceHash -ne $stagedHash) {
+            $handoffFailure = "The staged Windows installer bytes do not match the selected installer source."
+        }
+        if ($null -eq $handoffFailure) {
+            $childMode = if ($Activation) { "-ActivationOnly" } else { "-AgentTerminalChild" }
+            $escapedScript = $stagedScript.Replace('"', '""')
+            $argumentText = (
+                '-NoLogo -NoProfile -ExecutionPolicy Bypass -File "{0}" {1}' -f
+                $escapedScript,
+                $childMode
+            )
+            $activity = if ($Activation) {
+                "Decision Engine device activation"
+            }
+            else {
+                "the interactive Decision Engine installer"
+            }
+            Write-Host ("Opening one visible Windows PowerShell window for {0}..." -f $activity)
+            try {
+                $child = Start-Process `
+                    -FilePath $powerShellPath `
+                    -ArgumentList $argumentText `
+                    -WindowStyle Normal `
+                    -Wait `
+                    -PassThru `
+                    -ErrorAction Stop
+            }
+            catch {
+                $handoffFailure = "The Agent host did not permit a visible Windows PowerShell handoff. Run the documented manual terminal command instead."
+            }
+            if ($null -eq $handoffFailure) {
+                if ($null -eq $child -or $null -eq $child.ExitCode) {
+                    $handoffFailure = "The visible Windows PowerShell process did not report an installer exit status."
+                }
+                else {
+                    $childStatus = [int]$child.ExitCode
+                }
+            }
+        }
+    }
+    finally {
+        if (Test-Path -LiteralPath $handoffRoot) {
+            Remove-Item -LiteralPath $handoffRoot -Recurse -Force -ErrorAction SilentlyContinue
+        }
+    }
+    if ($null -ne $handoffFailure) {
+        Stop-Install $handoffFailure $ExitBlocked
+    }
+    switch ($childStatus) {
+        0 {
+            Write-Host ("{0}: PASS: visible Windows PowerShell completed with status 0" -f $ProgramName)
+        }
+        3 {
+            [Console]::Error.WriteLine(("{0}: BLOCKED: visible Windows PowerShell completed with status 3" -f $ProgramName))
+        }
+        4 {
+            [Console]::Error.WriteLine(("{0}: PARTIAL: visible Windows PowerShell completed with status 4" -f $ProgramName))
+        }
+        default {
+            [Console]::Error.WriteLine(("{0}: ERROR: visible Windows PowerShell completed with status {1}" -f $ProgramName, $childStatus))
+        }
+    }
+    exit $childStatus
 }
 
 function Confirm-UserAction {
@@ -204,7 +329,7 @@ function Invoke-PythonScript {
     ) ("dp-install-python-" + [Guid]::NewGuid().ToString("N") + ".py")
     [IO.File]::WriteAllText($scriptPath, $ScriptText, $script:Utf8NoBom)
     try {
-        [string[]]$arguments = @("-I", $scriptPath) + @($ScriptArguments)
+        [string[]]$arguments = @("-I", "-X", "utf8", $scriptPath) + @($ScriptArguments)
         if (-not [string]::IsNullOrWhiteSpace($WorkingDirectory)) {
             Push-Location -LiteralPath $WorkingDirectory
         }
@@ -223,6 +348,482 @@ function Invoke-PythonScript {
     }
     finally {
         Remove-Item -LiteralPath $scriptPath -Force -ErrorAction SilentlyContinue
+    }
+}
+
+function Get-InstalledAgentSnapshot {
+    param(
+        [Parameter(Mandatory = $true)][string]$SourceRoot,
+        [Parameter(Mandatory = $true)][string[]]$ValidClients
+    )
+
+    $snapshotScript = @'
+from pathlib import Path
+import json
+import shutil
+import sys
+
+root = Path(sys.argv[1]).resolve(strict=True)
+sys.path.insert(0, str(root))
+from installer import mcp_config
+
+
+def claude_code_has_independent_evidence():
+    if shutil.which("claude") or shutil.which("claude.exe"):
+        return True
+    config_path = Path.home() / ".claude.json"
+    if not config_path.is_file() or config_path.is_symlink():
+        return False
+    try:
+        data = json.loads(config_path.read_text(encoding="utf-8-sig"))
+    except (OSError, UnicodeError, ValueError):
+        return True
+    if not isinstance(data, dict):
+        return True
+    remaining = dict(data)
+    servers = remaining.get("mcpServers")
+    if isinstance(servers, dict):
+        other_servers = dict(servers)
+        other_servers.pop("decision-engine", None)
+        if other_servers:
+            remaining["mcpServers"] = other_servers
+        else:
+            remaining.pop("mcpServers", None)
+    return bool(remaining)
+
+
+clients = [
+    client
+    for client in mcp_config.detect_clients()
+    if client != "claude-code" or claude_code_has_independent_evidence()
+]
+print(json.dumps({"clients": clients}))
+'@
+    $result = Invoke-PythonScript `
+        -PythonPath $script:PythonPath `
+        -ScriptText $snapshotScript `
+        -ScriptArguments @($SourceRoot) `
+        -WorkingDirectory $SourceRoot `
+        -Capture
+    if ($result.ExitCode -ne 0) {
+        Stop-Install "Installed Agent detection failed before host configuration began." $ExitBlocked
+    }
+    $payload = ($result.Output | ForEach-Object { [string]$_ }) -join ""
+    try {
+        $decoded = ConvertFrom-Json -InputObject $payload
+    }
+    catch {
+        Stop-Install "Installed Agent detection returned invalid JSON." $ExitBlocked
+    }
+    $properties = @($decoded.PSObject.Properties | ForEach-Object { $_.Name })
+    if ($properties.Count -ne 1 -or $properties[0] -ne "clients") {
+        Stop-Install "Installed Agent detection returned an invalid JSON object." $ExitBlocked
+    }
+    $decodedClients = $decoded.clients
+    if ($null -eq $decodedClients) {
+        return @()
+    }
+    $clients = @()
+    foreach ($decodedClient in @($decodedClients)) {
+        if ($decodedClient -isnot [string]) {
+            Stop-Install "Installed Agent detection returned a non-string client id." $ExitBlocked
+        }
+        $client = [string]$decodedClient
+        if ([string]::IsNullOrWhiteSpace($client) -or
+            $client -match "[\r\n]" -or
+            $client -ne $client.Trim() -or
+            $ValidClients -notcontains $client -or
+            $clients -contains $client) {
+            Stop-Install "Installed Agent detection returned an invalid client list." $ExitBlocked
+        }
+        $clients += $client
+    }
+    return @($clients)
+}
+
+function Get-AgentDisplayName {
+    param([Parameter(Mandatory = $true)][string]$Client)
+
+    $names = @{
+        "claude-code" = "Claude Code [claude-code]"
+        "claude-desktop" = "Claude Desktop [claude-desktop]"
+        "claude-desktop-3p" = "Claude Desktop third-party provider profile [claude-desktop-3p]"
+        "codebuddy" = "CodeBuddy [codebuddy]"
+        "codex" = "Codex [codex]"
+        "cursor" = "Cursor [cursor]"
+        "qoder" = "Qoder Desktop [qoder]"
+        "qoder-cn" = "Qoder CN Desktop [qoder-cn]"
+        "qoder-ide" = "Qoder IDE [qoder-ide]"
+        "qoder-cn-ide" = "Qoder CN IDE [qoder-cn-ide]"
+        "trae" = "TraeCode [trae]"
+        "trae-work" = "TraeWork [trae-work]"
+        "trae-cn" = "TraeCode CN [trae-cn]"
+        "trae-work-cn" = "TraeWork CN [trae-work-cn]"
+        "workbuddy" = "WorkBuddy [workbuddy]"
+        "workbuddy-ai" = "WorkBuddy AI [workbuddy-ai]"
+    }
+    if ($names.ContainsKey($Client)) {
+        return [string]$names[$Client]
+    }
+    return $Client
+}
+
+function Get-ConfiguredAgentSnapshot {
+    param(
+        [Parameter(Mandatory = $true)][string]$SourceRoot,
+        [Parameter(Mandatory = $true)][AllowEmptyCollection()][string[]]$InstalledClients
+    )
+
+    if ($InstalledClients.Count -eq 0) {
+        return @()
+    }
+    $snapshotScript = @'
+from pathlib import Path
+import inspect
+import json
+import sys
+
+root = Path(sys.argv[1]).resolve(strict=True)
+clients = sys.argv[2:]
+sys.path.insert(0, str(root))
+from installer import mcp_config
+
+configured = []
+status_probe = getattr(mcp_config, "entry_status", None)
+if callable(status_probe):
+    supports_allow_unactivated = (
+        "allow_unactivated" in inspect.signature(status_probe).parameters
+    )
+    for client in clients:
+        try:
+            options = {"allow_unactivated": True} if supports_allow_unactivated else {}
+            status = status_probe(client, **options)
+        except Exception:
+            # This probe only decorates the selection UI. A malformed host that
+            # was not selected must not block configuration of another host.
+            continue
+        if status == "ready":
+            configured.append(client)
+print(json.dumps({"clients": configured}))
+'@
+    $result = Invoke-PythonScript `
+        -PythonPath $script:PythonPath `
+        -ScriptText $snapshotScript `
+        -ScriptArguments (@($SourceRoot) + @($InstalledClients)) `
+        -WorkingDirectory $SourceRoot `
+        -Capture
+    if ($result.ExitCode -ne 0) {
+        Stop-Install "Existing Agent integration detection failed before host configuration began." $ExitBlocked
+    }
+    $payload = ($result.Output | ForEach-Object { [string]$_ }) -join ""
+    try {
+        $decoded = ConvertFrom-Json -InputObject $payload
+    }
+    catch {
+        Stop-Install "Existing Agent integration detection returned invalid JSON." $ExitBlocked
+    }
+    $properties = @($decoded.PSObject.Properties | ForEach-Object { $_.Name })
+    if ($properties.Count -ne 1 -or $properties[0] -ne "clients") {
+        Stop-Install "Existing Agent integration detection returned an invalid JSON object." $ExitBlocked
+    }
+    $configured = @()
+    foreach ($clientValue in @($decoded.clients)) {
+        if ($clientValue -isnot [string] -or
+            $InstalledClients -notcontains [string]$clientValue -or
+            $configured -contains [string]$clientValue) {
+            Stop-Install "Existing Agent integration detection returned an invalid client list." $ExitBlocked
+        }
+        $configured += [string]$clientValue
+    }
+    return @($configured)
+}
+
+function Merge-AgentClientsByCatalog {
+    param(
+        [Parameter(Mandatory = $true)][string[]]$Catalog,
+        [Parameter(Mandatory = $true)][AllowEmptyCollection()][string[]]$First,
+        [Parameter(Mandatory = $true)][AllowEmptyCollection()][string[]]$Second
+    )
+
+    $merged = @()
+    foreach ($client in $Catalog) {
+        if ($First -contains $client -or $Second -contains $client) {
+            $merged += $client
+        }
+    }
+    return @($merged)
+}
+
+function Test-SharedSkillPairSelection {
+    param(
+        [Parameter(Mandatory = $true)][string[]]$Available,
+        [Parameter(Mandatory = $true)][AllowEmptyCollection()][string[]]$Configured,
+        [Parameter(Mandatory = $true)][string[]]$Requested
+    )
+
+    $effective = @(Merge-AgentClientsByCatalog `
+        -Catalog $Available `
+        -First $Configured `
+        -Second $Requested)
+    $pairs = @(
+        [pscustomobject]@{ First = "qoder"; Second = "qoder-ide" },
+        [pscustomobject]@{ First = "qoder-cn"; Second = "qoder-cn-ide" },
+        [pscustomobject]@{ First = "trae"; Second = "trae-work" },
+        [pscustomobject]@{ First = "trae-cn"; Second = "trae-work-cn" }
+    )
+    foreach ($pair in $pairs) {
+        if ($Available -notcontains $pair.First -or $Available -notcontains $pair.Second) {
+            continue
+        }
+        $firstSelected = $effective -contains $pair.First
+        $secondSelected = $effective -contains $pair.Second
+        if ($firstSelected -xor $secondSelected) {
+            Write-Host ((
+                "{0} and {1} share one Skills directory and must be selected together " +
+                "so neither product is left with Skills but no MCP."
+            ) -f (Get-AgentDisplayName -Client $pair.First), (Get-AgentDisplayName -Client $pair.Second))
+            return $false
+        }
+    }
+    return $true
+}
+
+function Select-InstallClients {
+    param(
+        [Parameter(Mandatory = $true)][string[]]$Available,
+        [Parameter(Mandatory = $true)][AllowEmptyCollection()][string[]]$Configured
+    )
+
+    Write-Host "Detected supported Agent hosts installed on this Windows device:"
+    $configuredIndices = @()
+    for ($offset = 0; $offset -lt $Available.Count; $offset++) {
+        $client = $Available[$offset]
+        $index = $offset + 1
+        Write-Host ("  {0}) {1}" -f $index, (Get-AgentDisplayName -Client $client)) -NoNewline
+        if ($Configured -contains $client) {
+            $configuredIndices += $index
+            Write-Host "  [configured]" -ForegroundColor Green
+        }
+        else {
+            Write-Host ""
+        }
+    }
+    if ($configuredIndices.Count -gt 0) {
+        Write-Host ("Configured Agent integrations are retained automatically: {0}" -f ($configuredIndices -join ","))
+    }
+
+    while ($true) {
+        try {
+            $answer = Read-Host "Select Agent hosts to configure [all]"
+        }
+        catch {
+            Write-Host "Agent selection was cancelled; no Agent host configuration was started."
+            exit $ExitPartial
+        }
+
+        $requested = @()
+        if ([string]::IsNullOrWhiteSpace($answer)) {
+            $requested = @($Available)
+        }
+        else {
+            $tokens = @(
+                $answer -split "[,\s]+" |
+                    Where-Object { -not [string]::IsNullOrWhiteSpace([string]$_) }
+            )
+            if ($tokens.Count -eq 1 -and ([string]$tokens[0]).ToLowerInvariant() -eq "all") {
+                $requested = @($Available)
+            }
+            else {
+                $selectedIndices = @()
+                $invalid = $tokens.Count -eq 0
+                foreach ($tokenValue in $tokens) {
+                    $token = [string]$tokenValue
+                    $parsedIndex = 0
+                    if ($token.ToLowerInvariant() -eq "all" -or
+                        $token -notmatch "^[0-9]+$" -or
+                        -not [int]::TryParse($token, [ref]$parsedIndex) -or
+                        $parsedIndex -lt 1 -or
+                        $parsedIndex -gt $Available.Count) {
+                        $invalid = $true
+                        continue
+                    }
+                    if ($selectedIndices -notcontains $parsedIndex) {
+                        $selectedIndices += $parsedIndex
+                    }
+                }
+                if (-not $invalid -and $selectedIndices.Count -gt 0) {
+                    for ($offset = 0; $offset -lt $Available.Count; $offset++) {
+                        if ($selectedIndices -contains ($offset + 1)) {
+                            $requested += $Available[$offset]
+                        }
+                    }
+                }
+            }
+        }
+
+        if ($requested.Count -eq 0) {
+            Write-Host "Invalid selection. Enter all, press Enter, or enter one or more listed numbers separated by commas or spaces."
+            continue
+        }
+        if (-not (Test-SharedSkillPairSelection `
+            -Available $Available `
+            -Configured $Configured `
+            -Requested $requested)) {
+            Write-Host "Enter both listed numbers for that product pair, or select all."
+            continue
+        }
+
+        $effective = @(Merge-AgentClientsByCatalog `
+            -Catalog $Available `
+            -First $Configured `
+            -Second $requested)
+        $newClients = @($requested | Where-Object { $Configured -notcontains $_ })
+        return [pscustomobject]@{
+            Requested = [string[]]$requested
+            Effective = [string[]]$effective
+            New = [string[]]$newClients
+        }
+    }
+}
+
+function Initialize-CodexHookTarget {
+    param([Parameter(Mandatory = $true)][string]$SourceRoot)
+
+    $pathScript = @'
+from pathlib import Path
+import json
+import os
+import sys
+
+root = Path(sys.argv[1]).resolve(strict=True)
+sys.path.insert(0, str(root))
+from installer import mcp_config
+
+configured = os.environ.get("CODEX_CONFIG")
+if configured and not Path(configured).expanduser().is_absolute():
+    raise SystemExit("CODEX_CONFIG must be an absolute path")
+config_path = mcp_config.agent_config_path("codex").expanduser().absolute()
+print(json.dumps({
+    "config_path": str(config_path),
+    "codex_home": str(config_path.parent),
+    "hooks_path": str(config_path.parent / "hooks.json"),
+}))
+'@
+    $result = Invoke-PythonScript `
+        -PythonPath $script:PythonPath `
+        -ScriptText $pathScript `
+        -ScriptArguments @($SourceRoot) `
+        -WorkingDirectory $SourceRoot `
+        -Capture
+    if ($result.ExitCode -ne 0) {
+        Stop-Install "Codex configuration path resolution failed." $ExitBlocked
+    }
+    $payload = ($result.Output | ForEach-Object { [string]$_ }) -join ""
+    try {
+        $decoded = ConvertFrom-Json -InputObject $payload
+    }
+    catch {
+        Stop-Install "Codex configuration path resolution returned invalid JSON." $ExitBlocked
+    }
+    foreach ($property in @("config_path", "codex_home", "hooks_path")) {
+        if ($decoded.PSObject.Properties.Name -notcontains $property -or
+            $decoded.$property -isnot [string] -or
+            [string]::IsNullOrWhiteSpace([string]$decoded.$property) -or
+            -not [IO.Path]::IsPathRooted([string]$decoded.$property)) {
+            Stop-Install "Codex configuration path resolution returned an invalid path." $ExitBlocked
+        }
+    }
+    $script:CodexConfigPath = [IO.Path]::GetFullPath([string]$decoded.config_path)
+    $script:CodexHome = [IO.Path]::GetFullPath([string]$decoded.codex_home)
+    $script:CodexHooksPath = [IO.Path]::GetFullPath([string]$decoded.hooks_path)
+    if ((Split-Path -Parent $script:CodexConfigPath) -ne $script:CodexHome -or
+        (Split-Path -Parent $script:CodexHooksPath) -ne $script:CodexHome) {
+        Stop-Install "Codex configuration and Hooks targets do not share one active config directory." $ExitBlocked
+    }
+    if (Test-Path -LiteralPath $script:CodexHooksPath -PathType Leaf) {
+        $item = Get-Item -LiteralPath $script:CodexHooksPath -Force
+        if (($item.Attributes -band [IO.FileAttributes]::ReparsePoint) -eq 0) {
+            $script:CodexHooksBeforeSha256 = (
+                Get-FileHash -LiteralPath $script:CodexHooksPath -Algorithm SHA256
+            ).Hash.ToLowerInvariant()
+        }
+    }
+}
+
+function Initialize-CodexHookReviewCapability {
+    $command = Get-Command codex -CommandType Application -ErrorAction SilentlyContinue |
+        Select-Object -First 1
+    if ($null -eq $command -or
+        [string]::IsNullOrWhiteSpace([string]$command.Source)) {
+        $script:CodexHookReviewAvailable = $false
+        $script:CodexHookReviewCommand = $null
+        $script:CodexHookReviewUnavailable = $true
+        return
+    }
+    $script:CodexHookReviewAvailable = $true
+    $script:CodexHookReviewCommand = [string]$command.Source
+    $script:CodexHookReviewUnavailable = $false
+}
+
+function Repair-CodexTomlNewlines {
+    param([Parameter(Mandatory = $true)][string]$SourceRoot)
+
+    if ([string]::IsNullOrWhiteSpace([string]$script:CodexConfigPath) -or
+        -not (Test-Path -LiteralPath $script:CodexConfigPath -PathType Leaf)) {
+        return $false
+    }
+    $item = Get-Item -LiteralPath $script:CodexConfigPath -Force
+    if (($item.Attributes -band [IO.FileAttributes]::ReparsePoint) -ne 0 -or
+        $item.Length -gt 4MB) {
+        Stop-Install "Codex configuration is link-like or oversized; preserve it and stop." $ExitBlocked
+    }
+    $beforeSha256 = (Get-FileHash -LiteralPath $item.FullName -Algorithm SHA256).Hash
+    try {
+        $strictUtf8 = New-Object System.Text.UTF8Encoding($false, $true)
+        $text = $strictUtf8.GetString([IO.File]::ReadAllBytes($item.FullName))
+    }
+    catch {
+        Stop-Install "Codex configuration is not valid UTF-8; preserve it and stop." $ExitBlocked
+    }
+    if ($text.IndexOf("`r", [StringComparison]::Ordinal) -lt 0) {
+        return $false
+    }
+    $normalized = $text.Replace("`r`n", "`n").Replace("`r", "`n")
+    $temporary = Join-Path $item.DirectoryName (
+        $item.Name + ".de-newline-" + [Guid]::NewGuid().ToString("N") + ".tmp"
+    )
+    $backup = $item.FullName + ".de-newline-bak." + (Get-Date -Format "yyyyMMdd-HHmmss")
+    try {
+        [IO.File]::WriteAllText($temporary, $normalized, $script:Utf8NoBom)
+        $validationScript = @'
+from pathlib import Path
+import sys
+import tomllib
+
+path = Path(sys.argv[1])
+tomllib.loads(path.read_text(encoding="utf-8"))
+'@
+        $validation = Invoke-PythonScript `
+            -PythonPath $script:PythonPath `
+            -ScriptText $validationScript `
+            -ScriptArguments @($temporary) `
+            -WorkingDirectory $SourceRoot `
+            -Capture
+        if ($validation.ExitCode -ne 0) {
+            Stop-Install "Codex configuration remains invalid after newline normalization; the original was preserved." $ExitBlocked
+        }
+        $currentSha256 = (Get-FileHash -LiteralPath $item.FullName -Algorithm SHA256).Hash
+        if ($currentSha256 -ne $beforeSha256) {
+            Stop-Install "Codex configuration changed during newline repair; nothing was replaced." $ExitBlocked
+        }
+        [IO.File]::Replace($temporary, $item.FullName, $backup, $true)
+        Write-Host "Normalized Codex TOML newlines before MCP wiring (backup: $backup)."
+        return $true
+    }
+    finally {
+        if (Test-Path -LiteralPath $temporary) {
+            Remove-Item -LiteralPath $temporary -Force -ErrorAction SilentlyContinue
+        }
     }
 }
 
@@ -382,19 +983,19 @@ function Test-PythonExecutable {
         return $false
     }
     $version = Invoke-WithCleanEnvironment -FilePath $verified -ArgumentList @(
-        "-I", "-c", "import sys; raise SystemExit(0 if sys.version_info[:2] >= (3, 12) else 1)"
+        "-I", "-X", "utf8", "-c", "import sys; raise SystemExit(0 if sys.version_info[:2] >= (3, 12) else 1)"
     ) -Capture
     if ($version.ExitCode -ne 0) {
         return $false
     }
     $modules = Invoke-WithCleanEnvironment -FilePath $verified -ArgumentList @(
-        "-I", "-c", "import ssl, venv, tkinter"
+        "-I", "-X", "utf8", "-c", "import ssl, venv, tkinter"
     ) -Capture
     if ($modules.ExitCode -ne 0) {
         return $false
     }
     $pip = Invoke-WithCleanEnvironment -FilePath $verified -ArgumentList @(
-        "-I", "-m", "pip", "--version"
+        "-I", "-X", "utf8", "-m", "pip", "--version"
     ) -Capture
     return $pip.ExitCode -eq 0
 }
@@ -424,7 +1025,7 @@ function Find-Python {
         }
         foreach ($selector in @("-3.14", "-3.13", "-3.12", "-3")) {
             $probe = Invoke-WithCleanEnvironment -FilePath $py -ArgumentList @(
-                $selector, "-I", "-c", "import sys; print(sys.executable)"
+                $selector, "-I", "-X", "utf8", "-c", "import sys; print(sys.executable)"
             ) -Capture
             if ($probe.ExitCode -eq 0 -and $probe.Output.Count -gt 0) {
                 $resolved = [string]$probe.Output[$probe.Output.Count - 1]
@@ -456,7 +1057,7 @@ function Find-Python {
     foreach ($candidate in ($candidates | Select-Object -Unique)) {
         if (Test-PythonExecutable -Candidate $candidate) {
             $identity = Invoke-WithCleanEnvironment -FilePath $candidate -ArgumentList @(
-                "-I", "-c", "import os, sys; print(os.path.abspath(sys.executable))"
+                "-I", "-X", "utf8", "-c", "import os, sys; print(os.path.abspath(sys.executable))"
             ) -Capture
             if ($identity.ExitCode -eq 0 -and $identity.Output.Count -gt 0) {
                 return ([string]$identity.Output[$identity.Output.Count - 1]).Trim()
@@ -469,16 +1070,35 @@ function Find-Python {
 function Test-PrivatePythonExecutable {
     param([Parameter(Mandatory = $true)][string]$Candidate)
 
+    $missingCapabilities = @(
+        Get-PrivatePythonMissingCapabilities -Candidate $Candidate
+    )
+    return $missingCapabilities.Count -eq 0
+}
+
+function Get-PrivatePythonMissingCapabilities {
+    param([Parameter(Mandatory = $true)][string]$Candidate)
+
     if (-not [IO.Path]::IsPathRooted($Candidate) -or
         -not (Test-Path -LiteralPath $Candidate -PathType Leaf) -or
         (Test-ReparsePoint -Path $Candidate)) {
-        return $false
+        return @("python")
     }
     $probe = Invoke-WithCleanEnvironment -FilePath $Candidate -ArgumentList @(
-        "-I", "-c",
-        "import ssl, sys, tkinter, venv; import pip; raise SystemExit(0 if sys.version_info[:2] >= (3, 12) else 1)"
+        "-I", "-X", "utf8", "-c",
+        "import importlib, sys; required=('ssl','venv','tkinter','pip'); missing=[] if sys.version_info[:2] >= (3,12) else ['python>=3.12'];`nfor name in required:`n try: importlib.import_module(name)`n except Exception: missing.append(name)`nprint(','.join(missing) if missing else 'ready'); raise SystemExit(0 if not missing else 1)"
     ) -Capture
-    return $probe.ExitCode -eq 0
+    if ($probe.Output.Count -eq 0) {
+        return @("python-startup")
+    }
+    $result = ([string]$probe.Output[$probe.Output.Count - 1]).Trim()
+    if ($probe.ExitCode -eq 0 -and $result -eq "ready") {
+        return @()
+    }
+    if ([string]::IsNullOrWhiteSpace($result)) {
+        return @("python-startup")
+    }
+    return @($result.Split(",") | Where-Object { -not [string]::IsNullOrWhiteSpace($_) })
 }
 
 function Assert-PrivateDirectory {
@@ -494,11 +1114,31 @@ function Assert-PrivateDirectory {
     if (-not $item.PSIsContainer -or (Test-ReparsePoint -Path $Path)) {
         Stop-Install "$Path is not a regular $Description directory; preserve it and stop." $ExitBlocked
     }
-    $owner = (Get-Acl -LiteralPath $Path -ErrorAction Stop).GetOwner(
+    $acl = Get-Acl -LiteralPath $Path -ErrorAction Stop
+    $owner = $acl.GetOwner(
         [System.Security.Principal.SecurityIdentifier]
     ).Value
-    if ($owner -ne [System.Security.Principal.WindowsIdentity]::GetCurrent().User.Value) {
-        Stop-Install "$Path is not owned by the current Windows user; preserve it and stop." $ExitBlocked
+    $currentOwner = [System.Security.Principal.WindowsIdentity]::GetCurrent().User.Value
+    $trustedOwners = @(
+        $currentOwner,
+        "S-1-5-18",       # LocalSystem from an older elevated installer.
+        "S-1-5-32-544"   # Builtin Administrators from an older elevated installer.
+    )
+    if ($owner -notin $trustedOwners) {
+        Stop-Install "$Path is not owned by the current Windows user or a trusted legacy installer identity; preserve it and stop." $ExitBlocked
+    }
+    foreach ($rule in $acl.Access) {
+        $sid = $rule.IdentityReference.Translate(
+            [System.Security.Principal.SecurityIdentifier]
+        ).Value
+        if ($rule.AccessControlType -eq "Allow" -and
+            $sid -in @("S-1-1-0", "S-1-5-11", "S-1-5-32-545") -and
+            (([int]$rule.FileSystemRights -band 0xD0156) -ne 0)) {
+            Stop-Install "$Path grants broad write access; preserve it and stop." $ExitBlocked
+        }
+    }
+    if ($owner -ne $currentOwner) {
+        Write-Host "$Description directory uses a trusted legacy Windows installer owner; continuing with guarded compatibility."
     }
 }
 
@@ -514,11 +1154,15 @@ function Get-PrivateRuntimeSpec {
         $runtimeArchitecture = "x86_64"
         $sha256 = "9bcc038a0bf180612ed56dec93d4977d035e80b8d9320ef51a38c287baf134b7"
         $size = 47042104L
+        $knownMissingCapabilities = @()
     }
     elseif ($architecture -match "^(?i:ARM64|aarch64)") {
         $runtimeArchitecture = "aarch64"
         $sha256 = "ce87247378f43f88e0202a0fa6d3cdb5f5fb246a3bc61b2fb604bd49b7862508"
         $size = 43801216L
+        # This immutable upstream asset was verified on Windows ARM64 and does
+        # not contain _tkinter/Tcl-Tk, which the masked activation UI requires.
+        $knownMissingCapabilities = @("tkinter")
     }
     else {
         Stop-Install "Unsupported Windows architecture for the private Python runtime: $architecture"
@@ -533,6 +1177,7 @@ function Get-PrivateRuntimeSpec {
         Sha256 = $sha256
         Size = $size
         Directory = Join-Path $PrivateRuntimeRoot $runtimeId
+        KnownMissingCapabilities = $knownMissingCapabilities
     }
 }
 
@@ -600,6 +1245,12 @@ function Install-PrivatePythonRuntime {
     $spec = Get-PrivateRuntimeSpec
     Assert-PrivateDirectory -Path $DeepPatternRoot -Description "Deep Pattern"
     Assert-PrivateDirectory -Path $PrivateRuntimeRoot -Description "Deep Pattern runtime"
+
+    if (@($spec.KnownMissingCapabilities).Count -gt 0) {
+        $script:PrivateRuntimeFallbackExpected = $true
+        Write-Host ("The fixed private Python {0} asset for {1} lacks {2}; selecting a trusted complete Python without downloading that asset." -f $PrivatePythonVersion, $spec.Architecture, (@($spec.KnownMissingCapabilities) -join ", "))
+        return $null
+    }
 
     if (Test-Path -LiteralPath $spec.Directory) {
         if (Test-PrivateRuntime -Spec $spec) {
@@ -669,14 +1320,23 @@ function Install-PrivatePythonRuntime {
         }
         $topLevel = @(Get-ChildItem -LiteralPath $extract -Force)
         $extractedPython = Join-Path $extract "python"
-        if ($topLevel.Count -ne 1 -or $topLevel[0].Name -ne "python" -or
-            -not (Test-Path -LiteralPath $extractedPython -PathType Container) -or
-            (Test-ReparsePoint -Path $extractedPython) -or
+        $runtimeLayoutValid = $topLevel.Count -eq 1 -and
+            $topLevel[0].Name -eq "python" -and
+            (Test-Path -LiteralPath $extractedPython -PathType Container) -and
+            -not (Test-ReparsePoint -Path $extractedPython) -and
             @(Get-ChildItem -LiteralPath $extractedPython -Recurse -Force | Where-Object {
                 ($_.Attributes -band [IO.FileAttributes]::ReparsePoint) -ne 0
-            }).Count -ne 0 -or
-            -not (Test-PrivatePythonExecutable -Candidate (Join-Path $extractedPython "python.exe"))) {
-            Write-Warning "The verified private Python archive does not provide ssl, venv, tkinter, and pip on this Windows device."
+            }).Count -eq 0
+        $missingCapabilities = @(
+            if ($runtimeLayoutValid) {
+                Get-PrivatePythonMissingCapabilities -Candidate (Join-Path $extractedPython "python.exe")
+            }
+            else {
+                "archive-layout"
+            }
+        )
+        if (-not $runtimeLayoutValid -or $missingCapabilities.Count -gt 0) {
+            Write-Warning ("The verified private Python archive is not complete on this Windows device; unavailable capability: {0}." -f ($missingCapabilities -join ", "))
             return $null
         }
 
@@ -722,7 +1382,70 @@ function Test-ManagedPythonEnvironment {
     }
     $lines = @(Get-Content -LiteralPath $ManagedPythonMarker -ErrorAction SilentlyContinue)
     return ($lines -contains "schema=1") -and
+        (Test-ManagedPythonBaseIdentity -MarkerLines $lines) -and
         (Test-PrivatePythonExecutable -Candidate $ManagedPythonPath)
+}
+
+function Test-ManagedPythonBaseIdentity {
+    param([Parameter(Mandatory = $true)][string[]]$MarkerLines)
+
+    $baseLines = @(
+        $MarkerLines | Where-Object { $_.StartsWith("base_python=", [StringComparison]::Ordinal) }
+    )
+    if ($baseLines.Count -ne 1) {
+        return $false
+    }
+    $basePython = $baseLines[0].Substring("base_python=".Length)
+    if ([string]::IsNullOrWhiteSpace($basePython) -or
+        -not [IO.Path]::IsPathRooted($basePython)) {
+        return $false
+    }
+    try {
+        $fullBase = [IO.Path]::GetFullPath($basePython)
+        $fullRuntimeRoot = [IO.Path]::GetFullPath($PrivateRuntimeRoot).TrimEnd("\") + "\"
+    }
+    catch {
+        return $false
+    }
+
+    if ($fullBase.StartsWith($fullRuntimeRoot, [StringComparison]::OrdinalIgnoreCase)) {
+        $spec = Get-PrivateRuntimeSpec
+        $expectedBase = [IO.Path]::GetFullPath(
+            (Join-Path $spec.Directory "python\python.exe")
+        )
+        if (-not [string]::Equals(
+                $fullBase,
+                $expectedBase,
+                [StringComparison]::OrdinalIgnoreCase
+            ) -or
+            -not (Test-PrivateRuntime -Spec $spec)) {
+            return $false
+        }
+    }
+    elseif (-not (Test-PythonExecutable -Candidate $fullBase)) {
+        return $false
+    }
+
+    $identity = Invoke-WithCleanEnvironment -FilePath $ManagedPythonPath -ArgumentList @(
+        "-I", "-X", "utf8", "-c",
+        "import os, sys; print(os.path.realpath(sys._base_executable))"
+    ) -Capture
+    if ($identity.ExitCode -ne 0 -or $identity.Output.Count -eq 0) {
+        return $false
+    }
+    try {
+        $actualBase = [IO.Path]::GetFullPath(
+            ([string]$identity.Output[$identity.Output.Count - 1]).Trim()
+        )
+    }
+    catch {
+        return $false
+    }
+    return [string]::Equals(
+        $actualBase,
+        $fullBase,
+        [StringComparison]::OrdinalIgnoreCase
+    )
 }
 
 function New-ManagedPythonEnvironment {
@@ -733,7 +1456,9 @@ function New-ManagedPythonEnvironment {
     $stagedEnvironment = Join-Path $stage "de-python"
     New-Item -ItemType Directory -Path $stage | Out-Null
     try {
-        $code = Invoke-WithCleanEnvironment -FilePath $BasePython -ArgumentList @("-I", "-m", "venv", $stagedEnvironment)
+        $code = Invoke-WithCleanEnvironment -FilePath $BasePython -ArgumentList @(
+            "-I", "-X", "utf8", "-m", "venv", $stagedEnvironment
+        )
         $stagedPython = Join-Path $stagedEnvironment "Scripts\python.exe"
         if ($code -ne 0 -or -not (Test-PrivatePythonExecutable -Candidate $stagedPython)) {
             Stop-Install "Could not create a complete private Deep Pattern Python environment with $BasePython." $ExitBlocked
@@ -784,7 +1509,9 @@ function Resolve-Python {
         $basePython = Install-PrivatePythonRuntime
     }
     if ([string]::IsNullOrWhiteSpace($basePython)) {
-        Write-Warning "A verified private Python runtime could not be used. Checking an existing trusted Python or WinGet fallback."
+        if (-not $script:PrivateRuntimeFallbackExpected) {
+            Write-Warning "A verified private Python runtime could not be used. Checking an existing trusted Python or WinGet fallback."
+        }
         $basePython = Find-Python
     }
     if ([string]::IsNullOrWhiteSpace($basePython)) {
@@ -796,6 +1523,127 @@ function Resolve-Python {
         Stop-Install "A compatible verified Python could not be prepared. Open a new PowerShell window and retry."
     }
     return New-ManagedPythonEnvironment -BasePython $basePython
+}
+
+function Install-WindowsNativeTrustBridge {
+    $bridgeScript = @'
+from pathlib import Path
+import os
+import sys
+import sysconfig
+
+managed_root = Path(sys.argv[1]).resolve(strict=True)
+if Path(sys.prefix).resolve(strict=True) != managed_root:
+    raise SystemExit("managed Python prefix mismatch")
+
+purelib_value = sysconfig.get_path("purelib")
+if not purelib_value:
+    raise SystemExit("managed Python purelib path is unavailable")
+site_root = Path(purelib_value).resolve(strict=True)
+try:
+    site_root.relative_to(managed_root)
+except ValueError:
+    raise SystemExit("managed Python purelib path is outside the managed environment")
+if not site_root.is_dir():
+    raise SystemExit("managed Python purelib path is not a directory")
+
+module = site_root / "deeppattern_windows_native_trust.py"
+pth = site_root / "deeppattern-windows-native-trust.pth"
+for target in (module, pth):
+    if target.is_symlink() or (target.exists() and not target.is_file()):
+        raise SystemExit("native trust bridge path is unsafe")
+module_content = '''import os
+import ssl
+
+_EXPLICIT_CA = ("SSL_CERT_FILE", "REQUESTS_CA_BUNDLE", "SSL_CERT_DIR")
+if not any(os.getenv(name) for name in _EXPLICIT_CA):
+    try:
+        from pip._vendor.truststore import SSLContext as _NativeSSLContext
+    except Exception:
+        _NativeSSLContext = None
+
+    if _NativeSSLContext is not None:
+        class SSLContext(_NativeSSLContext):
+            def get_ca_certs(self, binary_form=False):
+                # Native Windows chain building does not expose an enumerable
+                # CA list. DE asks only whether a platform store exists; peer
+                # verification remains inside truststore/CryptoAPI.
+                return [b"windows-native-store"] if binary_form else [{"source": "windows-native-store"}]
+
+        ssl.SSLContext = SSLContext
+    else:
+        _stdlib_create_default_context = ssl.create_default_context
+        _SERVER_AUTH_OID = "1.3.6.1.5.5.7.3.1"
+
+        def _store_certificates(name):
+            try:
+                return tuple(ssl.enum_certificates(name))
+            except (AttributeError, OSError):
+                return ()
+
+        def _windows_server_roots():
+            disallowed = {
+                certificate
+                for certificate, encoding, _trust in _store_certificates("Disallowed")
+                if encoding == "x509_asn"
+            }
+            roots = []
+            seen = set()
+            for certificate, encoding, trust in _store_certificates("ROOT"):
+                if encoding != "x509_asn" or certificate in disallowed or certificate in seen:
+                    continue
+                if trust is not True and _SERVER_AUTH_OID not in trust:
+                    continue
+                seen.add(certificate)
+                roots.append(ssl.DER_cert_to_PEM_cert(certificate))
+            if not roots:
+                raise ssl.SSLError("Windows ROOT certificate store has no server-authentication roots")
+            return "".join(roots)
+
+        def create_default_context(
+            purpose=ssl.Purpose.SERVER_AUTH, *, cafile=None, capath=None, cadata=None
+        ):
+            if cafile is not None or capath is not None or cadata is not None:
+                return _stdlib_create_default_context(
+                    purpose, cafile=cafile, capath=capath, cadata=cadata
+                )
+            # Passing cadata creates a fresh context whose anchors come only
+            # from the current Windows ROOT store. This does not union certifi
+            # or OpenSSL defaults onto the operating-system trust decision.
+            return _stdlib_create_default_context(
+                purpose, cadata=_windows_server_roots()
+            )
+
+        ssl.create_default_context = create_default_context
+'''
+pth_content = "import deeppattern_windows_native_trust\n"
+for target, content in ((module, module_content), (pth, pth_content)):
+    if not target.exists() or target.read_text(encoding="utf-8") != content:
+        temporary = target.with_name(target.name + ".tmp-%d" % os.getpid())
+        temporary.write_text(content, encoding="utf-8", newline="\n")
+        os.replace(temporary, target)
+print(pth)
+'@
+    $bridgeResult = Invoke-PythonScript `
+        -PythonPath $script:PythonPath `
+        -ScriptText $bridgeScript `
+        -ScriptArguments @($ManagedPythonRoot) `
+        -Capture
+    if ($bridgeResult.ExitCode -ne 0) {
+        $bridgeDetail = @($bridgeResult.Output | ForEach-Object { ([string]$_).Trim() }) -join " | "
+        Stop-Install "The private Python environment could not prepare Windows certificate-store verification. Detail: $bridgeDetail" $ExitBlocked
+    }
+
+    $probe = Invoke-WithCleanEnvironment -FilePath $script:PythonPath -ArgumentList @(
+        "-I", "-X", "utf8", "-c",
+        "import os, ssl; overridden=any(os.getenv(k) for k in ('SSL_CERT_FILE','REQUESTS_CA_BUNDLE','SSL_CERT_DIR')); expected='deeppattern_windows_native_trust'; context=ssl.create_default_context(); mode='explicit-ca' if overridden else ('cryptoapi' if ssl.SSLContext.__module__ == expected else ('windows-root' if ssl.create_default_context.__module__ == expected else 'inactive')); secure=context.verify_mode == ssl.CERT_REQUIRED and context.check_hostname; anchors=True if overridden else bool(context.get_ca_certs()); print('mode=%s secure=%s anchors=%s' % (mode, secure, anchors)); raise SystemExit(0 if secure and anchors and (overridden or mode != 'inactive') else 1)"
+    ) -Capture
+    if ($probe.ExitCode -ne 0) {
+        $probeDetail = @($probe.Output | ForEach-Object { ([string]$_).Trim() }) -join " | "
+        Stop-Install "Windows certificate-store verification did not load in a fresh private Python process. Detail: $probeDetail" $ExitBlocked
+    }
+    $probeSummary = @($probe.Output | ForEach-Object { ([string]$_).Trim() } | Where-Object { $_ -ne "" }) -join " | "
+    Write-Host "Windows certificate-store verification is ready in the private Deep Pattern Python environment ($probeSummary)."
 }
 
 function Test-ReparsePoint {
@@ -1220,9 +2068,9 @@ function Install-AqgDependencies {
     $requirements = Join-Path $AqgRoot "requirements.txt"
     Write-Host ("Installing or verifying Agent Quality Gates runtime dependencies with {0}..." -f $script:PythonPath)
     $venvProbe = Invoke-WithCleanEnvironment -FilePath $script:PythonPath -ArgumentList @(
-        "-c", "import sys; raise SystemExit(0 if sys.prefix != sys.base_prefix else 1)"
+        "-X", "utf8", "-c", "import sys; raise SystemExit(0 if sys.prefix != sys.base_prefix else 1)"
     ) -Capture
-    $pipArguments = @("-m", "pip", "install")
+    $pipArguments = @("-X", "utf8", "-m", "pip", "install")
     if ($venvProbe.ExitCode -ne 0) {
         $pipArguments += "--user"
     }
@@ -1234,10 +2082,18 @@ function Install-AqgDependencies {
 }
 
 function Repair-AqgCodexHookEntrance {
+    param([switch]$Required)
+
     $null = Get-VerifiedAqgLayout
+    if ([string]::IsNullOrWhiteSpace([string]$script:CodexConfigPath) -or
+        [string]::IsNullOrWhiteSpace([string]$script:CodexHooksPath)) {
+        Stop-Install "Codex Hooks target was not resolved before installation." $ExitBlocked
+    }
     $aqgHookScript = @'
 from pathlib import Path
+import json
 import sys
+import tomllib
 
 root = Path(sys.argv[1]).resolve(strict=True)
 logical = Path(sys.argv[1]).absolute()
@@ -1245,25 +2101,76 @@ sys.dont_write_bytecode = True
 sys.path.insert(0, str(root))
 from scripts import install_aqg_clients, install_aqg_codex_hooks
 
+required = len(sys.argv) > 4 and sys.argv[4] == "1"
+target = Path(sys.argv[2]).absolute()
+config_path = Path(sys.argv[3]).absolute()
+
 # Match the existing Windows client relay's BOM-tolerant JSON reads.
 original_read_text = Path.read_text
 def read_text_compatible(path, encoding=None, errors=None):
     text = original_read_text(path, encoding=encoding, errors=errors)
     return text.removeprefix("\ufeff") if encoding == "utf-8" and path.suffix.lower() == ".json" else text
 Path.read_text = read_text_compatible
-if "codex" not in install_aqg_clients.installed_supported_clients():
+if not required and "codex" not in install_aqg_clients.installed_supported_clients():
     raise SystemExit(0)
-arguments = ["--aqg-root", str(logical)]
+arguments = ["--target", str(target), "--aqg-root", str(logical)]
 if install_aqg_codex_hooks.main(["--verify", *arguments]) == 0:
-    raise SystemExit(0)
-print("Rebinding AQG Codex hooks to the stable managed entrance...")
-if install_aqg_codex_hooks.main(["--apply", *arguments]) != 0:
+    verified = True
+else:
+    print("Rebinding AQG Codex hooks to the stable managed entrance...")
+    if install_aqg_codex_hooks.main(["--apply", *arguments]) != 0:
+        raise SystemExit(2)
+    verified = install_aqg_codex_hooks.main(["--verify", *arguments]) == 0
+if not verified:
     raise SystemExit(2)
-raise SystemExit(install_aqg_codex_hooks.main(["--verify", *arguments]))
+
+document = json.loads(target.read_text(encoding="utf-8-sig"))
+event_count = 0
+definition_count = 0
+for groups in document.get("hooks", {}).values():
+    owned_in_event = False
+    for group in groups if isinstance(groups, list) else ():
+        for hook in group.get("hooks", ()) if isinstance(group, dict) else ():
+            if install_aqg_codex_hooks._owned_script(hook) is not None:
+                definition_count += 1
+                owned_in_event = True
+    event_count += int(owned_in_event)
+print(
+    f"AQG Codex hooks: {definition_count} definitions across {event_count} events "
+    f"installed in {target}"
+)
+
+if config_path.is_file():
+    config = tomllib.loads(config_path.read_text(encoding="utf-8-sig"))
+    features = config.get("features", {})
+    enabled = features.get("hooks", features.get("codex_hooks", True)) \
+        if isinstance(features, dict) else True
+    if enabled is False:
+        print(
+            f"AQG Codex hooks are installed but disabled by {config_path}: "
+            "set [features] hooks = true, then fully restart Codex.",
+            file=sys.stderr,
+        )
+        raise SystemExit(5)
 '@
     $code = Invoke-PythonScript -PythonPath $script:PythonPath -ScriptText $aqgHookScript `
-        -ScriptArguments @($AqgRoot) -WorkingDirectory (Split-Path -Parent $AqgRoot) `
-        -Environment @{ "PATH" = "$(Split-Path -Parent $GitPath);$env:PATH"; "AQG_ROOT" = $AqgRoot; "AQG_BASH" = $BashPath }
+        -ScriptArguments @(
+            $AqgRoot,
+            $script:CodexHooksPath,
+            $script:CodexConfigPath,
+            $(if ($Required) { "1" } else { "0" })
+        ) `
+        -WorkingDirectory (Split-Path -Parent $AqgRoot) `
+        -Environment @{
+            "PATH" = "$(Split-Path -Parent $GitPath);$env:PATH"
+            "AQG_ROOT" = $AqgRoot
+            "AQG_BASH" = $BashPath
+            "CODEX_HOME" = $script:CodexHome
+        }
+    if ($code -eq 5) {
+        $script:CodexHooksDisabled = $true
+        return
+    }
     if ($code -ne 0) {
         Stop-Install "AQG Codex hooks could not be verified against the stable managed entrance." $ExitBlocked
     }
@@ -1348,11 +2255,18 @@ finally:
     shutil.rmtree(shim_root, ignore_errors=True)
 raise SystemExit(result)
 '@
+    $wrapperEnvironment = @{
+        "PATH" = "$(Split-Path -Parent $GitPath);$env:PATH"
+        "AQG_BASH" = $BashPath
+    }
+    if (-not [string]::IsNullOrWhiteSpace([string]$script:CodexHome)) {
+        $wrapperEnvironment["CODEX_HOME"] = $script:CodexHome
+    }
     return Invoke-PythonScript `
         -PythonPath $script:PythonPath `
         -ScriptText $bridgeScript `
         -ScriptArguments (@($AqgRoot) + @($ArgumentList)) `
-        -Environment @{ "PATH" = "$(Split-Path -Parent $GitPath);$env:PATH"; "AQG_BASH" = $BashPath } `
+        -Environment $wrapperEnvironment `
         -WorkingDirectory (Split-Path -Parent $AqgRoot) `
         -Capture:$Capture
 }
@@ -1367,11 +2281,183 @@ function Invoke-ManagedPython {
     }
     Push-Location -LiteralPath $ManagedRoot
     try {
-        return Invoke-WithCleanEnvironment -FilePath $script:PythonPath -ArgumentList $Arguments -Capture:$Capture
+        [string[]]$pythonArguments = @("-X", "utf8") + @($Arguments)
+        $managedEnvironment = @{}
+        if (-not [string]::IsNullOrWhiteSpace([string]$script:CodexHome)) {
+            $managedEnvironment["CODEX_HOME"] = $script:CodexHome
+            $managedEnvironment["CODEX_SKILLS_DIR"] = Join-Path $script:CodexHome "skills"
+        }
+        return Invoke-WithCleanEnvironment `
+            -FilePath $script:PythonPath `
+            -ArgumentList $pythonArguments `
+            -Environment $managedEnvironment `
+            -Capture:$Capture
     }
     finally {
         Pop-Location
     }
+}
+
+function Invoke-ManagedBootstrapInstall {
+    param(
+        [Parameter(Mandatory = $true)][string]$SourceRoot,
+        [Parameter(Mandatory = $true)][AllowEmptyCollection()][string[]]$Clients
+    )
+
+$bootstrapScript = @'
+from dataclasses import replace
+import inspect
+from pathlib import Path
+import sys
+
+root = Path(sys.argv[1]).resolve(strict=True)
+clients = sys.argv[2:]
+sys.path.insert(0, str(root))
+from installer import bootstrap_managed_install, managed_activation, mcp_config
+
+if (
+    len(clients) != len(set(clients))
+    or any(client not in mcp_config.CLIENT_SPECS for client in clients)
+):
+    raise SystemExit("bootstrap client list is invalid")
+
+allowed_routes = {
+    mcp_config.CLIENT_SPECS[client].skill_route_name
+    for client in clients
+    if mcp_config.CLIENT_SPECS[client].skill_route_name is not None
+}
+original_active_skill_routes = mcp_config.active_skill_routes
+frozen_clients = tuple(clients)
+
+def scoped_active_skill_routes(*, for_doctor=False, setup_only=False):
+    routes = original_active_skill_routes(
+        for_doctor=for_doctor,
+        setup_only=setup_only,
+    )
+    return {
+        name: value
+        for name, value in routes.items()
+        if name in allowed_routes
+    }
+
+mcp_config.detect_clients = lambda: frozen_clients
+mcp_config.active_skill_routes = scoped_active_skill_routes
+
+# Signed stable releases before agentless installation required a non-empty
+# client list even though managed activation writes only DE identity/update
+# state. Keep that compatibility entirely in memory, fail closed if the old
+# function's side-effect boundary changes, and never expose the placeholder as
+# an installed host.
+if not frozen_clients:
+    original_activate_prepared_install = managed_activation.activate_prepared_install
+    activation_source = inspect.getsource(original_activate_prepared_install)
+    required_operations = (
+        "managed_install.write_managed_identity",
+        "update_transaction._write_protocol_ready_locked",
+    )
+    forbidden_operations = (
+        "write_entry(",
+        "_configure_agent_hosts(",
+        "repair_client_integration(",
+    )
+    if (
+        any(operation not in activation_source for operation in required_operations)
+        or any(operation in activation_source for operation in forbidden_operations)
+        or not mcp_config.CLIENTS
+    ):
+        raise SystemExit(
+            "agentless bootstrap compatibility is unavailable for this release"
+        )
+
+    def activate_prepared_install_agentless(
+        prepared_root=None, *, clients=None, startup_budget_seconds=10.0
+    ):
+        requested = tuple(clients or ())
+        if requested:
+            return original_activate_prepared_install(
+                prepared_root,
+                clients=requested,
+                startup_budget_seconds=startup_budget_seconds,
+            )
+        result = original_activate_prepared_install(
+            prepared_root,
+            clients=(mcp_config.CLIENTS[0],),
+            startup_budget_seconds=startup_budget_seconds,
+        )
+        return replace(result, clients=())
+
+    managed_activation.activate_prepared_install = (
+        activate_prepared_install_agentless
+    )
+    # The outer Windows entrypoint owns masked activation and deliberately
+    # performs no host writes when no Agent is installed. Older bootstrap
+    # releases unconditionally launch permanent_setup --from-env after core
+    # activation; with owner credentials present that would persist activation
+    # and then fail while trying to configure an absent host. Suppress only
+    # that redundant child step in agentless mode.
+    bootstrap_managed_install._run_permanent_setup_from_env = (
+        lambda *_args, **_kwargs: 0
+    )
+
+arguments = ["install"]
+for client in clients:
+    arguments.extend(("--client", client))
+raise SystemExit(bootstrap_managed_install.main(arguments))
+'@
+    return Invoke-PythonScript `
+        -PythonPath $script:PythonPath `
+        -ScriptText $bootstrapScript `
+        -ScriptArguments (@($SourceRoot) + @($Clients)) `
+        -WorkingDirectory $SourceRoot
+}
+
+function Invoke-ScopedDecisionEngineDoctor {
+    param(
+        [Parameter(Mandatory = $true)][AllowEmptyCollection()][string[]]$Clients
+    )
+
+    $doctorScript = @'
+from pathlib import Path
+import sys
+
+root = Path(sys.argv[1]).resolve(strict=True)
+clients = sys.argv[2:]
+sys.path.insert(0, str(root))
+from installer import doctor, mcp_config
+
+if (
+    len(clients) != len(set(clients))
+    or any(client not in mcp_config.CLIENT_SPECS for client in clients)
+):
+    raise SystemExit("Doctor client list is invalid")
+
+allowed_routes = {
+    mcp_config.CLIENT_SPECS[client].skill_route_name
+    for client in clients
+    if mcp_config.CLIENT_SPECS[client].skill_route_name is not None
+}
+original_active_skill_routes = mcp_config.active_skill_routes
+
+def scoped_active_skill_routes(*, for_doctor=False, setup_only=False):
+    routes = original_active_skill_routes(
+        for_doctor=for_doctor,
+        setup_only=setup_only,
+    )
+    return {
+        name: value
+        for name, value in routes.items()
+        if name in allowed_routes
+    }
+
+mcp_config.detect_clients = lambda: tuple(clients)
+mcp_config.active_skill_routes = scoped_active_skill_routes
+raise SystemExit(doctor.main([]))
+'@
+    return Invoke-PythonScript `
+        -PythonPath $script:PythonPath `
+        -ScriptText $doctorScript `
+        -ScriptArguments (@($ManagedRoot) + @($Clients)) `
+        -WorkingDirectory $ManagedRoot
 }
 
 function Invoke-ManagedPermanentSetup {
@@ -1381,7 +2467,11 @@ function Invoke-ManagedPermanentSetup {
 
     $setupScript = @'
 from pathlib import Path
+import inspect
+import socket
+import ssl
 import sys
+from types import SimpleNamespace
 
 root = Path(sys.argv[1]).resolve(strict=True)
 entry = (root / "installer" / "permanent_setup.py").resolve(strict=True)
@@ -1393,19 +2483,177 @@ if Path(permanent_setup.__file__).resolve(strict=True) != entry:
     raise RuntimeError("managed permanent setup identity mismatch")
 
 show_status_dialog = permanent_setup._show_gui_message
+original_activate_once = getattr(permanent_setup, "_activate_once", None)
+
+def activation_exception_chain(exc):
+    chain = []
+    pending = [exc]
+    seen = set()
+    while pending:
+        current = pending.pop(0)
+        if not isinstance(current, BaseException) or id(current) in seen:
+            continue
+        seen.add(id(current))
+        chain.append(current)
+        for nested in (
+            getattr(current, "__cause__", None),
+            getattr(current, "__context__", None),
+            getattr(current, "reason", None),
+        ):
+            if isinstance(nested, BaseException):
+                pending.append(nested)
+    return tuple(chain)
+
+def activation_failure_category(exc):
+    activate = permanent_setup.activate
+    refused = getattr(activate, "ActivationRefusedError", ())
+    recovery = getattr(activate, "ActivationRecoveryRequiredError", ())
+    persistence = getattr(activate, "ActivationPersistenceError", ())
+    if refused and isinstance(exc, refused):
+        status = getattr(exc, "status_code", 0)
+        return "server-refused-http-%s" % status
+    if recovery and isinstance(exc, recovery):
+        return "recovery-required"
+    if persistence and isinstance(exc, persistence):
+        return "credential-persistence-failed"
+    chain = activation_exception_chain(exc)
+    if any(isinstance(item, ssl.SSLCertVerificationError) for item in chain):
+        return "tls-certificate-verification-failed"
+    if any(isinstance(item, ssl.SSLError) for item in chain):
+        return "tls-failed"
+    if any(isinstance(item, socket.gaierror) for item in chain):
+        return "dns-failed"
+    if any(isinstance(item, TimeoutError) for item in chain):
+        return "transport-timeout"
+    if any(isinstance(item, ConnectionRefusedError) for item in chain):
+        return "connection-refused"
+    if any(isinstance(item, ConnectionResetError) for item in chain):
+        return "connection-reset"
+    message = str(exc)
+    if message.startswith("activation request timed out"):
+        return "transport-timeout"
+    if message.startswith("activation request failed"):
+        return "transport-failed"
+    if message.startswith("invalid JSON"):
+        return "invalid-json-response"
+    if message.startswith("activation response malformed"):
+        return "malformed-response"
+    return "local-or-service-error-%s" % type(exc).__name__
+
+def activation_certificate_detail(exc):
+    for item in activation_exception_chain(exc):
+        if not isinstance(item, ssl.SSLCertVerificationError):
+            continue
+        code = getattr(item, "verify_code", None)
+        if code == 9:
+            return "not-yet-valid"
+        if code == 10:
+            return "expired"
+        if code in {18, 19}:
+            return "self-signed"
+        if code in {2, 20, 21}:
+            return "issuer-or-chain-untrusted"
+        if code in {62, 64}:
+            return "hostname-or-address-mismatch"
+        if isinstance(code, int):
+            return "verify-code-%s" % code
+        return "unclassified"
+    return "not-applicable"
+
+if callable(original_activate_once):
+    def diagnosed_activate_once(*args, **kwargs):
+        try:
+            return original_activate_once(*args, **kwargs)
+        except Exception as exc:
+            category = activation_failure_category(exc)
+            chain_types = ">".join(
+                type(item).__name__ for item in activation_exception_chain(exc)
+            )
+            certificate = (
+                " certificate=%s" % activation_certificate_detail(exc)
+                if category == "tls-certificate-verification-failed"
+                else ""
+            )
+            print(
+                "de-permanent-setup: activation diagnostic category=%s chain=%s%s"
+                % (category, chain_types or type(exc).__name__, certificate),
+                file=sys.stderr,
+            )
+            raise
+
+    permanent_setup._activate_once = diagnosed_activate_once
+
+def activation_is_persisted():
+    try:
+        config_path = permanent_setup._managed_config_path()
+        config = permanent_setup._load_managed_config(config_path)
+        return permanent_setup.activate.is_permanently_activated(config)
+    except Exception:
+        return False
 
 def show_error_dialog_only(title, message, *, error=False):
-    if error:
-        show_status_dialog(title, message, error=True)
+    if not error:
+        return
+    if activation_is_persisted():
+        print(
+            "de-permanent-setup: activation is persisted; "
+            "the calling installer will complete host repair and Doctor",
+            file=sys.stderr,
+        )
+        return
+    show_status_dialog(title, message, error=True)
 
 permanent_setup._show_gui_message = show_error_dialog_only
-raise SystemExit(permanent_setup.main([]))
+run_setup = getattr(permanent_setup, "run_permanent_setup", None)
+supports_activation_only = (
+    callable(run_setup)
+    and "configure_hosts" in inspect.signature(run_setup).parameters
+)
+if supports_activation_only:
+    arguments = ["--activation-only"]
+else:
+    # The public stable source may predate --activation-only. Keep that source
+    # responsible for activation only; this installer owns host repair and Doctor.
+    permanent_setup._configure_agent_hosts = (
+        lambda *_args, **_kwargs: SimpleNamespace(failures=(), notices=())
+    )
+    permanent_setup._doctor_has_blocking_failure = lambda _failures: False
+    arguments = []
+
+raise SystemExit(permanent_setup.main(arguments))
 '@
     return Invoke-PythonScript `
         -PythonPath $script:PythonPath `
         -ScriptText $setupScript `
         -ScriptArguments @($ManagedRoot) `
         -WorkingDirectory $ManagedRoot
+}
+
+function Show-ActivationCompletionDialog {
+    $dialogScript = @'
+from pathlib import Path
+import sys
+
+root = Path(sys.argv[1]).resolve(strict=True)
+entry = (root / "installer" / "permanent_setup.py").resolve(strict=True)
+sys.path.insert(0, str(root))
+from installer import permanent_setup
+
+if Path(permanent_setup.__file__).resolve(strict=True) != entry:
+    raise RuntimeError("managed permanent setup identity mismatch")
+result = permanent_setup.PermanentSetupResult(permanent=True)
+title, message = permanent_setup._localized_setup_success_dialog(result)
+permanent_setup._show_gui_message(title, message)
+'@
+    Write-Host "Opening the Decision Engine activation completion window..."
+    $dialogCode = Invoke-PythonScript `
+        -PythonPath $script:PythonPath `
+        -ScriptText $dialogScript `
+        -ScriptArguments @($ManagedRoot) `
+        -WorkingDirectory $ManagedRoot
+    if ($dialogCode -ne 0) {
+        Write-Warning "Activation succeeded, but the completion window could not be displayed."
+    }
 }
 
 function Test-ManagedRootGitState {
@@ -1511,6 +2759,66 @@ if version != state.last_version:
     return $true
 }
 
+function Test-ResumablePreparedManagedRoot {
+    if (-not (Test-Path -LiteralPath $ManagedRoot -PathType Container) -or
+        (Test-ReparsePoint -Path $ManagedRoot)) {
+        return $false
+    }
+    foreach ($relativePath in @(
+        ".git",
+        "VERSION",
+        "pyproject.toml",
+        "installer\bootstrap_managed_install.py",
+        "installer\managed_activation.py",
+        "installer\managed_install.py"
+    )) {
+        $requiredPath = Join-Path $ManagedRoot $relativePath
+        if (-not (Test-Path -LiteralPath $requiredPath) -or
+            (Test-ReparsePoint -Path $requiredPath)) {
+            return $false
+        }
+    }
+    foreach ($publishedState in @(
+        ".managed-install.json",
+        ".runtime\update-protocol.json",
+        ".runtime\activation-recovery-required.json"
+    )) {
+        if (Test-Path -LiteralPath (Join-Path $ManagedRoot $publishedState)) {
+            return $false
+        }
+    }
+    if (-not (Test-ManagedRootGitState)) {
+        return $false
+    }
+    $remoteNames = Invoke-WithCleanEnvironment -FilePath $GitPath -ArgumentList @(
+        "-C", $ManagedRoot, "remote"
+    ) -Capture
+    $remoteNameList = @(
+        $remoteNames.Output |
+            ForEach-Object { ([string]$_).Trim() } |
+            Where-Object { $_ }
+    )
+    if ($remoteNames.ExitCode -ne 0 -or
+        $remoteNameList.Count -ne 2 -or
+        $remoteNameList -notcontains "github" -or
+        $remoteNameList -notcontains "gitee") {
+        return $false
+    }
+    foreach ($remote in @(
+        @("github", "https://github.com/deeppatternai/decision-engine.git"),
+        @("gitee", "https://gitee.com/deeppatternai/decision-engine.git")
+    )) {
+        $remoteUrl = Invoke-WithCleanEnvironment -FilePath $GitPath -ArgumentList @(
+            "-C", $ManagedRoot, "remote", "get-url", $remote[0]
+        ) -Capture
+        if ($remoteUrl.ExitCode -ne 0 -or
+            (($remoteUrl.Output -join "").Trim()) -ne $remote[1]) {
+            return $false
+        }
+    }
+    return $true
+}
+
 function Get-ManagedActivationState {
     $probe = Invoke-ManagedPython -Arguments @(
         "-c",
@@ -1541,6 +2849,54 @@ function Get-ManagedConfigDigest {
         return $null
     }
     return (Get-FileHash -LiteralPath $configPath -Algorithm SHA256).Hash.ToLowerInvariant()
+}
+
+function Invoke-ManagedActivationOnly {
+    if (-not (Test-CompleteManagedRoot)) {
+        $rootDefect = if ([string]::IsNullOrWhiteSpace($script:ManagedRootValidationError)) {
+            "validation failed for an unspecified reason"
+        }
+        else {
+            $script:ManagedRootValidationError
+        }
+        Stop-Install "Device activation requires a complete, clean, verified managed Decision Engine install. Reason: $rootDefect. Run the normal installer instead." $ExitBlocked
+    }
+    if (Test-ManagedActivationRecoveryPending) {
+        Stop-Install "The managed installation has an activation recovery marker. Do not retry automatically; preserve it for owner-guided recovery." $ExitBlocked
+    }
+
+    $activationState = Get-ManagedActivationState
+    if ($null -eq $activationState) {
+        Stop-Install "The managed installation exists, but its activation state could not be verified." $ExitBlocked
+    }
+    if ($activationState -eq "activated") {
+        Write-Host ("{0}: PASS: the device is already activated; existing Agent configuration was preserved." -f $ProgramName)
+        exit 0
+    }
+
+    Write-Host "Opening the masked Decision Engine activation window..."
+    $setupCode = Invoke-ManagedPermanentSetup
+    $activationState = Get-ManagedActivationState
+    if ($null -eq $activationState) {
+        Stop-Install "Activation returned, but the saved device state could not be verified." $ExitBlocked
+    }
+    if ($activationState -eq "activated") {
+        if ($setupCode -ne 0) {
+            Write-Warning "Activation was persisted even though the activation process returned a nonzero status. Continuing with the verified saved state."
+        }
+        Show-ActivationCompletionDialog
+        Write-Host ("{0}: PASS: device activation completed; existing Agent configuration was preserved. Fully restart the configured Agent applications." -f $ProgramName)
+        exit 0
+    }
+    if (Test-ManagedActivationRecoveryPending) {
+        Stop-Install "Activation left a recovery marker. Do not retry automatically; preserve it for owner-guided recovery." $ExitBlocked
+    }
+    if ($setupCode -eq 2) {
+        [Console]::Error.WriteLine(("{0}: PARTIAL: device activation was cancelled; the existing installation and Agent configuration were preserved." -f $ProgramName))
+        exit $ExitPartial
+    }
+    [Console]::Error.WriteLine(("{0}: ERROR: device activation failed with status {1}; the existing installation and Agent configuration were preserved." -f $ProgramName, $setupCode))
+    exit $setupCode
 }
 
 function Invoke-ManagedStableUpdate {
@@ -1724,6 +3080,15 @@ function Get-LikelyHostForProcess {
     return "Unknown Agent"
 }
 
+$entryModeCount = 0
+foreach ($entryMode in @($AgentTerminal, $AgentActivate, $Activate, $ActivationOnly, $AgentTerminalChild)) {
+    if ($entryMode.IsPresent) {
+        $entryModeCount += 1
+    }
+}
+if ($entryModeCount -gt 1) {
+    Stop-Install "Use no arguments, -AgentTerminal, -AgentActivate, or -Activate; entry modes cannot be combined." $ExitUsage
+}
 if (-not (Test-NativeWindows)) {
     Stop-Install "This entrypoint supports native Windows only."
 }
@@ -1734,9 +3099,30 @@ if ([string]::IsNullOrWhiteSpace($env:APPDATA) -or [string]::IsNullOrWhiteSpace(
     Stop-Install "APPDATA and LOCALAPPDATA must identify the current Windows user profile."
 }
 
+if ($AgentTerminal -or $AgentActivate) {
+    Invoke-AgentTerminalHandoff -Activation:$AgentActivate
+}
+
+if ($Activate -or $ActivationOnly) {
+    if (Test-ReparsePoint -Path (Join-Path $HOME ".deeppattern")) {
+        Stop-Install "$HOME\.deeppattern is a reparse point; preserve it and use an owner-guided install." $ExitBlocked
+    }
+    $GitPath = Find-Git
+    if ([string]::IsNullOrWhiteSpace($GitPath)) {
+        Stop-Install "Device activation requires the verified Git for Windows installation used by the existing managed install; no dependency installation was attempted." $ExitBlocked
+    }
+    if (-not (Test-ManagedPythonEnvironment)) {
+        Stop-Install "Device activation requires the existing verified private Deep Pattern Python environment; no dependency repair was attempted." $ExitBlocked
+    }
+    $script:PythonPath = $ManagedPythonPath
+    Install-WindowsNativeTrustBridge
+    Invoke-ManagedActivationOnly
+}
+
 $GitPath = Resolve-Git
 $BashPath = Resolve-GitBash -GitPath $GitPath
 $script:PythonPath = Resolve-Python
+Install-WindowsNativeTrustBridge
 
 if (Test-ReparsePoint -Path (Join-Path $HOME ".deeppattern")) {
     Stop-Install "$HOME\.deeppattern is a reparse point; preserve it and use an owner-guided install." $ExitBlocked
@@ -1747,6 +3133,7 @@ $aqgLayoutInfo = Get-VerifiedAqgLayout
 # temporary main checkout performs bootstrap repair or writes host state.
 $managedRootItem = Get-Item -LiteralPath $ManagedRoot -Force -ErrorAction SilentlyContinue
 $managedRootWasPresent = $null -ne $managedRootItem
+$managedRootResumePending = $false
 if ($managedRootWasPresent) {
     if (-not (Test-CompleteManagedRoot)) {
         $rootDefect = if ([string]::IsNullOrWhiteSpace($script:ManagedRootValidationError)) {
@@ -1755,8 +3142,15 @@ if ($managedRootWasPresent) {
         else {
             $script:ManagedRootValidationError
         }
-        Stop-Install "$ManagedRoot exists but is not a complete, clean, verified managed stable install. Reason: $rootDefect. Preserve it and use the managed uninstall or replacement flow." $ExitBlocked
+        if (Test-ResumablePreparedManagedRoot) {
+            $managedRootResumePending = $true
+            Write-Host "Found a clean official Decision Engine checkout whose managed activation was interrupted before identity publication; resuming verified bootstrap."
+        }
+        else {
+            Stop-Install "$ManagedRoot exists but is not a complete, clean, verified managed stable install. Reason: $rootDefect. Preserve it and use the managed uninstall or replacement flow." $ExitBlocked
+        }
     }
+    if (-not $managedRootResumePending) {
     $activationStateBeforeUpdate = Get-ManagedActivationState
     if ($null -eq $activationStateBeforeUpdate) {
         Stop-Install "The managed activation state could not be verified before update. Preserve the managed root and use the owner-guided repair flow." $ExitBlocked
@@ -1815,6 +3209,7 @@ if ($managedRootWasPresent) {
     }
     if (-not $script:UpdateDeferred) {
         Write-Host "Decision Engine signed stable update status: $($managedUpdate.Status)"
+    }
     }
 }
 
@@ -1879,6 +3274,60 @@ try {
     }
     $sourceSha = (($sourceShaResult.Output -join "").Trim())
 
+    # Freeze the installed hosts before AQG or DE can create any host directory,
+    # then retain configured integrations while allowing an explicit subset of
+    # newly detected hosts. Every later routing phase consumes this selection.
+    $installedClients = @(Get-InstalledAgentSnapshot -SourceRoot $sourceRoot -ValidClients $ValidClients)
+    if ($installedClients.Count -eq 0) {
+        Write-Host "No installed Agent host supported by the active Decision Engine catalog was detected."
+        Write-Host "Install a supported Agent host, then rerun this installer."
+        [Console]::Error.WriteLine((
+            "{0}: PARTIAL: Agent preflight found no supported installed host; " +
+            "AQG configuration, the DE core install, activation, and Agent configuration were not started."
+        ) -f $ProgramName)
+        exit $ExitPartial
+    }
+    $configuredClientsBefore = @(Get-ConfiguredAgentSnapshot `
+        -SourceRoot $sourceRoot `
+        -InstalledClients $installedClients)
+    $selection = Select-InstallClients `
+        -Available $installedClients `
+        -Configured $configuredClientsBefore
+    $selectedClients = @($selection.Effective)
+    if ($selectedClients.Count -eq 0) {
+        Stop-Install "Agent selection and configured-host retention returned no supported host." $ExitBlocked
+    }
+    Write-Host "Agent hosts maintained by this installation run:"
+    foreach ($client in $selectedClients) {
+        Write-Host (Get-AgentDisplayName -Client $client)
+    }
+    Write-Host "Configured integrations are retained automatically; other unselected hosts will not be configured or removed."
+    if (@($selection.New).Count -eq 0) {
+        Write-Host "No new Agent integration was selected; this run will only update or repair Decision Engine and Agent Quality Gates for the configured hosts."
+    }
+    else {
+        Write-Host "New Agent integrations selected for this run:"
+        foreach ($client in @($selection.New)) {
+            Write-Host (Get-AgentDisplayName -Client $client)
+        }
+    }
+
+    if ($selectedClients -contains "codex") {
+        Initialize-CodexHookTarget -SourceRoot $sourceRoot
+        Initialize-CodexHookReviewCapability
+    }
+    $aqgSupportedClients = @(
+        "claude-code", "codebuddy", "codex", "cursor", "qoder", "qoder-cn",
+        "trae", "trae-work", "trae-cn", "trae-work-cn", "workbuddy", "workbuddy-ai"
+    )
+    $aqgClients = @($selectedClients | Where-Object { $aqgSupportedClients -contains $_ })
+    $runtimeRestartRequired = $false
+    if ($selectedClients -contains "codex") {
+        if (Repair-CodexTomlNewlines -SourceRoot $sourceRoot) {
+            $runtimeRestartRequired = $true
+        }
+    }
+
     Repair-AqgBackupResidue
     $aqgLayoutInfo = Get-VerifiedAqgLayout
     Sync-AqgCheckout -LayoutInfo $aqgLayoutInfo
@@ -1886,74 +3335,80 @@ try {
 
     $aqgAdapter = Join-Path $AqgRoot "scripts\install_aqg_clients.py"
     $aqgDoctor = Join-Path $AqgRoot "scripts\aqg_doctor.py"
-    $aqgVerifyArguments = @(
-        $aqgAdapter, "--installed-supported", "--verify",
-        "--aqg-root", $AqgRoot, "--home", $HOME
-    )
-    $aqgApplyArguments = @(
-        $aqgAdapter, "--installed-supported", "--apply",
-        "--aqg-root", $AqgRoot, "--home", $HOME
-    )
     $aqgLayoutAfterSync = Get-VerifiedAqgLayout
     $aqgRouteTimer = [System.Diagnostics.Stopwatch]::StartNew()
-    Write-Host "Checking existing Agent Quality Gates host routes..."
-    $initialAqgVerify = Invoke-AqgClientWrapper -ArgumentList $aqgVerifyArguments -Capture
-    $aqgRoutesVerified = ($initialAqgVerify.ExitCode -eq 0 -or $initialAqgVerify.ExitCode -eq 3)
-    $aqgManagedLayoutReady = $aqgLayoutAfterSync.Layout -eq "managed"
-    if ($aqgRoutesVerified -and $aqgManagedLayoutReady) {
-        Write-Host "Agent Quality Gates host routes are already verified; skipping junction recreation."
+    if ($aqgClients.Count -eq 0) {
+        Write-Host "No supported Agent host was detected; host routing was skipped."
     }
     else {
-        if ($initialAqgVerify.ExitCode -eq 3) {
-            Write-Host "No supported Agent host was detected; installing the default Codex routes."
-            $aqgApplyArguments = @(
-                $aqgAdapter, "--clients", "codex", "--apply",
-                "--aqg-root", $AqgRoot, "--home", $HOME
-            )
-            $aqgVerifyArguments = @(
-                $aqgAdapter, "--clients", "codex", "--verify",
-                "--aqg-root", $AqgRoot, "--home", $HOME
-            )
+        $aqgClientList = $aqgClients -join ","
+        $aqgVerifyArguments = @(
+            $aqgAdapter, "--clients", $aqgClientList, "--verify",
+            "--aqg-root", $AqgRoot, "--home", $HOME
+        )
+        $aqgApplyArguments = @(
+            $aqgAdapter, "--clients", $aqgClientList, "--apply",
+            "--aqg-root", $AqgRoot, "--home", $HOME
+        )
+        Write-Host "Checking existing Agent Quality Gates host routes..."
+        $initialAqgVerify = Invoke-AqgClientWrapper -ArgumentList $aqgVerifyArguments -Capture
+        $aqgRoutesVerified = $initialAqgVerify.ExitCode -eq 0
+        $aqgManagedLayoutReady = $aqgLayoutAfterSync.Layout -eq "managed"
+        if ($aqgRoutesVerified -and $aqgManagedLayoutReady) {
+            Write-Host "Agent Quality Gates host routes are already verified; skipping junction recreation."
         }
-        Write-Host "Agent Quality Gates host routes need installation or repair; applying them once..."
-        $aqgApplyCode = Invoke-AqgClientWrapper -ArgumentList $aqgApplyArguments
-        if ($aqgApplyCode -ne 0 -and $aqgApplyCode -ne 3) {
-            Stop-Install "AQG host adapter apply failed; Decision Engine was not installed." $ExitBlocked
+        else {
+            Write-Host "Agent Quality Gates host routes need installation or repair; applying them once..."
+            $aqgApplyCode = Invoke-AqgClientWrapper -ArgumentList $aqgApplyArguments
+            if ($aqgApplyCode -ne 0) {
+                Stop-Install "AQG host adapter apply failed; Decision Engine was not installed." $ExitBlocked
+            }
+            $runtimeRestartRequired = $true
         }
     }
     Invoke-AqgUpdateContract -Mode migrate
-    Repair-AqgCodexHookEntrance
-    $aqgVerifyCode = Invoke-AqgClientWrapper -ArgumentList $aqgVerifyArguments
-    if ($aqgVerifyCode -ne 0 -and $aqgVerifyCode -ne 3) {
-        Stop-Install "AQG host adapter verify failed; Decision Engine was not installed." $ExitBlocked
+    if ($aqgClients.Count -gt 0) {
+        if ($aqgClients -contains "codex") {
+            Repair-AqgCodexHookEntrance
+        }
+        $aqgVerifyCode = Invoke-AqgClientWrapper -ArgumentList $aqgVerifyArguments
+        if ($aqgVerifyCode -ne 0) {
+            Stop-Install "AQG host adapter verify failed; Decision Engine was not installed." $ExitBlocked
+        }
     }
     $aqgRouteTimer.Stop()
     Write-Host ("Agent Quality Gates host routing ready in {0:N1} seconds." -f $aqgRouteTimer.Elapsed.TotalSeconds)
-    $aqgDoctorCode = Invoke-WithCleanEnvironment `
-        -FilePath $script:PythonPath `
-        -ArgumentList @($aqgDoctor, "--no-cli") `
-        -Environment @{ "AQG_ROOT" = $AqgRoot }
-    if ($aqgDoctorCode -ne 0) {
-        Stop-Install "AQG Doctor reported an unhealthy installation; Decision Engine was not installed." $ExitBlocked
+    $aqgGlobalDoctorClients = @("claude-code", "codex")
+    $aqgGlobalDoctorApplicable = @(
+        $aqgGlobalDoctorClients |
+            Where-Object { $aqgClients -notcontains $_ }
+    ).Count -eq 0
+    if ($aqgGlobalDoctorApplicable) {
+        $aqgDoctorCode = Invoke-WithCleanEnvironment `
+            -FilePath $script:PythonPath `
+            -ArgumentList @($aqgDoctor, "--no-cli") `
+            -Environment @{ "AQG_ROOT" = $AqgRoot }
+        if ($aqgDoctorCode -ne 0) {
+            Stop-Install "AQG Doctor reported an unhealthy installation; Decision Engine was not installed." $ExitBlocked
+        }
+    }
+    else {
+        Write-Host (
+            "AQG target-specific verification passed for: {0}. The global Doctor was not run because it validates both Claude Code and Codex, including clients outside this frozen install target." -f
+            $(if ($aqgClients.Count -gt 0) { $aqgClients -join ", " } else { "none" })
+        )
     }
 
     Write-Host "Installing the signed Decision Engine stable release..."
-    if ($managedRootWasPresent) {
+    if ($managedRootWasPresent -and -not $managedRootResumePending) {
         Write-Host "Reusing the existing verified signed Decision Engine checkout without cloning or replacing it."
     }
     else {
-        # The public install.sh performs its own newline-delimited host loop.
-        # Keep the signed bootstrap in Python and let the validated JSON phase
-        # below own all native Windows host wiring.
-        Push-Location -LiteralPath $sourceRoot
-        try {
-            $installCode = Invoke-WithCleanEnvironment -FilePath $script:PythonPath -ArgumentList @(
-                "-m", "installer.bootstrap_managed_install", "install"
-            )
-        }
-        finally {
-            Pop-Location
-        }
+        # Freeze bootstrap skill delivery to the same pre-mutation host snapshot
+        # used by MCP wiring and final Doctor verification.
+        $installCode = Invoke-ManagedBootstrapInstall `
+            -SourceRoot $sourceRoot `
+            -Clients ([string[]]$selectedClients)
         if ($installCode -ne 0) {
             Stop-Install "The core installer failed. Preserve its output and run dp-uninstall.ps1 -Scope both -Apply before a clean retry." $ExitBlocked
         }
@@ -1972,6 +3427,7 @@ try {
         Stop-Install "The managed activation state could not be verified." $ExitBlocked
     }
 
+    $activationCompletedThisRun = $false
     if ($activationState -ne "activated") {
         Write-Host "Opening the masked Decision Engine activation window..."
         $setupCode = Invoke-ManagedPermanentSetup
@@ -1981,57 +3437,19 @@ try {
             "from installer import activate, config; print('activated' if activate.is_permanently_activated(config.load_json(config.de_config_path())) else 'pending')"
         ) -Capture
         $activationState = ($activationProbe.Output -join "").Trim()
+        $activationCompletedThisRun = $activationState -eq "activated"
         if ($setupCode -ne 0 -and $activationState -eq "activated") {
-            Write-Warning "Activation completed, but a post-activation check failed; Doctor output below is authoritative."
+            Write-Warning "Activation completed; installer-owned host repair and Doctor will continue."
         }
         elseif ($setupCode -ne 0) {
             Write-Host "Activation remains pending. The credential-free DE Lite transport stays installed."
         }
     }
 
-    $clientsResult = Invoke-ManagedPython -Arguments @(
-        "-c", "import json; from installer import mcp_config; print(json.dumps({'clients': mcp_config.detect_clients()}))"
-    ) -Capture
-    if ($clientsResult.ExitCode -ne 0) {
-        Stop-Install "Installed host detection failed." $ExitBlocked
-    }
     $wiringFailed = $false
     $configuredClients = New-Object System.Collections.Generic.List[string]
     $skippedClients = New-Object System.Collections.Generic.List[object]
-    $validClients = @(
-        "claude-code", "claude-desktop", "claude-desktop-3p", "codebuddy",
-        "codex", "cursor", "qoder", "qoder-cn", "qoder-ide", "qoder-cn-ide",
-        "trae", "trae-work", "trae-cn", "trae-work-cn", "workbuddy", "workbuddy-ai"
-    )
-    $clients = @()
-    $clientsPayload = ($clientsResult.Output | ForEach-Object { [string]$_ }) -join ""
-    try {
-        $decodedPayload = ConvertFrom-Json -InputObject $clientsPayload
-    }
-    catch {
-        Stop-Install "Installed host detection returned invalid JSON." $ExitBlocked
-    }
-    $payloadProperties = @($decodedPayload.PSObject.Properties | ForEach-Object { $_.Name })
-    if ($payloadProperties.Count -ne 1 -or $payloadProperties[0] -ne "clients") {
-        Stop-Install "Installed host detection returned an invalid JSON object." $ExitBlocked
-    }
-    $decodedClients = $decodedPayload.clients
-    if ($null -eq $decodedClients -or $decodedClients -isnot [System.Array]) {
-        Stop-Install "Installed host detection did not return a clients array." $ExitBlocked
-    }
-    foreach ($decodedClient in $decodedClients) {
-        if ($null -eq $decodedClient -or $decodedClient -isnot [string]) {
-            Stop-Install "Installed host detection returned a non-string client id." $ExitBlocked
-        }
-        $client = [string]$decodedClient
-        if ([string]::IsNullOrWhiteSpace($client) -or $client -match "[\r\n]" -or $client -ne $client.Trim()) {
-            Stop-Install "Installed host detection returned an invalid client id." $ExitBlocked
-        }
-        if ($validClients -notcontains $client) {
-            Stop-Install ("Installed host detection returned an unsupported client id: {0}" -f $client) $ExitBlocked
-        }
-        $clients += $client
-    }
+    $clients = @($selectedClients)
     foreach ($client in $clients) {
         $preflightArguments = @(
             "-c",
@@ -2092,6 +3510,16 @@ try {
             $wiringFailed = $true
             continue
         }
+        if (($preflightProperties -notcontains "action") -or
+            $preflight.action -isnot [string] -or
+            [string]::IsNullOrWhiteSpace([string]$preflight.action)) {
+            [Console]::Error.WriteLine(("{0}: ERROR: MCP preflight omitted its action for {1}" -f $ProgramName, $client))
+            $wiringFailed = $true
+            continue
+        }
+        if ($preflight.action -ne "unchanged") {
+            $runtimeRestartRequired = $true
+        }
         $wireArguments = @("-m", "installer.mcp_config", "--write", "--client", $client)
         if ($activationState -ne "activated") {
             $wireArguments += "--allow-unactivated"
@@ -2099,6 +3527,17 @@ try {
         $wireCode = Invoke-ManagedPython -Arguments $wireArguments
         if ($wireCode -ne 0) {
             [Console]::Error.WriteLine(("{0}: ERROR: MCP wiring failed for {1}" -f $ProgramName, $client))
+            $wiringFailed = $true
+            continue
+        }
+        $wireVerify = Invoke-ManagedPython -Arguments @(
+            "-c",
+            "from installer import mcp_config; import sys; print(mcp_config.entry_status(sys.argv[1], allow_unactivated=True))",
+            $client
+        ) -Capture
+        $wireState = ($wireVerify.Output -join "").Trim()
+        if ($wireVerify.ExitCode -ne 0 -or $wireState -ne "ready") {
+            [Console]::Error.WriteLine(("{0}: ERROR: MCP wiring could not be verified for {1}" -f $ProgramName, $client))
             $wiringFailed = $true
             continue
         }
@@ -2145,40 +3584,87 @@ with install.install_lock(blocking=False):
                 destination,
                 spec.excluded_skills,
             )
-            routed[client] = install._route_skills(
+            routed_skills = install._route_skills(
                 "decision-engine",
                 body_root,
                 dest_root=destination,
                 excluded_skills=spec.excluded_skills,
             )
+            expected_skills = sorted(
+                skill.name
+                for skill in body_root.joinpath("skills").iterdir()
+                if skill.is_dir() and skill.name not in spec.excluded_skills
+            )
+            if sorted(routed_skills) != expected_skills:
+                raise ShellError("managed skill routing returned an incomplete result")
+            for skill_name in expected_skills:
+                route = destination / skill_name
+                expected = body_root / "skills" / skill_name
+                if (
+                    not install._is_skill_route(route)
+                    or not install._route_points_to(route, expected)
+                ):
+                    raise ShellError("managed skill routing verification failed")
+            routed[client] = routed_skills
         except (ShellError, OSError) as exc:
             failed[client] = install._skill_route_failure_reason(exc)
 
 print(json.dumps({"routed": routed, "failed": failed}, sort_keys=True))
 raise SystemExit(1 if failed else 0)
 '@
+    $routeEnvironment = @{}
+    if (-not [string]::IsNullOrWhiteSpace([string]$script:CodexHome)) {
+        $routeEnvironment["CODEX_HOME"] = $script:CodexHome
+        $routeEnvironment["CODEX_SKILLS_DIR"] = Join-Path $script:CodexHome "skills"
+    }
     $routeCode = Invoke-PythonScript `
         -PythonPath $script:PythonPath `
         -ScriptText $routeScript `
         -ScriptArguments (@($ManagedRoot) + @([string[]]$configuredClients.ToArray())) `
-        -WorkingDirectory $ManagedRoot
+        -WorkingDirectory $ManagedRoot `
+        -Environment $routeEnvironment
     if ($routeCode -ne 0) {
         [Console]::Error.WriteLine(("{0}: ERROR: managed skill routing failed" -f $ProgramName))
         $wiringFailed = $true
+    }
+    if ($configuredClients.Contains("codex") -and -not $wiringFailed) {
+        $codexRoutingCode = Invoke-ManagedPython -Arguments @(
+            "-m", "installer.codex_routing", "--require-skills-root", $ManagedRoot
+        )
+        if ($codexRoutingCode -ne 0) {
+            [Console]::Error.WriteLine(("{0}: ERROR: Codex skill routing verification failed" -f $ProgramName))
+            $wiringFailed = $true
+        }
     }
     if ($wiringFailed) {
         Stop-Install "Core installation is complete, but one or more host integrations failed." $ExitBlocked
     }
 
+    $codexHooksVerified = $false
+    if ($configuredClients.Contains("codex")) {
+        Repair-AqgCodexHookEntrance -Required
+        $codexHooksVerified = $true
+        $script:CodexHooksAfterSha256 = (
+            Get-FileHash -LiteralPath $script:CodexHooksPath -Algorithm SHA256
+        ).Hash.ToLowerInvariant()
+        if ($script:CodexHooksBeforeSha256 -ne $script:CodexHooksAfterSha256) {
+            $runtimeRestartRequired = $true
+        }
+    }
+
     $aqgVerifyFailed = $false
 
-    $doctorCode = Invoke-ManagedPython -Arguments @("-m", "installer.doctor")
+    $doctorCode = Invoke-ScopedDecisionEngineDoctor `
+        -Clients ([string[]]$configuredClients.ToArray())
     $doctorVerifyFailed = $doctorCode -ne 0
     if ($activationState -eq "activated" -and $doctorCode -ne 0) {
         Stop-Install "Decision Engine is activated, but Doctor reports a failure." $ExitBlocked
     }
     elseif ($doctorVerifyFailed) {
         Write-Warning "Decision Engine Doctor could not verify the unactivated DE Lite installation; review the Doctor output above."
+    }
+    if ($activationCompletedThisRun -and -not $doctorVerifyFailed) {
+        Show-ActivationCompletionDialog
     }
 
     Write-Host "Decision Engine host capability report:"
@@ -2192,7 +3678,27 @@ raise SystemExit(1 if failed else 0)
         if ($entry.ExitCode -ne 0) {
             $state = "unverifiable"
         }
-        Write-Host ("{0}: DE MCP={1}; runtime=restart-required" -f $client, $state)
+        $runtimeState = if ($runtimeRestartRequired) { "restart-required" } else { "unchanged" }
+        if ($client -eq "codex" -and $codexHooksVerified) {
+            $hookLoadState = if ($script:CodexHooksDisabled) {
+                "disabled-by-config"
+            }
+            elseif (-not $script:CodexHookReviewAvailable) {
+                "review-unavailable-no-codex-cli"
+            }
+            else {
+                "pending-user-review"
+            }
+            Write-Host ("{0}: DE MCP={1}; AQG Hooks=installed-on-disk; hook-file={2}; activation={3}; runtime={4}" -f
+                $client,
+                $state,
+                $script:CodexHooksPath,
+                $hookLoadState,
+                $runtimeState)
+        }
+        else {
+            Write-Host ("{0}: DE MCP={1}; runtime={2}" -f $client, $state, $runtimeState)
+        }
     }
     foreach ($skipped in $skippedClients) {
         Write-Host ("{0}: DE MCP=not-configured; runtime=not-applicable; reason={1}" -f $skipped.Client, $skipped.Reason)
@@ -2206,7 +3712,7 @@ raise SystemExit(1 if failed else 0)
         @{ Path = (Join-Path $env:LOCALAPPDATA "Programs\Qoder"); Client = "qoder"; Name = "Qoder" }
     )
     foreach ($product in $expectedProducts) {
-        if ((Test-Path -LiteralPath $product.Path -PathType Container) -and ($clients -notcontains $product.Client)) {
+        if ((Test-Path -LiteralPath $product.Path -PathType Container) -and ($installedClients -notcontains $product.Client)) {
             $unsupported.Add("$($product.Name): installed but not configured by the current signed adapter")
         }
     }
@@ -2242,10 +3748,28 @@ raise SystemExit(1 if failed else 0)
         Write-Host "The first new MCP session will retry the pending signed update."
     }
 
+    if ($runtimeRestartRequired) {
+        Write-Warning "Do not verify MCP tools or Hooks in an Agent process that remained open during installation; it still has the previous runtime configuration."
+        Write-Host "Fully quit every configured Agent application, confirm its process has exited, then reopen it. Starting only a new chat is not sufficient."
+        if ($configuredClients.Contains("codex")) {
+            if ($script:CodexHookReviewAvailable) {
+                Write-Host ("After reopening the Codex CLI at {0}, open /hooks and review the AQG definitions loaded from {1}. Trust is a Codex user action and cannot be granted by this installer." -f $script:CodexHookReviewCommand, $script:CodexHooksPath)
+            }
+            else {
+                Write-Warning ("AQG Hooks are installed at {0}, but this Windows host has Codex Desktop only and no codex CLI on PATH. The current Desktop surface does not expose the documented /hooks trust command, so these non-managed Hooks remain inactive." -f $script:CodexHooksPath)
+            }
+        }
+    }
+    elseif ($configuredClients.Count -gt 0) {
+        Write-Host "No Agent configuration changed in this run; an additional restart is not required."
+    }
     Write-Host ("{0}: source={1}" -f $ProgramName, $sourceSha)
     Write-Host ("{0}: activation={1}" -f $ProgramName, $activationState)
-    Write-Host ("{0}: restart every configured host before runtime verification" -f $ProgramName)
-    if ($unsupported.Count -gt 0 -or $skippedClients.Count -gt 0 -or $aqgVerifyFailed -or $doctorVerifyFailed -or $script:AqgUpdatePending) {
+    Write-Host ("{0}: runtime-restart={1}" -f $ProgramName, $(if ($runtimeRestartRequired) { "required" } else { "not-required" }))
+    if ($script:CodexHooksDisabled) {
+        Write-Warning ("Codex Hooks are installed at {0}, but the active Codex config disables Hooks. Enable [features] hooks = true and fully restart Codex." -f $script:CodexHooksPath)
+    }
+    if ($unsupported.Count -gt 0 -or $skippedClients.Count -gt 0 -or $aqgVerifyFailed -or $doctorVerifyFailed -or $script:AqgUpdatePending -or $script:CodexHooksDisabled -or $script:CodexHookReviewUnavailable) {
         if ($unsupported.Count -gt 0) {
             Write-Host "Unsupported or unconfigured installed products:"
             foreach ($item in $unsupported) {
@@ -2263,7 +3787,12 @@ raise SystemExit(1 if failed else 0)
         [Console]::Error.WriteLine(("{0}: PARTIAL: device activation and the signed DE update remain pending; the current verified release and host configuration were preserved." -f $ProgramName))
         exit $ExitPartial
     }
-    Write-Host ("{0}: PASS: installation completed; runtime verification requires host restart" -f $ProgramName)
+    if ($runtimeRestartRequired) {
+        Write-Host ("{0}: PASS: installation completed; runtime verification requires host restart" -f $ProgramName)
+    }
+    else {
+        Write-Host ("{0}: PASS: installation completed; no host configuration changed" -f $ProgramName)
+    }
 }
 finally {
     if (Test-Path -LiteralPath $tempRoot) {

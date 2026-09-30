@@ -43,6 +43,7 @@ try:
 except ImportError:  # pragma: no cover - POSIX has no msvcrt
     msvcrt = None  # type: ignore[assignment]
 
+from client.device_identity import device_name_default
 from client.http_safety import NoRedirect  # the one redirect guard (stdlib-only leaf)
 from client.version import CLIENT_VERSION, USER_AGENT  # single source of truth (leaf module, no deps)
 
@@ -976,9 +977,75 @@ def save_active_run_status(run_id: str, view: Dict[str, Any]) -> None:
         _save_active_run_locked(merged, registry, existing_only=True)
 
 
+_TERMINAL_AUDITOR_LIMIT = 64
+_AUDITOR_LABEL_MAX_CHARS = 256
+_AUDITOR_NUMBER_MAX = (1 << 63) - 1
+_AUDITOR_IDENTITY_FIELDS = ("model_id", "model_alias", "model", "provider")
+_AUDITOR_TIMING_FIELDS = ("duration_ms", "started_at", "completed_at")
+_AUDITOR_VIEW_STATUSES = TERMINAL_STATUSES | {"pending", "queued", "running"}
+
+
+def _valid_auditor_number(value: Any) -> bool:
+    if type(value) is int:
+        return 0 <= value <= _AUDITOR_NUMBER_MAX
+    if type(value) is float:
+        return math.isfinite(value) and 0 <= value <= _AUDITOR_NUMBER_MAX
+    return False
+
+
+def _merge_terminal_auditors(
+    current: Any, incoming: list[Any], *, debug_authorized: bool,
+) -> list[Dict[str, Any]]:
+    """Retain only bounded fields used by the terminal per-voice display.
+
+    The hosted API preserves roster order for its normal status-only terminal response. Cached
+    positional metadata is therefore reused only for a complete, valid roster of equal size; a
+    sparse or malformed response is sanitized without borrowing identity from another position.
+    """
+    existing = current if isinstance(current, list) else []
+    can_reuse_existing = (
+        len(incoming) == len(existing)
+        and len(incoming) <= _TERMINAL_AUDITOR_LIMIT
+        and all(
+            isinstance(item, dict)
+            and isinstance(item.get("status"), str)
+            and item["status"] in _AUDITOR_VIEW_STATUSES
+            for item in incoming
+        )
+    )
+    output: list[Dict[str, Any]] = []
+    for index, item in enumerate(incoming[:_TERMINAL_AUDITOR_LIMIT]):
+        if not isinstance(item, dict):
+            continue
+        status = item.get("status")
+        if not isinstance(status, str) or status not in _AUDITOR_VIEW_STATUSES:
+            continue
+        prior = existing[index] if can_reuse_existing and isinstance(existing[index], dict) else {}
+        entry: Dict[str, Any] = {"status": status}
+        sources = (prior, item)
+
+        for source in sources:
+            voice = source.get("voice")
+            if isinstance(voice, str) and voice:
+                entry["voice"] = voice[:_AUDITOR_LABEL_MAX_CHARS]
+        if debug_authorized:
+            for source in sources:
+                for field in _AUDITOR_IDENTITY_FIELDS:
+                    value = source.get(field)
+                    if isinstance(value, str) and value:
+                        entry[field] = value[:_AUDITOR_LABEL_MAX_CHARS]
+                for field in _AUDITOR_TIMING_FIELDS:
+                    value = source.get(field)
+                    if _valid_auditor_number(value):
+                        entry[field] = value
+        output.append(entry)
+    return output
+
+
 def sync_hosted_run_completion(run_id: str, view: Dict[str, Any]) -> None:
     """Complete an existing hosted row without reopening history or launching a panel."""
-    if view.get("status") not in TERMINAL_STATUSES or view.get("local") is True:
+    status = view.get("status")
+    if not isinstance(status, str) or status not in TERMINAL_STATUSES or view.get("local") is True:
         return
     with active_runs_lock():
         registry = prune_active_runs(load_active_runs_registry())
@@ -988,17 +1055,28 @@ def sync_hosted_run_completion(run_id: str, view: Dict[str, Any]) -> None:
         merged = dict(current)
         # Result envelopes may contain the entire review. Persist display metadata only,
         # retaining the submit-time title and locale when follow-ups omit them.
-        merged["status"] = view["status"]
+        merged["status"] = status
         for field in ("started_at", "completed_at"):
             value = view.get(field)
             if type(value) in (int, float) and math.isfinite(value):
                 merged[field] = value
-        if isinstance(view.get("auditors"), list):
-            merged["auditors"] = [
-                {"status": item["status"]} for item in view["auditors"][:64]
-                if isinstance(item, dict) and isinstance(item.get("status"), str)
-                and item["status"] in TERMINAL_STATUSES | {"pending", "queued", "running"}
-            ]
+        debug_authorized = view.get("debug_authorized")
+        if isinstance(debug_authorized, bool):
+            merged["debug_authorized"] = debug_authorized
+        effective_debug = (
+            debug_authorized if isinstance(debug_authorized, bool)
+            else merged.get("debug_authorized") is True
+        )
+        incoming_auditors = view.get("auditors")
+        if isinstance(incoming_auditors, list):
+            merged["auditors"] = _merge_terminal_auditors(
+                merged.get("auditors"), incoming_auditors,
+                debug_authorized=effective_debug,
+            )
+        elif debug_authorized is False and isinstance(merged.get("auditors"), list):
+            merged["auditors"] = _merge_terminal_auditors(
+                merged["auditors"], merged["auditors"], debug_authorized=False,
+            )
         merged["run_id"] = run_id
         _save_active_run_locked(merged, registry)
 
@@ -1546,11 +1624,6 @@ def request_json(
     return loaded if isinstance(loaded, dict) else {"data": loaded}
 
 
-def device_name_default() -> str:
-    hostname = socket.gethostname().split(".")[0] or "device"
-    return "%s-%s" % (getpass.getuser(), hostname)
-
-
 def device_fingerprint() -> str:
     raw = "|".join(
         [
@@ -2068,7 +2141,11 @@ def cmd_login(args: argparse.Namespace) -> int:
     secret = args.activation_secret or os.getenv("DE_ACTIVATION_SECRET")
     if not secret:
         raise AuditError("--activation-secret is required")
-    device_name = args.device_name or device_name_default()
+    device_name = (
+        args.device_name
+        if isinstance(args.device_name, str) and args.device_name.strip()
+        else device_name_default()
+    )
     print("Activating %s with %s ..." % (device_name, server_url), file=sys.stderr)
     activate_with_secret(
         server_url,

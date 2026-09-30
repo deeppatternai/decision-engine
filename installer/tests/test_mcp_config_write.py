@@ -398,6 +398,35 @@ class WriteCodexClientTestCase(unittest.TestCase):
         self.assertEqual(result["action"], "unchanged")
         self.assertEqual(self.toml.read_text(), first)
 
+    def test_write_repairs_legacy_windows_duplicate_carriage_returns(self):
+        valid = (
+            "# preserve me\n"
+            + mcp_config.render_codex_toml()
+            + "\n[features]\nhooks = true\n"
+        )
+        damaged = valid.replace("\n", "\r\r\n").encode("utf-8")
+        self.toml.write_bytes(damaged)
+
+        real_write = mcp_config._atomic_write_text
+        with mock.patch.object(
+            mcp_config,
+            "_atomic_write_text",
+            wraps=real_write,
+        ) as writer:
+            result = mcp_config.write_entry("codex")
+
+        self.assertEqual(result["action"], "updated")
+        self.assertIsNotNone(result["backup"])
+        self.assertEqual(Path(result["backup"]).read_bytes(), damaged)
+        self.assertNotIn(b"\r\r\n", self.toml.read_bytes())
+        self.assertEqual(
+            tomllib.loads(self.toml.read_text(encoding="utf-8"))["mcp_servers"][
+                "decision-engine"
+            ],
+            self._desired(),
+        )
+        self.assertEqual(writer.call_args.kwargs["newline"], "")
+
     def test_write_replaces_stale_table(self):
         self.toml.write_text(
             "[mcp_servers.decision-engine]\n"

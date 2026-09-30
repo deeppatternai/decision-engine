@@ -21,6 +21,7 @@ import socket
 from pathlib import Path
 from typing import Any, Dict
 
+from client.device_identity import device_name_default
 from client import windows_security
 
 # Real bodies install side-by-side under here:
@@ -97,11 +98,6 @@ def de_config_path() -> Path:
     if override:
         return Path(override).expanduser()
     return component_root("decision-engine") / "config.json"
-
-
-def device_name_default() -> str:
-    hostname = socket.gethostname().split(".")[0] or "device"
-    return "%s-%s" % (getpass.getuser(), hostname)
 
 
 def device_fingerprint() -> str:

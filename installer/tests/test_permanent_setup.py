@@ -1867,6 +1867,31 @@ class PermanentSetupTestCase(unittest.TestCase):
         self.assertNotIn(secret, stdout.getvalue())
         self.assertNotIn(secret, stderr.getvalue())
 
+    def test_activation_only_persists_activation_without_host_configuration(self):
+        self._write_config({})
+        with (
+            mock.patch.object(
+                permanent_setup, "_managed_config_path", return_value=self.config_path
+            ),
+            mock.patch.object(
+                permanent_setup,
+                "_prompt_credentials_gui",
+                return_value=("https://owner.example", "owner_invite_value"),
+            ),
+            mock.patch.object(
+                permanent_setup.activate,
+                "activate_with_credentials",
+                return_value={"activated": True, "device_id": "device-1"},
+            ),
+            mock.patch.object(permanent_setup, "_configure_agent_hosts") as configure_hosts,
+            mock.patch.object(permanent_setup.doctor, "main") as run_doctor,
+        ):
+            result = permanent_setup.run_permanent_setup(configure_hosts=False)
+
+        self.assertTrue(result.permanent)
+        configure_hosts.assert_not_called()
+        run_doctor.assert_not_called()
+
     def test_default_gui_activates_before_the_form_closes_and_does_not_retry(self):
         secret = "owner_invite_value"
 
@@ -1975,7 +2000,34 @@ class PermanentSetupTestCase(unittest.TestCase):
         run.assert_called_once_with(
             from_env=True,
             clients=["codex", "cursor"],
+            configure_hosts=True,
         )
+
+    def test_cli_activation_only_leaves_host_repair_to_calling_installer(self):
+        stdout = io.StringIO()
+        result = permanent_setup.PermanentSetupResult(
+            permanent=True,
+            already_activated=False,
+        )
+        with (
+            mock.patch.object(
+                permanent_setup, "run_permanent_setup", return_value=result
+            ) as run,
+            mock.patch.object(permanent_setup, "_show_gui_message") as show_gui,
+            redirect_stdout(stdout),
+        ):
+            exit_code = permanent_setup.main(["--activation-only"])
+
+        self.assertEqual(exit_code, 0)
+        run.assert_called_once_with(
+            from_env=False,
+            clients=None,
+            configure_hosts=False,
+        )
+        show_gui.assert_not_called()
+        output = stdout.getvalue()
+        self.assertIn("device activation is ready", output)
+        self.assertNotIn("MCP wiring and Doctor are ready", output)
 
     def test_cli_renders_host_notice_after_first_or_repeated_activation(self):
         notice = (

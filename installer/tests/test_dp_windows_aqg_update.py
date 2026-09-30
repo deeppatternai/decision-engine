@@ -169,13 +169,27 @@ def main(args):
         target.parent.mkdir()
         self.root.rename(target)
         self.root.symlink_to(target)
-        result = self.run_script('aqgHookScript', self.root)
+        codex = self.home / '.codex'
+        codex.mkdir()
+        hooks = codex / 'hooks.json'
+        hooks.write_text('{"hooks": {}}\n', encoding='utf-8')
+        config = codex / 'config.toml'
+        config.write_text('', encoding='utf-8')
+        result = self.run_script(
+            'aqgHookScript', self.root, hooks, config, '0'
+        )
         self.assertEqual(result.returncode, 0, result.stderr)
         self.assertEqual(log.read_text(), '--verify\n')
 
     def test_codex_hooks_repair_and_propagate_apply_failure(self):
         (self.root / 'scripts/install_aqg_clients.py').write_text(
             "def installed_supported_clients(): return ['codex']\n")
+        codex = self.home / '.codex'
+        codex.mkdir()
+        hooks = codex / 'hooks.json'
+        hooks.write_text('{"hooks": {}}\n', encoding='utf-8')
+        config = codex / 'config.toml'
+        config.write_text('', encoding='utf-8')
         for apply_code in (0, 2):
             with self.subTest(apply_code=apply_code):
                 log = self.home / ('hook-calls-' + str(apply_code))
@@ -190,7 +204,9 @@ def main(args):
     if args[0] == '--apply': return {apply_code}
     return 1 if calls == 1 else 0
 ''')
-                result = self.run_script('aqgHookScript', self.root)
+                result = self.run_script(
+                    'aqgHookScript', self.root, hooks, config, '0'
+                )
                 self.assertEqual(result.returncode, apply_code, result.stderr)
                 expected = '--verify\n--apply\n' + ('--verify\n' if apply_code == 0 else '')
                 self.assertEqual(log.read_text(), expected)

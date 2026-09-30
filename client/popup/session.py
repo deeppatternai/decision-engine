@@ -913,7 +913,7 @@ def spawn(html_body: str, title: str, *, python: Optional[str] = None,
             "stderr": stderr_stream,
             **_detach_kwargs(),
         }
-        if api_profile in ("cursor-ge", "cursor-db"):
+        if sys.platform == "win32" or api_profile in ("cursor-ge", "cursor-db"):
             child_env = os.environ.copy()
             child_env["WEBVIEW2_USER_DATA_FOLDER"] = str(workdir / "webview2-data")
             popen_kwargs["env"] = child_env

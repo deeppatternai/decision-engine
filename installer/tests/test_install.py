@@ -1048,6 +1048,23 @@ class InstallerTestCase(unittest.TestCase):
             mode = stat.S_IMODE(cfg_path.stat().st_mode)
             self.assertEqual(mode, 0o600)
 
+    def test_install_without_explicit_device_name_defers_default_until_activation(self):
+        self._run("de", device_name=None)
+
+        cfg = json.loads(
+            Path(self._env["DE_CONFIG_PATH"]).read_text(encoding="utf-8")
+        )
+        self.assertEqual(cfg["device_name"], "")
+
+    def test_reinstall_without_explicit_device_name_preserves_existing_name(self):
+        cfg_path = Path(self._env["DE_CONFIG_PATH"])
+        config.atomic_write_json(cfg_path, {"device_name": "owner-chosen-name"})
+
+        self._run("de", device_name=None)
+
+        cfg = json.loads(cfg_path.read_text(encoding="utf-8"))
+        self.assertEqual(cfg["device_name"], "owner-chosen-name")
+
     def test_endpoint_normalized_and_required(self):
         # https:// is prepended when scheme missing.
         self._run("de", server_endpoint="myhost")

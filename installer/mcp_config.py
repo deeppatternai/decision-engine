@@ -2293,7 +2293,14 @@ def _write_codex_client(client: str, path: Path, server_name: str, block: str,
         raise ShellError("refusing to parse oversized Agent configuration %s" % path)
     mtime_ns = os.stat(path).st_mtime_ns if existed else None
     original_bytes = path.read_bytes() if existed else b""
-    original = original_bytes.decode("utf-8")
+    original_raw = original_bytes.decode("utf-8")
+    # Python's default text newline handling translates every ``\n`` on
+    # Windows. Rewriting text that already contains CRLF would therefore turn
+    # each line ending into CRCRLF. Older installers shipped that behavior, so
+    # narrowly collapse duplicate CR bytes before parsing and persist the
+    # repaired text even when the managed table itself is already current.
+    original = re.sub(r"\r+(?=\n)", "\r", original_raw)
+    newline_repair_required = original != original_raw
     original_digest = hashlib.sha256(original_bytes).hexdigest() if existed else None
     existing_servers: Dict[str, Any] = {}
     if original.strip():
@@ -2306,7 +2313,7 @@ def _write_codex_client(client: str, path: Path, server_name: str, block: str,
             raise ShellError("refusing to write %s: 'mcp_servers' is a %s, not a table"
                              % (path, type(servers).__name__))
         existing_servers = servers
-        if existing_servers.get(server_name) == desired:
+        if existing_servers.get(server_name) == desired and not newline_repair_required:
             return {"client": client, "path": str(path), "action": "unchanged", "backup": None}
     action = "updated" if server_name in existing_servers else "added"
     merged = _splice_toml_table(original, "[mcp_servers.%s]" % _toml_key(server_name), block)
@@ -2326,7 +2333,24 @@ def _write_codex_client(client: str, path: Path, server_name: str, block: str,
         expect_mtime_ns=mtime_ns,
         expect_sha256=original_digest,
         expect_exists=existed,
+        newline="",
     )
+    try:
+        written = tomllib.loads(path.read_bytes().decode("utf-8"))
+    except (OSError, UnicodeError, tomllib.TOMLDecodeError) as exc:
+        if backup is not None:
+            shutil.copy2(backup, path)
+        raise ShellError(
+            "post-write TOML verification failed for %s%s"
+            % (path, " (restored backup %s)" % backup if backup else "")
+        ) from exc
+    if written.get("mcp_servers", {}).get(server_name) != desired:
+        if backup is not None:
+            shutil.copy2(backup, path)
+        raise ShellError(
+            "post-write verification failed for %s%s"
+            % (path, " (restored backup %s)" % backup if backup else "")
+        )
     return {"client": client, "path": str(path), "action": action,
             "backup": str(backup) if backup else None}
 

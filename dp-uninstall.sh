@@ -474,6 +474,45 @@ def path_has_symlink_component(path: Path, floor: Path) -> Path | None:
     return None
 
 
+def validate_owned_transient_directory(path: Path, home: Path) -> None:
+    path = lex(path)
+    unsafe_component = path_has_symlink_component(path, home)
+    if unsafe_component is not None:
+        raise RuntimeError(
+            f"popup session state is unsafe through symlink: {unsafe_component}"
+        )
+    if not path.is_dir():
+        raise RuntimeError(f"popup session state is not a directory: {path}")
+
+    expected_uid = os.getuid() if hasattr(os, "getuid") else None
+
+    def raise_walk_error(exc: OSError) -> None:
+        raise RuntimeError(f"popup session state cannot be inspected: {path}: {exc}")
+
+    for current, directories, files in os.walk(
+        path, topdown=True, followlinks=False, onerror=raise_walk_error
+    ):
+        current_path = Path(current)
+        entries = (current_path, *(current_path / name for name in (*directories, *files)))
+        for entry in entries:
+            try:
+                metadata = entry.lstat()
+            except OSError as exc:
+                raise RuntimeError(
+                    f"popup session state cannot be inspected: {entry}: {exc}"
+                ) from exc
+            if stat.S_ISLNK(metadata.st_mode):
+                raise RuntimeError(f"popup session state contains a symlink: {entry}")
+            if not (stat.S_ISDIR(metadata.st_mode) or stat.S_ISREG(metadata.st_mode)):
+                raise RuntimeError(
+                    f"popup session state contains an unsafe entry: {entry}"
+                )
+            if expected_uid is not None and metadata.st_uid != expected_uid:
+                raise RuntimeError(
+                    f"popup session state owner is unexpected: {entry}"
+                )
+
+
 def flatten_strings(value: Any) -> Iterable[str]:
     if isinstance(value, str):
         yield value
@@ -551,6 +590,7 @@ class Inventory:
         self.de_aux: list[Path] = []
         self.aqg_aux: list[Path] = []
         self.aqg_version_residue: list[Path] = []
+        self.popup_session_roots: list[Path] = []
         self.empty_managed_dirs: list[Path] = []
         self.runtime_roots: list[Path] = []
         self.launchagent: Path | None = None
@@ -881,6 +921,21 @@ class Inventory:
         )
 
     def inspect_managed_state_cleanup(self) -> None:
+        if self.scope in ("de", "both"):
+            popup_sessions = self.dp / "popup-sessions"
+            if lexists(popup_sessions):
+                try:
+                    validate_owned_transient_directory(popup_sessions, self.home)
+                except RuntimeError as exc:
+                    self.blockers.append(str(exc))
+                else:
+                    self.popup_session_roots.append(popup_sessions)
+                    self.add_action(
+                        "remove-popup-sessions",
+                        popup_sessions,
+                        "remove transient popup session data",
+                    )
+
         if self.scope in ("aqg", "both"):
             state = self.dp / "aqg-state"
             if lexists(state):
@@ -924,7 +979,7 @@ class Inventory:
             planned_children.add(self.aqg_managed_target)
         directories: list[Path] = []
         if self.scope in ("de", "both"):
-            directories.extend((self.dp / "installations", self.dp / "popup-sessions"))
+            directories.append(self.dp / "installations")
         if self.scope in ("aqg", "both"):
             directories.append(self.dp / "versions")
         for directory in directories:
@@ -3826,6 +3881,34 @@ def apply_inventory(inv: Inventory) -> Path:
             destination.parent.mkdir(parents=True, exist_ok=True)
             shutil.move(str(root), str(destination))
             manifest.record_tree_moved(root, destination)
+
+        for index, path in enumerate(inv.popup_session_roots, start=1):
+            if not lexists(path):
+                manifest.add(
+                    {
+                        "operation": "remove-transient-popup-sessions",
+                        "source": str(path),
+                        "status": "already-removed",
+                    }
+                )
+                continue
+            validate_owned_transient_directory(path, inv.home)
+            destination = backup / "transient" / f"{index:03d}-{path.name}"
+            destination.parent.mkdir(parents=True, exist_ok=True)
+            os.replace(path, destination)
+            validate_owned_transient_directory(destination, inv.home)
+            shutil.rmtree(destination)
+            if lexists(destination):
+                raise RuntimeError(
+                    f"popup session directory removal could not be verified: {path}"
+                )
+            manifest.add(
+                {
+                    "operation": "remove-transient-popup-sessions",
+                    "source": str(path),
+                    "destination": None,
+                }
+            )
 
         for path in inv.de_aux:
             if not lexists(path):

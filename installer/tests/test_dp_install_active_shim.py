@@ -65,9 +65,9 @@ class DeferredActiveSessionTests(unittest.TestCase):
         self.assertIn("SUCCESS_WITH_RESTART_REQUIRED", self.source)
 
     def test_deferred_update_requires_verified_unchanged_state(self) -> None:
+        start = self.source.index("if ! run_managed_update_once; then")
         block = self.source[
-            self.source.index("if ! run_managed_update_once; then") :
-            self.source.index('catalog_root="$source_root"')
+            start : self.source.index('catalog_root="$source_root"', start)
         ]
         self.assertIn("validate_complete_managed_root", block)
         self.assertIn("managed_activation_state", block)
