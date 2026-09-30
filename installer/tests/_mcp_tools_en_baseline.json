@@ -43,6 +43,13 @@
                 true
               ]
             },
+            "client_request_id": {
+              "type": [
+                "string",
+                "null"
+              ],
+              "maxLength": 128
+            },
             "ui_locale": {
               "type": "string",
               "enum": [

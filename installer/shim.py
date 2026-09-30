@@ -169,7 +169,13 @@ _OUTCOME_UNKNOWN_MESSAGE = "Decision Engine request outcome unknown — reconcil
 class OutcomeUnknownError(ShellError):
     """The request crossed the wire, but no trustworthy final response was received."""
 
-    def __init__(self, reason: str, request_id: str):
+    def __init__(
+        self,
+        reason: str,
+        request_id: str,
+        *,
+        client_request_id: Optional[str] = None,
+    ):
         super().__init__(_OUTCOME_UNKNOWN_MESSAGE)
         self.data = {
             "status": "request_outcome_unknown",
@@ -179,6 +185,10 @@ class OutcomeUnknownError(ShellError):
             "retryable": False,
             "action": "reconcile",
         }
+        if client_request_id is not None:
+            self.data["retryable"] = True
+            self.data["action"] = "retry_same_client_request_id"
+            self.data["client_request_id"] = client_request_id
 
 
 def _local_advisory_offer(message: Dict[str, Any]) -> Optional[Dict[str, Any]]:
@@ -524,6 +534,10 @@ _LITE_AUDIT_TOOL = {
                         "enum": ["prescriptive"],
                     },
                     "accept_degrade": {"type": "boolean", "enum": [True]},
+                    "client_request_id": {
+                        "type": ["string", "null"],
+                        "maxLength": 128,
+                    },
                     "ui_locale": {
                         "type": "string",
                         "enum": ["zh-CN", "en-US"],
@@ -1716,6 +1730,124 @@ def _copy_tool_call_arguments(
     return forwarded, forwarded_arguments
 
 
+def _normalize_audit_client_request_id(raw: Any) -> str:
+    if raw is None:
+        return str(uuid.uuid4())
+    if not isinstance(raw, str):
+        raise ShellError("client_request_id must be a string or null")
+    normalized = raw.strip()
+    if not normalized:
+        return str(uuid.uuid4())
+    if len(normalized) > 128:
+        raise ShellError("client_request_id must be at most 128 characters")
+    return normalized
+
+
+def _with_audit_client_request_id(message: Dict[str, Any]) -> Dict[str, Any]:
+    """Copy a routed hosted /audit submit and stamp its stable replay identity."""
+    if message.get("method") != "tools/call":
+        return message
+    params = message.get("params")
+    if not isinstance(params, dict):
+        return message
+    if _logical_mcp_tool_name(params.get("name")) != "audit_skill_submit":
+        return message
+    arguments = params.get("arguments")
+    if not isinstance(arguments, dict) or arguments.get("skill_name") != "audit":
+        return message
+    workflow_args = arguments.get("args")
+    if workflow_args is None:
+        workflow_args = {}
+    elif not isinstance(workflow_args, dict):
+        raise ShellError("audit_skill_submit args must be an object")
+    client_request_id = _normalize_audit_client_request_id(
+        workflow_args.get("client_request_id")
+    )
+    forwarded, forwarded_arguments = _copy_tool_call_arguments(
+        message, params, arguments
+    )
+    forwarded_workflow_args = dict(workflow_args)
+    forwarded_workflow_args["client_request_id"] = client_request_id
+    forwarded_arguments["args"] = forwarded_workflow_args
+    return forwarded
+
+
+def _without_audit_client_request_id(message: Dict[str, Any]) -> Dict[str, Any]:
+    """Remove the extension before forwarding to a server that did not advertise it."""
+    if message.get("method") != "tools/call":
+        return message
+    params = message.get("params")
+    if not isinstance(params, dict):
+        return message
+    if _logical_mcp_tool_name(params.get("name")) != "audit_skill_submit":
+        return message
+    arguments = params.get("arguments")
+    if not isinstance(arguments, dict) or arguments.get("skill_name") != "audit":
+        return message
+    workflow_args = arguments.get("args")
+    if not isinstance(workflow_args, dict) or "client_request_id" not in workflow_args:
+        return message
+    forwarded, forwarded_arguments = _copy_tool_call_arguments(
+        message, params, arguments
+    )
+    forwarded_workflow_args = dict(workflow_args)
+    forwarded_workflow_args.pop("client_request_id", None)
+    forwarded_arguments["args"] = forwarded_workflow_args
+    return forwarded
+
+
+def _audit_client_request_id(message: Dict[str, Any]) -> Optional[str]:
+    if message.get("method") != "tools/call":
+        return None
+    params = message.get("params")
+    if not isinstance(params, dict):
+        return None
+    if _logical_mcp_tool_name(params.get("name")) != "audit_skill_submit":
+        return None
+    arguments = params.get("arguments")
+    if not isinstance(arguments, dict) or arguments.get("skill_name") != "audit":
+        return None
+    workflow_args = arguments.get("args")
+    if not isinstance(workflow_args, dict):
+        return None
+    client_request_id = workflow_args.get("client_request_id")
+    return client_request_id if isinstance(client_request_id, str) else None
+
+
+def _server_supports_audit_client_request_id(response: Dict[str, Any]) -> bool:
+    result = response.get("result")
+    tools = result.get("tools") if isinstance(result, dict) else None
+    if not isinstance(tools, list):
+        return False
+    for tool in tools:
+        if not isinstance(tool, dict) or tool.get("name") != "audit_skill_submit":
+            continue
+        schema = tool.get("inputSchema")
+        properties = schema.get("properties") if isinstance(schema, dict) else None
+        args_schema = properties.get("args") if isinstance(properties, dict) else None
+        args_properties = (
+            args_schema.get("properties") if isinstance(args_schema, dict) else None
+        )
+        request_schema = (
+            args_properties.get("client_request_id")
+            if isinstance(args_properties, dict)
+            else None
+        )
+        if not isinstance(request_schema, dict):
+            return False
+        request_type = request_schema.get("type")
+        supports_string = request_type == "string" or (
+            isinstance(request_type, list) and "string" in request_type
+        )
+        max_length = request_schema.get("maxLength")
+        return (
+            supports_string
+            and isinstance(max_length, int)
+            and max_length >= 128
+        )
+    return False
+
+
 def _with_client_host_metadata(
     message: Dict[str, Any], client_host: Optional[str]
 ) -> Dict[str, Any]:
@@ -2473,6 +2605,8 @@ def _hosted_run_in_flight_error(
     }
     if dispatch is not None:
         data["request_id"] = dispatch.data["request_id"]
+        if "client_request_id" in dispatch.data:
+            data["client_request_id"] = dispatch.data["client_request_id"]
     return data
 
 
@@ -2499,7 +2633,10 @@ def _hosted_work_blocking_local_audit(
         return _hosted_run_in_flight_error(in_flight_run, unreconciled_audit_dispatch)
     if unreconciled_audit_dispatch is not None:
         # A copy: the emitted envelope must never alias the exception's own ``data``.
-        return dict(unreconciled_audit_dispatch.data)
+        blocked = dict(unreconciled_audit_dispatch.data)
+        blocked["retryable"] = False
+        blocked["action"] = "reconcile"
+        return blocked
     return None
 
 
@@ -3062,6 +3199,7 @@ def serve(
     # cannot open a local DE Lite second opinion for an intent the hub may already be serving.
     # Session-scoped by design — a fresh process re-reads the network instead of inheriting it.
     unreconciled_audit_dispatch: Optional[OutcomeUnknownError] = None
+    audit_client_request_id_supported = False
     if isinstance(forwarder, Forwarder) and not hub_reachable(forwarder.endpoint):
         # Probe once before MCP traffic: an activated host still completes the handshake locally,
         # but no request, popup sweep, or local display implementation is allowed during outage.
@@ -3339,9 +3477,15 @@ def serve(
         forced_local_fallback = False
         forced_local_panel_locale = None
         forced_local_fallback_reused = False
+        forwarded_message = message
         try:
+            forwarded_message = (
+                _with_audit_client_request_id(message)
+                if audit_client_request_id_supported
+                else _without_audit_client_request_id(message)
+            )
             response = forwarder.forward(
-                _with_client_host_metadata(message, resolved_client_host)
+                _with_client_host_metadata(forwarded_message, resolved_client_host)
             )
         except EntitlementBlockedError as exc:
             fallback_context = _audit_fallback_context(message)
@@ -3430,6 +3574,14 @@ def serve(
                             )
                     continue
             else:
+                if isinstance(exc, OutcomeUnknownError) and audit_client_request_id_supported:
+                    client_request_id = _audit_client_request_id(forwarded_message)
+                    if client_request_id is not None:
+                        exc = OutcomeUnknownError(
+                            exc.data["reason"],
+                            exc.data["request_id"],
+                            client_request_id=client_request_id,
+                        )
                 if isinstance(exc, OutcomeUnknownError) and _is_audit_traffic(message):
                     # The request reached the wire, so the hub may have accepted this audit. Latch
                     # it for the rest of the session: nothing observed from this client afterwards
@@ -3558,6 +3710,11 @@ def serve(
                     elif transport_gate.stage == CapabilityStage.READY_FOR_INITIALIZE:
                         transport_gate.fail_initialize()
                 if method == "tools/list":
+                    if not lite_mode and not offline_mode:
+                        audit_client_request_id_supported = (
+                            audit_client_request_id_supported
+                            or _server_supports_audit_client_request_id(response)
+                        )
                     adapter = mcp_config.host_adapter(resolved_client_host)
                     if adapter is not None:
                         response = _merge_local_audit_tools(response)
