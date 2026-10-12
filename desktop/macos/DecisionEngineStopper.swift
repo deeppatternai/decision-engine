@@ -55,6 +55,107 @@ private final class TaskListDocumentView: NSView {
     override var isFlipped: Bool { true }
 }
 
+private final class ShimmerStatusLabel: NSTextField {
+    static let duration: TimeInterval = 1.75
+
+    private let highlightColor = NSColor(calibratedWhite: 0.97, alpha: 1)
+    private var highlightCell: NSTextFieldCell?
+    private var displayTimer: Timer?
+    private var accessibilityObserver: NSObjectProtocol?
+    private var reduceMotion = NSWorkspace.shared.accessibilityDisplayShouldReduceMotion
+
+    static func phase(at uptime: TimeInterval) -> Double {
+        return uptime.truncatingRemainder(dividingBy: duration) / duration
+    }
+
+    init(text: String, color: NSColor) {
+        super.init(frame: .zero)
+        stringValue = text
+        isEditable = false
+        isSelectable = false
+        isBordered = false
+        drawsBackground = false
+        font = NSFont.systemFont(ofSize: 13, weight: .semibold)
+        textColor = color
+        alignment = .left
+        lineBreakMode = .byTruncatingMiddle
+        setContentCompressionResistancePriority(.defaultLow, for: .horizontal)
+        highlightCell = cell?.copy() as? NSTextFieldCell
+
+        accessibilityObserver = NSWorkspace.shared.notificationCenter.addObserver(
+            forName: NSWorkspace.accessibilityDisplayOptionsDidChangeNotification,
+            object: nil,
+            queue: .main
+        ) { [weak self] _ in
+            self?.refreshVisibility()
+        }
+    }
+
+    required init?(coder: NSCoder) {
+        fatalError("init(coder:) has not been implemented")
+    }
+
+    deinit {
+        displayTimer?.invalidate()
+        if let accessibilityObserver {
+            NSWorkspace.shared.notificationCenter.removeObserver(accessibilityObserver)
+        }
+    }
+
+    override func viewDidMoveToWindow() {
+        super.viewDidMoveToWindow()
+        refreshVisibility()
+    }
+
+    func refreshVisibility() {
+        reduceMotion = NSWorkspace.shared.accessibilityDisplayShouldReduceMotion
+        displayTimer?.invalidate()
+        displayTimer = nil
+        if let window, window.isVisible, !window.isMiniaturized, !reduceMotion {
+            let timer = Timer(timeInterval: 1.0 / 60.0, repeats: true) { [weak self] _ in
+                guard let self else { return }
+                if self.window?.isVisible != true || self.window?.isMiniaturized == true {
+                    self.refreshVisibility()
+                } else {
+                    self.needsDisplay = true
+                }
+            }
+            RunLoop.main.add(timer, forMode: .common)
+            displayTimer = timer
+        }
+        needsDisplay = true
+    }
+
+    override func draw(_ dirtyRect: NSRect) {
+        super.draw(dirtyRect)
+        guard displayTimer != nil, bounds.width > 0,
+              let highlightCell,
+              let font else { return }
+
+        let textRect = cell?.drawingRect(forBounds: bounds) ?? bounds
+        let textWidth = min(textRect.width,
+                            ceil((stringValue as NSString).size(withAttributes: [.font: font]).width))
+        let bandWidth = max(48, min(104, textWidth * 0.2))
+        let progress = Self.phase(at: ProcessInfo.processInfo.systemUptime)
+        let centerX = textRect.minX - bandWidth + progress * (textWidth + bandWidth * 2)
+        let sliceWidth = bandWidth / 24
+
+        for index in 0..<24 {
+            let unit = (CGFloat(index) + 0.5) / 24
+            let distance = abs(unit - 0.5) * 2
+            let alpha = pow(max(0, 1 - distance), 1.7) * 0.95
+            let x = centerX - bandWidth / 2 + CGFloat(index) * sliceWidth
+            let clipRect = NSRect(x: x, y: textRect.minY,
+                                  width: sliceWidth + 0.75, height: textRect.height)
+            NSGraphicsContext.saveGraphicsState()
+            NSBezierPath(rect: clipRect).addClip()
+            highlightCell.textColor = highlightColor.withAlphaComponent(alpha)
+            highlightCell.drawInterior(withFrame: bounds, in: self)
+            NSGraphicsContext.restoreGraphicsState()
+        }
+    }
+}
+
 final class DecisionEngineStopper: NSObject, NSApplicationDelegate {
     private let statusItem = NSStatusBar.system.statusItem(withLength: NSStatusItem.variableLength)
     private let activeRunPath = ProcessInfo.processInfo.environment["DE_ACTIVE_RUN"]
@@ -125,6 +226,7 @@ final class DecisionEngineStopper: NSObject, NSApplicationDelegate {
     private var panelWindow: NSPanel?
     private var rowsStack: NSStackView?
     private var rowsScrollView: NSScrollView?
+    private var shimmerLabels: [ShimmerStatusLabel] = []
     private var lockFD: Int32 = -1
     // Run ids this panel has finished showing (hidden_after passed). Mirrors client/stopper/panel.py's
     // `_retired`: a reaped run must be dropped from the on-disk registry AND never re-adopted from a
@@ -632,6 +734,7 @@ final class DecisionEngineStopper: NSObject, NSApplicationDelegate {
               let serverURL = config["server_endpoint"] as? String,
               let token = config["access_token"] as? String,
               let url = URL(string: serverURL + "/v1/audits/" + runID) else {
+            serverVerifiedRunIDs.remove(runID)
             return
         }
 
@@ -923,6 +1026,7 @@ final class DecisionEngineStopper: NSObject, NSApplicationDelegate {
     private func hidePanel() {
         hiddenByUser = true
         panelWindow?.orderOut(nil)
+        shimmerLabels.forEach { $0.refreshVisibility() }
     }
 
     private func showPanel(activate: Bool) {
@@ -939,11 +1043,13 @@ final class DecisionEngineStopper: NSObject, NSApplicationDelegate {
         } else {
             panelWindow?.orderFrontRegardless()
         }
+        shimmerLabels.forEach { $0.refreshVisibility() }
     }
 
     private func updatePanel() {
         guard let rowsStack else { return }
         let scrollOffset = rowsScrollView?.contentView.bounds.origin ?? .zero
+        shimmerLabels.removeAll()
         for view in Array(rowsStack.arrangedSubviews) {
             rowsStack.removeArrangedSubview(view)
             view.removeFromSuperview()
@@ -1167,7 +1273,16 @@ final class DecisionEngineStopper: NSObject, NSApplicationDelegate {
         // ONE collapsed line: DEPTH + overall status + live elapsed — NOT one row per voice. This shows
         // the audit DEPTH (Fast/Standard/Deep) the user chose and deliberately hides the number of voices
         // (a cross-vendor panel size is a privacy surface — never bake the count into user-facing UI).
-        let label = auditorLabel(text: "· " + depthLineText(run), color: depthLineColor(run))
+        let lineText = "· " + depthLineText(run)
+        let lineColor = depthLineColor(run)
+        let label: NSTextField
+        if shouldShimmerDepthLine(run) {
+            let shimmer = ShimmerStatusLabel(text: lineText, color: lineColor)
+            shimmerLabels.append(shimmer)
+            label = shimmer
+        } else {
+            label = auditorLabel(text: lineText, color: lineColor)
+        }
         stack.addArrangedSubview(label)
         label.widthAnchor.constraint(lessThanOrEqualTo: stack.widthAnchor).isActive = true
         for rowText in debugAuditorRows(run) {
@@ -1248,7 +1363,7 @@ final class DecisionEngineStopper: NSObject, NSApplicationDelegate {
         let runStatus = (run["status"] as? String ?? "").lowercased()
         if runStatus == "cancelling" || runStatus == "cancelled" { return runStatus }
         let auditors = (run["auditors"] as? [[String: Any]]) ?? []
-        if auditors.isEmpty { return (run["status"] as? String) ?? "queued" }
+        if auditors.isEmpty { return runStatus.isEmpty ? "queued" : runStatus }
         let statuses = auditors.map { ($0["status"] as? String ?? "pending").lowercased() }
         let terminal: Set<String> = ["completed", "failed"]
         if statuses.contains(where: { !terminal.contains($0) }) { return "running" }
@@ -1256,6 +1371,16 @@ final class DecisionEngineStopper: NSObject, NSApplicationDelegate {
         let anyOk = statuses.contains("completed")
         if anyFail && anyOk { return "partial" }
         return anyFail ? "failed" : "completed"
+    }
+
+    private func shouldShimmerDepthLine(_ run: [String: Any]) -> Bool {
+        guard (run["status"] as? String ?? "").lowercased() == "running",
+              overallVoiceStatus(run) == "running" else { return false }
+        if isLocalRun(run) { return true }
+        guard let runID = run["run_id"] as? String, !runID.isEmpty else { return false }
+        return serverVerifiedRunIDs.contains(runID)
+            && pollFailures[runID] == nil
+            && notFoundPolls[runID] == nil
     }
 
     /// Live elapsed seconds from `started_at`, FROZEN once the panel is terminal (so a finished run stops

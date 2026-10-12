@@ -45,7 +45,7 @@ class WorkBuddyAIHostTestCase(unittest.TestCase):
         self.assertEqual(spec.host_family, "workbuddy-ai")
         self.assertEqual(spec.config_renderer, "json-mcp-v1")
         self.assertEqual(spec.launch_policy, "desktop-python-v1")
-        self.assertTrue(spec.require_observed_identity)
+        self.assertFalse(spec.require_observed_identity)
         self.assertEqual(spec.skill_delivery_mode, "managed-copy")
         self.assertEqual(spec.routing_kind, "skill")
         self.assertEqual(spec.skill_route_name, "workbuddy-ai")
@@ -62,7 +62,7 @@ class WorkBuddyAIHostTestCase(unittest.TestCase):
         self.assertTrue(spec.local_display_tools)
         self.assertFalse(spec.popup_followup)
         self.assertTrue(spec.audit_stop_panel)
-        self.assertTrue(spec.unverified_lite_stopper)
+        self.assertFalse(spec.unverified_lite_stopper)
         self.assertIsNotNone(spec.post_mcp_write)
         self.assertNotEqual(spec.config_env, legacy.config_env)
         self.assertNotEqual(spec.skill_route_name, legacy.skill_route_name)
@@ -94,6 +94,32 @@ class WorkBuddyAIHostTestCase(unittest.TestCase):
                 workbuddy_ai._workbuddy_ai_settings_path(),
                 Path("/Users/test/.workbuddy-ai/settings.json"),
             )
+
+    def test_workbuddy_ai_skills_path_tracks_562_layout_migration(self):
+        from installer.client_hosts.hosts import workbuddy_ai
+
+        with tempfile.TemporaryDirectory() as tmp:
+            root = Path(tmp)
+            app_root = root / "WorkBuddy AI.app"
+            home = root / "home"
+            environment = {
+                "WORKBUDDY_AI_APP_ROOT": str(app_root),
+                "WORKBUDDY_AI_SKILLS_DIR": "",
+            }
+            with mock.patch.object(Path, "home", return_value=home), mock.patch.dict(
+                os.environ, environment, clear=False
+            ):
+                self._write_bundle(app_root, version="5.5.2")
+                self.assertEqual(
+                    workbuddy_ai._workbuddy_ai_skills_path(),
+                    home / ".workbuddy-ai" / "skills",
+                )
+
+                self._write_bundle(app_root, version="5.6.2")
+                self.assertEqual(
+                    workbuddy_ai._workbuddy_ai_skills_path(),
+                    home / ".workbuddy" / "skills",
+                )
 
     def test_workbuddy_ai_guard_checks_exact_bundle_identity_and_version(self):
         from installer.client_hosts.hosts import workbuddy_ai

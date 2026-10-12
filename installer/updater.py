@@ -31,7 +31,7 @@ import time
 import unicodedata
 from bisect import bisect_left
 from dataclasses import dataclass
-from pathlib import Path
+from pathlib import Path, PureWindowsPath
 from typing import Dict, Iterable, Mapping, Optional, Sequence, Tuple
 
 from . import managed_install, release_contract
@@ -55,6 +55,7 @@ _MAX_GIT_EXECUTABLE_BYTES = 128 * 1024 * 1024
 _TRACKED_HASH_TIMEOUT_SECONDS = 15
 _TREE_OPERATION_TIMEOUT_SECONDS = 20
 _MINIMUM_GIT_VERSION = (2, 36, 0)
+_WINDOWS_GIT_PUBLISHER_RE = r"(?i:Johannes Schindelin|Git for Windows)"
 _COMMIT_RE = re.compile(r"[0-9a-f]{40}\Z")
 _DIGEST_RE = re.compile(r"[0-9a-f]{64}\Z")
 _VERSION_RE = re.compile(r"(?:0|[1-9][0-9]*)\.(?:0|[1-9][0-9]*)\.(?:0|[1-9][0-9]*)\Z")
@@ -514,29 +515,147 @@ def _ambient_git_environment(git_executable: Optional[str] = None) -> Dict[str, 
     return environment
 
 
+def _windows_registry_views(registry) -> Tuple[int, ...]:
+    return tuple(dict.fromkeys((
+        getattr(registry, "KEY_WOW64_64KEY", 0),
+        getattr(registry, "KEY_WOW64_32KEY", 0),
+    )))
+
+
+def _windows_absolute_registry_path(value: object) -> Optional[str]:
+    if not isinstance(value, str) or not value or "\x00" in value:
+        return None
+    path = PureWindowsPath(value)
+    if not path.is_absolute():
+        return None
+    return str(path)
+
+
+def _windows_program_files_roots(registry) -> Tuple[str, ...]:
+    roots = []
+    seen = set()
+    for view in _windows_registry_views(registry):
+        try:
+            with registry.OpenKey(
+                registry.HKEY_LOCAL_MACHINE,
+                r"SOFTWARE\Microsoft\Windows\CurrentVersion",
+                access=registry.KEY_READ | view,
+            ) as key:
+                for name in (
+                    "ProgramFilesDir",
+                    "ProgramFilesDir (x86)",
+                    "ProgramW6432Dir",
+                ):
+                    try:
+                        value, _kind = registry.QueryValueEx(key, name)
+                    except OSError:
+                        continue
+                    path = _windows_absolute_registry_path(value)
+                    folded = path.casefold() if path is not None else ""
+                    if path is not None and folded not in seen:
+                        seen.add(folded)
+                        roots.append(path)
+        except OSError:
+            continue
+    return tuple(roots)
+
+
+def _windows_git_for_windows_install_roots(registry) -> Tuple[str, ...]:
+    roots = []
+    seen = set()
+    for hive in (
+        registry.HKEY_LOCAL_MACHINE,
+        registry.HKEY_CURRENT_USER,
+    ):
+        for view in _windows_registry_views(registry):
+            try:
+                with registry.OpenKey(
+                    hive,
+                    r"SOFTWARE\GitForWindows",
+                    access=registry.KEY_READ | view,
+                ) as key:
+                    value, _kind = registry.QueryValueEx(key, "InstallPath")
+            except OSError:
+                continue
+            path = _windows_absolute_registry_path(value)
+            folded = path.casefold() if path is not None else ""
+            if path is not None and folded not in seen:
+                seen.add(folded)
+                roots.append(path)
+    return tuple(roots)
+
+
+def _windows_git_authenticode_is_valid(candidate: Path) -> bool:
+    try:
+        system_root = _windows_system_root()
+        powershell = (
+            system_root
+            / "System32"
+            / "WindowsPowerShell"
+            / "v1.0"
+            / "powershell.exe"
+        )
+        if not candidate.is_absolute() or not powershell.is_absolute():
+            return False
+        environment = {
+            "SYSTEMROOT": str(system_root),
+            "WINDIR": str(system_root),
+            "PATH": str(system_root / "System32"),
+            "DE_GIT_SIGNATURE_PATH": str(candidate),
+        }
+        for name in ("TEMP", "TMP"):
+            value = os.environ.get(name)
+            if value:
+                environment[name] = value
+        script = (
+            "$ErrorActionPreference='Stop';"
+            "$p=[Environment]::GetEnvironmentVariable('DE_GIT_SIGNATURE_PATH','Process');"
+            "if([string]::IsNullOrWhiteSpace($p) -or "
+            "-not [IO.Path]::IsPathRooted($p)){exit 2};"
+            "$s=Get-AuthenticodeSignature -LiteralPath $p -ErrorAction Stop;"
+            "if($s.Status -ne "
+            "[System.Management.Automation.SignatureStatus]::Valid){exit 3};"
+            "$subject=[string]$s.SignerCertificate.Subject;"
+            "if($subject -notmatch '" + _WINDOWS_GIT_PUBLISHER_RE + "'){exit 4};"
+            "[Console]::Out.Write('VALID')"
+        )
+        completed = subprocess.run(
+            [
+                str(powershell),
+                "-NoLogo",
+                "-NoProfile",
+                "-NonInteractive",
+                "-ExecutionPolicy",
+                "Bypass",
+                "-Command",
+                script,
+            ],
+            env=environment,
+            stdin=subprocess.DEVNULL,
+            stdout=subprocess.PIPE,
+            stderr=subprocess.DEVNULL,
+            timeout=_GIT_TIMEOUT_SECONDS,
+            check=False,
+            shell=False,
+        )
+    except (OSError, subprocess.SubprocessError):
+        return False
+    return completed.returncode == 0 and completed.stdout == b"VALID"
+
+
 def _trusted_git_candidates() -> Tuple[Path, ...]:
     if os.name == "nt":
         import winreg
 
-        roots = []
-        try:
-            with winreg.OpenKey(
-                winreg.HKEY_LOCAL_MACHINE,
-                r"SOFTWARE\Microsoft\Windows\CurrentVersion",
-                access=winreg.KEY_READ | getattr(winreg, "KEY_WOW64_64KEY", 0),
-            ) as key:
-                for name in ("ProgramFilesDir", "ProgramFilesDir (x86)", "ProgramW6432Dir"):
-                    try:
-                        value, _kind = winreg.QueryValueEx(key, name)
-                    except OSError:
-                        continue
-                    if isinstance(value, str) and Path(value).is_absolute():
-                        roots.append(Path(value))
-        except OSError:
-            pass
+        program_files = _windows_program_files_roots(winreg)
+        registered = _windows_git_for_windows_install_roots(winreg)
         candidates = [
-            root / "Git" / leaf / "git.exe"
-            for root in roots
+            Path(root) / "Git" / leaf / "git.exe"
+            for root in program_files
+            for leaf in ("cmd", "bin")
+        ] + [
+            Path(root) / leaf / "git.exe"
+            for root in registered
             for leaf in ("cmd", "bin")
         ]
     else:
@@ -588,7 +707,7 @@ def _resolve_git_executables(
             try:
                 trusted_root = candidate.parents[2].resolve(strict=True)
                 resolved.relative_to(trusted_root)
-            except (OSError, ValueError):
+            except (IndexError, OSError, ValueError):
                 continue
             current = trusted_root
             unsafe_component = False
@@ -607,6 +726,8 @@ def _resolve_git_executables(
                     unsafe_component = True
                     break
             if unsafe_component:
+                continue
+            if not _windows_git_authenticode_is_valid(resolved):
                 continue
         else:
             if not _posix_git_path_is_trusted(resolved):

@@ -32,11 +32,32 @@ body{background:#262624;color:#f5f5f4;font-family:-apple-system,BlinkMacSystemFo
 .idline{display:flex;gap:7px;align-items:baseline;margin-top:4px;color:#8e8d86;font-size:12px;min-width:0}
 .idline code{font-family:"Noto Sans Mono CJK SC","DejaVu Sans Mono",monospace;user-select:text;overflow-wrap:anywhere}
 .detail{margin-top:5px;color:#8e8d86;font-size:14px;line-height:1.45;overflow-wrap:anywhere}
+.detail.shimmer{color:transparent!important;background-image:linear-gradient(90deg,var(--detail-color) 0%,var(--detail-color) 38%,#f5f5f4 50%,var(--detail-color) 62%,var(--detail-color) 100%);background-size:250% 100%;background-clip:text;-webkit-background-clip:text;-webkit-text-fill-color:transparent;animation:detail-shimmer 1750ms linear infinite}
+@keyframes detail-shimmer{from{background-position:100% 0}to{background-position:-100% 0}}
 .auditor{margin-top:2px;font-family:"Noto Sans Mono CJK SC","DejaVu Sans Mono",monospace;font-size:13px;line-height:1.45;overflow-wrap:anywhere}
 @media (max-width:520px){.row{grid-template-columns:1fr}.action{width:116px}.title{font-size:15px}}
+@media(prefers-reduced-motion:reduce){.detail.shimmer{animation:none;background:none;color:var(--detail-color)!important;-webkit-text-fill-color:currentColor}}
 </style></head><body><main id="viewport"></main><script>
 const viewport=document.getElementById('viewport');
+const shimmerDurationMs=1750;
+const reduceMotionQuery=window.matchMedia('(prefers-reduced-motion: reduce)');
+let nativeWindowActive=true;
+let pageAlive=true;
 function node(tag,className,text){const el=document.createElement(tag);if(className)el.className=className;if(text!==undefined)el.textContent=text;return el}
+function syncShimmer(){
+  const animate=pageAlive&&nativeWindowActive&&!document.hidden&&!reduceMotionQuery.matches;
+  const phase=performance.now()%shimmerDurationMs;
+  for(const detail of viewport.querySelectorAll('.detail[data-shimmer="true"]')){
+    detail.classList.toggle('shimmer',animate);
+    detail.style.animationDelay=animate?(-phase)+'ms':'';
+  }
+}
+window.setPanelWindowActive=function(active){nativeWindowActive=active===true;syncShimmer()};
+document.addEventListener('visibilitychange',syncShimmer);
+window.addEventListener('pagehide',()=>{pageAlive=false;syncShimmer()});
+window.addEventListener('pageshow',()=>{pageAlive=true;syncShimmer()});
+window.addEventListener('beforeunload',()=>{pageAlive=false;syncShimmer()});
+if(typeof reduceMotionQuery.addEventListener==='function'){reduceMotionQuery.addEventListener('change',syncShimmer)}else{reduceMotionQuery.addListener(syncShimmer)}
 window.renderPanel=function(payload){
   document.documentElement.lang=payload.lang||'en';
   const scrollTop=viewport.scrollTop;
@@ -51,11 +72,12 @@ window.renderPanel=function(payload){
     row.append(button);
     const content=node('div','content');content.append(node('h1','title',item.title));
     if(item.audit_id){const idline=node('div','idline');idline.append(node('span','',payload.id_label));idline.append(node('code','',item.audit_id));content.append(idline)}
-    const detail=node('div','detail','\u00b7 '+item.detail.text);detail.style.color=item.detail.color;content.append(detail);
+    const detail=node('div','detail','\u00b7 '+item.detail.text);detail.style.color=item.detail.color;detail.style.setProperty('--detail-color',item.detail.color);if(item.detail.shimmer)detail.dataset.shimmer='true';content.append(detail);
     for(const info of item.auditors){const line=node('div','auditor',info.text);line.style.color=info.color;content.append(line)}
     row.append(content);viewport.append(row);
   }
   viewport.scrollTop=scrollTop;
+  syncShimmer();
 };
 </script></body></html>"""
 
@@ -97,6 +119,34 @@ class LinuxWebViewStopPanelApp(panel.StopPanelApp):
             zoomable=False,
         )
         self.window.events.closed += lambda *_args: self._closed.set()
+        for event_name, active in (
+            ("minimized", False),
+            ("restored", True), ("shown", True),
+        ):
+            event = getattr(self.window.events, event_name, None)
+            if event is not None:
+                event += lambda *_args, value=active: self._set_animation_window_active(value)
+
+    def _set_animation_window_active(self, active: bool) -> None:
+        try:
+            self.window.evaluate_js(
+                "window.setPanelWindowActive(%s)" % ("true" if active else "false")
+            )
+        except Exception:
+            pass
+
+    def _should_shimmer_detail(
+        self, row_key: str, run: Dict[str, Any], now: float
+    ) -> bool:
+        render_run = {**run, "run_id": row_key}
+        return panel.should_shimmer_depth_line(
+            render_run,
+            run_id=row_key,
+            server_verified=self._server_verified,
+            poll_failures=self._poll_failures,
+            not_found_polls=self._not_found_polls,
+            now=now,
+        )
 
     def _action_view(self, row_key: str, run: Dict[str, Any]) -> Dict[str, Any]:
         render_run = {**run, "run_id": row_key}
@@ -136,6 +186,7 @@ class LinuxWebViewStopPanelApp(panel.StopPanelApp):
                 "detail": {
                     "text": panel.depth_line_text(render_run, now, self._frozen),
                     "color": panel.depth_line_color(render_run, now),
+                    "shimmer": self._should_shimmer_detail(row_key, run, now),
                 },
                 "auditors": panel._debug_auditor_details(
                     render_run, now, self._auditor_frozen

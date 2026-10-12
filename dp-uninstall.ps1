@@ -1394,6 +1394,16 @@ DE_PRODUCT_REMOTES = {
     "gitee": "https://gitee.com/deeppatternai/decision-engine.git",
 }
 AQG_PRODUCT_REMOTE = "https://github.com/deeppatternai/agent-quality-gates.git"
+# A 2026-09 AQG Windows install could copy these cache files into the managed
+# checkout with the literal ``%SystemDrive%`` token.  They are accepted only as
+# this exact, fully enumerated residue and are quarantined before removal.
+AQG_LEGACY_RESIDUE = frozenset(
+    {
+        "%SystemDrive%/ProgramData/Microsoft/Windows/Caches/cversions.2.db",
+        "%SystemDrive%/ProgramData/Microsoft/Windows/Caches/{6AF0698E-D558-4F6E-9B3C-3716689AF493}.2.ver0x0000000000000001.db",
+        "%SystemDrive%/ProgramData/Microsoft/Windows/Caches/{DDF571F2-BE98-426D-8288-1A9A39C3FDA2}.2.ver0x0000000000000001.db",
+    }
+)
 UNINSTALL_BACKUP_NAME = re.compile(
     r"(?P<stamp>[0-9]{8}-[0-9]{6})(?:-(?P<suffix>[0-9]+))?"
     r"-dp-uninstall-(?P<scope>de|aqg|both)"
@@ -1610,6 +1620,33 @@ def checkout_is_clean(root: Path) -> bool:
         return False
 
 
+def aqg_legacy_residue(root: Path) -> tuple[Path, ...] | None:
+    """Return the exact known AQG residue, or None for any other dirty tree."""
+    try:
+        status = git_output(root, "status", "--porcelain=v1", "--untracked-files=all")
+    except (OSError, subprocess.SubprocessError, ValueError):
+        return None
+    rows = tuple(line for line in status.splitlines() if line)
+    if not rows or any(not line.startswith("?? ") for line in rows):
+        return None
+    relative = frozenset(line[3:] for line in rows)
+    if relative != AQG_LEGACY_RESIDUE:
+        return None
+    paths = tuple(root / item for item in sorted(relative))
+    if any(
+        not is_under(path, root)
+        or is_reparse(path)
+        or not path.is_file()
+        for path in paths
+    ):
+        return None
+    return paths
+
+
+def aqg_checkout_is_clean_or_legacy_residue(root: Path) -> bool:
+    return checkout_is_clean(root) or aqg_legacy_residue(root) is not None
+
+
 def de_checkout_has_product_remotes(root: Path) -> bool:
     try:
         names = tuple(line for line in git_output(root, "remote").splitlines() if line)
@@ -1714,6 +1751,59 @@ def orphan_mcp_entry_is_owned(entry: Any, managed_root: Path) -> bool:
         return False
     launch_text = " ".join(values).lower().replace("\\", "/")
     return any(marker.replace("\\", "/") in launch_text for marker in ORPHAN_LAUNCHER_MARKERS)
+
+
+def legacy_codex_entry_is_owned(
+    entry: Any, managed_root: Path, home: Path
+) -> bool:
+    """Recognize the exact pre-sidecar Windows Codex entry emitted by DE."""
+    if not isinstance(entry, dict):
+        return False
+    if not set(entry).issubset(
+        {
+            "type",
+            "command",
+            "args",
+            "cwd",
+            "startup_timeout_sec",
+            "tool_timeout_sec",
+            "env",
+        }
+    ):
+        return False
+    if "env" in entry and entry["env"] != {"DE_MCP_CLIENT_HOST": "codex"}:
+        return False
+    if (
+        entry.get("type") not in (None, "stdio")
+        or entry.get("args") != ["-m", "installer.launcher"]
+        or not isinstance(entry.get("cwd"), str)
+        or path_key(Path(entry["cwd"])) != path_key(managed_root)
+        or entry.get("startup_timeout_sec", 120) != 120
+        or entry.get("tool_timeout_sec", 660) != 660
+        or not isinstance(entry.get("command"), str)
+    ):
+        return False
+    command = lex(Path(entry["command"]))
+    runtimes = managed_root.parent / "runtimes"
+    try:
+        relative = command.relative_to(lex(runtimes))
+    except ValueError:
+        return False
+    if (
+        len(relative.parts) != 3
+        or relative.parts[1].lower() != "python"
+        or relative.parts[2].lower() != "python.exe"
+        or re.fullmatch(
+            r"cpython-3\.13\.15\+20260901-[0-9A-Za-z._-]+",
+            relative.parts[0],
+        )
+        is None
+    ):
+        return False
+    return (
+        not is_reparse(command)
+        and managed_runtime_path_owned(lex(runtimes), lex(managed_root.parent), lex(home))
+    )
 
 
 def orphan_json_entry(path: Path, managed_root: Path) -> bool:
@@ -2101,15 +2191,28 @@ class Inventory:
                 target_head = git_output(target, "rev-parse", "HEAD")
             except (OSError, subprocess.SubprocessError, ValueError):
                 target_head = ""
+            legacy_residue = aqg_legacy_residue(target)
             if (
                 not aqg_checkout_has_product_remote(target)
-                or not checkout_is_clean(target)
+                or not aqg_checkout_is_clean_or_legacy_residue(target)
                 or not aqg_managed_target_name_matches(target, target_head)
             ):
                 self.blockers.append("AQG managed target source identity is unknown: %s" % target)
                 return
             self.aqg_target = target
             self.aqg_uninstaller = required[0]
+            for residue in legacy_residue or ():
+                self.add(
+                    "quarantine-aqg-legacy-residue",
+                    residue,
+                    "known legacy AQG cache residue; quarantine before uninstall",
+                    expected_sha256=sha256_file(residue),
+                )
+            if legacy_residue:
+                self.notes.append(
+                    "RECOVER known legacy AQG residue from managed checkout: %s"
+                    % target
+                )
             self.add("quarantine-root-link", root, "AQG managed root link")
             self.add("quarantine-root", target, "AQG managed version target")
             return
@@ -2226,6 +2329,12 @@ class Inventory:
                     )
                 except Exception:
                     owned = False
+            if not owned and client == "codex":
+                owned = legacy_codex_entry_is_owned(actual, self.de_root, self.home)
+                if owned:
+                    self.notes.append(
+                        "RECOVER legacy Codex Decision Engine entry without ownership sidecar"
+                    )
             if not owned:
                 self.blockers.append("%s %s entry ownership is unknown: %s" % (client, SERVER_NAME, path))
                 continue
@@ -2514,7 +2623,7 @@ class Inventory:
             return False
         return (
             aqg_checkout_has_product_remote(path)
-            and checkout_is_clean(path)
+            and aqg_checkout_is_clean_or_legacy_residue(path)
             and aqg_managed_target_name_matches(path, head)
         )
 
@@ -2675,6 +2784,8 @@ def print_inventory(inv: Inventory, apply: bool) -> None:
     for action in inv.actions:
         if action.kind == "aqg-uninstall":
             print("RUN %s (%s)" % (action.path, action.detail))
+        elif action.kind == "quarantine-aqg-legacy-residue":
+            print("RECOVER %s (%s)" % (action.path, action.detail))
         elif action.kind == "backup-retention":
             print("PRUNE %s (%s)" % (action.path, action.detail))
         else:
@@ -3020,7 +3131,11 @@ def apply_inventory(inv: Inventory) -> Path:
     popup_actions = [a for a in effective_actions if a.kind == "remove-popup-sessions"]
     aux_actions = [
         a for a in effective_actions
-        if a.kind in {"quarantine-aux", "quarantine-aqg-version"}
+        if a.kind in {
+            "quarantine-aux",
+            "quarantine-aqg-version",
+            "quarantine-aqg-legacy-residue",
+        }
     ]
     root_actions = [
         a for a in effective_actions

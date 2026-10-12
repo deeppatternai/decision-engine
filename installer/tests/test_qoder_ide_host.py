@@ -90,13 +90,20 @@ class QoderIdeHostTestCase(unittest.TestCase):
             mcp_config.CLIENT_SPECS["qoder"].observed_client_aliases
             | mcp_config.CLIENT_SPECS["qoder-cn"].observed_client_aliases
         )
+        acp_aliases = frozenset({"mcphost", "qoder-desktop-mcp-host"})
         for client, _, _, _, _, root_name, _, _, _, _, alias in self.CASES:
             with self.subTest(client=client):
                 spec = mcp_config.CLIENT_SPECS[client]
                 self.assertEqual(spec.host_family, client)
                 self.assertEqual(spec.detection, "installation-probe")
-                self.assertEqual(spec.observed_client_aliases, frozenset({alias}))
-                self.assertTrue(spec.observed_client_aliases.isdisjoint(desktop_aliases))
+                self.assertEqual(
+                    spec.observed_client_aliases,
+                    frozenset({alias}) | acp_aliases,
+                )
+                self.assertEqual(
+                    spec.observed_client_aliases & desktop_aliases,
+                    acp_aliases,
+                )
                 self.assertTrue(spec.require_observed_identity)
                 self.assertEqual(spec.config_renderer, "json-mcp-v1")
                 self.assertEqual(spec.launch_policy, "absolute-bootstrap-v1")
@@ -110,12 +117,18 @@ class QoderIdeHostTestCase(unittest.TestCase):
                 self.assertTrue(spec.audit_stop_panel)
                 self.assertTrue(spec.unverified_lite_stopper)
 
-                identity = mcp_config.resolve_host_identity(
-                    client,
-                    {"clientInfo": {"name": alias.title(), "version": "1.28.0"}},
-                )
-                self.assertEqual(identity.status, "matched")
-                self.assertEqual(identity.observed_host, client)
+                for observed_name in (alias.title(), *sorted(acp_aliases)):
+                    identity = mcp_config.resolve_host_identity(
+                        client,
+                        {
+                            "clientInfo": {
+                                "name": observed_name,
+                                "version": "1.32.2",
+                            }
+                        },
+                    )
+                    self.assertEqual(identity.status, "matched")
+                    self.assertEqual(identity.observed_host, client)
 
     def test_ide_paths_use_product_mcp_and_shared_family_assets(self):
         with tempfile.TemporaryDirectory() as tmp:

@@ -13,6 +13,7 @@ import sys
 import tempfile
 import unittest
 from pathlib import Path
+from unittest import mock
 
 
 TOOLS = Path(__file__).resolve().parents[2]
@@ -258,6 +259,85 @@ assert context.get_ca_certs()
         doctor = self.install.index("$doctorCode = Invoke-ScopedDecisionEngineDoctor")
         completion = self.install.index("Show-ActivationCompletionDialog", doctor)
         self.assertGreater(completion, doctor)
+
+    def _legacy_codex_fixture(self) -> tuple[dict[str, object], Path, Path]:
+        home = Path(tempfile.mkdtemp())
+        self.addCleanup(shutil.rmtree, home, ignore_errors=True)
+        dp = home / ".deeppattern"
+        managed_root = dp / "decision-engine"
+        runtimes = dp / "runtimes"
+        runtime = runtimes / "cpython-3.13.15+20260901-x86_64-pc-windows-msvc"
+        (runtime / "python").mkdir(parents=True)
+        (runtime / ".deeppattern-python-runtime").write_text(
+            "schema=1\n", encoding="utf-8"
+        )
+        command = runtime / "python" / "python.exe"
+        command.write_bytes(b"fixture")
+        entry = {
+            "type": "stdio",
+            "command": str(command),
+            "args": ["-m", "installer.launcher"],
+            "cwd": str(managed_root),
+            "startup_timeout_sec": 120,
+            "tool_timeout_sec": 660,
+            "env": {"DE_MCP_CLIENT_HOST": "codex"},
+        }
+        return entry, managed_root, home
+
+    def test_legacy_codex_entry_accepts_exact_managed_env(self) -> None:
+        entry, managed_root, home = self._legacy_codex_fixture()
+        self.assertTrue(
+            self.helper["legacy_codex_entry_is_owned"](entry, managed_root, home)
+        )
+
+    def test_legacy_codex_entry_rejects_extra_or_wrong_env(self) -> None:
+        entry, managed_root, home = self._legacy_codex_fixture()
+        for env in (
+            {"DE_MCP_CLIENT_HOST": "other"},
+            {"DE_MCP_CLIENT_HOST": "codex", "UNTRUSTED": "1"},
+            "DE_MCP_CLIENT_HOST=codex",
+        ):
+            with self.subTest(env=env):
+                candidate = dict(entry)
+                candidate["env"] = env
+                self.assertFalse(
+                    self.helper["legacy_codex_entry_is_owned"](
+                        candidate, managed_root, home
+                    )
+                )
+
+    def test_aqg_legacy_residue_accepts_only_the_three_known_paths(self) -> None:
+        with tempfile.TemporaryDirectory() as temporary:
+            root = Path(temporary)
+            known = tuple(sorted(self.helper["AQG_LEGACY_RESIDUE"]))
+            for relative in known:
+                path = root / relative
+                path.parent.mkdir(parents=True, exist_ok=True)
+                path.write_bytes(b"legacy residue")
+            status = "\n".join("?? " + relative for relative in known)
+            with mock.patch.dict(
+                self.helper, {"git_output": lambda *_args: status}
+            ):
+                recovered = self.helper["aqg_legacy_residue"](root)
+            self.assertEqual(
+                tuple(path.relative_to(root).as_posix() for path in recovered), known
+            )
+
+    def test_aqg_legacy_residue_rejects_any_extra_path(self) -> None:
+        with tempfile.TemporaryDirectory() as temporary:
+            root = Path(temporary)
+            known = tuple(sorted(self.helper["AQG_LEGACY_RESIDUE"]))
+            for relative in known:
+                path = root / relative
+                path.parent.mkdir(parents=True, exist_ok=True)
+                path.write_bytes(b"legacy residue")
+            status = "\n".join(
+                [*("?? " + relative for relative in known), "?? personal.txt"]
+            )
+            with mock.patch.dict(
+                self.helper, {"git_output": lambda *_args: status}
+            ):
+                self.assertIsNone(self.helper["aqg_legacy_residue"](root))
         self.assertIn("$activationCompletedThisRun -and -not $doctorVerifyFailed", self.install)
 
     def test_aqg_wrapper_uses_only_the_verified_bash(self) -> None:

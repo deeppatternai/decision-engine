@@ -7,6 +7,7 @@ No real network is used — a fake forwarder records what it was asked to send.
 
 from __future__ import annotations
 
+import copy
 import hashlib
 import http.client
 import io
@@ -788,6 +789,134 @@ class ShimServeTestCase(unittest.TestCase):
                     "display tools stripped for clientInfo.name=%r" % observed,
                 )
 
+    def test_workbuddy_ai_server_key_identity_advertises_all_display_tools(self):
+        fwd = FakeForwarder(
+            responses={
+                "initialize": {
+                    "jsonrpc": "2.0",
+                    "id": 1,
+                    "result": {"serverInfo": {"name": "de"}},
+                },
+                "tools/list": {
+                    "jsonrpc": "2.0",
+                    "id": 2,
+                    "result": {"tools": []},
+                },
+            }
+        )
+        initialize = {
+            "jsonrpc": "2.0",
+            "id": 1,
+            "method": "initialize",
+            "params": {
+                "clientInfo": {"name": "decision-engine", "version": "fixture"}
+            },
+        }
+        tools_list = {
+            "jsonrpc": "2.0",
+            "id": 2,
+            "method": "tools/list",
+            "params": {},
+        }
+
+        out = _run(
+            fwd,
+            [json.dumps(initialize), json.dumps(tools_list)],
+            client_host="workbuddy-ai",
+        )
+
+        names = {tool["name"] for tool in out[1]["result"]["tools"]}
+        self.assertTrue(
+            {"open_ge", "open_ge_popup", "open_db_board", "db_board_result"}
+            <= names
+        )
+
+    def test_workbuddy_ai_server_key_identity_enables_hosted_audit_stopper(self):
+        fwd = FakeForwarder(
+            responses={
+                "initialize": {
+                    "jsonrpc": "2.0",
+                    "id": 1,
+                    "result": {"serverInfo": {"name": "de"}},
+                },
+                "tools/call": {
+                    "jsonrpc": "2.0",
+                    "id": 2,
+                    "result": {"run_id": "audit-workbuddy-ai"},
+                },
+            }
+        )
+        initialize = {
+            "jsonrpc": "2.0",
+            "id": 1,
+            "method": "initialize",
+            "params": {
+                "clientInfo": {"name": "decision-engine", "version": "fixture"}
+            },
+        }
+        audit_call = {
+            "jsonrpc": "2.0",
+            "id": 2,
+            "method": "tools/call",
+            "params": {
+                "name": "submit_audit",
+                "arguments": {"title": "WorkBuddy AI hosted audit"},
+            },
+        }
+
+        with mock.patch.object(shim.threading, "Thread") as thread:
+            _run(
+                fwd,
+                [json.dumps(initialize), json.dumps(audit_call)],
+                client_host="workbuddy-ai",
+            )
+
+        stopper_threads = [
+            call
+            for call in thread.call_args_list
+            if call.kwargs.get("target") == shim._spawn_stopper_for_audit
+        ]
+        self.assertEqual(len(stopper_threads), 1)
+
+    def test_workbuddy_ai_lite_audit_uses_the_normal_stopper_path_once(self):
+        initialize = {
+            "jsonrpc": "2.0",
+            "id": 1,
+            "method": "initialize",
+            "params": {
+                "clientInfo": {"name": "decision-engine", "version": "fixture"}
+            },
+        }
+        audit_call = {
+            "jsonrpc": "2.0",
+            "id": 2,
+            "method": "tools/call",
+            "params": {
+                "name": "audit_skill_submit",
+                "arguments": {
+                    "skill_name": "audit",
+                    "args": {
+                        "title": "WorkBuddy AI Lite audit",
+                        "content": "artifact",
+                    },
+                },
+            },
+        }
+
+        with mock.patch.object(shim.threading, "Thread") as thread:
+            _run(
+                shim.LiteForwarder(),
+                [json.dumps(initialize), json.dumps(audit_call)],
+                client_host="workbuddy-ai",
+            )
+
+        stopper_threads = [
+            call
+            for call in thread.call_args_list
+            if call.kwargs.get("target") == shim._spawn_stopper_for_audit
+        ]
+        self.assertEqual(len(stopper_threads), 1)
+
     def test_enforcing_host_still_strips_display_on_unrecognised_client_name(self):
         """Counterpart to the workbuddy case: dropping enforcement for ONE host must
         not disable the mechanism for the hosts that still declare it. Without this,
@@ -989,10 +1118,71 @@ class ShimServeTestCase(unittest.TestCase):
         self.assertTrue(gate.stopper_enabled)
 
     def test_qoder_ide_identities_advertise_all_local_display_tools(self):
-        for client_host, observed_name in (
-            ("qoder-ide", "Qoder"),
-            ("qoder-cn-ide", "Qoder CN"),
+        for client_host, observed_names in (
+            (
+                "qoder-ide",
+                ("Qoder", "mcphost", "qoder-desktop-mcp-host"),
+            ),
+            (
+                "qoder-cn-ide",
+                ("Qoder CN", "mcphost", "qoder-desktop-mcp-host"),
+            ),
         ):
+            for observed_name in observed_names:
+                with self.subTest(
+                    client_host=client_host, observed_name=observed_name
+                ):
+                    fwd = FakeForwarder(
+                        responses={
+                            "initialize": {
+                                "jsonrpc": "2.0",
+                                "id": 1,
+                                "result": {"serverInfo": {"name": "de"}},
+                            },
+                            "tools/list": {
+                                "jsonrpc": "2.0",
+                                "id": 2,
+                                "result": {"tools": []},
+                            },
+                        }
+                    )
+                    initialize = {
+                        "jsonrpc": "2.0",
+                        "id": 1,
+                        "method": "initialize",
+                        "params": {
+                            "clientInfo": {
+                                "name": observed_name,
+                                "version": "1.32.2",
+                            }
+                        },
+                    }
+                    tools_list = {
+                        "jsonrpc": "2.0",
+                        "id": 2,
+                        "method": "tools/list",
+                        "params": {},
+                    }
+
+                    out = _run(
+                        fwd,
+                        [json.dumps(initialize), json.dumps(tools_list)],
+                        client_host=client_host,
+                    )
+
+                    names = {tool["name"] for tool in out[1]["result"]["tools"]}
+                    self.assertTrue(
+                        {
+                            "open_ge",
+                            "open_ge_popup",
+                            "open_db_board",
+                            "db_board_result",
+                        }
+                        <= names
+                    )
+
+    def test_qoder_ide_acp_identity_enables_hosted_audit_stopper(self):
+        for client_host in ("qoder-ide", "qoder-cn-ide"):
             with self.subTest(client_host=client_host):
                 fwd = FakeForwarder(
                     responses={
@@ -1001,10 +1191,10 @@ class ShimServeTestCase(unittest.TestCase):
                             "id": 1,
                             "result": {"serverInfo": {"name": "de"}},
                         },
-                        "tools/list": {
+                        "tools/call": {
                             "jsonrpc": "2.0",
                             "id": 2,
-                            "result": {"tools": []},
+                            "result": {"run_id": f"audit-{client_host}"},
                         },
                     }
                 )
@@ -1014,29 +1204,34 @@ class ShimServeTestCase(unittest.TestCase):
                     "method": "initialize",
                     "params": {
                         "clientInfo": {
-                            "name": observed_name,
-                            "version": "1.28.0",
+                            "name": "mcphost",
+                            "version": "1.32.2",
                         }
                     },
                 }
-                tools_list = {
+                audit_call = {
                     "jsonrpc": "2.0",
                     "id": 2,
-                    "method": "tools/list",
-                    "params": {},
+                    "method": "tools/call",
+                    "params": {
+                        "name": "submit_audit",
+                        "arguments": {"title": "Qoder IDE hosted audit"},
+                    },
                 }
 
-                out = _run(
-                    fwd,
-                    [json.dumps(initialize), json.dumps(tools_list)],
-                    client_host=client_host,
-                )
+                with mock.patch.object(shim.threading, "Thread") as thread:
+                    _run(
+                        fwd,
+                        [json.dumps(initialize), json.dumps(audit_call)],
+                        client_host=client_host,
+                    )
 
-                names = {tool["name"] for tool in out[1]["result"]["tools"]}
-                self.assertTrue(
-                    {"open_ge", "open_ge_popup", "open_db_board", "db_board_result"}
-                    <= names
-                )
+                stopper_threads = [
+                    call
+                    for call in thread.call_args_list
+                    if call.kwargs.get("target") == shim._spawn_stopper_for_audit
+                ]
+                self.assertEqual(len(stopper_threads), 1)
 
     def test_qoder_cn_018_identity_advertises_all_local_display_tools(self):
         fwd = FakeForwarder(
@@ -6025,6 +6220,267 @@ class ForwardOutcomeUnknownTests(unittest.TestCase):
         self.assertTrue(body.closed)
 
 
+class AuditClientRequestIdTests(unittest.TestCase):
+    @staticmethod
+    def _tools_list_response(request_type=None, max_length=128):
+        return {
+            "jsonrpc": "2.0",
+            "id": 70,
+            "result": {
+                "tools": [{
+                    "name": "audit_skill_submit",
+                    "inputSchema": {
+                        "type": "object",
+                        "properties": {
+                            "args": {
+                                "type": "object",
+                                "properties": {
+                                    "client_request_id": {
+                                        "type": request_type or ["string", "null"],
+                                        "maxLength": max_length,
+                                    }
+                                },
+                            }
+                        },
+                    },
+                }]
+            },
+        }
+
+    def _supported_forwarder(self):
+        return FakeForwarder(responses={
+            "tools/list": self._tools_list_response(),
+        })
+
+    @staticmethod
+    def _tools_list_message():
+        return {"jsonrpc": "2.0", "id": 70, "method": "tools/list"}
+
+    def _run_supported(self, forwarder, message):
+        return _run(forwarder, [
+            json.dumps(self._tools_list_message()),
+            json.dumps(message),
+        ])
+
+    @staticmethod
+    def _message(client_request_id=mock.sentinel.missing):
+        workflow_args = {"title": "Explicit audit", "content": "artifact"}
+        if client_request_id is not mock.sentinel.missing:
+            workflow_args["client_request_id"] = client_request_id
+        return {
+            "jsonrpc": "2.0",
+            "id": 71,
+            "method": "tools/call",
+            "params": {
+                "name": "audit_skill_submit",
+                "arguments": {
+                    "skill_name": "audit",
+                    "args": workflow_args,
+                },
+            },
+        }
+
+    def test_missing_id_is_generated_and_forwarded_without_mutating_input(self):
+        request = self._message()
+        original = copy.deepcopy(request)
+        forwarder = self._supported_forwarder()
+
+        self._run_supported(forwarder, request)
+
+        sent_id = forwarder.sent[1]["params"]["arguments"]["args"]["client_request_id"]
+        self.assertRegex(sent_id, r"^[0-9a-f-]{36}$")
+        self.assertEqual(request, original)
+
+    def test_supplied_id_is_trimmed_and_preserved(self):
+        forwarder = self._supported_forwarder()
+
+        self._run_supported(forwarder, self._message(" request-123 "))
+
+        sent_id = forwarder.sent[1]["params"]["arguments"]["args"]["client_request_id"]
+        self.assertEqual(sent_id, "request-123")
+
+    def test_blank_or_null_id_is_treated_as_missing(self):
+        for value in (None, "", "   "):
+            with self.subTest(value=value):
+                forwarder = self._supported_forwarder()
+                self._run_supported(forwarder, self._message(value))
+                sent_id = forwarder.sent[1]["params"]["arguments"]["args"][
+                    "client_request_id"
+                ]
+                self.assertRegex(sent_id, r"^[0-9a-f-]{36}$")
+
+    def test_invalid_id_fails_before_forwarding(self):
+        for value in (42, "x" * 129):
+            with self.subTest(value=value):
+                forwarder = self._supported_forwarder()
+                out = self._run_supported(forwarder, self._message(value))[1]
+                self.assertEqual(out["error"]["code"], -32001)
+                self.assertIn("client_request_id", out["error"]["message"])
+                self.assertEqual(forwarder.sent, [self._tools_list_message()])
+
+    def test_missing_args_keeps_existing_explicit_topic_error(self):
+        forwarder = self._supported_forwarder()
+        message = {
+            "jsonrpc": "2.0",
+            "id": 71,
+            "method": "tools/call",
+            "params": {
+                "name": "audit_skill_submit",
+                "arguments": {"skill_name": "audit"},
+            },
+        }
+
+        out = self._run_supported(forwarder, message)
+
+        self.assertEqual(out[1]["error"]["data"]["reason"], "missing_user_audit_topic")
+        self.assertEqual(forwarder.sent, [self._tools_list_message()])
+
+    def test_without_tools_list_forwards_legacy_shape(self):
+        forwarder = FakeForwarder()
+        message = self._message("caller-supplied")
+
+        _run(forwarder, [json.dumps(message)])
+
+        self.assertNotIn(
+            "client_request_id",
+            forwarder.sent[0]["params"]["arguments"]["args"],
+        )
+
+    def test_unknown_outcome_returns_exact_retry_identity(self):
+        class UnknownForwarder:
+            def __init__(self):
+                self.sent = []
+
+            def forward(self, message):
+                self.sent.append(message)
+                if message.get("method") == "tools/list":
+                    return {
+                        "jsonrpc": "2.0",
+                        "id": message.get("id"),
+                        "result": {
+                            "tools": [{
+                                "name": "audit_skill_submit",
+                                "inputSchema": {
+                                    "type": "object",
+                                    "properties": {
+                                        "args": {
+                                            "type": "object",
+                                            "properties": {
+                                                "client_request_id": {
+                                                    "type": ["string", "null"],
+                                                    "maxLength": 128,
+                                                }
+                                            },
+                                        }
+                                    },
+                                },
+                            }]
+                        },
+                    }
+                raise shim.OutcomeUnknownError("read_timeout", "a" * 32)
+
+        forwarder = UnknownForwarder()
+        out = _run(
+            forwarder,
+            [
+                json.dumps({"jsonrpc": "2.0", "id": 70, "method": "tools/list"}),
+                json.dumps(self._message(" retry-me ")),
+            ],
+        )[1]
+
+        data = out["error"]["data"]
+        self.assertEqual(data["status"], "request_outcome_unknown")
+        self.assertTrue(data["retryable"])
+        self.assertEqual(data["action"], "retry_same_client_request_id")
+        self.assertEqual(data["client_request_id"], "retry-me")
+        self.assertEqual(
+            forwarder.sent[1]["params"]["arguments"]["args"]["client_request_id"],
+            "retry-me",
+        )
+
+    def test_old_server_schema_does_not_claim_safe_retry(self):
+        class OldServerForwarder:
+            def __init__(self):
+                self.sent = []
+
+            def forward(self, message):
+                self.sent.append(message)
+                if message.get("method") == "tools/list":
+                    return {
+                        "jsonrpc": "2.0",
+                        "id": message.get("id"),
+                        "result": {"tools": [{
+                            "name": "audit_skill_submit",
+                            "inputSchema": {"type": "object", "properties": {}},
+                        }]},
+                    }
+                raise shim.OutcomeUnknownError("read_timeout", "b" * 32)
+
+        forwarder = OldServerForwarder()
+        out = _run(
+            forwarder,
+            [
+                json.dumps({"jsonrpc": "2.0", "id": 72, "method": "tools/list"}),
+                json.dumps(self._message("unsafe-on-old-server")),
+            ],
+        )[1]
+
+        data = out["error"]["data"]
+        self.assertFalse(data["retryable"])
+        self.assertEqual(data["action"], "reconcile")
+        self.assertNotIn("client_request_id", data)
+        self.assertNotIn(
+            "client_request_id",
+            forwarder.sent[1]["params"]["arguments"]["args"],
+        )
+
+    def test_capability_accepts_nullable_schema_and_larger_compatible_limit(self):
+        response = self._tools_list_response(max_length=256)
+
+        self.assertTrue(shim._server_supports_audit_client_request_id(response))
+
+    def test_capability_accepts_original_string_schema(self):
+        response = self._tools_list_response(request_type="string")
+
+        self.assertTrue(shim._server_supports_audit_client_request_id(response))
+
+    def test_later_tools_list_without_audit_tool_does_not_clear_support(self):
+        class SequencedForwarder:
+            def __init__(self, supported):
+                self.supported = supported
+                self.sent = []
+                self.list_calls = 0
+
+            def forward(self, message):
+                self.sent.append(message)
+                if message.get("method") == "tools/list":
+                    self.list_calls += 1
+                    if self.list_calls == 1:
+                        return self.supported
+                    return {
+                        "jsonrpc": "2.0",
+                        "id": message.get("id"),
+                        "result": {"tools": []},
+                    }
+                raise shim.OutcomeUnknownError("read_timeout", "c" * 32)
+
+        forwarder = SequencedForwarder(self._tools_list_response())
+        out = _run(
+            forwarder,
+            [
+                json.dumps(self._tools_list_message()),
+                json.dumps({"jsonrpc": "2.0", "id": 73, "method": "tools/list"}),
+                json.dumps(self._message("stable-after-second-list")),
+            ],
+        )[2]
+
+        self.assertTrue(out["error"]["data"]["retryable"])
+        self.assertEqual(
+            out["error"]["data"]["client_request_id"],
+            "stable-after-second-list",
+        )
+
+
 class SessionOutcomeUnknownLatchTests(unittest.TestCase):
     """DE-026 / R-076 behaviour locks.
 
@@ -7020,6 +7476,13 @@ class McpToolLocalizationTests(unittest.TestCase):
         self.assertEqual(
             advertised["audit_skill_submit"]["inputSchema"]["properties"]["args"]["properties"][
                 "ui_locale"]["enum"], ["zh-CN", "en-US"])
+        audit_submit = advertised["audit_skill_submit"]
+        self.assertEqual(
+            audit_submit["inputSchema"]["properties"]["args"]["properties"][
+                "client_request_id"
+            ]["maxLength"],
+            128,
+        )
 
     def test_every_advertised_tool_has_a_locale_table_entry(self):
         # _localize_tool ships structure-only (no description) for a tool missing from the table;

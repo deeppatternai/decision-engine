@@ -39,7 +39,12 @@ installer/
 
 ## Install
 
-**Normal path**: `./install.sh de` (see the repo root README) — this calls
+**End-user path**: use the platform entrypoint documented in the repo root:
+`dp-install.sh` on macOS/Linux or `dp-install.ps1` on Windows. The root
+`install.sh` is a source-checkout orchestration entry retained for the managed
+bootstrap and maintainers; it is not the standalone public bootstrap.
+
+**Managed source path**: `./install.sh de` calls
 `bootstrap_managed_install`, which clones `stable` straight into the fixed
 canonical root (`~/.deeppattern/decision-engine`), verifies its signature,
 lands the body via `installer.install` underneath (see below), and prepares the
@@ -89,14 +94,17 @@ an owner-issued device activation key.
 | TRAE CN Desktop | `trae-cn` | Windows: `%APPDATA%/Trae CN/User/mcp.json`<br>macOS: `~/Library/Application Support/Trae CN/User/mcp.json` | `~/.trae-cn/skills/` | desktop Python (Windows space-safe, macOS direct); JSON includes `cwd`, omits `type` |
 | TRAE Work CN | `trae-work-cn` | Windows: `%APPDATA%/TRAE SOLO CN/User/mcp.json`<br>macOS: `~/Library/Application Support/TRAE SOLO CN/User/mcp.json` | `~/.trae-cn/skills/` | desktop Python (Windows space-safe, macOS direct); JSON includes `cwd`, omits `type` |
 | Tencent WorkBuddy Desktop | `workbuddy` | `~/.workbuddy/mcp.json` | `~/.workbuddy/skills/` | desktop Python (Windows space-safe, macOS direct); JSON omits `cwd`; omits `type` |
-| Tencent WorkBuddy AI Desktop | `workbuddy-ai` | `~/.workbuddy-ai/mcp.json` | `~/.workbuddy-ai/skills/` | desktop Python (macOS direct); JSON omits `cwd`; omits `type` |
+| Tencent WorkBuddy AI Desktop | `workbuddy-ai` | `~/.workbuddy-ai/mcp.json` | before 5.6.2: `~/.workbuddy-ai/skills/`<br>5.6.2+: `~/.workbuddy/skills/` | desktop Python (macOS direct); JSON omits `cwd`; omits `type` |
 
 The Qoder and TRAE families are product-specific Desktop contracts. Claude's
 third-party provider profile, Qoder CN, and TRAE are currently macOS-only;
 Qoder IDE and Qoder CN IDE are not
 silently accepted as their Desktop counterparts. Their host
 modules own the exact installed-product/version guards and launch shape; the
-macOS paths are architecture-neutral for Intel and Apple Silicon.
+macOS paths are architecture-neutral for Intel and Apple Silicon. The IDE
+registrations remain distinct even though Qoder's ACP runtime reports the
+shared `mcphost` connector identity; the installer-authored host marker selects
+the exact adapter before that observed identity enables local display tools.
 
 On macOS, wiring Qoder or Qoder CN also merges the owned
 `decision-engine-audit-routing-v1` `UserPromptSubmit` hook into the same

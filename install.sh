@@ -2,6 +2,11 @@
 #
 # Decision Engine — umbrella installer (Decision Engine + Agent Quality Gates)
 #
+# This is the source-checkout orchestration entry used by the managed bootstrap
+# and maintainers. End users should run dp-install.sh on macOS/Linux or
+# dp-install.ps1 on Windows; those public entrypoints acquire and verify the
+# managed source before invoking this script.
+#
 # One command to put both products on your machine. AQG is the free, local,
 # no-account engineering-discipline toolkit; Decision Engine (DE) is the hosted
 # engine that completes it. DE also runs standalone. Start from either side and

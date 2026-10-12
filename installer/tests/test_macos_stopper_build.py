@@ -15,6 +15,7 @@ Run:  python3 -m unittest installer.tests.test_macos_stopper_build
 
 from __future__ import annotations
 
+import os
 import shutil
 import struct
 import subprocess
@@ -49,6 +50,97 @@ def _last_commit_epoch(path: Path) -> int:
 
 
 class SwiftSourceCompiles(unittest.TestCase):
+    @unittest.skipUnless(sys.platform == "darwin" and shutil.which("swiftc"),
+                         "Native shimmer regression requires macOS + swiftc")
+    def test_native_shimmer_predicate_and_rebuilt_phase(self):
+        source = SOURCE.read_text(encoding="utf-8").split("let app = NSApplication.shared", 1)[0]
+        harness = r'''
+extension DecisionEngineStopper {
+    func verifyShimmerPredicate() {
+        let running: [String: Any] = ["run_id": "hosted", "status": "running"]
+        runsByID["hosted"] = running
+        poll(runID: "hosted")
+        precondition(!serverVerifiedRunIDs.contains("hosted"))
+        var failures: [String] = []
+        if shouldShimmerDepthLine(running) {
+            failures.append("Unpolled Hosted run shimmered")
+        }
+        serverVerifiedRunIDs.insert("hosted")
+        precondition(shouldShimmerDepthLine(running))
+        poll(runID: "hosted")
+        if shouldShimmerDepthLine(running) {
+            failures.append("Confirmed Hosted run shimmered after config disappeared")
+        }
+        serverVerifiedRunIDs.insert("hosted")
+        precondition(shouldShimmerDepthLine(running))
+        for _ in 0..<2 {
+            handleRunVanished(runID: "hosted")
+            if shouldShimmerDepthLine(running) {
+                failures.append("404/410 grace shimmered")
+            }
+        }
+        notFoundPolls.removeValue(forKey: "hosted")
+        precondition(shouldShimmerDepthLine(running))
+        let line = "· DE Lite · Local review in progress · 12s"
+        let reference = NSTextField(labelWithString: line)
+        reference.font = .systemFont(ofSize: 13, weight: .semibold)
+        reference.lineBreakMode = .byTruncatingMiddle
+        let first = ShimmerStatusLabel(text: line, color: .gray)
+        precondition(first.font == reference.font)
+        precondition(first.lineBreakMode == reference.lineBreakMode)
+        precondition(first.cell?.usesSingleLineMode == reference.cell?.usesSingleLineMode)
+        precondition(first.intrinsicContentSize == reference.intrinsicContentSize)
+        var lite = running
+        lite["run_id"] = "lite"
+        lite["local"] = true
+        lite["local_surface"] = "de_lite"
+        runsByID["lite"] = lite
+        poll(runID: "lite")
+        precondition(shouldShimmerDepthLine(lite))
+        for status in ["queued", "checking", "cancelling", "completed", "partial",
+                       "failed", "cancelled", "unknown", "stale"] {
+            var run = running
+            run["status"] = status
+            precondition(!shouldShimmerDepthLine(run), "Unexpected shimmer: \(status)")
+            run["auditors"] = [["status": "running"]]
+            precondition(!shouldShimmerDepthLine(run), "Auditor overrode \(status)")
+        }
+        pollFailures["hosted"] = 1
+        precondition(!shouldShimmerDepthLine(running), "Stale polling state shimmered")
+        pollFailures.removeValue(forKey: "hosted")
+        precondition(shouldShimmerDepthLine(running))
+        let duration = ShimmerStatusLabel.duration
+        let before = ShimmerStatusLabel.phase(at: 5.25)
+        let rebuilt = ShimmerStatusLabel(text: line, color: .gray)
+        precondition(rebuilt.intrinsicContentSize == first.intrinsicContentSize)
+        let afterRebuild = ShimmerStatusLabel.phase(at: 5.25)
+        precondition(before == afterRebuild)
+        precondition(ShimmerStatusLabel.phase(at: 5.25 + duration) == before)
+        if !failures.isEmpty {
+            FileHandle.standardError.write(Data((failures.joined(separator: "; ") + "\n").utf8))
+            Darwin.exit(1)
+        }
+        print("Native shimmer predicate and phase OK")
+    }
+}
+let app = NSApplication.shared
+app.setActivationPolicy(.accessory)
+DecisionEngineStopper().verifyShimmerPredicate()
+'''
+        with tempfile.TemporaryDirectory() as directory:
+            test_source = Path(directory) / "main.swift"
+            binary = Path(directory) / "shimmer-test"
+            test_source.write_text(source + harness, encoding="utf-8")
+            built = subprocess.run(["swiftc", str(test_source), "-o", str(binary)],
+                                   capture_output=True, text=True, timeout=120)
+            self.assertEqual(built.returncode, 0, built.stderr)
+            result = subprocess.run(
+                [str(binary)], capture_output=True, text=True, timeout=30,
+                env={**os.environ, "DE_CONFIG_PATH": str(Path(directory) / "missing-config.json")},
+            )
+            self.assertEqual(result.returncode, 0, result.stderr)
+            self.assertIn("Native shimmer predicate and phase OK", result.stdout)
+
     @unittest.skipUnless(sys.platform == "darwin",
                          "Native model-row regression requires macOS")
     def test_native_model_rows_show_elapsed_and_freeze_terminal_durations(self):

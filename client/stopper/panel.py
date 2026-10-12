@@ -48,6 +48,8 @@ FINISHED_LINGER_S = 30.0     # keep a finished run visible this long before prun
 IDLE_EXIT_S = 2.0            # quit the app this long after the last run disappears
 POLL_INTERVAL_MS = 1000
 SCROLL_MAX_SCREEN_FRACTION = 0.618
+SHIMMER_DURATION_S = 1.75
+SHIMMER_FRAME_MS = 33
 # A running row goes "连接中断" after this long with no successful poll. Polls run at 1 Hz, so this
 # tolerates a long burst of failures (transient drop / hub restart / laptop resume) before we admit
 # we're blind — but stays far under the minutes a real outage lasts.
@@ -211,6 +213,53 @@ def is_stale(run: Dict[str, Any], now: float) -> bool:
     if last_ok <= 0:
         return False                      # never polled yet (just seeded) — not a disconnect
     return (now - last_ok) > STALE_AFTER_S
+
+
+def should_shimmer_depth_line(
+    run: Dict[str, Any], *, run_id: Optional[str] = None,
+    server_verified: Optional[set] = None,
+    poll_failures: Optional[Dict[str, int]] = None,
+    not_found_polls: Optional[Dict[str, int]] = None,
+    now: Optional[float] = None,
+) -> bool:
+    """Whether the collapsed detail line is a trusted, live running state.
+
+    Disk discovery is not proof that a Hosted audit still exists. Hosted rows therefore animate
+    only after a successful poll, and stop immediately during poll failure or gone-response grace.
+    Local rows have no Hub poll; their own running state is authoritative.
+    """
+    if str(run.get("status") or "").lower() != "running" or overall_status(run) != "running":
+        return False
+    if run.get("local"):
+        return True
+    if now is not None and is_stale(run, now):
+        return False
+    authoritative_id = str(run_id or run.get("run_id") or "")
+    return bool(
+        authoritative_id
+        and authoritative_id in (server_verified or set())
+        and authoritative_id not in (poll_failures or {})
+        and authoritative_id not in (not_found_polls or {})
+    )
+
+
+def shimmer_phase(uptime: float) -> float:
+    """Shared process-wide phase, stable across the panel's 1 Hz row reconciliation."""
+    return (uptime % SHIMMER_DURATION_S) / SHIMMER_DURATION_S
+
+
+def _blend_hex_color(base: str, highlight: str, amount: float) -> str:
+    amount = max(0.0, min(1.0, amount))
+    try:
+        base_rgb = tuple(int(base[index:index + 2], 16) for index in (1, 3, 5))
+        highlight_rgb = tuple(int(highlight[index:index + 2], 16) for index in (1, 3, 5))
+    except (TypeError, ValueError):
+        return highlight if amount >= 0.5 else base
+    blended = tuple(
+        round(start + (end - start) * amount)
+        for start, end in zip(base_rgb, highlight_rgb)
+    )
+    return "#%02X%02X%02X" % blended
 
 
 def elapsed_string(seconds: float) -> str:
@@ -490,6 +539,174 @@ def apply_always_on_top(root: Any, tk: Any) -> bool:
     except (AttributeError, TypeError, tk.TclError):
         return False
     return True
+
+
+def _windows_reduce_motion_enabled() -> bool:
+    """Read Windows' "Show animations" accessibility setting without changing it."""
+    try:
+        import ctypes
+
+        animations_enabled = ctypes.c_int(1)
+        ok = ctypes.windll.user32.SystemParametersInfoW(
+            0x1042, 0, ctypes.byref(animations_enabled), 0  # SPI_GETCLIENTAREAANIMATION
+        )
+        return bool(ok) and not bool(animations_enabled.value)
+    except (AttributeError, OSError, TypeError, ValueError):
+        return False
+
+
+def _desktop_setting(command: List[str]) -> Optional[str]:
+    if not command or not os.path.isabs(command[0]):
+        return None
+    try:
+        import subprocess
+
+        result = subprocess.run(
+            command, capture_output=True, text=True, timeout=0.25, check=False,
+        )
+    except (OSError, subprocess.SubprocessError):
+        return None
+    return result.stdout.strip() if result.returncode == 0 else None
+
+
+def _linux_reduce_motion_enabled() -> bool:
+    """Read the common GNOME/GTK and KDE animation settings on a real desktop session."""
+    if not (os.getenv("DISPLAY") or os.getenv("WAYLAND_DISPLAY")):
+        return False
+    enabled = _desktop_setting([
+        "/usr/bin/gsettings", "get", "org.gnome.desktop.interface", "enable-animations",
+    ])
+    if enabled is not None and enabled.lower() == "false":
+        return True
+    if "kde" in os.getenv("XDG_CURRENT_DESKTOP", "").lower():
+        for reader in ("/usr/bin/kreadconfig6", "/usr/bin/kreadconfig5"):
+            factor = _desktop_setting([
+                reader, "--file", "kdeglobals", "--group", "KDE",
+                "--key", "AnimationDurationFactor",
+            ])
+            if factor is not None:
+                try:
+                    return float(factor) <= 0
+                except ValueError:
+                    return False
+    return False
+
+
+def reduce_motion_enabled() -> bool:
+    if os.getenv("DE_REDUCE_MOTION", "").strip().lower() in ("1", "true", "yes", "on"):
+        return True
+    if sys.platform.startswith("win"):
+        return _windows_reduce_motion_enabled()
+    if sys.platform.startswith("linux"):
+        return _linux_reduce_motion_enabled()
+    return False
+
+
+class _ShimmerDetailOverlay:
+    """Canvas overlay that sweeps one highlight band across the complete detail line."""
+
+    def __init__(self, tk: Any, parent: Any, target: Any, *, font: Any) -> None:
+        self._tk = tk
+        self._target = target
+        self._font = font
+        self._font_metrics = None
+        if hasattr(target, "tk"):
+            try:
+                from tkinter import font as tk_font
+
+                self._font_metrics = tk_font.Font(root=target, font=font)
+            except (AttributeError, TypeError, tk.TclError):
+                pass
+        self._canvas = tk.Canvas(
+            parent, bg=BG, bd=0, highlightthickness=0, takefocus=False,
+        )
+        self._items: List[Any] = []
+        self._centers: List[float] = []
+        self._text_width = 0.0
+        self._text = ""
+        self._fg = FG_MUTED
+        self.eligible = False
+        self.animating = False
+        self.phase: Optional[float] = None
+
+    def configure(self, *, text: str, fg: str, eligible: bool) -> None:
+        if text != self._text or fg != self._fg:
+            self._text = text
+            self._fg = fg
+            self._rebuild()
+        self.eligible = bool(eligible)
+        if not self.eligible:
+            self.stop()
+
+    config = configure
+
+    def cget(self, name: str) -> Any:
+        if name == "text":
+            return self._text
+        if name == "fg":
+            return self._fg
+        return self._canvas.cget(name)
+
+    def _rebuild(self) -> None:
+        self._canvas.delete("all")
+        self._items = []
+        self._centers = []
+        cursor = 0.0
+        try:
+            line_midpoint = max(1, int(self._target.winfo_reqheight())) / 2
+        except (AttributeError, TypeError, ValueError, self._tk.TclError):
+            line_midpoint = 10.0
+        for character in self._text:
+            item = self._canvas.create_text(
+                cursor, line_midpoint, text=character, fill=self._fg,
+                font=self._font, anchor="w",
+            )
+            try:
+                bounds = self._canvas.bbox(item)
+            except (AttributeError, TypeError, self._tk.TclError):
+                bounds = None
+            if self._font_metrics is not None:
+                try:
+                    width = max(1.0, float(self._font_metrics.measure(character)))
+                except (AttributeError, TypeError, ValueError, self._tk.TclError):
+                    width = max(1.0, float(bounds[2] - bounds[0])) if bounds is not None else 7.0
+            else:
+                width = max(1.0, float(bounds[2] - bounds[0])) if bounds is not None else 7.0
+            self._items.append(item)
+            self._centers.append(cursor + width / 2)
+            cursor += width
+        self._text_width = cursor
+        if self.animating:
+            self.draw(self.phase if self.phase is not None else shimmer_phase(time.monotonic()))
+
+    def draw(self, phase: float) -> None:
+        if not self.eligible:
+            self.stop()
+            return
+        self.animating = True
+        self.phase = phase
+        self._canvas.place(in_=self._target, x=0, y=0, relwidth=1, relheight=1)
+        try:
+            self._canvas.lift()
+        except (AttributeError, self._tk.TclError):
+            pass
+        band_width = max(48.0, min(104.0, self._text_width * 0.2))
+        center = -band_width + phase * (self._text_width + band_width * 2)
+        radius = band_width / 2
+        for item, item_center in zip(self._items, self._centers):
+            distance = abs(item_center - center) / radius
+            intensity = pow(max(0.0, 1.0 - distance), 1.7) * 0.95
+            self._canvas.itemconfigure(
+                item, fill=_blend_hex_color(self._fg, FG_TEXT, intensity),
+            )
+
+    def stop(self) -> None:
+        self.animating = False
+        self.phase = None
+        try:
+            self._canvas.place_forget()
+        except (AttributeError, self._tk.TclError):
+            pass
 
 
 class _DarkScrollbar:
@@ -864,11 +1081,15 @@ class StopPanelApp:
         self._rows: Dict[str, Dict[str, Any]] = {}
         self._row_order: List[str] = []
         self._empty_label = None
+        self._shimmer_after_id = None
+        self._shimmer_destroyed = False
+        self._reduce_motion = False
 
         # Before Tk(): Windows reads the AppUserModelID when the window registers with the shell,
         # and without our own the taskbar button shows Python's icon rather than this window's.
         tk_icon.claim_app_identity()
         self.root = tk.Tk()
+        self._reduce_motion = reduce_motion_enabled()
         if sys.platform.startswith("linux"):
             self._ui_font, self._mono_font = resolve_linux_tk_fonts(self.root)
         else:
@@ -913,8 +1134,83 @@ class StopPanelApp:
             self.root.bind("<Button-4>", self._scroll_wheel, add="+")
             self.root.bind("<Button-5>", self._scroll_wheel, add="+")
         self.root.bind("<FocusIn>", self._reveal_focused_row, add="+")
+        self.root.bind("<Map>", self._on_window_visibility_changed, add="+")
+        self.root.bind("<Unmap>", self._on_window_visibility_changed, add="+")
+        self.root.bind("<Visibility>", self._on_window_visibility_changed, add="+")
+        self.root.bind("<Destroy>", self._on_window_destroyed, add="+")
         for key, direction in (("<Prior>", -1), ("<Next>", 1)):
             self.scroll_canvas.bind(key, lambda _event, d=direction: self.scroll_canvas.yview_scroll(d, "pages"))
+
+    def _shimmer_overlays(self) -> List[_ShimmerDetailOverlay]:
+        return [
+            widgets["detail_shimmer"]
+            for widgets in self._rows.values()
+            if "detail_shimmer" in widgets
+        ]
+
+    def _window_can_animate(self) -> bool:
+        if self._shimmer_destroyed:
+            return False
+        try:
+            return bool(
+                self.root.winfo_exists()
+                and self.root.winfo_viewable()
+                and self.root.state() not in ("withdrawn", "iconic")
+            )
+        except (AttributeError, TypeError, self._tk.TclError):
+            return False
+
+    def _cancel_shimmer_timer(self) -> None:
+        after_id = self._shimmer_after_id
+        self._shimmer_after_id = None
+        if after_id is None:
+            return
+        try:
+            self.root.after_cancel(after_id)
+        except (AttributeError, TypeError, self._tk.TclError):
+            pass
+
+    def _sync_shimmer_animation(self, *, refresh_motion: bool = True) -> None:
+        overlays = self._shimmer_overlays()
+        eligible = [overlay for overlay in overlays if overlay.eligible]
+        if not eligible or not self._window_can_animate():
+            self._cancel_shimmer_timer()
+            for overlay in overlays:
+                overlay.stop()
+            return
+        if refresh_motion:
+            self._reduce_motion = reduce_motion_enabled()
+        if self._reduce_motion:
+            self._cancel_shimmer_timer()
+            for overlay in overlays:
+                overlay.stop()
+            return
+
+        phase = shimmer_phase(time.monotonic())
+        for overlay in overlays:
+            if overlay.eligible:
+                overlay.draw(phase)
+            else:
+                overlay.stop()
+        if self._shimmer_after_id is None:
+            self._shimmer_after_id = self.root.after(SHIMMER_FRAME_MS, self._animate_shimmer)
+
+    def _animate_shimmer(self) -> None:
+        self._shimmer_after_id = None
+        self._sync_shimmer_animation(refresh_motion=False)
+
+    def _on_window_visibility_changed(self, event: Any = None) -> None:
+        if event is not None and getattr(event, "widget", None) is not self.root:
+            return
+        self._sync_shimmer_animation()
+
+    def _on_window_destroyed(self, event: Any) -> None:
+        if getattr(event, "widget", None) is not self.root:
+            return
+        self._shimmer_destroyed = True
+        self._cancel_shimmer_timer()
+        for overlay in self._shimmer_overlays():
+            overlay.stop()
 
     def _resize_viewport(self, event: Any) -> None:
         self.scroll_canvas.itemconfigure(self._body_window, width=event.width)
@@ -1343,12 +1639,15 @@ class StopPanelApp:
             text, bg=BG, font=(self._ui_font, 12), anchor="w", justify="left",
         )
         detail.pack(anchor="w")
+        detail_shimmer = _ShimmerDetailOverlay(
+            tk, text, detail, font=(self._ui_font, 12),
+        )
         auditor_details = tk.Frame(text, bg=BG)
         return {
             "row": row, "button": button, "title": title,
             "auditor_details": auditor_details, "auditor_labels": [],
             "audit_id_row": audit_id_row, "audit_id_label": audit_id_label,
-            "audit_id": audit_id, "detail": detail,
+            "audit_id": audit_id, "detail": detail, "detail_shimmer": detail_shimmer,
         }
 
     def _update_row(
@@ -1402,9 +1701,20 @@ class StopPanelApp:
             )
         else:
             widgets["audit_id_row"].pack_forget()
-        widgets["detail"].configure(
-            text="· " + depth_line_text(render_run, now, self._frozen),
-            fg=depth_line_color(render_run, now),
+        detail_text = "· " + depth_line_text(render_run, now, self._frozen)
+        detail_color = depth_line_color(render_run, now)
+        widgets["detail"].configure(text=detail_text, fg=detail_color)
+        widgets["detail_shimmer"].configure(
+            text=detail_text,
+            fg=detail_color,
+            eligible=should_shimmer_depth_line(
+                render_run,
+                run_id=row_key,
+                server_verified=self._server_verified,
+                poll_failures=self._poll_failures,
+                not_found_polls=self._not_found_polls,
+                now=now,
+            ),
         )
         self._update_auditor_details(widgets, render_run, now)
 
@@ -1453,6 +1763,7 @@ class StopPanelApp:
                 )
                 self._empty_label.pack(anchor="w")
             self.body.after_idle(self._sync_scroll_region)
+            self._sync_shimmer_animation(refresh_motion=False)
             return
 
         if self._empty_label is not None:
@@ -1480,6 +1791,7 @@ class StopPanelApp:
             self._row_order = list(desired_order)
         # Off-screen canvas windows may defer their Configure event after rows are removed.
         self.body.after_idle(self._sync_scroll_region)
+        self._sync_shimmer_animation(refresh_motion=False)
 
     def run(self) -> None:
         self._tick()

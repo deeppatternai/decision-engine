@@ -35,6 +35,47 @@ _BINARIES = tuple(
 
 
 class MacOSStopperSourceContractTests(unittest.TestCase):
+    def test_hosted_shimmer_requires_confirmed_run_without_gone_grace(self):
+        predicate = _SOURCE.split("private func shouldShimmerDepthLine", 1)[1].split(
+            "private func depthElapsedSeconds", 1
+        )[0]
+        self.assertIn("serverVerifiedRunIDs.contains(runID)", predicate)
+        self.assertIn("notFoundPolls[runID] == nil", predicate)
+        self.assertIn("pollFailures[runID] == nil", predicate)
+        self.assertIn("isLocalRun(run)", predicate)
+
+    def test_missing_hosted_poll_config_revokes_shimmer_confirmation(self):
+        poll = _SOURCE.split("private func poll(runID: String)", 1)[1].split(
+            "let expectedGeneration", 1
+        )[0]
+        config_guard = poll.split("guard let config = readJSON(path: configPath)", 1)[1]
+        self.assertIn("serverVerifiedRunIDs.remove(runID)", config_guard)
+
+    def test_shimmer_is_only_on_the_whole_running_depth_line(self):
+        detail = _SOURCE.split("private func makeRunDetailStack", 1)[1].split(
+            "private func depthLabel", 1
+        )[0]
+        self.assertIn("shouldShimmerDepthLine(run)", detail)
+        self.assertIn('"· " + depthLineText(run)', detail)
+        self.assertIn("depthLineColor(run)", detail)
+        self.assertIn("ShimmerStatusLabel", detail)
+        self.assertIn("auditorLabel(text:", detail)
+        self.assertNotIn('range(of: "审核中")', detail)
+
+    def test_shimmer_uses_shared_phase_and_stops_when_hidden_or_motion_is_reduced(self):
+        shimmer = _SOURCE.split("private final class ShimmerStatusLabel", 1)[1].split(
+            "final class DecisionEngineStopper", 1
+        )[0]
+        self.assertIn("ProcessInfo.processInfo.systemUptime", shimmer)
+        self.assertIn("truncatingRemainder(dividingBy: duration)", shimmer)
+        self.assertIn("accessibilityDisplayShouldReduceMotion", shimmer)
+        self.assertIn("accessibilityDisplayOptionsDidChangeNotification", shimmer)
+        self.assertIn("window.isVisible", shimmer)
+        self.assertIn("displayTimer?.invalidate()", shimmer)
+        self.assertIn("override func viewDidMoveToWindow()", shimmer)
+        self.assertIn("override func draw(_ dirtyRect: NSRect)", shimmer)
+        self.assertIn("0..<24", shimmer)
+
     def test_registry_lock_path_is_injected_by_the_runner(self):
         self.assertIn('"DE_ACTIVE_RUNS_LOCK_PATHS"', _SOURCE)
         self.assertIn('"DE_ACTIVE_RUNS_WRITE_PATHS"', _SOURCE)

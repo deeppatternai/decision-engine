@@ -2016,6 +2016,125 @@ class GitCommandPolicyTests(unittest.TestCase):
         self.assertTrue(candidates)
         self.assertFalse(any("attacker" in str(path).casefold() for path in candidates))
 
+    def test_windows_git_install_roots_cover_both_hives_and_registry_views(self):
+        class FakeKey:
+            def __init__(self, values):
+                self.values = values
+
+            def __enter__(self):
+                return self
+
+            def __exit__(self, _type, _value, _traceback):
+                return False
+
+        class FakeRegistry:
+            HKEY_LOCAL_MACHINE = "HKLM"
+            HKEY_CURRENT_USER = "HKCU"
+            KEY_READ = 1
+            KEY_WOW64_64KEY = 0x100
+            KEY_WOW64_32KEY = 0x200
+
+            def __init__(self):
+                self.values = {
+                    ("HKLM", self.KEY_WOW64_64KEY): {"InstallPath": r"D:\Git"},
+                    ("HKLM", self.KEY_WOW64_32KEY): {"InstallPath": r"D:\Git"},
+                    ("HKCU", self.KEY_WOW64_64KEY): {"InstallPath": r"E:\Tools\Git"},
+                    ("HKCU", self.KEY_WOW64_32KEY): {"InstallPath": "relative\\Git"},
+                }
+
+            def OpenKey(self, hive, subkey, *, access):
+                self.assert_subkey = subkey
+                view = access & (self.KEY_WOW64_64KEY | self.KEY_WOW64_32KEY)
+                values = self.values.get((hive, view))
+                if values is None:
+                    raise OSError("missing fixture key")
+                return FakeKey(values)
+
+            @staticmethod
+            def QueryValueEx(key, name):
+                if name not in key.values:
+                    raise OSError("missing fixture value")
+                return key.values[name], 1
+
+        registry = FakeRegistry()
+        self.assertEqual(
+            updater._windows_git_for_windows_install_roots(registry),
+            (r"D:\Git", r"E:\Tools\Git"),
+        )
+        self.assertEqual(registry.assert_subkey, r"SOFTWARE\GitForWindows")
+
+    def test_windows_custom_git_requires_valid_authenticode_publisher(self):
+        with tempfile.TemporaryDirectory() as folder:
+            candidate = Path(folder) / "Custom" / "Git" / "cmd" / "git.exe"
+            candidate.parent.mkdir(parents=True)
+            candidate.write_bytes(b"signed-git-fixture")
+
+            with (
+                mock.patch.object(updater.os, "name", "nt"),
+                mock.patch.object(
+                    updater, "_trusted_git_candidates", return_value=(candidate,)
+                ),
+                mock.patch.object(
+                    updater, "_windows_git_authenticode_is_valid", return_value=False
+                ) as signature,
+                mock.patch.object(updater, "_run_bounded_git") as run,
+            ):
+                with self.assertRaisesRegex(
+                    updater.UpdateInspectionError, "trusted system"
+                ):
+                    updater._resolve_git_executable()
+            signature.assert_called_once_with(candidate.resolve())
+            run.assert_not_called()
+
+            with (
+                mock.patch.object(updater.os, "name", "nt"),
+                mock.patch.object(
+                    updater, "_trusted_git_candidates", return_value=(candidate,)
+                ),
+                mock.patch.object(
+                    updater, "_windows_git_authenticode_is_valid", return_value=True
+                ),
+                mock.patch.object(updater, "_git_environment", return_value={}),
+                mock.patch.object(
+                    updater,
+                    "_git_arguments",
+                    return_value=(str(candidate.resolve()), "--version"),
+                ),
+                mock.patch.object(
+                    updater,
+                    "_run_bounded_git",
+                    return_value=(0, b"git version 2.51.2.windows.1\n"),
+                ),
+            ):
+                selected = updater._resolve_git_executable(
+                    minimum_version=updater._MINIMUM_GIT_VERSION
+                )
+            self.assertEqual(selected, str(candidate.resolve()))
+
+    def test_windows_git_authenticode_uses_fixed_system_powershell_and_environment_path(
+        self,
+    ):
+        candidate = Path("/fixtures/custom/Git/cmd/git.exe")
+        completed = subprocess.CompletedProcess([], 0, stdout=b"VALID", stderr=b"")
+        with (
+            mock.patch.object(
+                updater, "_windows_system_root", return_value=Path("/Windows")
+            ),
+            mock.patch.object(updater.subprocess, "run", return_value=completed) as run,
+        ):
+            self.assertTrue(updater._windows_git_authenticode_is_valid(candidate))
+
+        args, kwargs = run.call_args
+        argv = args[0]
+        self.assertEqual(
+            argv[0],
+            str(Path("/Windows/System32/WindowsPowerShell/v1.0/powershell.exe")),
+        )
+        self.assertNotIn(str(candidate), argv)
+        self.assertEqual(kwargs["env"]["DE_GIT_SIGNATURE_PATH"], str(candidate))
+        self.assertEqual(kwargs["shell"], False)
+        self.assertEqual(kwargs["timeout"], updater._GIT_TIMEOUT_SECONDS)
+
     def test_posix_git_path_accepts_root_owned_non_writable_system_git(self):
         git = Path("/usr/bin/git")
         stats = {

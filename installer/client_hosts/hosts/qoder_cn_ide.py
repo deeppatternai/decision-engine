@@ -87,7 +87,12 @@ QODER_CN_IDE = AgentHostSpec(
     config_renderer="json-mcp-v1",
     entry_ownership_policy="replace-marked-de-v1",
     config_write_guard_probe=lambda: _config_write_guard(),
-    observed_client_aliases=frozenset({"qoder cn"}),
+    # Qoder CN's ACP runtime owns MCP dispatch and reports the shared Qoder
+    # connector identity. The declared host marker keeps the CN IDE adapter
+    # unambiguous while retaining fail-closed identity enforcement.
+    observed_client_aliases=frozenset(
+        {"qoder cn", "mcphost", "qoder-desktop-mcp-host"}
+    ),
     require_observed_identity=True,
     detection="installation-probe",
     installation_probe=lambda: _installed(),

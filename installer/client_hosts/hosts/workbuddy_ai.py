@@ -13,6 +13,7 @@ from installer.config import ShellError
 
 _MINIMUM_VERSION = (5, 5, 2)
 _TESTED_VERSION = (5, 5, 2)
+_WORKBUDDY_SKILLS_LAYOUT_VERSION = (5, 6, 2)
 
 
 def _workbuddy_ai_config_path() -> Path:
@@ -30,6 +31,13 @@ def _workbuddy_ai_skills_path() -> Path:
     configured = os.getenv("WORKBUDDY_AI_SKILLS_DIR")
     if configured and configured.strip():
         return Path(configured).expanduser()
+    probe = _workbuddy_ai_product_metadata()
+    if (
+        probe.status == "matched"
+        and probe.version is not None
+        and probe.version >= _WORKBUDDY_SKILLS_LAYOUT_VERSION
+    ):
+        return Path.home() / ".workbuddy" / "skills"
     return Path.home() / ".workbuddy-ai" / "skills"
 
 
@@ -143,7 +151,9 @@ WORKBUDDY_AI = AgentHostSpec(
     entry_ownership_policy="replace-marked-de-v1",
     config_write_guard_probe=lambda: _workbuddy_ai_config_write_guard(),
     observed_client_aliases=frozenset({"codebuddy"}),
-    require_observed_identity=True,
+    # WorkBuddy AI derives clientInfo.name from the user-controlled MCP server key.
+    # Keep the observed alias for diagnostics, but do not gate local display on it.
+    require_observed_identity=False,
     detection="installation-probe",
     installation_probe=lambda: _workbuddy_ai_installed(),
     json_include_type=False,
@@ -169,7 +179,7 @@ WORKBUDDY_AI = AgentHostSpec(
     optional_features=frozenset({"local-display", "audit-stop-panel"}),
     onboarding_evidence=("skill",),
     host_owned_entry_fields=frozenset({"disabled"}),
-    unverified_lite_stopper=True,
+    unverified_lite_stopper=False,
     post_mcp_write=_workbuddy_ai_post_mcp_write,
 )
 

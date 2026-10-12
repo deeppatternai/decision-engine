@@ -67,6 +67,12 @@ class _FakeWidget:
 
     place_configure = place
 
+    def place_forget(self):
+        self.options.pop("place", None)
+
+    def lift(self):
+        self.options["lifted"] = True
+
     def pack_propagate(self, value):
         self.options["pack_propagate"] = value
 
@@ -172,6 +178,12 @@ class _FakeCanvas(_FakeWidget):
         left = x if item["options"].get("anchor") == "w" else x - width / 2
         return (round(left), round(y - 7), round(left + width), round(y + 7))
 
+    def delete(self, item_id):
+        if item_id == "all":
+            self.items.clear()
+            return
+        self.items = [item for item in self.items if item["id"] != item_id]
+
 class _FakeTk:
     class TclError(Exception):
         pass
@@ -183,10 +195,44 @@ class _FakeTk:
     Entry = _FakeWidget
 
 
+class _FakeRoot:
+    def __init__(self):
+        self.window_state = "normal"
+        self.viewable = True
+        self.exists = True
+        self.scheduled = {}
+        self.cancelled = []
+        self._next_after_id = 0
+
+    def state(self):
+        return self.window_state
+
+    def winfo_viewable(self):
+        return int(self.viewable)
+
+    def winfo_exists(self):
+        return int(self.exists)
+
+    def after(self, delay, callback):
+        self._next_after_id += 1
+        after_id = "after-%d" % self._next_after_id
+        self.scheduled[after_id] = (delay, callback)
+        return after_id
+
+    def after_cancel(self, after_id):
+        self.cancelled.append(after_id)
+        self.scheduled.pop(after_id, None)
+
+    def run_after(self, after_id):
+        _delay, callback = self.scheduled.pop(after_id)
+        callback()
+
+
 class RenderReconciliationTests(unittest.TestCase):
     def _app(self):
         app = object.__new__(panel.StopPanelApp)
         app._tk = _FakeTk
+        app.root = _FakeRoot()
         app._ui_font = panel._UI
         app._mono_font = panel._MONO
         app.body = _FakeWidget()
@@ -206,11 +252,16 @@ class RenderReconciliationTests(unittest.TestCase):
         app._retired = set()
         app._cancel_inflight = set()
         app._server_verified = {"registry-real"}
+        app._poll_failures = {}
+        app._not_found_polls = {}
         app._state_epochs = {}
         app._lock = threading.Lock()
         app._rows = {}
         app._row_order = []
         app._empty_label = None
+        app._shimmer_after_id = None
+        app._shimmer_destroyed = False
+        app._reduce_motion = False
         return app
 
     def test_refresh_reuses_widgets_and_keeps_button_colors(self):
@@ -291,6 +342,95 @@ class RenderReconciliationTests(unittest.TestCase):
         self.assertEqual(button.cget("bg"), panel.FG_RED)
         self.assertEqual(button.cget("disabledforeground"), "#FFFFFF")
         self.assertEqual(button.canvas.items[1]["options"]["state"], "hidden")
+
+    def test_shimmer_is_limited_to_the_whole_running_detail_line(self):
+        app = self._app()
+        app.runs["registry-real"].update(
+            status="running", auditors=[{"status": "running"}], started_at=1.0,
+        )
+
+        with mock.patch.object(panel, "reduce_motion_enabled", return_value=False), \
+             mock.patch.object(panel.time, "time", return_value=100.0), \
+             mock.patch.object(panel.time, "monotonic", return_value=5.25):
+            app._render()
+
+        widgets = app._rows["registry-real"]
+        shimmer = widgets["detail_shimmer"]
+        self.assertTrue(shimmer.eligible)
+        self.assertTrue(shimmer.animating)
+        self.assertEqual(shimmer.cget("text"), widgets["detail"].cget("text"))
+        self.assertIn("Auditing", shimmer.cget("text"))
+        self.assertEqual(widgets["title"].cget("text"), "Specific audit")
+        self.assertEqual(widgets["button"].cget("bg"), panel.FG_RED)
+        self.assertNotIn("title_shimmer", widgets)
+        self.assertNotIn("button_shimmer", widgets)
+
+    def test_shimmer_keeps_a_shared_monotonic_phase_across_one_hz_rerenders(self):
+        app = self._app()
+        app.runs["registry-real"].update(
+            status="running", auditors=[{"status": "running"}], started_at=1.0,
+        )
+
+        with mock.patch.object(panel, "reduce_motion_enabled", return_value=False), \
+             mock.patch.object(panel.time, "time", return_value=100.0), \
+             mock.patch.object(panel.time, "monotonic", return_value=5.25):
+            app._render()
+        shimmer = app._rows["registry-real"]["detail_shimmer"]
+        first_phase = shimmer.phase
+
+        with mock.patch.object(panel, "reduce_motion_enabled", return_value=False), \
+             mock.patch.object(panel.time, "time", return_value=101.0), \
+             mock.patch.object(panel.time, "monotonic", return_value=6.25):
+            app._render()
+
+        self.assertIs(app._rows["registry-real"]["detail_shimmer"], shimmer)
+        self.assertEqual(first_phase, panel.shimmer_phase(5.25))
+        self.assertEqual(shimmer.phase, panel.shimmer_phase(6.25))
+        self.assertEqual(
+            panel.shimmer_phase(5.25),
+            panel.shimmer_phase(5.25 + panel.SHIMMER_DURATION_S),
+        )
+
+    def test_reduce_motion_and_window_lifecycle_stop_shimmer_work(self):
+        app = self._app()
+        app.runs["registry-real"].update(
+            status="running", auditors=[{"status": "running"}], started_at=1.0,
+        )
+        with mock.patch.object(panel, "reduce_motion_enabled", return_value=False):
+            app._render()
+        shimmer = app._rows["registry-real"]["detail_shimmer"]
+        scheduled = app._shimmer_after_id
+        self.assertIsNotNone(scheduled)
+
+        app.root.window_state = "iconic"
+        with mock.patch.object(panel, "reduce_motion_enabled", return_value=False):
+            app._sync_shimmer_animation()
+        self.assertIsNone(app._shimmer_after_id)
+        self.assertIn(scheduled, app.root.cancelled)
+        self.assertFalse(shimmer.animating)
+
+        app.root.window_state = "normal"
+        with mock.patch.object(panel, "reduce_motion_enabled", return_value=True):
+            app._sync_shimmer_animation()
+        self.assertIsNone(app._shimmer_after_id)
+        self.assertFalse(shimmer.animating)
+
+        app.root.viewable = False
+        with mock.patch.object(panel, "reduce_motion_enabled", return_value=False):
+            app._sync_shimmer_animation()
+        self.assertIsNone(app._shimmer_after_id)
+        self.assertFalse(shimmer.animating)
+
+        app.root.viewable = True
+        with mock.patch.object(panel, "reduce_motion_enabled", return_value=False):
+            app._sync_shimmer_animation()
+        scheduled = app._shimmer_after_id
+        self.assertIsNotNone(scheduled)
+        app._on_window_destroyed(mock.Mock(widget=app.root))
+        self.assertTrue(app._shimmer_destroyed)
+        self.assertIsNone(app._shimmer_after_id)
+        self.assertIn(scheduled, app.root.cancelled)
+        self.assertFalse(shimmer.animating)
 
     def test_unverified_disk_seeded_queue_shows_checking_and_disables_cancel(self):
         app = self._app()
@@ -845,6 +985,52 @@ class AlwaysOnTopTests(unittest.TestCase):
         self.assertTrue(bool(app.root.attributes("-topmost")))
 
 
+class ReduceMotionSettingTests(unittest.TestCase):
+    def test_windows_disabled_client_animation_enables_reduce_motion(self):
+        import ctypes
+
+        user32 = mock.Mock()
+
+        def system_parameters_info(action, _parameter, output, _flags):
+            self.assertEqual(action, 0x1042)
+            output._obj.value = 0
+            return 1
+
+        user32.SystemParametersInfoW.side_effect = system_parameters_info
+        with mock.patch.object(
+            ctypes, "windll", mock.Mock(user32=user32), create=True,
+        ):
+            self.assertTrue(panel._windows_reduce_motion_enabled())
+
+    def test_linux_disabled_desktop_animations_enable_reduce_motion(self):
+        with mock.patch.dict(
+            os.environ,
+            {"DISPLAY": ":0", "XDG_CURRENT_DESKTOP": "GNOME"},
+            clear=True,
+        ), mock.patch.object(panel, "_desktop_setting", return_value="false") as setting:
+            self.assertTrue(panel._linux_reduce_motion_enabled())
+        setting.assert_called_once_with([
+            "/usr/bin/gsettings", "get", "org.gnome.desktop.interface", "enable-animations",
+        ])
+
+    def test_desktop_setting_rejects_non_absolute_commands(self):
+        with mock.patch("subprocess.run") as run:
+            self.assertIsNone(panel._desktop_setting(["gsettings", "get", "schema", "key"]))
+        run.assert_not_called()
+
+    def test_explicit_reduce_motion_override_only_disables_animation(self):
+        with mock.patch.dict(os.environ, {"DE_REDUCE_MOTION": "true"}):
+            self.assertTrue(panel.reduce_motion_enabled())
+
+        with mock.patch.dict(os.environ, {"DE_REDUCE_MOTION": "false"}), \
+             mock.patch.object(panel.sys, "platform", "linux"), \
+             mock.patch.object(panel, "_linux_reduce_motion_enabled", return_value=True):
+            self.assertTrue(
+                panel.reduce_motion_enabled(),
+                "an explicit false value must not override an OS reduce-motion setting",
+            )
+
+
 class RenderHelperTests(unittest.TestCase):
     NOW = 1_000_000.0
 
@@ -940,6 +1126,50 @@ class RenderHelperTests(unittest.TestCase):
             panel.depth_line_text(english_queued, self.NOW, {}),
             "Fast · Queued ⏱",
         )
+
+    def test_shimmer_predicate_matches_running_trust_and_failure_boundaries(self):
+        lite = {
+            "run_id": "local-lite", "local": True, "local_surface": "de_lite",
+            "status": "running", "auditors": [{"status": "running"}],
+            "last_ok_at": self.NOW - panel.STALE_AFTER_S - 1,
+        }
+        hosted = {
+            "run_id": "hosted", "status": "running",
+            "auditors": [{"status": "running"}], "last_ok_at": self.NOW,
+        }
+        self.assertTrue(panel.should_shimmer_depth_line(lite, now=self.NOW))
+        self.assertTrue(panel.should_shimmer_depth_line(
+            hosted, run_id="hosted", server_verified={"hosted"}, now=self.NOW,
+        ))
+
+        self.assertFalse(panel.should_shimmer_depth_line(
+            hosted, run_id="hosted", server_verified=set(), now=self.NOW,
+        ), "an unverified Hosted disk seed must stay static")
+        self.assertFalse(panel.should_shimmer_depth_line(
+            hosted, run_id="hosted", server_verified={"hosted"},
+            poll_failures={"hosted": 1}, now=self.NOW,
+        ))
+        self.assertFalse(panel.should_shimmer_depth_line(
+            hosted, run_id="hosted", server_verified={"hosted"},
+            not_found_polls={"hosted": 1}, now=self.NOW,
+        ), "404/410 grace is not a trusted running view")
+        stale = {**hosted, "last_ok_at": self.NOW - panel.STALE_AFTER_S - 1}
+        self.assertFalse(panel.should_shimmer_depth_line(
+            stale, run_id="hosted", server_verified={"hosted"}, now=self.NOW,
+        ))
+
+        for status in (
+            "completed", "partial", "failed", "cancelled", "cancelling", "timeout", "queued",
+        ):
+            with self.subTest(status=status):
+                run = {**hosted, "status": status, "auditors": []}
+                self.assertFalse(panel.should_shimmer_depth_line(
+                    run, run_id="hosted", server_verified={"hosted"}, now=self.NOW,
+                ))
+        completed_voices = {**hosted, "auditors": [{"status": "completed"}]}
+        self.assertFalse(panel.should_shimmer_depth_line(
+            completed_voices, run_id="hosted", server_verified={"hosted"}, now=self.NOW,
+        ))
 
     def test_hosted_run_ignores_stale_lite_metadata_and_keeps_the_hosted_line(self):
         run = {

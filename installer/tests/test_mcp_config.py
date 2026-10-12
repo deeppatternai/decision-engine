@@ -2796,7 +2796,7 @@ tool_timeout_sec = 660
                 "trae-cn": False,
                 "trae-work-cn": False,
                 "workbuddy": False,
-                "workbuddy-ai": True,
+                "workbuddy-ai": False,
             },
         )
 
