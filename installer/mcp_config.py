@@ -27,6 +27,7 @@ creating a backup before replacing an existing file.
 from __future__ import annotations
 
 import datetime
+import base64
 import hashlib
 import json
 import ntpath
@@ -44,17 +45,28 @@ from typing import Any, Callable, Dict, FrozenSet, List, Optional, Tuple
 
 from installer import client_host_ownership, config, cursor_version, managed_install
 from installer.client_hosts import AgentHostSpec, ClientSpec
+from installer.client_hosts import jsonc as client_jsonc
 from installer.client_hosts import launchers as client_host_launchers
 from installer.client_hosts.contract import (
     SUPPORTED_DOCTOR_CAPABILITIES as _SUPPORTED_DOCTOR_CAPABILITIES,
     validate_host_specs as _validate_host_specs,
 )
 from installer.client_hosts.renderers import (
+    CORDIS_ADDED_SEPARATOR,
+    CORDIS_MANAGED_BEGIN,
+    CORDIS_MANAGED_END,
+    CORDIS_ORIGINAL_ABSENT,
+    CORDIS_ORIGINAL_FILE,
     RendererRequest,
+    cordis_foreign_conflict,
+    cordis_managed_span,
     parse_server_collection,
+    parse_cordis_managed_entry,
     render_entry as _render_registered_entry,
+    render_cordis_managed_block,
     renderer_collection_key,
     renderer_writer,
+    validate_cordis_patch_text,
 )
 from installer.client_hosts.registry import (
     CLIENTS,
@@ -276,6 +288,7 @@ def _render_client_entry(
     startup_timeout_sec: int = _CODEX_STARTUP_TIMEOUT_SEC,
     allow_unactivated: bool = False,
     tool_timeout_sec: int = _CODEX_TOOL_TIMEOUT_SEC,
+    server_name: str = DEFAULT_SERVER_NAME,
 ) -> Dict[str, Any]:
     """Render one MCP entry through the host's registered renderer adapter."""
 
@@ -319,6 +332,7 @@ def _render_client_entry(
         json_include_cwd=spec.json_include_cwd,
         startup_timeout_sec=startup_timeout_sec,
         tool_timeout_sec=tool_timeout_sec,
+        server_name=server_name,
     )
     return _render_registered_entry(spec.config_renderer, request)
 
@@ -362,6 +376,7 @@ def render_entry(
         cwd=cwd,
         dev_root=dev_root,
         allow_unactivated=allow_unactivated,
+        server_name=server_name,
     )
     return {"mcpServers": {server_name: entry}}
 
@@ -401,6 +416,7 @@ def render_codex_entry(
         startup_timeout_sec=startup_timeout_sec,
         allow_unactivated=allow_unactivated,
         tool_timeout_sec=tool_timeout_sec,
+        server_name=server_name,
     )
 
 
@@ -1163,6 +1179,7 @@ def expected_entry(
         cwd=cwd,
         dev_root=dev_root,
         allow_unactivated=allow_unactivated,
+        server_name=server_name,
     )
 
 
@@ -1190,6 +1207,28 @@ def entry_status(
     actual = read_entry(client, server_name)
     if actual is None:
         return "absent"
+    spec = CLIENT_SPECS[client]
+    if spec.config_renderer == "mimocode-jsonc-mcp-v1":
+        command = actual.get("command")
+        if not isinstance(command, list) or not all(
+            isinstance(value, str) for value in command
+        ):
+            return "stale"
+        dev_root = dev_root_from_args(command[1:])
+        if dev_root is not None and not dev_root:
+            return "stale"
+        dev_root_path = Path(dev_root) if dev_root is not None else None
+        if dev_root_path is not None and not (
+            dev_root_path / "installer" / "launcher.py"
+        ).is_file():
+            return "stale"
+        desired = expected_entry(
+            client,
+            server_name,
+            dev_root=dev_root_path,
+            allow_unactivated=allow_unactivated and dev_root_path is None,
+        )
+        return "ready" if actual == desired else "stale"
     dev_root = dev_root_from_args(actual.get("args"))
     if dev_root is not None and not dev_root:
         return "stale"
@@ -2528,9 +2567,481 @@ def _write_toml_renderer(
     )
 
 
+_CORDIS_ORIGINAL_FILE = CORDIS_ORIGINAL_FILE
+_CORDIS_ORIGINAL_ABSENT = CORDIS_ORIGINAL_ABSENT
+_CORDIS_ADDED_SEPARATOR = CORDIS_ADDED_SEPARATOR
+
+
+def _read_cordis_snapshot(
+    path: Path,
+) -> Tuple[bool, Optional[int], Optional[str], bytes, str]:
+    try:
+        managed_install._reject_link_components(path.parent)
+    except managed_install.ManagedInstallError as exc:
+        raise ShellError("Cordis configuration path is unsafe") from exc
+    try:
+        before = os.lstat(path)
+    except FileNotFoundError:
+        return False, None, None, b"", ""
+    except OSError as exc:
+        raise ShellError("Cordis configuration could not be inspected safely") from exc
+    if _stat_is_link_like(before) or not stat.S_ISREG(before.st_mode):
+        raise ShellError("Cordis configuration must be a regular file")
+    if before.st_size > MAX_AGENT_CONFIG_BYTES:
+        raise ShellError("Cordis configuration is too large")
+    flags = os.O_RDONLY | getattr(os, "O_NOFOLLOW", 0) | getattr(os, "O_BINARY", 0)
+    try:
+        fd = os.open(path, flags)
+    except OSError as exc:
+        raise ShellError("Cordis configuration could not be opened safely") from exc
+    try:
+        opened = os.fstat(fd)
+        if (
+            not stat.S_ISREG(opened.st_mode)
+            or not _same_file_snapshot(before, opened)
+            or opened.st_size > MAX_AGENT_CONFIG_BYTES
+        ):
+            raise ShellError("Cordis configuration changed while being read")
+        with os.fdopen(fd, "rb", closefd=False) as handle:
+            raw = handle.read(MAX_AGENT_CONFIG_BYTES + 1)
+        after = os.fstat(fd)
+        path_after = os.lstat(path)
+        if (
+            len(raw) > MAX_AGENT_CONFIG_BYTES
+            or not _same_file_snapshot(opened, after)
+            or not _same_file_snapshot(after, path_after)
+        ):
+            raise ShellError("Cordis configuration changed while being read")
+    finally:
+        os.close(fd)
+    try:
+        text = raw.decode("utf-8")
+    except UnicodeDecodeError as exc:
+        raise ShellError("Cordis configuration is not UTF-8") from exc
+    return (
+        True,
+        before.st_mtime_ns,
+        hashlib.sha256(raw).hexdigest(),
+        raw,
+        text,
+    )
+
+
+def _cordis_newline(text: str) -> str:
+    return "\r\n" if "\r\n" in text else "\n"
+
+
+def _cordis_metadata(block: str) -> Tuple[str, ...]:
+    return tuple(
+        line
+        for line in block.splitlines()
+        if line.startswith(
+            (_CORDIS_ORIGINAL_FILE, _CORDIS_ORIGINAL_ABSENT, _CORDIS_ADDED_SEPARATOR)
+        )
+    )
+
+
+def _compose_cordis_config(
+    text: str,
+    raw: bytes,
+    desired: Dict[str, Any],
+    *,
+    existed: bool,
+) -> str:
+    validate_cordis_patch_text(text)
+    newline = _cordis_newline(text)
+    span = cordis_managed_span(text)
+    metadata: Tuple[str, ...] = ()
+    if span is not None:
+        metadata = _cordis_metadata(text[span[0] : span[1]])
+        block = render_cordis_managed_block(
+            desired,
+            newline=newline,
+            metadata=metadata,
+        )
+        return text[: span[0]] + block + text[span[1] :]
+
+    if cordis_foreign_conflict(text, desired["server_name"]) is not None:
+        raise ShellError(
+            "same_name_unowned: Cordis patch already uses the Decision Engine "
+            "id or serverName; nothing was written"
+        )
+    body = text[1:] if text.startswith("\ufeff") else text
+    empty_flow = re.fullmatch(r"\s*\[\s*\]\s*", body) is not None
+    if not existed:
+        metadata = (_CORDIS_ORIGINAL_ABSENT,)
+        return render_cordis_managed_block(desired, newline=newline, metadata=metadata)
+    if not body.strip() or empty_flow:
+        encoded = base64.b64encode(raw).decode("ascii")
+        metadata = (f"{_CORDIS_ORIGINAL_FILE} {encoded}",)
+        bom = "\ufeff" if text.startswith("\ufeff") else ""
+        return bom + render_cordis_managed_block(
+            desired,
+            newline=newline,
+            metadata=metadata,
+        )
+    separator = ""
+    if not text.endswith(("\n", "\r")):
+        separator = newline
+        metadata = (f"{_CORDIS_ADDED_SEPARATOR} {'CRLF' if newline == chr(13) + chr(10) else 'LF'}",)
+    block = render_cordis_managed_block(desired, newline=newline, metadata=metadata)
+    return text + separator + block
+
+
+def _write_cordis_renderer(
+    client: str,
+    path: Path,
+    server_name: str,
+    *,
+    python: Optional[str],
+    cwd: Optional[Path],
+    dev_root: Optional[Path],
+    dry_run: bool,
+) -> Dict[str, Any]:
+    spec = CLIENT_SPECS[client]
+    desired = _render_client_entry(
+        client,
+        python=python,
+        cwd=cwd,
+        dev_root=dev_root,
+        server_name=server_name,
+    )
+    warning = _config_write_warning(spec)
+    existed, mtime_ns, digest, raw, text = _read_cordis_snapshot(path)
+    current = parse_cordis_managed_entry(text)
+    if current is not None and current.get("server_name") != server_name:
+        raise ShellError("Cordis managed entry identity is invalid")
+    rendered = _compose_cordis_config(text, raw, desired, existed=existed)
+    rendered_raw = rendered.encode("utf-8")
+    if rendered_raw == raw:
+        return {
+            "client": client,
+            "path": str(path),
+            "action": "unchanged",
+            "backup": None,
+            "warning": warning,
+        }
+    action = "updated" if current is not None else "added"
+    if dry_run:
+        return {
+            "client": client,
+            "path": str(path),
+            "action": action + " (dry-run)",
+            "backup": None,
+            "warning": warning,
+        }
+    backup = _backup(path) if existed else None
+    _atomic_write_text(
+        path,
+        rendered,
+        expect_mtime_ns=mtime_ns,
+        expect_sha256=digest,
+        expect_exists=existed,
+        newline="",
+    )
+    verify = read_entry(client, server_name)
+    if verify != desired:
+        raise ShellError("Cordis post-write verification failed")
+    return {
+        "client": client,
+        "path": str(path),
+        "action": action,
+        "backup": str(backup) if backup else None,
+        "warning": warning,
+    }
+
+
+_MIMOCODE_MANAGED_BEGIN = "// BEGIN DEEP PATTERN decision-engine (managed)"
+_MIMOCODE_MANAGED_END = "// END DEEP PATTERN decision-engine (managed)"
+_MIMOCODE_ORIGINAL_ABSENT = "// DE-ORIGINAL-FILE-ABSENT: true"
+_MIMOCODE_ORIGINAL_EMPTY = "// DE-ORIGINAL-FILE-EMPTY: true"
+_MIMOCODE_ADDED_COMMA = "// DE-ADDED-SEPARATOR: comma"
+
+
+def _read_mimocode_snapshot(
+    path: Path,
+) -> Tuple[bool, Optional[int], Optional[str], bytes, str]:
+    try:
+        managed_install._reject_link_components(path.parent)
+    except managed_install.ManagedInstallError as exc:
+        raise ShellError("MiMo configuration path is unsafe") from exc
+    try:
+        before = os.lstat(path)
+    except FileNotFoundError:
+        return False, None, None, b"", ""
+    except OSError as exc:
+        raise ShellError("MiMo configuration could not be inspected safely") from exc
+    if _stat_is_link_like(before) or not stat.S_ISREG(before.st_mode):
+        raise ShellError("MiMo configuration must be a regular file")
+    if before.st_size > MAX_AGENT_CONFIG_BYTES:
+        raise ShellError("MiMo configuration is too large")
+    flags = os.O_RDONLY | getattr(os, "O_NOFOLLOW", 0) | getattr(os, "O_BINARY", 0)
+    try:
+        fd = os.open(path, flags)
+    except OSError as exc:
+        raise ShellError("MiMo configuration could not be opened safely") from exc
+    try:
+        opened = os.fstat(fd)
+        if not stat.S_ISREG(opened.st_mode) or not _same_file_snapshot(before, opened):
+            raise ShellError("MiMo configuration changed while being read")
+        with os.fdopen(fd, "rb", closefd=False) as handle:
+            raw = handle.read(MAX_AGENT_CONFIG_BYTES + 1)
+        after = os.fstat(fd)
+        path_after = os.lstat(path)
+        if (
+            len(raw) > MAX_AGENT_CONFIG_BYTES
+            or not _same_file_snapshot(opened, after)
+            or not _same_file_snapshot(after, path_after)
+        ):
+            raise ShellError("MiMo configuration changed while being read")
+    finally:
+        os.close(fd)
+    try:
+        text = raw.decode("utf-8")
+    except UnicodeDecodeError as exc:
+        raise ShellError("MiMo configuration is not UTF-8") from exc
+    return (
+        True,
+        before.st_mtime_ns,
+        hashlib.sha256(raw).hexdigest(),
+        raw,
+        text,
+    )
+
+
+def _mimocode_managed_span(text: str) -> Optional[Tuple[int, int, str]]:
+    if text.count(_MIMOCODE_MANAGED_BEGIN) != text.count(_MIMOCODE_MANAGED_END):
+        raise ShellError("MiMo managed markers are malformed")
+    if _MIMOCODE_MANAGED_BEGIN not in text:
+        return None
+    if text.count(_MIMOCODE_MANAGED_BEGIN) != 1:
+        raise ShellError("MiMo managed markers are duplicated")
+    begin = text.index(_MIMOCODE_MANAGED_BEGIN)
+    end_marker = text.index(_MIMOCODE_MANAGED_END, begin)
+    managed = text[begin : end_marker + len(_MIMOCODE_MANAGED_END)]
+    line_start = max(text.rfind("\n", 0, begin), text.rfind("\r", 0, begin)) + 1
+    prefix = text[line_start:begin]
+    comma = prefix.rfind(",") if _MIMOCODE_ADDED_COMMA in managed else -1
+    if comma >= 0 and not prefix[comma + 1 :].strip():
+        start = line_start + comma
+        indent = prefix[:comma]
+    else:
+        start = begin
+        indent = prefix[len(prefix.rstrip(" \t")) :]
+    end = end_marker + len(_MIMOCODE_MANAGED_END)
+    newline = "\r\n" if text.startswith("\r\n", end) else "\n" if text.startswith("\n", end) else ""
+    if newline:
+        end += len(newline)
+        if text.startswith(indent, end):
+            end += len(indent)
+    return start, end, managed
+
+
+def _mimocode_owned_entry(entry: Any) -> bool:
+    if not isinstance(entry, dict) or not set(entry).issubset(
+        {"type", "command", "environment", "enabled"}
+    ):
+        return False
+    command = entry.get("command")
+    environment = entry.get("environment")
+    if (
+        entry.get("type") != "local"
+        or not isinstance(command, list)
+        or len(command) < 3
+        or not all(isinstance(value, str) for value in command)
+        or not isinstance(environment, dict)
+        or environment.get(CLIENT_HOST_ENV) != "xiaomi-mimo"
+        or not isinstance(environment.get("PYTHONPATH"), str)
+        or ("enabled" in entry and type(entry["enabled"]) is not bool)
+    ):
+        return False
+    root = _managed_launcher_root(command[1:], environment["PYTHONPATH"])
+    return root is not None and root == environment["PYTHONPATH"]
+
+
+def _mimocode_member_text(
+    key: str,
+    value: Dict[str, Any],
+    *,
+    indent: str,
+    newline: str,
+) -> str:
+    rendered = json.dumps(value, indent=2, ensure_ascii=False).splitlines()
+    first = json.dumps(key, ensure_ascii=False) + ": " + rendered[0]
+    lines = [indent + first]
+    lines.extend(indent + line for line in rendered[1:])
+    return newline.join(lines)
+
+
+def _insert_mimocode_member(
+    text: str,
+    document: client_jsonc.JsoncDocument,
+    *,
+    object_pointer: Tuple[str, ...],
+    key: str,
+    value: Dict[str, Any],
+    original_marker: Optional[str] = None,
+) -> str:
+    close = document.object_closes.get(object_pointer)
+    if close is None:
+        raise ShellError("MiMo MCP parent is not an object")
+    members = document.object_members.get(object_pointer, ())
+    close_indent = client_jsonc.line_indent(text, close)
+    member_indent = close_indent + "  "
+    if members:
+        detected = client_jsonc.line_indent(text, members[-1].key_start)
+        if detected:
+            member_indent = detected
+    needs_comma = bool(members and members[-1].comma is None)
+    newline = client_jsonc.newline_for(text)
+    metadata_lines = []
+    if needs_comma:
+        metadata_lines.append(_MIMOCODE_ADDED_COMMA)
+    if original_marker:
+        metadata_lines.append(original_marker)
+    metadata = "".join(
+        newline + member_indent + marker for marker in metadata_lines
+    )
+    block = (
+        (", " if needs_comma else "")
+        + _MIMOCODE_MANAGED_BEGIN
+        + metadata
+        + newline
+        + _mimocode_member_text(
+            key,
+            value,
+            indent=member_indent,
+            newline=newline,
+        )
+        + newline
+        + member_indent
+        + _MIMOCODE_MANAGED_END
+        + newline
+        + close_indent
+    )
+    return text[:close] + block + text[close:]
+
+
+def _write_mimocode_renderer(
+    client: str,
+    path: Path,
+    server_name: str,
+    *,
+    python: Optional[str],
+    cwd: Optional[Path],
+    dev_root: Optional[Path],
+    dry_run: bool,
+) -> Dict[str, Any]:
+    spec = CLIENT_SPECS[client]
+    warning = _config_write_warning(spec)
+    desired = _render_client_entry(
+        client,
+        python=python,
+        cwd=cwd,
+        dev_root=dev_root,
+        server_name=server_name,
+    )
+    existed, mtime_ns, digest, raw, original = _read_mimocode_snapshot(path)
+    empty = existed and not original.strip("\ufeff \t\r\n")
+    text = original if not empty else "{}"
+    if not existed:
+        text = "{}"
+    document = client_jsonc.parse(text)
+    if not isinstance(document.data, dict):
+        raise ShellError("MiMo configuration top level must be an object")
+    managed_span = _mimocode_managed_span(text)
+    servers = document.data.get("mcp")
+    if servers is not None and not isinstance(servers, dict):
+        raise ShellError("MiMo MCP collection must be an object")
+    existing = servers.get(server_name) if isinstance(servers, dict) else None
+    if existing is not None:
+        if managed_span is None or not _mimocode_owned_entry(existing):
+            raise ShellError(
+                "same_name_unowned: Decision Engine entry differs from the requested "
+                "registration; nothing was written"
+            )
+        if existing == desired:
+            return {
+                "client": client,
+                "path": str(path),
+                "action": "unchanged",
+                "backup": None,
+                "warning": warning,
+            }
+        value_range = document.value_ranges.get(("mcp", server_name))
+        if value_range is None:
+            raise ShellError("MiMo managed entry cannot be located safely")
+        replacement = json.dumps(desired, indent=2, ensure_ascii=False)
+        line_indent = client_jsonc.line_indent(text, value_range[0])
+        replacement = replacement.replace("\n", client_jsonc.newline_for(text) + line_indent)
+        rendered = text[: value_range[0]] + replacement + text[value_range[1] :]
+        action = "updated"
+    else:
+        if managed_span is not None:
+            raise ShellError("MiMo managed markers do not contain the managed entry")
+        original_marker = (
+            _MIMOCODE_ORIGINAL_ABSENT
+            if not existed
+            else _MIMOCODE_ORIGINAL_EMPTY
+            if empty
+            else None
+        )
+        if servers is None:
+            rendered = _insert_mimocode_member(
+                text,
+                document,
+                object_pointer=(),
+                key="mcp",
+                value={server_name: desired},
+                original_marker=original_marker,
+            )
+        else:
+            rendered = _insert_mimocode_member(
+                text,
+                document,
+                object_pointer=("mcp",),
+                key=server_name,
+                value=desired,
+                original_marker=original_marker,
+            )
+        action = "added"
+    parsed = client_jsonc.parse(rendered).data
+    if not isinstance(parsed, dict) or not isinstance(parsed.get("mcp"), dict):
+        raise ShellError("MiMo rendered configuration did not round-trip")
+    if parsed["mcp"].get(server_name) != desired:
+        raise ShellError("MiMo rendered entry did not round-trip")
+    if dry_run:
+        return {
+            "client": client,
+            "path": str(path),
+            "action": action + " (dry-run)",
+            "backup": None,
+            "warning": warning,
+        }
+    _atomic_write_text(
+        path,
+        rendered,
+        expect_mtime_ns=mtime_ns,
+        expect_sha256=digest,
+        expect_exists=existed,
+        newline="",
+    )
+    if read_entry(client, server_name) != desired:
+        raise ShellError("MiMo post-write verification failed")
+    return {
+        "client": client,
+        "path": str(path),
+        "action": action,
+        "backup": None,
+        "warning": warning,
+    }
+
+
 _CONFIG_WRITERS = {
     "json-merge-v1": _write_json_renderer,
     "toml-splice-v1": _write_toml_renderer,
+    "cordis-managed-block-v1": _write_cordis_renderer,
+    "mimocode-jsonc-splice-v1": _write_mimocode_renderer,
 }
 
 
@@ -2601,6 +3112,214 @@ def write_entry(client: str, server_name: str = DEFAULT_SERVER_NAME, *,
         )
     except OSError as exc:
         raise ShellError(client_write_failure_reason(exc)) from exc
+
+
+def _cordis_removed_bytes(text: str, raw: bytes) -> Tuple[bytes, bool]:
+    span = cordis_managed_span(text)
+    if span is None:
+        return raw, False
+    block = text[span[0] : span[1]]
+    parse_cordis_managed_entry(text)
+    original_lines = [
+        line for line in block.splitlines() if line.startswith(_CORDIS_ORIGINAL_FILE)
+    ]
+    absent = _CORDIS_ORIGINAL_ABSENT in block
+    separator_lines = [
+        line for line in block.splitlines() if line.startswith(_CORDIS_ADDED_SEPARATOR)
+    ]
+    if len(original_lines) > 1 or len(separator_lines) > 1 or (original_lines and absent):
+        raise ShellError("Cordis managed restoration metadata is invalid")
+    if original_lines:
+        outside = text[: span[0]] + text[span[1] :]
+        if outside not in {"", "\ufeff"}:
+            raise ShellError(
+                "Cordis patch changed outside the managed block after an empty-patch "
+                "conversion; nothing was removed"
+            )
+        encoded = original_lines[0][len(_CORDIS_ORIGINAL_FILE) :].strip()
+        try:
+            restored = base64.b64decode(encoded, validate=True)
+            restored.decode("utf-8")
+        except (ValueError, UnicodeError) as exc:
+            raise ShellError("Cordis managed restoration metadata is invalid") from exc
+        return restored, False
+    prefix = text[: span[0]]
+    suffix = text[span[1] :]
+    if separator_lines:
+        label = separator_lines[0][len(_CORDIS_ADDED_SEPARATOR) :].strip()
+        separator = "\r\n" if label == "CRLF" else "\n" if label == "LF" else None
+        if separator is None or not prefix.endswith(separator):
+            raise ShellError("Cordis managed separator metadata is invalid")
+        prefix = prefix[: -len(separator)]
+    rendered = (prefix + suffix).encode("utf-8")
+    return rendered, absent and not rendered
+
+
+def _require_cordis_snapshot_current(
+    path: Path,
+    *,
+    mtime_ns: Optional[int],
+    digest: Optional[str],
+) -> None:
+    try:
+        current = os.lstat(path)
+        current_raw = path.read_bytes()
+    except OSError as exc:
+        raise ShellError("Cordis configuration changed before removal") from exc
+    if (
+        _stat_is_link_like(current)
+        or not stat.S_ISREG(current.st_mode)
+        or current.st_mtime_ns != mtime_ns
+        or hashlib.sha256(current_raw).hexdigest() != digest
+    ):
+        raise ShellError("Cordis configuration changed before removal")
+
+
+def _require_mimocode_snapshot_current(
+    path: Path,
+    *,
+    mtime_ns: Optional[int],
+    digest: Optional[str],
+) -> None:
+    try:
+        current = os.lstat(path)
+        current_raw = path.read_bytes()
+    except OSError as exc:
+        raise ShellError("MiMo configuration changed before removal") from exc
+    if (
+        _stat_is_link_like(current)
+        or not stat.S_ISREG(current.st_mode)
+        or current.st_mtime_ns != mtime_ns
+        or hashlib.sha256(current_raw).hexdigest() != digest
+    ):
+        raise ShellError("MiMo configuration changed before removal")
+
+
+def _remove_mimocode_entry(
+    client: str,
+    server_name: str,
+    *,
+    dry_run: bool,
+) -> Dict[str, Any]:
+    path = agent_config_path(client)
+    existed, mtime_ns, digest, _raw, text = _read_mimocode_snapshot(path)
+    if not existed:
+        return {"client": client, "path": str(path), "action": "unchanged", "backup": None}
+    document = client_jsonc.parse(text)
+    if not isinstance(document.data, dict):
+        raise ShellError("MiMo configuration top level must be an object")
+    servers = document.data.get("mcp")
+    if servers is None:
+        return {"client": client, "path": str(path), "action": "unchanged", "backup": None}
+    if not isinstance(servers, dict):
+        raise ShellError("MiMo MCP collection must be an object")
+    entry = servers.get(server_name)
+    if entry is None:
+        return {"client": client, "path": str(path), "action": "unchanged", "backup": None}
+    span = _mimocode_managed_span(text)
+    if span is None or not _mimocode_owned_entry(entry):
+        raise ShellError(
+            "same_name_unowned: Decision Engine entry ownership is unknown; "
+            "nothing was removed"
+        )
+    start, end, managed = span
+    original_absent = _MIMOCODE_ORIGINAL_ABSENT in managed
+    original_empty = _MIMOCODE_ORIGINAL_EMPTY in managed
+    rendered = text[:start] + text[end:]
+    if original_empty:
+        rendered = ""
+    if dry_run:
+        return {
+            "client": client,
+            "path": str(path),
+            "action": "removed (dry-run)",
+            "backup": None,
+        }
+    if original_absent:
+        _require_mimocode_snapshot_current(path, mtime_ns=mtime_ns, digest=digest)
+        path.unlink()
+    else:
+        _atomic_write_text(
+            path,
+            rendered,
+            expect_mtime_ns=mtime_ns,
+            expect_sha256=digest,
+            expect_exists=True,
+            newline="",
+        )
+    if path.exists() and read_entry(client, server_name) is not None:
+        raise ShellError("MiMo post-remove verification failed")
+    return {
+        "client": client,
+        "path": str(path),
+        "action": "removed",
+        "backup": None,
+    }
+
+
+def remove_entry(
+    client: str,
+    server_name: str = DEFAULT_SERVER_NAME,
+    *,
+    dry_run: bool = False,
+    create_backup: bool = True,
+) -> Dict[str, Any]:
+    """Remove one byte-preserving managed host entry.
+
+    Existing JSON/TOML uninstallers retain their established paths. Managed
+    JSONC and Cordis renderers remove only their bounded owned block.
+    """
+
+    spec = CLIENT_SPECS.get(client)
+    if spec is None:
+        raise ShellError("unknown client %r" % client)
+    writer_id = renderer_writer(spec.config_renderer)
+    if writer_id == "mimocode-jsonc-splice-v1":
+        return _remove_mimocode_entry(
+            client,
+            server_name,
+            dry_run=dry_run,
+        )
+    if writer_id != "cordis-managed-block-v1":
+        raise ShellError("configuration remover is unsupported for this client")
+    path = agent_config_path(client)
+    existed, mtime_ns, digest, raw, text = _read_cordis_snapshot(path)
+    if not existed:
+        return {"client": client, "path": str(path), "action": "unchanged", "backup": None}
+    entry = parse_cordis_managed_entry(text)
+    if entry is None:
+        return {"client": client, "path": str(path), "action": "unchanged", "backup": None}
+    if entry.get("server_name") != server_name:
+        raise ShellError("Cordis managed entry identity is invalid")
+    rendered, remove_file = _cordis_removed_bytes(text, raw)
+    if dry_run:
+        return {
+            "client": client,
+            "path": str(path),
+            "action": "removed (dry-run)",
+            "backup": None,
+        }
+    backup = _backup(path) if create_backup else None
+    if remove_file:
+        _require_cordis_snapshot_current(path, mtime_ns=mtime_ns, digest=digest)
+        path.unlink()
+    else:
+        _atomic_write_text(
+            path,
+            rendered.decode("utf-8"),
+            expect_mtime_ns=mtime_ns,
+            expect_sha256=digest,
+            expect_exists=True,
+            newline="",
+        )
+    if path.exists() and parse_cordis_managed_entry(path.read_text(encoding="utf-8")) is not None:
+        raise ShellError("Cordis post-remove verification failed")
+    return {
+        "client": client,
+        "path": str(path),
+        "action": "removed",
+        "backup": str(backup) if backup else None,
+    }
 
 
 def write_entries(

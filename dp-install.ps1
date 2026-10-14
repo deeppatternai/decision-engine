@@ -72,7 +72,7 @@ $script:CodexHookReviewCommand = $null
 $script:CodexHookReviewUnavailable = $false
 $ValidClients = @(
     "claude-code", "claude-desktop", "claude-desktop-3p", "codebuddy",
-    "codex", "cursor", "qoder", "qoder-cn", "qoder-ide", "qoder-cn-ide",
+    "codex", "cursor", "deepseek-harness", "xiaomi-mimo", "qoder", "qoder-cn", "qoder-ide", "qoder-cn-ide",
     "trae", "trae-work", "trae-cn", "trae-work-cn", "workbuddy", "workbuddy-ai"
 )
 
@@ -451,6 +451,8 @@ function Get-AgentDisplayName {
         "codebuddy" = "CodeBuddy [codebuddy]"
         "codex" = "Codex [codex]"
         "cursor" = "Cursor [cursor]"
+        "deepseek-harness" = "DeepSeek Harness [deepseek-harness]"
+        "xiaomi-mimo" = "Xiaomi MiMo [xiaomi-mimo]"
         "qoder" = "Qoder Desktop [qoder]"
         "qoder-cn" = "Qoder CN Desktop [qoder-cn]"
         "qoder-ide" = "Qoder IDE [qoder-ide]"
@@ -2271,6 +2273,62 @@ raise SystemExit(result)
         -Capture:$Capture
 }
 
+function Get-AqgRegistryClients {
+    param(
+        [Parameter(Mandatory = $true)][string]$SourceRoot,
+        [Parameter(Mandatory = $true)][AllowEmptyCollection()][string[]]$SelectedClients
+    )
+
+    $capabilityScript = @'
+from pathlib import Path
+import json
+import sys
+
+root = Path(sys.argv[1]).resolve(strict=True)
+sys.path.insert(0, str(root))
+from scripts.aqg_client_registry import CLIENT_REGISTRY
+
+requested = sys.argv[2:]
+if len(requested) != len(set(requested)) or not all(requested):
+    raise SystemExit("requested AQG client list is invalid")
+print(json.dumps({"clients": [client for client in requested if client in CLIENT_REGISTRY]}))
+'@
+    $result = Invoke-PythonScript `
+        -PythonPath $script:PythonPath `
+        -ScriptText $capabilityScript `
+        -ScriptArguments (@($SourceRoot) + @($SelectedClients)) `
+        -WorkingDirectory (Split-Path -Parent $SourceRoot) `
+        -Capture
+    if ($result.ExitCode -ne 0) {
+        Stop-Install "AQG client capability discovery failed." $ExitBlocked
+    }
+    try {
+        $decoded = ConvertFrom-Json -InputObject (($result.Output | ForEach-Object { [string]$_ }) -join "")
+    }
+    catch {
+        Stop-Install "AQG client capability discovery returned invalid JSON." $ExitBlocked
+    }
+    $properties = @($decoded.PSObject.Properties | ForEach-Object { $_.Name })
+    if ($properties.Count -ne 1 -or $properties[0] -ne "clients") {
+        Stop-Install "AQG client capability discovery returned an invalid JSON object." $ExitBlocked
+    }
+    $clients = @()
+    foreach ($clientValue in @($decoded.clients)) {
+        if ($clientValue -isnot [string]) {
+            Stop-Install "AQG client capability discovery returned a non-string client id." $ExitBlocked
+        }
+        $client = [string]$clientValue
+        if ([string]::IsNullOrWhiteSpace($client) -or
+            $client -match "[\r\n]" -or
+            $SelectedClients -notcontains $client -or
+            $clients -contains $client) {
+            Stop-Install "AQG client capability discovery returned an invalid client list." $ExitBlocked
+        }
+        $clients += $client
+    }
+    return @($clients)
+}
+
 function Invoke-ManagedPython {
     param(
         [Parameter(Mandatory = $true)][string[]]$Arguments,
@@ -3248,7 +3306,8 @@ try {
         "install.sh",
         "AI_SETUP.md",
         "installer\managed_install.py",
-        "installer\bootstrap_managed_install.py"
+        "installer\bootstrap_managed_install.py",
+        "installer\updater.py"
     )) {
         $requiredPath = Join-Path $sourceRoot $required
         if (-not (Test-Path -LiteralPath $requiredPath -PathType Leaf) -or (Test-ReparsePoint -Path $requiredPath)) {
@@ -3266,6 +3325,18 @@ try {
         Stop-Install "The installer source does not declare the approved product repository." $ExitBlocked
     }
 
+    $updaterContract = [System.IO.File]::ReadAllText((Join-Path $sourceRoot "installer\updater.py"))
+    foreach ($requiredContract in @(
+        "def _windows_git_for_windows_install_roots",
+        "def _windows_git_authenticode_is_valid",
+        "SignatureStatus]::Valid"
+    )) {
+        if ($updaterContract -notmatch [regex]::Escape($requiredContract)) {
+            $staleSourceMessage = "The downloaded installer source is stale: installer/updater.py is missing the registered Windows Git resolver contract ('$requiredContract'). Refresh the official installer source before retrying."
+            Stop-Install $staleSourceMessage $ExitBlocked
+        }
+    }
+
     $sourceShaResult = Invoke-WithCleanEnvironment -FilePath $GitPath -ArgumentList @(
         "-C", $sourceRoot, "rev-parse", "HEAD"
     ) -Capture
@@ -3273,6 +3344,7 @@ try {
         Stop-Install "The installer source identity could not be recorded." $ExitBlocked
     }
     $sourceSha = (($sourceShaResult.Output -join "").Trim())
+    Write-Host ("{0}: bootstrap-source={1}" -f $ProgramName, $sourceSha)
 
     # Freeze the installed hosts before AQG or DE can create any host directory,
     # then retain configured integrations while allowing an explicit subset of
@@ -3316,11 +3388,6 @@ try {
         Initialize-CodexHookTarget -SourceRoot $sourceRoot
         Initialize-CodexHookReviewCapability
     }
-    $aqgSupportedClients = @(
-        "claude-code", "codebuddy", "codex", "cursor", "qoder", "qoder-cn",
-        "trae", "trae-work", "trae-cn", "trae-work-cn", "workbuddy", "workbuddy-ai"
-    )
-    $aqgClients = @($selectedClients | Where-Object { $aqgSupportedClients -contains $_ })
     $runtimeRestartRequired = $false
     if ($selectedClients -contains "codex") {
         if (Repair-CodexTomlNewlines -SourceRoot $sourceRoot) {
@@ -3332,6 +3399,20 @@ try {
     $aqgLayoutInfo = Get-VerifiedAqgLayout
     Sync-AqgCheckout -LayoutInfo $aqgLayoutInfo
     Install-AqgDependencies
+
+    $aqgClients = @(
+        Get-AqgRegistryClients `
+            -SourceRoot $AqgRoot `
+            -SelectedClients ([string[]]$selectedClients)
+    )
+    if (($selectedClients -contains "deepseek-harness") -and
+        ($aqgClients -notcontains "deepseek-harness")) {
+        Write-Host "AQG does not expose a deepseek-harness adapter; continuing with DE-only DeepSeek Harness integration."
+    }
+    if (($selectedClients -contains "xiaomi-mimo") -and
+        ($aqgClients -notcontains "xiaomi-mimo")) {
+        Write-Host "AQG does not expose a xiaomi-mimo adapter; continuing with DE-only Xiaomi MiMo integration."
+    }
 
     $aqgAdapter = Join-Path $AqgRoot "scripts\install_aqg_clients.py"
     $aqgDoctor = Join-Path $AqgRoot "scripts\aqg_doctor.py"

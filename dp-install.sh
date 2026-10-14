@@ -47,6 +47,8 @@ DPKG_BIN="/usr/bin/dpkg"
 DPKG_QUERY_BIN="/usr/bin/dpkg-query"
 DNF_BIN=""
 RPM_BIN="/usr/bin/rpm"
+PACMAN_BIN="/usr/bin/pacman"
+PACMAN_KEY_BIN="/usr/bin/pacman-key"
 SUDO_BIN="/usr/bin/sudo"
 EXIT_USAGE=2
 EXIT_BLOCKED=3
@@ -56,7 +58,10 @@ PLATFORM_FAMILY=""
 PLATFORM_DISPLAY_NAME=""
 LINUX_DISTRO_ID=""
 LINUX_VERSION_ID=""
+LINUX_ID_LIKE=""
+LINUX_VARIANT_ID=""
 LINUX_MACHINE_ARCH=""
+LINUX_PACKAGE_MANAGER=""
 PRIVATE_RUNTIME_DOWNLOAD_LABEL=""
 LINUX_PACKAGEKIT_NOTICE_SHOWN=0
 AGENT_TERMINAL_MODE=0
@@ -93,7 +98,7 @@ PLATFORM_KERNEL="$(/usr/bin/uname -s 2>/dev/null || true)"
 case "$PLATFORM_KERNEL" in
   Darwin) PLATFORM_FAMILY="macos"; PLATFORM_DISPLAY_NAME="this Mac" ;;
   Linux) PLATFORM_FAMILY="linux"; PLATFORM_DISPLAY_NAME="this Linux desktop" ;;
-  *) fail "unsupported platform: ${PLATFORM_KERNEL:-unknown}; supported platforms are macOS and supported Ubuntu, Debian, or Fedora desktops" ;;
+  *) fail "unsupported platform: ${PLATFORM_KERNEL:-unknown}; supported platforms are macOS and supported Ubuntu, Debian, Fedora, or Arch-based desktops" ;;
 esac
 
 if [ "$AGENT_ACTIVATION_MODE" -eq 1 ]; then
@@ -260,21 +265,46 @@ fi
 read_linux_os_release() {
   local key value
   [ -r /etc/os-release ] \
-    || fail "Linux installation requires a readable /etc/os-release; supported families are Ubuntu 22.04+, Debian 12+, and Fedora 44+"
+    || fail "Linux installation requires a readable /etc/os-release; supported families are Ubuntu 22.04+, Debian 12+, Fedora 44+, and Arch-based desktops"
   while IFS='=' read -r key value; do
     case "$key" in
       ID)
         value="${value#\"}"
         value="${value%\"}"
+        value="${value#\'}"
+        value="${value%\'}"
         LINUX_DISTRO_ID="$value"
         ;;
       VERSION_ID)
         value="${value#\"}"
         value="${value%\"}"
+        value="${value#\'}"
+        value="${value%\'}"
         LINUX_VERSION_ID="$value"
+        ;;
+      ID_LIKE)
+        value="${value#\"}"
+        value="${value%\"}"
+        value="${value#\'}"
+        value="${value%\'}"
+        LINUX_ID_LIKE="$value"
+        ;;
+      VARIANT_ID)
+        value="${value#\"}"
+        value="${value%\"}"
+        value="${value#\'}"
+        value="${value%\'}"
+        LINUX_VARIANT_ID="$value"
         ;;
     esac
   done </etc/os-release
+}
+
+linux_arch_family() {
+  case " $LINUX_DISTRO_ID $LINUX_ID_LIKE $LINUX_VARIANT_ID " in
+    *\ arch\ *|*\ omarchy\ *) return 0 ;;
+    *) return 1 ;;
+  esac
 }
 
 linux_release_at_least() {
@@ -298,10 +328,26 @@ preflight_linux_platform() {
   local libc_version machine_arch user_id
   read_linux_os_release
   case "$LINUX_DISTRO_ID" in
-    ubuntu) linux_release_at_least 22.04 || fail "unsupported Ubuntu release: ${LINUX_VERSION_ID:-unknown}; Ubuntu 22.04 or newer is required" ;;
-    debian) linux_release_at_least 12 || fail "unsupported Debian release: ${LINUX_VERSION_ID:-unknown}; Debian 12 or newer is required" ;;
-    fedora) linux_release_at_least 44 || fail "unsupported Fedora release: ${LINUX_VERSION_ID:-unknown}; Fedora 44 or newer is required" ;;
-    *) fail "unsupported Linux distribution: ${LINUX_DISTRO_ID:-unknown}; supported families are Ubuntu, Debian, and Fedora" ;;
+    ubuntu)
+      LINUX_PACKAGE_MANAGER="apt"
+      linux_release_at_least 22.04 || fail "unsupported Ubuntu release: ${LINUX_VERSION_ID:-unknown}; Ubuntu 22.04 or newer is required"
+      ;;
+    debian)
+      LINUX_PACKAGE_MANAGER="apt"
+      linux_release_at_least 12 || fail "unsupported Debian release: ${LINUX_VERSION_ID:-unknown}; Debian 12 or newer is required"
+      ;;
+    fedora)
+      LINUX_PACKAGE_MANAGER="dnf"
+      linux_release_at_least 44 || fail "unsupported Fedora release: ${LINUX_VERSION_ID:-unknown}; Fedora 44 or newer is required"
+      ;;
+    arch|omarchy)
+      linux_arch_family || fail "the reported Linux distribution is not an Arch-based system; refusing an unverified pacman layout"
+      LINUX_PACKAGE_MANAGER="pacman"
+      ;;
+    *)
+      linux_arch_family || fail "unsupported Linux distribution: ${LINUX_DISTRO_ID:-unknown}; supported families are Ubuntu, Debian, Fedora, and Arch-based desktops"
+      LINUX_PACKAGE_MANAGER="pacman"
+      ;;
   esac
   [ -x /usr/bin/id ] \
     || fail "the trusted /usr/bin/id tool is unavailable; the desktop user identity cannot be verified"
@@ -321,6 +367,14 @@ preflight_linux_platform() {
     *) fail "unsupported Linux architecture: ${machine_arch:-unknown}; expected x86_64 or aarch64" ;;
   esac
   LINUX_MACHINE_ARCH="$machine_arch"
+  if [ "$LINUX_PACKAGE_MANAGER" = "pacman" ]; then
+    [ -x "$PACMAN_BIN" ] \
+      || fail "the trusted pacman executable is unavailable at $PACMAN_BIN; install Arch's pacman package and retry"
+    [ -x "$PACMAN_KEY_BIN" ] \
+      || fail "the trusted pacman-key executable is unavailable at $PACMAN_KEY_BIN; repair the Arch keyring and retry"
+    "$PACMAN_BIN" --version </dev/null >/dev/null 2>&1 \
+      || fail "the Arch package manager could not report its version; preserve the system and repair pacman before retrying"
+  fi
   if [ -z "${DISPLAY:-}" ] && [ -z "${WAYLAND_DISPLAY:-}" ]; then
     fail "a Linux desktop session is required for masked activation; DISPLAY and WAYLAND_DISPLAY are both unset"
   fi
@@ -612,6 +666,7 @@ client_display_name() {
     codebuddy) printf '%s' 'CodeBuddy [codebuddy]' ;;
     codex) printf '%s' 'Codex [codex]' ;;
     cursor) printf '%s' 'Cursor [cursor]' ;;
+    xiaomi-mimo) printf '%s' 'Xiaomi MiMo [xiaomi-mimo]' ;;
     qoder) printf '%s' 'Qoder Desktop [qoder]' ;;
     qoder-cn) printf '%s' 'Qoder CN Desktop [qoder-cn]' ;;
     qoder-ide) printf '%s' 'Qoder IDE [qoder-ide]' ;;
@@ -1079,6 +1134,12 @@ bootstrap_git_prerequisite_macos() {
 }
 
 linux_native_popup_supported() {
+  if [ "$LINUX_PACKAGE_MANAGER" = "pacman" ]; then
+    case "$LINUX_MACHINE_ARCH" in
+      x86_64|amd64|aarch64|arm64) return 0 ;;
+      *) return 1 ;;
+    esac
+  fi
   case "$LINUX_DISTRO_ID:$LINUX_VERSION_ID" in
     ubuntu:24.04|ubuntu:26.04|fedora:44) return 0 ;;
     ubuntu:22.04|debian:12)
@@ -1196,6 +1257,48 @@ linux_dnf_dependency_packages() {
   fi
 
   printf '%s' "${packages# }"
+}
+
+linux_arch_package_installed() {
+  local package="$1"
+  [ -x "$PACMAN_BIN" ] || return 1
+  "$PACMAN_BIN" -Qq "$package" </dev/null >/dev/null 2>&1
+}
+
+linux_arch_dependency_packages() {
+  local packages="" package
+
+  for package in git curl ca-certificates; do
+    linux_arch_package_installed "$package" || packages="$packages $package"
+  done
+  if linux_native_popup_supported; then
+    linux_shared_library_available "libminizip.so.1" \
+      || packages="$packages minizip"
+    linux_shared_library_available "libxcb-cursor.so.0" \
+      || packages="$packages xcb-util-cursor"
+  fi
+  printf '%s' "${packages# }"
+}
+
+linux_pacman_state_ready() {
+  local database_lock="/var/lib/pacman/db.lck"
+  [ -x "$PACMAN_BIN" ] && [ -x "$PACMAN_KEY_BIN" ] || {
+    tty_print "The trusted pacman or pacman-key executable is unavailable."
+    return 1
+  }
+  if [ -e "$database_lock" ] || [ -L "$database_lock" ]; then
+    tty_print "The Arch package database is locked at $database_lock; finish the other package operation and rerun this installer."
+    return 1
+  fi
+  if ! "$PACMAN_BIN" -Dk </dev/null >/dev/null 2>&1; then
+    tty_print "The Arch package database did not pass its read-only integrity check."
+    return 1
+  fi
+  if ! "$PACMAN_KEY_BIN" --list-keys </dev/null >/dev/null 2>&1; then
+    tty_print "The Arch package signing keyring could not be read safely."
+    return 1
+  fi
+  return 0
 }
 
 select_linux_dnf_bin() {
@@ -1413,6 +1516,59 @@ install_linux_dnf_packages() {
   tty_print "The approved Linux system dependencies were installed."
 }
 
+print_linux_pacman_manual_command() {
+  local packages="$1"
+  tty_print "Run the following command with your system administrator's approval, then rerun this installer:"
+  tty_print "  sudo pacman -Syu --needed $packages"
+  tty_print "The installer will not run a partial-upgrade sequence such as pacman -Sy."
+}
+
+install_linux_pacman_packages() {
+  local packages="$1" prompt="Install these Arch dependencies now?" package
+
+  [ -n "$packages" ] || return 0
+  tty_print "Deep Pattern requires the following Arch package(s):"
+  for package in $packages; do
+    case "$package" in
+      git|curl|ca-certificates|minizip|xcb-util-cursor) ;;
+      *) fail "refusing an unrecognized Arch dependency package: $package" ;;
+    esac
+    tty_print "  $package"
+  done
+  tty_print "pacman will use the system's configured signed repositories and sudo authorization is required."
+  tty_print "No repository configuration will be changed. The installer will not run pacman -Sy or a distribution upgrade."
+  if ! linux_pacman_state_ready; then
+    print_linux_pacman_manual_command "$packages"
+    return 1
+  fi
+  if ! confirm_dependency_install "$prompt"; then
+    tty_print "Arch dependency installation was declined; no package manager was invoked."
+    print_linux_pacman_manual_command "$packages"
+    return 1
+  fi
+  [ -x "$SUDO_BIN" ] || {
+    tty_print "The trusted sudo executable is unavailable at $SUDO_BIN."
+    print_linux_pacman_manual_command "$packages"
+    return 1
+  }
+  if ! clean_exec "$SUDO_BIN" -v </dev/tty; then
+    tty_print "Sudo authorization was not granted; no pacman command was run."
+    print_linux_pacman_manual_command "$packages"
+    return 1
+  fi
+  set --
+  for package in $packages; do
+    set -- "$@" "$package"
+  done
+  tty_print "Installing the approved Arch dependencies without refreshing repositories separately..."
+  if ! clean_exec "$SUDO_BIN" "$PACMAN_BIN" -S --needed --noconfirm "$@" </dev/tty; then
+    tty_print "pacman did not complete successfully; repair the package state and rerun this installer."
+    print_linux_pacman_manual_command "$packages"
+    return 1
+  fi
+  tty_print "The approved Arch dependencies were installed."
+}
+
 linux_core_dependencies_ready() {
   try_git "/usr/bin/git" \
     && [ -x /usr/bin/curl ] \
@@ -1442,13 +1598,31 @@ linux_git_prerequisite() {
         install_linux_dnf_packages "$packages" || true
       fi
       ;;
+    arch|omarchy|*)
+      if [ "$LINUX_PACKAGE_MANAGER" = "pacman" ]; then
+        packages="$(linux_arch_dependency_packages)"
+        package_manager="pacman"
+        if [ -n "$packages" ]; then
+          install_linux_pacman_packages "$packages" || true
+        fi
+      fi
+      ;;
   esac
+  if [ "$LINUX_PACKAGE_MANAGER" = "pacman" ] && [ -z "$packages" ] \
+      && ! linux_pacman_state_ready; then
+    fail "the Arch package database or signing keyring is not ready; repair it without changing the Deep Pattern managed state, then retry"
+  fi
   if [ -n "$packages" ] && ! linux_core_dependencies_ready; then
     linux_core_dependencies_ready \
       || fail "required Linux dependencies are unavailable; install the packages shown above, then rerun this installer"
   fi
   if [ -n "$packages" ]; then
-    if [ "$LINUX_DISTRO_ID:$LINUX_VERSION_ID" = "fedora:44" ] \
+    if [ "$LINUX_PACKAGE_MANAGER" = "pacman" ] \
+        && linux_native_popup_supported \
+        && { ! linux_shared_library_available "libminizip.so.1" \
+          || ! linux_shared_library_available "libxcb-cursor.so.0"; }; then
+      tty_print "Core Linux prerequisites are ready; optional Arch native visual-window dependencies remain unavailable."
+    elif [ "$LINUX_DISTRO_ID:$LINUX_VERSION_ID" = "fedora:44" ] \
         && { [ ! -x /usr/bin/ar ] \
           || [ ! -x /usr/bin/zstd ] \
           || ! linux_shared_library_available "libxcb-cursor.so.0"; }; then
@@ -2793,6 +2967,15 @@ while IFS= read -r aqg_client; do
   fi
 done <<<"$aqg_detected_clients"
 
+if line_list_contains "$selected_source_clients" "deepseek-harness" \
+    && ! comma_list_contains "$aqg_selected_clients" "deepseek-harness"; then
+  tty_print "AQG does not expose a deepseek-harness adapter; continuing with DE-only DeepSeek Harness integration."
+fi
+if line_list_contains "$selected_source_clients" "xiaomi-mimo" \
+    && ! comma_list_contains "$aqg_selected_clients" "xiaomi-mimo"; then
+  tty_print "AQG does not expose a xiaomi-mimo adapter; continuing with DE-only Xiaomi MiMo integration."
+fi
+
 install_aqg_dependencies \
   || fail "AQG dependency installation failed; Decision Engine was not installed"
 
@@ -3579,8 +3762,13 @@ raise SystemExit(0 if all(metadata.version(name) == version for name, version in
       xcb_cursor_package="xcb-util-cursor"
       ;;
     *)
-      tty_print "Warning: no native visual-window package mapping exists for $LINUX_DISTRO_ID $LINUX_VERSION_ID."
-      return 1
+      if [ "$LINUX_PACKAGE_MANAGER" = "pacman" ]; then
+        minizip_package="minizip"
+        xcb_cursor_package="xcb-util-cursor"
+      else
+        tty_print "Warning: no native visual-window package mapping exists for $LINUX_DISTRO_ID $LINUX_VERSION_ID."
+        return 1
+      fi
       ;;
   esac
   if [ -n "$minizip_package" ] && ! run_managed_python -c \
@@ -3596,7 +3784,9 @@ raise SystemExit(0 if all(metadata.version(name) == version for name, version in
   if [ -n "$missing_packages" ]; then
     tty_print "$LINUX_DISTRO_ID $LINUX_VERSION_ID native visual windows require missing system package(s):$missing_packages"
     tty_print "Install them with your system administrator's approval, then rerun:"
-    if [ "$LINUX_DISTRO_ID" = "fedora" ]; then
+    if [ "$LINUX_PACKAGE_MANAGER" = "pacman" ]; then
+      tty_print "  sudo pacman -Syu --needed$missing_packages"
+    elif [ "$LINUX_DISTRO_ID" = "fedora" ]; then
       tty_print "  sudo dnf --refresh --setopt=install_weak_deps=False install$missing_packages"
     else
       tty_print "  sudo apt-get install --no-install-recommends$missing_packages"

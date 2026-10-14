@@ -133,10 +133,21 @@ class InstallerTestCase(unittest.TestCase):
             "WORKBUDDY_AI_APP_ROOT": str(
                 base / "no-workbuddy-ai" / "app"
             ),
+            "MIMOCODE_HOME": str(base / "no-mimocode"),
+            "XIAOMI_MIMO_APP_DIRS": str(base / "no-mimo-apps"),
+            "DSH_HOME": str(base / "no-deepseek-harness"),
+            "DEEPSEEK_HARNESS_CONFIG": str(
+                base / "no-deepseek-harness" / "cordis.patch.yml"
+            ),
             "DE_CONFIG_PATH": str(self.deeppattern / "decision-engine" / "config.json"),
         }
         self._saved = {k: os.environ.get(k) for k in self._env}
         os.environ.update(self._env)
+        self._deepseek_app_roots_patch = mock.patch(
+            "installer.client_hosts.hosts.deepseek_harness._macos_application_roots",
+            return_value=(base / "no-deepseek-apps",),
+        )
+        self._deepseek_app_roots_patch.start()
         (base / ".claude.json").touch()
 
     def _seed_component(self, comp: str, skill: str) -> None:
@@ -145,6 +156,7 @@ class InstallerTestCase(unittest.TestCase):
         (skill_dir / "SKILL.md").write_text("# %s\n" % skill, encoding="utf-8")
 
     def tearDown(self) -> None:
+        self._deepseek_app_roots_patch.stop()
         for k, v in self._saved.items():
             if v is None:
                 os.environ.pop(k, None)

@@ -65,6 +65,129 @@ class WindowsLifecycleContractTests(unittest.TestCase):
         cls.helper: dict[str, object] = {"__name__": __name__}
         exec(compile(cls.helper_source, str(UNINSTALL), "exec"), cls.helper)
 
+    def test_deepseek_harness_uses_registry_driven_aqg_capability(self) -> None:
+        self.assertIn('"deepseek-harness"', self.install)
+        self.assertIn(
+            '"deepseek-harness" = "DeepSeek Harness [deepseek-harness]"',
+            self.install,
+        )
+        self.assertIn("aqg_client_registry", self.install)
+        self.assertIn("CLIENT_REGISTRY", self.install)
+        self.assertNotRegex(
+            self.install,
+            r"\$aqgSupportedClients\s*=\s*@\(",
+        )
+        self.assertIn("DE-only", self.install)
+
+    def test_xiaomi_mimo_uses_registry_driven_aqg_capability(self) -> None:
+        self.assertIn('"xiaomi-mimo"', self.install)
+        self.assertIn(
+            '"xiaomi-mimo" = "Xiaomi MiMo [xiaomi-mimo]"',
+            self.install,
+        )
+        self.assertIn("DE-only Xiaomi MiMo integration", self.install)
+
+    def test_xiaomi_mimo_uninstall_uses_dedicated_jsonc_action(self) -> None:
+        home = Path("C:/Users/test")
+        with mock.patch.dict(os.environ, {}, clear=False):
+            os.environ.pop("MIMOCODE_HOME", None)
+            os.environ.pop("XDG_CONFIG_HOME", None)
+            paths = self.helper["known_windows_mimocode_paths"](home)
+        self.assertEqual(
+            paths,
+            (
+                home / ".config" / "mimocode" / "mimocode.jsonc",
+                home / ".config" / "mimocode" / "mimocode.json",
+                home / ".config" / "mimocode" / "config.json",
+            ),
+        )
+        self.assertIn('"edit-mimocode-jsonc"', self.helper_source)
+        self.assertIn(
+            'remove_entry("xiaomi-mimo", create_backup=False)',
+            self.helper_source,
+        )
+        mimo_branch = self.helper_source.index('action.kind == "edit-mimocode-jsonc"')
+        backup_call = self.helper_source.index("copy_config_backup(path", mimo_branch)
+        branch_return = self.helper_source.index("return", mimo_branch)
+        self.assertLess(branch_return, backup_call)
+
+    def test_deepseek_harness_uninstall_uses_dedicated_cordis_action(self) -> None:
+        self.assertIn('home / ".dsh" / "cordis.patch.yml"', self.helper_source)
+        self.assertIn('home / ".dsh" / "skills"', self.helper_source)
+        config_paths = self.helper["known_windows_config_paths"](Path("C:/Users/test"))
+        cordis_paths = self.helper["known_windows_cordis_paths"](Path("C:/Users/test"))
+        self.assertNotIn(Path("C:/Users/test/.dsh/cordis.patch.yml"), config_paths)
+        self.assertEqual(
+            cordis_paths,
+            (Path("C:/Users/test/.dsh/cordis.patch.yml"),),
+        )
+        self.assertIn('"edit-cordis-yaml"', self.helper_source)
+        self.assertIn(
+            'remove_entry("deepseek-harness", create_backup=False)',
+            self.helper_source,
+        )
+        cordis_branch = self.helper_source.index('action.kind == "edit-cordis-yaml"')
+        json_branch = self.helper_source.index('action.kind == "edit-json"')
+        self.assertNotEqual(cordis_branch, json_branch)
+
+    def test_orphan_cordis_user_yaml_is_preserved_without_json_parsing(self) -> None:
+        with tempfile.TemporaryDirectory() as temporary:
+            home = Path(temporary).resolve() / "home"
+            config = home / ".dsh" / "cordis.patch.yml"
+            config.parent.mkdir(parents=True)
+            original = b"- id: personal\n  config:\n    token: !!js process.env.DSH_TOKEN\n"
+            config.write_bytes(original)
+
+            with mock.patch.dict(
+                os.environ,
+                {
+                    "APPDATA": str(home / "AppData" / "Roaming"),
+                    "LOCALAPPDATA": str(home / "AppData" / "Local"),
+                    "USERPROFILE": str(home),
+                    "HOME": str(home),
+                },
+                clear=False,
+            ):
+                inventory = self.helper["Inventory"](home, "de")
+                inventory.inspect_unprovable_residue()
+
+            self.assertEqual(inventory.blockers, [])
+            self.assertEqual(config.read_bytes(), original)
+            self.assertTrue(
+                any("PRESERVE no provable DE integration residue" in note for note in inventory.notes)
+            )
+
+    def test_orphan_cordis_managed_marker_fails_closed(self) -> None:
+        with tempfile.TemporaryDirectory() as temporary:
+            home = Path(temporary).resolve() / "home"
+            config = home / ".dsh" / "cordis.patch.yml"
+            config.parent.mkdir(parents=True)
+            original = (
+                b"- id: personal\n"
+                b"# BEGIN DEEP PATTERN decision-engine (managed)\n"
+                b"- insert: []\n"
+                b"# END DEEP PATTERN decision-engine (managed)\n"
+            )
+            config.write_bytes(original)
+
+            with mock.patch.dict(
+                os.environ,
+                {
+                    "APPDATA": str(home / "AppData" / "Roaming"),
+                    "LOCALAPPDATA": str(home / "AppData" / "Local"),
+                    "USERPROFILE": str(home),
+                    "HOME": str(home),
+                },
+                clear=False,
+            ):
+                inventory = self.helper["Inventory"](home, "de")
+                inventory.inspect_unprovable_residue()
+
+            self.assertTrue(
+                any("managed Cordis marker remains" in item for item in inventory.blockers)
+            )
+            self.assertEqual(config.read_bytes(), original)
+
     def test_agent_terminal_modes_preserve_the_no_argument_install_path(self) -> None:
         parameter_block = self.install[: self.install.index("Set-StrictMode")]
         for expected in (
@@ -1297,13 +1420,24 @@ Write-Host "PASS"
             self.helper_source.index("def apply_inventory(") :
             self.helper_source.index("def verify_after_apply(")
         ]
+        cordis_stage = apply_source.index("pre_root_config_actions")
         root_stage = apply_source.index("pre_aqg_root_actions")
         aqg_uninstall = apply_source.index("invoke_aqg_uninstaller(inv)")
-        config_apply = apply_source.index("apply_config(")
+        config_apply = apply_source.index(
+            "for index, action in enumerate(config_actions, 1)",
+            root_stage,
+        )
         route_remove = apply_source.index("remove_skill_route(")
+        self.assertLess(cordis_stage, root_stage)
         self.assertLess(root_stage, aqg_uninstall)
         self.assertLess(root_stage, config_apply)
         self.assertLess(root_stage, route_remove)
+        self.assertIn(
+            'action.kind == "edit-cordis-yaml"',
+            apply_source[cordis_stage:root_stage],
+        )
+        self.assertNotIn('"edit-json"', apply_source[cordis_stage:root_stage])
+        self.assertNotIn('"edit-toml"', apply_source[cordis_stage:root_stage])
         self.assertIn("prepare_tree_for_quarantine", self.helper_source)
         self.assertIn("remove_tree", self.helper_source)
 

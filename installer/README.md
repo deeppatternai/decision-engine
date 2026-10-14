@@ -84,6 +84,8 @@ an owner-issued device activation key.
 | Claude third-party provider profile | `claude-desktop-3p` | `~/Library/Application Support/Claude-3p/claude_desktop_config.json` | none | direct Python; JSON includes `cwd`; includes `type` |
 | Tencent CodeBuddy Agent CLI | `codebuddy` | `~/.codebuddy/mcp.json` | `~/.codebuddy/skills/` | direct Python; JSON omits `cwd`; omits `type`; CodeBuddy Studio is not installation evidence |
 | Codex | `codex` | `~/.codex/config.toml` | `~/.codex/skills/` | direct Python; TOML launcher |
+| DeepSeek Harness | `deepseek-harness` | `~/.dsh/cordis.patch.yml` (or `$DSH_HOME/cordis.patch.yml`) | `~/.dsh/skills/` (or `$DSH_HOME/skills/`) | direct Python; byte-preserving Cordis YAML managed block; detects the native macOS app bundle before first configuration; core MCP, native display windows, and Audit Stop Panel; no popup follow-up |
+| Xiaomi MiMo | `xiaomi-mimo` | `~/.config/mimocode/mimocode.jsonc` (or first existing `mimocode.jsonc`, `mimocode.json`, `config.json` under `$MIMOCODE_HOME/config` then `$XDG_CONFIG_HOME/mimocode`) | `~/.config/mimocode/skills/` (same config-root precedence) | direct Python; byte-preserving JSONC managed member; exact native macOS app identity or existing cross-platform config; core MCP, native display windows, and Audit Stop Panel; no popup follow-up; provider credentials remain foreign state |
 | Cursor | `cursor` | `~/.cursor/mcp.json` | `~/.cursor/skills/` | direct Python; JSON omits `cwd`; omits `type` |
 | Alibaba Qoder Desktop | `qoder` | `~/.qoder/mcp.json` (Windows); `~/.qoder/settings.json` (macOS) | `~/.qoder/skills/` | absolute `installer/mcp_bootstrap.py`; JSON omits `cwd`; omits `type` |
 | Alibaba Qoder CN Desktop | `qoder-cn` | `~/.qoder-cn/settings.json` | `~/.qoder-cn/skills/` | absolute `installer/mcp_bootstrap.py`; JSON omits `cwd`; omits `type` |
@@ -156,14 +158,19 @@ commit or paste anywhere.
 
 The public `dp-install.sh` entrypoint is shared by macOS and supported glibc
 Linux desktops. Linux support is bounded to Ubuntu 22.04/24.04 LTS, Debian 12,
-and Fedora 44 on `x86_64`/`aarch64`. The entrypoint verifies the distribution,
-architecture, non-root desktop session, Git 2.36+, system CA bundle, and its
-private Python 3.13 runtime before wiring hosts. Missing allowlisted APT/DNF
-packages require interactive consent and sudo; repository configuration and
-full system upgrades are outside its authority.
+Fedora 44, and recognized Arch Linux/Omarchy systems. Ubuntu, Debian, and Fedora
+support `x86_64`/`aarch64`; the Arch-family path is acceptance-tested on Omarchy
+`aarch64`, while its implemented `x86_64` path awaits native-device acceptance.
+The entrypoint verifies the distribution, architecture, non-root desktop
+session, Git 2.36+, system CA bundle, and its private Python 3.13 runtime before
+wiring hosts. Missing allowlisted APT/DNF/pacman packages require interactive
+consent and sudo. Repository configuration, standalone `pacman -Sy`, and silent
+full-system upgrades are outside its authority.
 
 Linux native popup provisioning uses fixed GTK bindings on Debian 12 ARM64 and
-fixed Qt/WebEngine packages on compatible targets. Fedora's non-system
+fixed Qt/WebEngine packages on compatible targets, including recognized
+Arch-family systems. Missing optional Arch visual-window packages do not block
+core MCP installation. Fedora's non-system
 `libminizip.so.1` compatibility file is downloaded by fixed URL, size, and
 SHA-256 into the private runtime. Linux uses the in-process Stopper fallback and
 does not install a system service. `dp-uninstall.sh --scope both --apply` is the
@@ -343,7 +350,14 @@ calls this to finish the job. It's documented here because it's the actual
 enforcement point: the checks above are what make a `bootstrap_managed_install`
 run refuse, not that module's own logic.
 
-## Verify the shell is clean
+## Source checkout development and release checks
+
+The commands in this section are for maintainers working from the repository
+root with a prepared development Python and declared dependencies. They are not
+installed-user diagnostic commands. Installed users should run the platform
+`dp-doctor` entrypoint documented in the root README instead.
+
+### Verify the shell is clean
 
 The shell must never carry server addresses, secrets, device tokens, prompts,
 layouts, orchestration, or GUI/ad source. Run its mechanical
@@ -358,7 +372,7 @@ These checks cover known-shape secrets, IP literals, configured internal
 identifiers, and scanner regressions. They complement rather than replace the
 public allowlist and manual review of the client/service boundary.
 
-## Run the tests
+### Run the tests
 
 Run these unittest checks in the Python environment used for installation and MCP,
 with the dependencies declared in the root `pyproject.toml` installed:

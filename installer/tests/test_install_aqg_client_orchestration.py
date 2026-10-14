@@ -24,6 +24,22 @@ set -u
 args="$*"
 event_file="${EVENT_FILE:?EVENT_FILE not set}"
 case "$args" in
+  *mcp_config.client_present*xiaomi-mimo*)
+    echo "mimo-detect" >> "$event_file"
+    exit "${FAKE_MIMO_INSTALLED_RC:-1}"
+    ;;
+  *aqg_client_registry*xiaomi-mimo*)
+    echo "mimo-capability" >> "$event_file"
+    exit "${FAKE_AQG_MIMO_CAPABILITY_RC:-1}"
+    ;;
+  *mcp_config.client_present*deepseek-harness*)
+    echo "dsh-detect" >> "$event_file"
+    exit "${FAKE_DSH_INSTALLED_RC:-1}"
+    ;;
+  *aqg_client_registry*deepseek-harness*)
+    echo "dsh-capability" >> "$event_file"
+    exit "${FAKE_AQG_DSH_CAPABILITY_RC:-1}"
+    ;;
   *aqg_doctor.py*)
     echo "doctor" >> "$event_file"
     exit "${FAKE_DOCTOR_RC:-0}"
@@ -123,6 +139,10 @@ class InstallAqgClientOrchestrationTest(unittest.TestCase):
         target="de",
         include_wrapper=True,
         git_file=False,
+        dsh_installed=False,
+        aqg_dsh_capable=False,
+        mimo_installed=False,
+        aqg_mimo_capable=False,
     ):
         tmp = Path(tempfile.mkdtemp(prefix="aqg-orch-"))
         self.addCleanup(shutil.rmtree, tmp, ignore_errors=True)
@@ -161,6 +181,10 @@ class InstallAqgClientOrchestrationTest(unittest.TestCase):
                 "FAKE_DOCTOR_RC": str(doctor_rc),
                 "FAKE_APPLY_RC": str(apply_rc),
                 "FAKE_VERIFY_RC": str(verify_rc),
+                "FAKE_DSH_INSTALLED_RC": "0" if dsh_installed else "1",
+                "FAKE_AQG_DSH_CAPABILITY_RC": "0" if aqg_dsh_capable else "1",
+                "FAKE_MIMO_INSTALLED_RC": "0" if mimo_installed else "1",
+                "FAKE_AQG_MIMO_CAPABILITY_RC": "0" if aqg_mimo_capable else "1",
             }
         )
 
@@ -175,10 +199,59 @@ class InstallAqgClientOrchestrationTest(unittest.TestCase):
         ]
         return completed, events, invocations
 
+    def test_old_aqg_degrades_deepseek_harness_to_de_only(self):
+        completed, events, _ = self._run_install(
+            dsh_installed=True,
+            aqg_dsh_capable=False,
+        )
+
+        self.assertEqual(completed.returncode, 0, msg=completed.stderr)
+        self.assertIn("dsh-detect", events)
+        self.assertIn("dsh-capability", events)
+        self.assertIn("de-core", events)
+        self.assertIn("deepseek-harness", completed.stdout)
+        self.assertIn("DE-only", completed.stdout)
+
+    def test_capable_aqg_does_not_emit_deepseek_degradation(self):
+        completed, events, _ = self._run_install(
+            dsh_installed=True,
+            aqg_dsh_capable=True,
+        )
+
+        self.assertEqual(completed.returncode, 0, msg=completed.stderr)
+        self.assertIn("dsh-capability", events)
+        self.assertNotIn("DE-only", completed.stdout)
+
+    def test_old_aqg_degrades_xiaomi_mimo_to_de_only(self):
+        completed, events, _ = self._run_install(
+            mimo_installed=True,
+            aqg_mimo_capable=False,
+        )
+
+        self.assertEqual(completed.returncode, 0, msg=completed.stderr)
+        self.assertIn("mimo-detect", events)
+        self.assertIn("mimo-capability", events)
+        self.assertIn("de-core", events)
+        self.assertIn("xiaomi-mimo", completed.stdout)
+        self.assertIn("DE-only", completed.stdout)
+
+    def test_capable_aqg_does_not_emit_mimo_degradation(self):
+        completed, events, _ = self._run_install(
+            mimo_installed=True,
+            aqg_mimo_capable=True,
+        )
+
+        self.assertEqual(completed.returncode, 0, msg=completed.stderr)
+        self.assertIn("mimo-capability", events)
+        self.assertNotIn("DE-only Xiaomi MiMo", completed.stdout)
+
     def test_updated_aqg_worktree_is_reused_without_cloning(self):
         completed, events, _ = self._run_install(git_file=True)
         self.assertEqual(completed.returncode, 0, msg=completed.stderr)
-        self.assertEqual(events, ["apply", "verify", "doctor", "de-core"])
+        self.assertEqual(
+            events,
+            ["dsh-detect", "mimo-detect", "apply", "verify", "doctor", "de-core"],
+        )
         self.assertNotIn("cloning", completed.stderr.lower())
 
     def test_r27_01_and_02_healthy_checkout_still_runs_wrapper_in_strict_order(self):
@@ -199,8 +272,9 @@ class InstallAqgClientOrchestrationTest(unittest.TestCase):
         )
         self.assertEqual(
             events,
-            ["apply", "verify", "doctor", "de-core"],
-            "expected strict apply -> verify -> Doctor -> DE core order, got %r"
+            ["dsh-detect", "mimo-detect", "apply", "verify", "doctor", "de-core"],
+            "expected read-only host detection before strict apply -> verify -> "
+            "Doctor -> DE core order, got %r"
             % (events,),
         )
         script = str(PurePosixPath(invocations[0][1]))
@@ -289,7 +363,7 @@ class InstallAqgClientOrchestrationTest(unittest.TestCase):
         self.assertEqual(completed.returncode, 1, msg=completed.stderr)
         self.assertEqual(
             events,
-            [],
+            ["dsh-detect", "mimo-detect"],
             "preparing/reusing the AQG checkout must not run Doctor as a "
             "pre-apply gate; the missing wrapper must fail before any Doctor "
             "or wrapper child runs",
@@ -335,7 +409,7 @@ class InstallAqgClientOrchestrationTest(unittest.TestCase):
         self.assertNotEqual(completed.returncode, 0, msg=completed.stderr)
         self.assertEqual(
             events,
-            ["apply", "verify", "doctor"],
+            ["dsh-detect", "mimo-detect", "apply", "verify", "doctor"],
             "apply and verify must run before the post-verify Doctor gate; "
             "a Doctor failure there must still block DE core, got %r"
             % (events,),
@@ -431,7 +505,15 @@ class InstallAqgClientOrchestrationTest(unittest.TestCase):
         self.assertEqual(completed.returncode, 0, msg=completed.stderr)
         self.assertEqual(
             events,
-            ["apply", "verify", "doctor", "de-core", "activate-probe"],
+            [
+                "dsh-detect",
+                "mimo-detect",
+                "apply",
+                "verify",
+                "doctor",
+                "de-core",
+                "activate-probe",
+            ],
             "the activation-state probe must actually run against the synthetic "
             "managed root and answer unactivated, not short-circuit on a "
             "missing directory",
@@ -467,7 +549,10 @@ class InstallAqgClientOrchestrationTest(unittest.TestCase):
                 target="all",
             )
             self.assertEqual(completed.returncode, 0, msg=completed.stderr)
-            self.assertEqual(events, ["apply", "verify", "doctor", "de-core"])
+            self.assertEqual(
+                events,
+                ["dsh-detect", "mimo-detect", "apply", "verify", "doctor", "de-core"],
+            )
             self.assertNotIn("activate", events)
 
         self.assertEqual(sentinel.read_text(), "keep-me")
@@ -511,7 +596,10 @@ class InstallAqgClientOrchestrationTest(unittest.TestCase):
                     verify_rc=0,
                 )
                 self.assertEqual(completed2.returncode, 0, msg=completed2.stderr)
-                self.assertEqual(events2, ["apply", "verify", "doctor", "de-core"])
+                self.assertEqual(
+                    events2,
+                    ["dsh-detect", "mimo-detect", "apply", "verify", "doctor", "de-core"],
+                )
                 self.assertNotIn("activate", events2)
                 self.assertEqual(sentinel.read_text(), "keep-me")
 

@@ -131,6 +131,25 @@ class InstallationDocsTestCase(unittest.TestCase):
         self.assertIn("### 方式二：", chinese)
         self.assertIn("#### Linux 桌面", chinese)
 
+    def test_root_readmes_use_only_managed_doctor_entrypoints(self):
+        english = ROOT_READMES[0].read_text(encoding="utf-8")
+        chinese = ROOT_READMES[1].read_text(encoding="utf-8")
+        for body in (english, chinese):
+            self.assertIn("dp-doctor.sh", body)
+            self.assertIn("dp-doctor.ps1", body)
+            self.assertNotIn("python3 -m installer.doctor", body)
+            self.assertNotIn("python3 -m installer.leak_scan", body)
+            self.assertNotIn("python3 -m unittest", body)
+            self.assertIn("installer/README.md", body)
+
+    def test_installer_readme_marks_python_commands_as_source_only(self):
+        body = INSTALLER_README.read_text(encoding="utf-8")
+        normalized = " ".join(body.split())
+        self.assertIn("Source checkout development and release checks", body)
+        self.assertIn("not installed-user diagnostic commands", normalized)
+        self.assertIn("python3 -m installer.leak_scan", body)
+        self.assertIn("python3 -m unittest", body)
+
     def test_installer_launch_rows_match_host_specs(self):
         body = INSTALLER_README.read_text(encoding="utf-8")
         policy_labels = {
@@ -148,6 +167,45 @@ class InstallationDocsTestCase(unittest.TestCase):
                     type_label = "includes `type`" if spec.json_include_type else "omits `type`"
                     self.assertIn(cwd_label, row)
                     self.assertIn(type_label, row)
+
+    def test_deepseek_harness_docs_describe_shared_display_capabilities(self):
+        installer_row = _table_row(
+            INSTALLER_README.read_text(encoding="utf-8"),
+            "deepseek-harness",
+        )
+        self.assertIn("Cordis YAML", installer_row)
+        self.assertIn("native display windows", installer_row)
+        self.assertIn("Audit Stop Panel", installer_row)
+        self.assertIn("no popup follow-up", installer_row)
+        self.assertIn("native macOS app bundle", installer_row)
+        english = ROOT_READMES[0].read_text(encoding="utf-8")
+        chinese = ROOT_READMES[1].read_text(encoding="utf-8")
+        for body in (english, chinese):
+            self.assertIn("DeepSeek Harness", body)
+            self.assertIn("cordis.patch.yml", body)
+            self.assertIn("Stop Panel", body)
+        self.assertIn("popup follow-up", english)
+        self.assertIn("DeepSeek Harness.app", english)
+        self.assertIn("弹窗追问", chinese)
+        self.assertIn("DeepSeek Harness.app", chinese)
+
+    def test_xiaomi_mimo_docs_describe_jsonc_and_shared_display_capabilities(self):
+        installer_row = _table_row(
+            INSTALLER_README.read_text(encoding="utf-8"),
+            "xiaomi-mimo",
+        )
+        self.assertIn("byte-preserving JSONC", installer_row)
+        self.assertIn("native display windows", installer_row)
+        self.assertIn("Audit Stop Panel", installer_row)
+        self.assertIn("no popup follow-up", installer_row)
+        self.assertIn("provider credentials remain foreign state", installer_row)
+        english = ROOT_READMES[0].read_text(encoding="utf-8")
+        chinese = ROOT_READMES[1].read_text(encoding="utf-8")
+        for body in (english, chinese):
+            self.assertIn("Xiaomi MiMo", body)
+            self.assertIn("mimocode.jsonc", body)
+            self.assertIn("MIMOCODE_HOME", body)
+            self.assertIn("Stop Panel", body)
 
     def test_desktop_only_hosts_keep_linux_write_guards(self):
         for client in (

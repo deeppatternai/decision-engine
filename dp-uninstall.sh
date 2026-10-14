@@ -7,6 +7,9 @@
 # broaden what this tool is allowed to remove.
 set -euo pipefail
 
+script_root="$(CDPATH= cd -- "$(dirname -- "$0")" && pwd -P)"
+export DE_DP_UNINSTALL_SCRIPT_ROOT="${script_root}"
+
 # Clear inherited Git redirection before the helper or any descendant starts.
 if [ -n "${BASH_VERSION:-}" ]; then
   for git_env_name in "${!GIT_@}"; do
@@ -388,6 +391,8 @@ QODER_PROCESS_MARKERS = (
     "/Applications/Qoder CN IDE.app/",
 )
 PROCESS_HOST_MARKERS = (
+    (("xiaomi mimo.app", "/mimocode/"), "Xiaomi MiMo"),
+    (("deepseek harness.app",), "DeepSeek Harness"),
     (("qoder cn ide.app",), "Qoder CN IDE"),
     (("qoder ide.app",), "Qoder IDE"),
     (("qodercn.app", "qoder cn.app", "/qoder-cn/"), "Qoder CN"),
@@ -409,6 +414,8 @@ REGISTERED_DE_HOST_LABELS = {
     "codebuddy": "CodeBuddy",
     "codex": "Codex",
     "cursor": "Cursor",
+    "deepseek-harness": "DeepSeek Harness",
+    "xiaomi-mimo": "Xiaomi MiMo",
     "qoder": "Qoder",
     "qoder-cn": "Qoder CN",
     "qoder-ide": "Qoder IDE",
@@ -472,6 +479,12 @@ def path_has_symlink_component(path: Path, floor: Path) -> Path | None:
         if current.is_symlink():
             return current
     return None
+
+
+def user_path_safety_floor(path: Path, home: Path) -> Path:
+    path = lex(path)
+    home = lex(home)
+    return home if is_under(path, home) else Path(path.anchor)
 
 
 def validate_owned_transient_directory(path: Path, home: Path) -> None:
@@ -566,6 +579,65 @@ def process_file_refs_with(command: str, pid: str) -> tuple[str, ...] | None:
     )
 
 
+def expected_cordis_entry(
+    mcp_config: Any,
+    actual: Any,
+    module_root: Path,
+) -> dict[str, Any] | None:
+    if not isinstance(actual, dict):
+        return None
+    actual_cwd = actual.get("cwd")
+    if (
+        not isinstance(actual_cwd, str)
+        or not Path(actual_cwd).is_absolute()
+        or lex(Path(actual_cwd)) != module_root
+    ):
+        return None
+    dev_root = mcp_config.dev_root_from_args(actual.get("args"))
+    if dev_root is not None:
+        if (
+            not dev_root
+            or not Path(dev_root).is_absolute()
+            or lex(Path(dev_root)) != module_root
+        ):
+            return None
+        return mcp_config._render_client_entry(
+            "deepseek-harness",
+            python=actual.get("command"),
+            dev_root=module_root,
+        )
+    return mcp_config._render_client_entry(
+        "deepseek-harness",
+        python=actual.get("command"),
+        cwd=module_root,
+    )
+
+
+def expected_mimocode_entry(
+    mcp_config: Any,
+    actual: Any,
+    module_root: Path,
+) -> dict[str, Any] | None:
+    if not isinstance(actual, dict):
+        return None
+    command = actual.get("command")
+    environment = actual.get("environment")
+    if (
+        not isinstance(command, list)
+        or len(command) < 3
+        or not all(isinstance(item, str) for item in command)
+        or not isinstance(environment, dict)
+        or environment.get("PYTHONPATH") != str(module_root)
+        or environment.get("DE_MCP_CLIENT_HOST") != "xiaomi-mimo"
+    ):
+        return None
+    return mcp_config._render_client_entry(
+        "xiaomi-mimo",
+        python=command[0],
+        cwd=module_root,
+    )
+
+
 class Inventory:
     def __init__(self, home: Path, scope: str) -> None:
         self.home = lex(home)
@@ -583,6 +655,8 @@ class Inventory:
         self.json_targets: list[tuple[Path, tuple[tuple[str, ...], ...]]] = []
         self.jsonc_targets: set[Path] = set()
         self.toml_ranges: list[tuple[Path, tuple[tuple[int, int], ...]]] = []
+        self.cordis_targets: list[tuple[Path, Path]] = []
+        self.mimocode_targets: list[tuple[Path, Path]] = []
         self.agents_target: Path | None = None
         self.skill_links: list[Path] = []
         self.aqg_skill_markers: list[tuple[Path, str]] = []
@@ -597,7 +671,8 @@ class Inventory:
         self.launchagent_loaded = False
         self.processes: list[dict[str, str]] = []
         self.process_blockers: list[str] = []
-        self.aqg_uninstaller: Path | None = None
+        self.paused_supervisors: list[dict[str, str]] = []
+        self.aqg_uninstallers: tuple[Path, ...] = ()
         self.aqg_managed_target: Path | None = None
         self.aqg_alias_env_target: Path | None = None
         self.orphaned_aqg_hook_targets: tuple[tuple[str, ...], ...] = ()
@@ -1608,7 +1683,7 @@ class Inventory:
         # AQG's official adapter owns its connector, hook, rule, and skill
         # lifecycle as one transaction. Once available, leave every AQG edit
         # to it so this outer uninstaller cannot race a second JSON deletion.
-        aqg_delegated = self.aqg_uninstaller is not None
+        aqg_delegated = bool(self.aqg_uninstallers)
         if self.scope == "de":
             return ("de",)
         if self.scope == "aqg":
@@ -1620,6 +1695,145 @@ class Inventory:
             return
         for path in self.json_paths():
             self.inspect_json_file(path)
+
+    def cordis_module_root(self) -> Path | None:
+        configured = os.environ.get("DE_DP_UNINSTALL_SCRIPT_ROOT", "").strip()
+        if configured:
+            candidate = lex(Path(configured))
+            module = candidate / "installer" / "mcp_config.py"
+            if (
+                candidate.is_dir()
+                and not candidate.is_symlink()
+                and module.is_file()
+                and not module.is_symlink()
+                and path_has_symlink_component(module, candidate) is None
+            ):
+                return candidate
+        if self.de.is_dir() and not self.de.is_symlink():
+            return self.de
+        return None
+
+    def import_de_mcp_config(self):
+        module_root = self.cordis_module_root()
+        if module_root is None:
+            return None
+        sys.path.insert(0, str(module_root))
+        try:
+            from installer import mcp_config
+            if Path(mcp_config.__file__).resolve().parent.parent != module_root.resolve():
+                raise RuntimeError("module identity mismatch")
+            return mcp_config, module_root
+        except Exception as exc:
+            self.blockers.append(
+                f"Decision Engine Cordis ownership module cannot be loaded: {exc.__class__.__name__}"
+            )
+            return None
+        finally:
+            try:
+                sys.path.remove(str(module_root))
+            except ValueError:
+                pass
+
+    def inspect_cordis(self) -> None:
+        if self.scope not in ("de", "both"):
+            return
+        configured_path = os.environ.get("DEEPSEEK_HARNESS_CONFIG", "").strip()
+        configured_home = os.environ.get("DSH_HOME", "").strip()
+        if configured_path:
+            path = Path(configured_path).expanduser()
+        elif configured_home:
+            path = Path(configured_home).expanduser() / "cordis.patch.yml"
+        else:
+            path = self.home / ".dsh" / "cordis.patch.yml"
+        if not path.is_absolute():
+            self.blockers.append(f"DeepSeek Harness config path is not absolute: {path}")
+            return
+        path = lex(path)
+        if not lexists(path):
+            return
+        if path.is_symlink() or path_has_symlink_component(
+            path, user_path_safety_floor(path, self.home)
+        ):
+            self.blockers.append(f"Cordis config ownership is unknown through symlink: {path}")
+            return
+        try:
+            raw = path.read_bytes()
+        except OSError as exc:
+            self.blockers.append(
+                f"cannot read Cordis configuration {path}: {exc.__class__.__name__}"
+            )
+            return
+        marker = b"# BEGIN DEEP PATTERN decision-engine (managed)"
+        end_marker = b"# END DEEP PATTERN decision-engine (managed)"
+        if marker not in raw and end_marker not in raw:
+            return
+        imported = self.import_de_mcp_config()
+        if imported is None:
+            return
+        mcp_config, module_root = imported
+        try:
+            if lex(mcp_config.agent_config_path("deepseek-harness")) != path:
+                raise RuntimeError("configured path mismatch")
+            actual = mcp_config.read_entry("deepseek-harness")
+            desired = expected_cordis_entry(mcp_config, actual, module_root)
+        except Exception as exc:
+            self.blockers.append(
+                f"DeepSeek Harness Cordis entry cannot be inspected: {exc.__class__.__name__}"
+            )
+            return
+        if actual is None or actual != desired:
+            self.blockers.append(
+                f"deepseek-harness decision-engine entry ownership is unknown: {path}"
+            )
+            return
+        if module_root not in self.de_refs:
+            self.de_refs = (*self.de_refs, module_root)
+        self.cordis_targets.append((path, module_root))
+        self.add_action(
+            "edit-cordis-yaml",
+            path,
+            "remove owned DeepSeek Harness Decision Engine row",
+        )
+
+    def inspect_mimocode(self) -> None:
+        if self.scope not in ("de", "both"):
+            return
+        imported = self.import_de_mcp_config()
+        if imported is None:
+            return
+        mcp_config, module_root = imported
+        try:
+            path = lex(mcp_config.agent_config_path("xiaomi-mimo"))
+        except Exception as exc:
+            self.blockers.append(
+                f"Xiaomi MiMo config path cannot be inspected: {exc.__class__.__name__}"
+            )
+            return
+        if not lexists(path):
+            return
+        try:
+            actual = mcp_config.read_entry("xiaomi-mimo")
+            desired = expected_mimocode_entry(mcp_config, actual, module_root)
+        except Exception as exc:
+            self.blockers.append(
+                f"Xiaomi MiMo JSONC entry cannot be inspected: {exc.__class__.__name__}"
+            )
+            return
+        if actual is None:
+            return
+        if actual != desired:
+            self.blockers.append(
+                f"xiaomi-mimo decision-engine entry ownership is unknown: {path}"
+            )
+            return
+        if module_root not in self.de_refs:
+            self.de_refs = (*self.de_refs, module_root)
+        self.mimocode_targets.append((path, module_root))
+        self.add_action(
+            "edit-mimocode-jsonc",
+            path,
+            "remove owned Xiaomi MiMo Decision Engine entry without copying provider state",
+        )
 
     def inspect_managed_aqg_alias_env(self) -> None:
         if self.scope not in ("aqg", "both"):
@@ -1893,6 +2107,35 @@ class Inventory:
             "Library/Application Support/WorkBuddy AI/skills",
         )
         paths = {self.home / item for item in relative}
+        configured_dsh_home = os.environ.get("DSH_HOME", "").strip()
+        if configured_dsh_home:
+            dsh_home = Path(configured_dsh_home).expanduser()
+            if dsh_home.is_absolute():
+                paths.add(lex(dsh_home) / "skills")
+            else:
+                self.blockers.append(
+                    f"DeepSeek Harness skills root is not absolute: {dsh_home}"
+                )
+        configured_mimo_home = os.environ.get("MIMOCODE_HOME", "").strip()
+        configured_xdg_home = os.environ.get("XDG_CONFIG_HOME", "").strip()
+        if configured_mimo_home:
+            mimo_home = Path(configured_mimo_home).expanduser()
+            if mimo_home.is_absolute():
+                paths.add(lex(mimo_home) / "config" / "skills")
+            else:
+                self.blockers.append(
+                    f"Xiaomi MiMo config root is not absolute: {mimo_home}"
+                )
+        elif configured_xdg_home:
+            xdg_home = Path(configured_xdg_home).expanduser()
+            if xdg_home.is_absolute():
+                paths.add(lex(xdg_home) / "mimocode" / "skills")
+            else:
+                self.blockers.append(
+                    f"XDG config root is not absolute: {xdg_home}"
+                )
+        else:
+            paths.add(self.home / ".config" / "mimocode" / "skills")
         try:
             paths.update(
                 child / "skills"
@@ -1946,7 +2189,9 @@ class Inventory:
         for directory in self.skill_dirs():
             if not lexists(directory):
                 continue
-            if directory.is_symlink() or path_has_symlink_component(directory, self.home):
+            if directory.is_symlink() or path_has_symlink_component(
+                directory, user_path_safety_floor(directory, self.home)
+            ):
                 self.blockers.append(f"skill directory ownership is unknown through symlink: {directory}")
                 continue
             if not directory.is_dir():
@@ -2803,10 +3048,6 @@ class Inventory:
             paths = ", ".join(str(path) for path in sorted(invalid))
             self.blockers.append(f"AQG references point to untrusted installer root(s): {paths}")
             return
-        if len(valid) > 1:
-            paths = ", ".join(str(path) for path in sorted(valid))
-            self.blockers.append(f"AQG references do not converge on one installer root: {paths}")
-            return
         if not valid:
             if residue_found:
                 self.blockers.append(
@@ -2814,10 +3055,24 @@ class Inventory:
                 )
             return
 
-        root = next(iter(valid))
-        script = root / "scripts" / "install_aqg_clients.py"
-        self.aqg_uninstaller = script
-        self.add_action("aqg-official-uninstall", script, "all detected user-scope adapters; project scope is preserved")
+        managed_root = self.aqg_managed_target or self.aqg
+        ordered_roots = sorted(
+            valid,
+            key=lambda root: (
+                root != managed_root,
+                str(root),
+            ),
+        )
+        self.aqg_uninstallers = tuple(
+            root / "scripts" / "install_aqg_clients.py"
+            for root in ordered_roots
+        )
+        for script in self.aqg_uninstallers:
+            self.add_action(
+                "aqg-official-uninstall",
+                script,
+                "all detected user-scope adapters owned by this proven root; project scope is preserved",
+            )
 
     def collect(self) -> "Inventory":
         if self.scope in ("de", "both"):
@@ -2830,6 +3085,8 @@ class Inventory:
         self.inspect_qoder_plugins()
         self.inspect_qoder_runtime_caches()
         self.inspect_json()
+        self.inspect_cordis()
+        self.inspect_mimocode()
         self.inspect_managed_aqg_alias_env()
         self.inspect_codex()
         self.inspect_agents()
@@ -3006,6 +3263,7 @@ def process_host_family(host: str) -> str | None:
         ("Claude", "Claude"),
         ("Codex", "Codex"),
         ("Cursor", "Cursor"),
+        ("DeepSeek", "DeepSeek Harness"),
         ("Qoder", "Qoder"),
         ("TRAE", "TRAE"),
         ("WorkBuddy", "WorkBuddy"),
@@ -3064,9 +3322,12 @@ def print_process_summary(inv: Inventory, heading: str) -> None:
             suffix = "" if count == 1 else "s"
             print(f"    {count} {label}{suffix}")
         if host == "Unknown Agent":
-            for process in inv.processes:
-                if effective_process_host(process, inv.processes) != host:
-                    continue
+            unknown_processes = [
+                process
+                for process in inv.processes
+                if effective_process_host(process, inv.processes) == host
+            ]
+            for process in unknown_processes:
                 print(
                     f"    PID={process.get('pid', '?')} "
                     f"PPID={process.get('ppid', '?')} "
@@ -3084,14 +3345,23 @@ def print_process_summary(inv: Inventory, heading: str) -> None:
                     print(
                         f"    parent={parent_executable} (PID={parent_pid})"
                     )
-            print(
-                "    Please quit the application identified above. If no application "
-                "is shown, close recently used Agent applications and rerun."
-            )
+            if unknown_processes and all(
+                process_term_eligible(process) for process in unknown_processes
+            ):
+                print(
+                    "    These verified Deep Pattern child sessions can be stopped "
+                    "after confirmation."
+                )
+            else:
+                print(
+                    "    Please quit the application identified above. If no application "
+                    "is shown, close recently used Agent applications and rerun."
+                )
 
 
 def process_only_inventory(inv: Inventory) -> Inventory:
     refreshed = Inventory(inv.home, inv.scope)
+    refreshed.de_refs = inv.de_refs
     refreshed.qoder_residue_paths = list(inv.qoder_residue_paths)
     refreshed.inspect_processes()
     return refreshed
@@ -3149,6 +3419,107 @@ def terminate_verified_processes(
     return True
 
 
+def same_process_identity(
+    current: dict[str, str] | None,
+    frozen: dict[str, str],
+) -> bool:
+    if current is None:
+        return False
+    return all(
+        current.get(key, "") == frozen.get(key, "")
+        for key in ("pid", "ppid", "uid", "start_time", "command_line", "executable")
+    )
+
+
+def resume_paused_supervisors(
+    inv: Inventory,
+    supervisors: list[dict[str, str]],
+) -> None:
+    for frozen in reversed(supervisors):
+        pid = frozen.get("pid", "")
+        current = read_process_identity(inv, {"pid": pid})
+        if not same_process_identity(current, frozen):
+            print(
+                f"WARNING: paused Agent supervisor pid={pid} changed identity; "
+                "SIGCONT was not sent."
+            )
+            continue
+        try:
+            os.kill(int(pid), signal.SIGCONT)
+        except (OSError, ValueError) as exc:
+            print(
+                f"WARNING: Agent supervisor pid={pid} could not be resumed: "
+                f"{exc.__class__.__name__}"
+            )
+            continue
+        print(f"Resumed Agent supervisor (pid={pid}).")
+
+
+def pause_verified_supervisors(
+    inv: Inventory,
+    candidates: list[dict[str, str]],
+) -> list[dict[str, str]] | None:
+    supervisors: dict[str, dict[str, str]] = {}
+    for process in candidates:
+        valid, reason = revalidate_term_target(inv, process)
+        if not valid:
+            print(
+                f"UNINSTALL_PENDING: helper pid={process['pid']} changed before "
+                f"supervisor pause: {reason}"
+            )
+            return None
+        if process.get("family") != "mcp-launcher":
+            continue
+        ppid = process.get("ppid", "")
+        if not re.fullmatch(r"\d+", ppid) or int(ppid) <= 1:
+            print(
+                f"UNINSTALL_PENDING: helper pid={process['pid']} has no safe "
+                "supervisor process to pause."
+            )
+            return None
+        parent = read_process_identity(inv, {"pid": ppid})
+        if (
+            parent is None
+            or parent.get("pid") != ppid
+            or parent.get("uid") != str(os.getuid())
+            or not parent.get("start_time")
+            or not parent.get("command_line")
+        ):
+            print(
+                f"UNINSTALL_PENDING: Agent supervisor pid={ppid} could not be "
+                f"verified for helper pid={process['pid']}."
+            )
+            return None
+        existing = supervisors.get(ppid)
+        if existing is not None and not same_process_identity(parent, existing):
+            print(f"UNINSTALL_PENDING: Agent supervisor pid={ppid} changed identity.")
+            return None
+        supervisors[ppid] = parent
+
+    paused: list[dict[str, str]] = []
+    for frozen in supervisors.values():
+        pid = frozen["pid"]
+        current = read_process_identity(inv, {"pid": pid})
+        if not same_process_identity(current, frozen):
+            print(
+                f"UNINSTALL_PENDING: Agent supervisor pid={pid} changed before pause."
+            )
+            resume_paused_supervisors(inv, paused)
+            return None
+        try:
+            os.kill(int(pid), signal.SIGSTOP)
+        except (OSError, ValueError) as exc:
+            print(
+                f"UNINSTALL_PENDING: Agent supervisor pid={pid} pause failed: "
+                f"{exc.__class__.__name__}"
+            )
+            resume_paused_supervisors(inv, paused)
+            return None
+        paused.append(frozen)
+        print(f"Temporarily paused Agent supervisor (pid={pid}).")
+    return paused
+
+
 def resolve_process_blockers(inv: Inventory) -> tuple[Inventory, bool]:
     current = process_only_inventory(inv)
     if not current.processes:
@@ -3161,10 +3532,12 @@ def resolve_process_blockers(inv: Inventory) -> tuple[Inventory, bool]:
     if eligible:
         print(
             "The listed DE/AQG MCP sessions are verified as managed child processes. "
-            "The Agent applications themselves will not be closed."
+            "Their supervisors will be paused temporarily so they cannot restart during "
+            "uninstall; the Agent applications themselves will not be closed."
         )
         answer = prompt_tty(
-            f"Terminate {len(eligible)} verified Deep Pattern process(es) now? [Y/N] "
+            f"Pause their supervisors and terminate {len(eligible)} verified "
+            "Deep Pattern process(es) now? [Y/N] "
         )
         if answer not in ("y", "yes"):
             print(
@@ -3172,13 +3545,25 @@ def resolve_process_blockers(inv: Inventory) -> tuple[Inventory, bool]:
                 "settings were changed."
             )
             return current, True
-        if terminate_verified_processes(current, eligible):
-            time.sleep(1)
-            refreshed = Inventory(inv.home, inv.scope).collect()
-            if not refreshed.processes:
-                print("All blocking Agent sessions have exited.")
-                return refreshed, False
-            return refreshed, True
+        paused = pause_verified_supervisors(current, eligible)
+        if paused is None:
+            return Inventory(inv.home, inv.scope).collect(), True
+        current.paused_supervisors = paused
+        try:
+            if terminate_verified_processes(current, eligible):
+                time.sleep(1)
+                refreshed = Inventory(inv.home, inv.scope).collect()
+                if not refreshed.processes:
+                    refreshed.paused_supervisors = paused
+                    current.paused_supervisors = []
+                    print("All blocking Agent sessions have exited.")
+                    return refreshed, False
+        except BaseException:
+            resume_paused_supervisors(current, paused)
+            current.paused_supervisors = []
+            raise
+        resume_paused_supervisors(current, paused)
+        current.paused_supervisors = []
         return Inventory(inv.home, inv.scope).collect(), True
 
     return current, True
@@ -3221,7 +3606,10 @@ def print_inventory(
     if not any(item["kind"] != "backup-retention" for item in inv.actions):
         print("NO IN-SCOPE INSTALLATION FOUND")
     if inv.blockers and process_resolution_pending:
-        print("ACTION REQUIRED: fully quit the listed Agent hosts, then rerun this uninstaller.")
+        print(
+            "ACTION REQUIRED: review the active sessions below; verified DE/AQG child "
+            "processes can be stopped after confirmation."
+        )
     elif inv.blockers:
         print("STOP: ownership or runtime state is not fully provable; no mutation is allowed.")
     elif not apply:
@@ -3614,37 +4002,38 @@ def bootout_launchagent(inv: Inventory) -> None:
 
 
 def invoke_aqg_uninstaller(inv: Inventory) -> None:
-    if not inv.aqg_uninstaller:
-        return
-    script = inv.aqg_uninstaller
-    root = script.parent.parent
-    environment = os.environ.copy()
-    environment["AQG_ROOT"] = str(root)
-    environment["HOME"] = str(inv.home)
-    environment.pop("PROJECT_ROOT", None)
-    command = [
-        sys.executable,
-        str(script),
-        "--installed-supported",
-        "--uninstall",
-        "--aqg-root",
-        str(root),
-        "--home",
-        str(inv.home),
-    ]
-    result = subprocess.run(
-        command,
-        cwd=str(root),
-        env=environment,
-        text=True,
-        stdout=subprocess.PIPE,
-        stderr=subprocess.STDOUT,
-        check=False,
-    )
-    if result.stdout.strip():
-        print(result.stdout.rstrip())
-    if result.returncode != 0:
-        raise RuntimeError(f"AQG official user-scope uninstaller failed: exit {result.returncode}")
+    for script in inv.aqg_uninstallers:
+        root = script.parent.parent
+        environment = os.environ.copy()
+        environment["AQG_ROOT"] = str(root)
+        environment["HOME"] = str(inv.home)
+        environment.pop("PROJECT_ROOT", None)
+        command = [
+            sys.executable,
+            str(script),
+            "--installed-supported",
+            "--uninstall",
+            "--aqg-root",
+            str(root),
+            "--home",
+            str(inv.home),
+        ]
+        result = subprocess.run(
+            command,
+            cwd=str(root),
+            env=environment,
+            text=True,
+            stdout=subprocess.PIPE,
+            stderr=subprocess.STDOUT,
+            check=False,
+        )
+        if result.stdout.strip():
+            print(result.stdout.rstrip())
+        if result.returncode != 0:
+            raise RuntimeError(
+                f"AQG official user-scope uninstaller failed for {root}: "
+                f"exit {result.returncode}"
+            )
 
 
 def remove_managed_aqg_alias_env(inv: Inventory, manifest: Manifest) -> None:
@@ -3716,6 +4105,50 @@ def remove_orphaned_managed_aqg_hooks(inv: Inventory, manifest: Manifest) -> Non
     manifest.add({"operation": "edit-json", "source": str(path), "destination": None})
 
 
+def edit_cordis(path: Path, module_root: Path) -> None:
+    sys.path.insert(0, str(module_root))
+    try:
+        from installer import mcp_config
+        if Path(mcp_config.__file__).resolve().parent.parent != module_root.resolve():
+            raise RuntimeError("Cordis remover was not loaded from the proven module root")
+        if lex(mcp_config.agent_config_path("deepseek-harness")) != lex(path):
+            raise RuntimeError("Cordis configuration path changed before apply")
+        actual = mcp_config.read_entry("deepseek-harness")
+        expected = expected_cordis_entry(mcp_config, actual, module_root)
+        if expected is None or actual != expected:
+            raise RuntimeError("Cordis entry changed before apply")
+        result = mcp_config.remove_entry("deepseek-harness", create_backup=False)
+    finally:
+        try:
+            sys.path.remove(str(module_root))
+        except ValueError:
+            pass
+    if result.get("action") != "removed":
+        raise RuntimeError(f"owned Cordis entry disappeared before apply: {path}")
+
+
+def edit_mimocode(path: Path, module_root: Path) -> None:
+    sys.path.insert(0, str(module_root))
+    try:
+        from installer import mcp_config
+        if Path(mcp_config.__file__).resolve().parent.parent != module_root.resolve():
+            raise RuntimeError("MiMo remover was not loaded from the proven module root")
+        if lex(mcp_config.agent_config_path("xiaomi-mimo")) != lex(path):
+            raise RuntimeError("MiMo configuration path changed before apply")
+        actual = mcp_config.read_entry("xiaomi-mimo")
+        expected = expected_mimocode_entry(mcp_config, actual, module_root)
+        if expected is None or actual != expected:
+            raise RuntimeError("MiMo entry changed before apply")
+        result = mcp_config.remove_entry("xiaomi-mimo", create_backup=False)
+    finally:
+        try:
+            sys.path.remove(str(module_root))
+        except ValueError:
+            pass
+    if result.get("action") != "removed":
+        raise RuntimeError(f"owned MiMo entry disappeared before apply: {path}")
+
+
 def apply_inventory(inv: Inventory) -> Path:
     backup = backup_root(inv.home, inv.dp, inv.scope)
     manifest = Manifest(backup, inv.home, inv.scope)
@@ -3728,6 +4161,7 @@ def apply_inventory(inv: Inventory) -> Path:
         if inv.orphaned_aqg_hook_targets:
             backup_paths.append(inv.home / CLAUDE_SETTINGS_RELATIVE)
         backup_paths.extend(path for path, _ in inv.toml_ranges)
+        backup_paths.extend(path for path, _module_root in inv.cordis_targets)
         backup_paths.extend(path for path, _digest in inv.aqg_skill_markers)
         if inv.agents_target:
             backup_paths.append(inv.agents_target)
@@ -3751,9 +4185,11 @@ def apply_inventory(inv: Inventory) -> Path:
         json_targets = inv.json_targets
         jsonc_targets = inv.jsonc_targets
         toml_ranges = inv.toml_ranges
+        cordis_targets = inv.cordis_targets
+        mimocode_targets = inv.mimocode_targets
         agents_target = inv.agents_target
         qoder_residue_paths = inv.qoder_residue_paths
-        if inv.scope == "both" and inv.aqg_uninstaller:
+        if inv.scope == "both" and inv.aqg_uninstallers:
             # AQG and DE can own separate entries in the same host file. The
             # official AQG uninstaller may remove a list item and shift the
             # frozen DE pointer, so rediscover DE targets after that trusted
@@ -3768,7 +4204,7 @@ def apply_inventory(inv: Inventory) -> Path:
                 path for path, _targets in refreshed_de.json_targets
             } | {
                 path for path, _ranges in refreshed_de.toml_ranges
-            }
+            } | {path for path, _module_root in refreshed_de.cordis_targets}
             if refreshed_de.agents_target:
                 refreshed_paths.add(refreshed_de.agents_target)
             unbacked = sorted(path for path in refreshed_paths if path not in seen)
@@ -3789,6 +4225,19 @@ def apply_inventory(inv: Inventory) -> Path:
             json_targets = refreshed_de.json_targets
             jsonc_targets = refreshed_de.jsonc_targets
             toml_ranges = refreshed_de.toml_ranges
+            cordis_targets = refreshed_de.cordis_targets
+            original_mimocode_paths = {
+                path for path, _module_root in inv.mimocode_targets
+            }
+            new_mimocode_paths = {
+                path for path, _module_root in refreshed_de.mimocode_targets
+            } - original_mimocode_paths
+            if new_mimocode_paths:
+                raise RuntimeError(
+                    "AQG uninstall exposed an unreviewed Xiaomi MiMo configuration target: "
+                    + ", ".join(str(path) for path in sorted(new_mimocode_paths))
+                )
+            mimocode_targets = refreshed_de.mimocode_targets
             agents_target = refreshed_de.agents_target
             qoder_residue_paths = refreshed_de.qoder_residue_paths
 
@@ -3798,6 +4247,12 @@ def apply_inventory(inv: Inventory) -> Path:
         for path, ranges in toml_ranges:
             edit_toml(path, ranges)
             manifest.add({"operation": "edit-toml", "source": str(path), "destination": None})
+        for path, module_root in cordis_targets:
+            edit_cordis(path, module_root)
+            manifest.add({"operation": "edit-cordis-yaml", "source": str(path), "destination": None})
+        for path, module_root in mimocode_targets:
+            edit_mimocode(path, module_root)
+            manifest.add({"operation": "edit-mimocode-jsonc", "source": str(path), "destination": None})
         if agents_target:
             edit_agents(agents_target)
             manifest.add({"operation": "edit-agents", "source": str(agents_target), "destination": None})
@@ -4072,38 +4527,43 @@ def main(argv: list[str]) -> int:
             return EXIT_PENDING
         print("Rechecked uninstall plan after process cleanup:")
         print_inventory(inventory, apply=args.apply)
-    if inventory.blockers:
-        return EXIT_BLOCKED
-    if not args.apply:
-        return EXIT_OK
-    cleanup_actions = [
-        item for item in inventory.actions if item["kind"] != "backup-retention"
-    ]
-    if not cleanup_actions:
-        try:
-            prune_uninstall_backups(home, inventory.dp)
-        except Exception as exc:
-            print(f"ERROR: uninstall backup retention failed: {exc}", file=sys.stderr)
-            return EXIT_BLOCKED
-        print("PASS: uninstall verified; no in-scope installation found")
-        return EXIT_OK
+    paused_supervisors = inventory.paused_supervisors
     try:
-        backup = apply_inventory(inventory)
-    except KeyboardInterrupt:
+        if inventory.blockers:
+            return EXIT_BLOCKED
+        if not args.apply:
+            return EXIT_OK
+        cleanup_actions = [
+            item for item in inventory.actions if item["kind"] != "backup-retention"
+        ]
+        if not cleanup_actions:
+            try:
+                prune_uninstall_backups(home, inventory.dp)
+            except Exception as exc:
+                print(f"ERROR: uninstall backup retention failed: {exc}", file=sys.stderr)
+                return EXIT_BLOCKED
+            print("PASS: uninstall verified; no in-scope installation found")
+            return EXIT_OK
+        try:
+            backup = apply_inventory(inventory)
+        except KeyboardInterrupt:
+            print(
+                "\nUNINSTALL_INTERRUPTED: quarantine integrity recording was interrupted. "
+                "No success was reported; preserve the newest uninstall backup for diagnosis."
+            )
+            return EXIT_INTERRUPTED
+        except Exception as exc:
+            print(f"ERROR: uninstall stopped without a clean verification: {exc}", file=sys.stderr)
+            return EXIT_BLOCKED
+        print(f"PASS: uninstall verified; quarantine={backup}")
         print(
-            "\nUNINSTALL_INTERRUPTED: quarantine integrity recording was interrupted. "
-            "No success was reported; preserve the newest uninstall backup for diagnosis."
+            "Restart affected Agent applications before using Deep Pattern again "
+            "so they reload the updated MCP configuration."
         )
-        return EXIT_INTERRUPTED
-    except Exception as exc:
-        print(f"ERROR: uninstall stopped without a clean verification: {exc}", file=sys.stderr)
-        return EXIT_BLOCKED
-    print(f"PASS: uninstall verified; quarantine={backup}")
-    print(
-        "Restart affected Agent applications before using Deep Pattern again "
-        "so they reload the updated MCP configuration."
-    )
-    return EXIT_OK
+        return EXIT_OK
+    finally:
+        resume_paused_supervisors(inventory, paused_supervisors)
+        inventory.paused_supervisors = []
 
 
 if __name__ == "__main__":

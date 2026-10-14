@@ -6,11 +6,16 @@ from __future__ import annotations
 import json
 import os
 import plistlib
+import shutil
 import stat
 import subprocess
+import sys
 import tempfile
 import unittest
 from pathlib import Path
+from unittest import mock
+
+from installer import mcp_config
 
 
 SCRIPT = Path(__file__).resolve().parents[2] / "dp-uninstall.sh"
@@ -52,6 +57,21 @@ HOST_MCP_RELATIVES = (
 
 
 class UninstallScriptTests(unittest.TestCase):
+    def test_deepseek_harness_uses_dedicated_cordis_uninstall_action(self) -> None:
+        source = SCRIPT.read_text(encoding="utf-8")
+        self.assertIn('"edit-cordis-yaml"', source)
+        self.assertIn('remove_entry("deepseek-harness", create_backup=False)', source)
+        self.assertNotIn('edit_json(path, (("cordis.patch.yml",)', source)
+
+    def test_xiaomi_mimo_uses_dedicated_jsonc_uninstall_action(self) -> None:
+        source = SCRIPT.read_text(encoding="utf-8")
+        self.assertIn('"edit-mimocode-jsonc"', source)
+        self.assertIn('remove_entry("xiaomi-mimo", create_backup=False)', source)
+        self.assertNotIn(
+            "backup_paths.extend(path for path, _module_root in inv.mimocode_targets)",
+            source,
+        )
+
     def test_uninstaller_is_remote_independent(self) -> None:
         source = SCRIPT.read_text(encoding="utf-8")
         for command in (
@@ -681,6 +701,222 @@ class UninstallScriptTests(unittest.TestCase):
         rerun = self._run("--scope", "de", "--apply")
         self.assertEqual(rerun.returncode, 0, rerun.stdout)
 
+    def test_deepseek_harness_uninstall_restores_cordis_and_preserves_foreign_skills(self) -> None:
+        de, _ = self._install_fixture()
+        shutil.copytree(
+            Path(__file__).resolve().parents[1],
+            de / "installer",
+            ignore=shutil.ignore_patterns("__pycache__", "*.pyc"),
+        )
+        shutil.copytree(
+            Path(__file__).resolve().parents[2] / "client",
+            de / "client",
+            dirs_exist_ok=True,
+            ignore=shutil.ignore_patterns("__pycache__", "*.pyc"),
+        )
+        managed_skill = de / "skills" / "layer-check"
+        managed_skill.mkdir()
+
+        dsh = self.home / "custom" / "dsh-home"
+        dsh.mkdir(parents=True)
+        self.env["DSH_HOME"] = str(dsh)
+        config = dsh / "cordis.patch.yml"
+        original = (
+            b"\xef\xbb\xbf# personal\r\n"
+            b"- id: personal\r\n"
+            b"  config:\r\n"
+            b"    token: !!js process.env.DSH_TOKEN\r\n"
+        )
+        config.write_bytes(original)
+        with mock.patch.dict(
+            os.environ,
+            {"HOME": str(self.home), "DSH_HOME": str(dsh)},
+        ):
+            mcp_config.write_entry(
+                "deepseek-harness",
+                python=sys.executable,
+                dev_root=SCRIPT.parent,
+            )
+
+        skills = dsh / "skills"
+        skills.mkdir()
+        owned_route = skills / managed_skill.name
+        owned_route.symlink_to(managed_skill)
+        foreign_target = self.home / "foreign-skill"
+        foreign_target.mkdir()
+        foreign_route = skills / "foreign-link"
+        foreign_route.symlink_to(foreign_target)
+        real_directory = skills / "personal-skill"
+        real_directory.mkdir()
+
+        result = self._run("--scope", "de", "--apply")
+
+        self.assertEqual(result.returncode, 0, result.stdout)
+        self.assertEqual(config.read_bytes(), original)
+        self.assertFalse(owned_route.exists())
+        self.assertTrue(foreign_route.is_symlink())
+        self.assertEqual(foreign_route.resolve(), foreign_target)
+        self.assertTrue(real_directory.is_dir())
+        manifests = list(
+            (self.home / ".deeppattern" / "uninstall-backups").glob(
+                "*-dp-uninstall-de/manifest.json"
+            )
+        )
+        self.assertEqual(len(manifests), 1)
+        manifest = json.loads(manifests[0].read_text(encoding="utf-8"))
+        self.assertIn(
+            "edit-cordis-yaml",
+            {entry["operation"] for entry in manifest["entries"]},
+        )
+
+    def test_xiaomi_mimo_uninstall_restores_jsonc_without_credential_backup(self) -> None:
+        de, _ = self._install_fixture()
+        managed_skill = de / "skills" / "layer-check"
+        managed_skill.mkdir()
+
+        mimo_home = self.home / "custom" / "mimocode-home"
+        config_root = mimo_home / "config"
+        config_root.mkdir(parents=True)
+        self.env["MIMOCODE_HOME"] = str(mimo_home)
+        config = config_root / "mimocode.jsonc"
+        original = (
+            b"{\n"
+            b"  // provider credential is foreign state\n"
+            b'  "provider": {"token": "SYNTHETIC_MIMO_SECRET"},\n'
+            b'  "mcp": {"foreign": {"type": "remote"}},\n'
+            b"}\n"
+        )
+        config.write_bytes(original)
+        with mock.patch.dict(
+            os.environ,
+            {"HOME": str(self.home), "MIMOCODE_HOME": str(mimo_home)},
+        ):
+            mcp_config.write_entry(
+                "xiaomi-mimo",
+                python=sys.executable,
+                cwd=SCRIPT.parent,
+            )
+
+        skills = config_root / "skills"
+        skills.mkdir()
+        owned_route = skills / managed_skill.name
+        owned_route.symlink_to(managed_skill)
+
+        result = self._run("--scope", "de", "--apply")
+
+        self.assertEqual(result.returncode, 0, result.stdout)
+        self.assertEqual(config.read_bytes(), original)
+        self.assertFalse(owned_route.exists())
+        manifests = list(
+            (self.home / ".deeppattern" / "uninstall-backups").glob(
+                "*-dp-uninstall-de/manifest.json"
+            )
+        )
+        self.assertEqual(len(manifests), 1)
+        backup_root = manifests[0].parent
+        for path in backup_root.rglob("*"):
+            if path.is_file():
+                self.assertNotIn(b"SYNTHETIC_MIMO_SECRET", path.read_bytes())
+        manifest = json.loads(manifests[0].read_text(encoding="utf-8"))
+        self.assertIn(
+            "edit-mimocode-jsonc",
+            {entry["operation"] for entry in manifest["entries"]},
+        )
+
+    def test_candidate_uninstaller_removes_candidate_cordis_with_legacy_managed_de(self) -> None:
+        de, _ = self._install_fixture()
+        legacy_installer = de / "installer"
+        legacy_installer.mkdir()
+        (legacy_installer / "__init__.py").write_text("", encoding="utf-8")
+        (legacy_installer / "mcp_config.py").write_text(
+            "raise RuntimeError('legacy installer has no DeepSeek Harness adapter')\n",
+            encoding="utf-8",
+        )
+
+        dsh = self.home / "custom" / "dsh-home"
+        dsh.mkdir(parents=True)
+        self.env["DSH_HOME"] = str(dsh)
+        config = dsh / "cordis.patch.yml"
+        original = b"# personal\n- id: personal\n  config: !!js process.env.DSH_CONFIG\n"
+        config.write_bytes(original)
+        with mock.patch.dict(
+            os.environ,
+            {"HOME": str(self.home), "DSH_HOME": str(dsh)},
+        ):
+            mcp_config.write_entry(
+                "deepseek-harness",
+                python=sys.executable,
+                cwd=SCRIPT.parent,
+            )
+
+        result = self._run("--scope", "de", "--apply")
+
+        self.assertEqual(result.returncode, 0, result.stdout)
+        self.assertEqual(config.read_bytes(), original)
+        self.assertFalse(de.exists(), result.stdout)
+        self.assertNotIn("Cordis entry cannot be inspected", result.stdout)
+
+    def test_candidate_uninstaller_blocks_foreign_cordis_root_without_mutation(self) -> None:
+        de, _ = self._install_fixture()
+        dsh = self.home / "custom" / "dsh-home"
+        dsh.mkdir(parents=True)
+        self.env["DSH_HOME"] = str(dsh)
+        foreign_root = self.home / "foreign-de"
+        foreign_root.mkdir()
+        with mock.patch.dict(
+            os.environ,
+            {"HOME": str(self.home), "DSH_HOME": str(dsh)},
+        ):
+            mcp_config.write_entry(
+                "deepseek-harness",
+                python=sys.executable,
+                dev_root=foreign_root,
+            )
+        config = dsh / "cordis.patch.yml"
+        original = config.read_bytes()
+
+        result = self._run("--scope", "de", "--apply")
+
+        self.assertNotEqual(result.returncode, 0, result.stdout)
+        self.assertIn(
+            "deepseek-harness decision-engine entry ownership is unknown",
+            result.stdout,
+        )
+        self.assertEqual(config.read_bytes(), original)
+        self.assertTrue(de.exists())
+
+    def test_candidate_cordis_root_proves_active_development_launcher(self) -> None:
+        self._install_fixture()
+        dsh = self.home / "custom" / "dsh-home"
+        dsh.mkdir(parents=True)
+        self.env["DSH_HOME"] = str(dsh)
+        with mock.patch.dict(
+            os.environ,
+            {"HOME": str(self.home), "DSH_HOME": str(dsh)},
+        ):
+            mcp_config.write_entry(
+                "deepseek-harness",
+                python=sys.executable,
+                dev_root=SCRIPT.parent,
+            )
+        self._write_command(
+            "ps",
+            "#!/bin/sh\n"
+            "printf '%s\\n' "
+            + repr(
+                "901 1 /opt/python -m installer.launcher --dev-root "
+                + str(SCRIPT.parent)
+            )
+            + "\n",
+        )
+
+        result = self._run("--scope", "de")
+
+        self.assertNotEqual(result.returncode, 0, result.stdout)
+        self.assertIn("family=mcp-launcher", result.stdout)
+        self.assertNotIn("family=unverified-de-launcher", result.stdout)
+        self.assertNotIn("live process ownership is unknown", result.stdout)
+
     def test_both_runs_official_aqg_user_uninstall_and_removes_all_routes(self) -> None:
         de, _ = self._install_fixture()
         result = self._run("--scope", "both", "--apply")
@@ -699,6 +935,27 @@ class UninstallScriptTests(unittest.TestCase):
             "Library/Application Support/TRAE SOLO/User/skills/audit",
         ):
             self.assertFalse((self.home / relative).exists())
+
+    def test_both_runs_each_proven_aqg_uninstaller_when_routes_span_roots(self) -> None:
+        de, _ = self._install_fixture()
+        managed_root = self.home / ".deeppattern" / "agent-quality-gates"
+        dev_root = Path(self.temp.name) / "aqg-dev-root"
+        shutil.copytree(managed_root, dev_root)
+        dev_skill = dev_root / "skills" / "aqg-dev-only"
+        dev_skill.mkdir()
+        dsh_skills = self.home / ".dsh" / "skills"
+        dsh_skills.mkdir(parents=True)
+        dev_route = dsh_skills / dev_skill.name
+        dev_route.symlink_to(dev_skill)
+
+        result = self._run("--scope", "both", "--apply")
+
+        self.assertEqual(result.returncode, 0, result.stdout)
+        self.assertEqual(result.stdout.count("AQG official user uninstall"), 2)
+        self.assertFalse(de.exists(), result.stdout)
+        self.assertFalse(managed_root.exists(), result.stdout)
+        self.assertFalse(dev_route.exists(), result.stdout)
+        self.assertTrue(dev_root.exists(), result.stdout)
 
     def test_both_is_idempotent_when_aqg_uninstaller_removed_planned_skill(self) -> None:
         de, _ = self._install_fixture()

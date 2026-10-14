@@ -10,6 +10,9 @@ from installer.client_hosts.hosts.claude import HOST_SPECS as CLAUDE_HOST_SPECS
 from installer.client_hosts.hosts.codebuddy import HOST_SPECS as CODEBUDDY_HOST_SPECS
 from installer.client_hosts.hosts.codex import HOST_SPECS as CODEX_HOST_SPECS
 from installer.client_hosts.hosts.cursor import HOST_SPECS as CURSOR_HOST_SPECS
+from installer.client_hosts.hosts.deepseek_harness import (
+    HOST_SPECS as DEEPSEEK_HARNESS_HOST_SPECS,
+)
 from installer.client_hosts.hosts.qoder import HOST_SPECS as QODER_HOST_SPECS
 from installer.client_hosts.hosts.qoder_cn import HOST_SPECS as QODER_CN_HOST_SPECS
 from installer.client_hosts.hosts.qoder_cn_ide import (
@@ -25,6 +28,9 @@ from installer.client_hosts.hosts.trae_work_cn import (
 from installer.client_hosts.hosts.workbuddy import HOST_SPECS as WORKBUDDY_HOST_SPECS
 from installer.client_hosts.hosts.workbuddy_ai import (
     HOST_SPECS as WORKBUDDY_AI_HOST_SPECS,
+)
+from installer.client_hosts.hosts.xiaomi_mimo import (
+    HOST_SPECS as XIAOMI_MIMO_HOST_SPECS,
 )
 from installer.config import ShellError
 
@@ -47,6 +53,7 @@ CLIENT_SPECS: Mapping[str, AgentHostSpec] = MappingProxyType(
             CODEBUDDY_HOST_SPECS,
             CODEX_HOST_SPECS,
             CURSOR_HOST_SPECS,
+            DEEPSEEK_HARNESS_HOST_SPECS,
             QODER_HOST_SPECS,
             QODER_CN_HOST_SPECS,
             QODER_IDE_HOST_SPECS,
@@ -57,6 +64,7 @@ CLIENT_SPECS: Mapping[str, AgentHostSpec] = MappingProxyType(
             TRAE_WORK_CN_HOST_SPECS,
             WORKBUDDY_HOST_SPECS,
             WORKBUDDY_AI_HOST_SPECS,
+            XIAOMI_MIMO_HOST_SPECS,
         )
     )
 )

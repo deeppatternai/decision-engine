@@ -30,61 +30,67 @@ class PublicInstallEntryPointTests(unittest.TestCase):
             "dp-install.sh": [
                 # APT's namespace syntax, fixed public download checksums, and
                 # the existing approval-key separator are scanner false positives.
-                ("ipv6:::a", 988),
+                ("ipv6:::a", 1430),
                 *(
                     ("secret:bearer-hex-token", line)
                     for line in (
-                        1211,
-                        1216,
-                        1227,
-                        1233,
+                        1724,
+                        1729,
+                        1740,
+                        1746,
                     )
                 ),
-                ("ipv6:::dec", 2336),
+                ("ipv6:::dec", 2849),
                 *(
                     ("secret:bearer-hex-token", line)
                     for line in (
-                        2998,
-                        3000,
-                        3007,
-                        3009,
-                        3147,
-                        3148,
-                        3149,
-                        3276,
+                        3511,
+                        3513,
+                        3520,
+                        3522,
+                        3660,
+                        3661,
+                        3662,
+                        3796,
                     )
                 ),
             ],
             "dp-install.ps1": [
-                ("ipv6:::e", 76),
+                ("ipv6:::e", 84),
+                ("ipv6:::e", 180),
+                ("ipv6:::e", 183),
+                ("ipv6:::e", 186),
                 # Fixed public SHA-256 digests for the pinned private runtimes.
-                ("secret:bearer-hex-token", 1047),
-                ("secret:bearer-hex-token", 1053),
-                ("ipv6:::e", 1308),
-                ("ipv6:::e", 1336),
+                ("secret:bearer-hex-token", 1155),
+                ("secret:bearer-hex-token", 1161),
+                ("ipv6:::e", 1416),
+                ("ipv6:::e", 1444),
                 # The standard TLS server-auth OID is not an IPv4 address.
                 ("ipv4:" + "1.3"
-                 + ".6.1", 1468),
+                 + ".6.1", 1576),
                 ("ipv4:" + "5.5"
-                 + ".7.3", 1468),
+                 + ".7.3", 1576),
                 *(
                     ("ipv6:::e", line)
                     for line in (
-                        2844,
-                        3080,
-                        3099,
-                        3277,
-                        3286,
-                        3296,
-                        3304,
-                        3324,
-                        3331,
-                        3344,
-                        3355,
-                        3442,
-                        3450,
-                        3594,
-                        3602,
+                        2895,
+                        2898,
+                        3000,
+                        3266,
+                        3276,
+                        3298,
+                        3476,
+                        3485,
+                        3495,
+                        3503,
+                        3523,
+                        3530,
+                        3543,
+                        3554,
+                        3641,
+                        3649,
+                        3793,
+                        3801,
                     )
                 ),
             ],
@@ -96,8 +102,8 @@ class PublicInstallEntryPointTests(unittest.TestCase):
                 ("ipv6:::d", 633),
                 ("ipv6:::de", 662),
                 ("ipv6:::e", 1000),
-                ("ipv6:::e", 3210),
-                ("ipv6:::e", 3216),
+                ("ipv6:::e", 3325),
+                ("ipv6:::e", 3331),
             ],
         }
 

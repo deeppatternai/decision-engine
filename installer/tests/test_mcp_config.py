@@ -517,6 +517,7 @@ class CursorConfigTestCase(unittest.TestCase):
                 "codebuddy",
                 "codex",
                 "cursor",
+                "deepseek-harness",
                 "qoder",
                 "qoder-cn",
                 "qoder-ide",
@@ -527,6 +528,7 @@ class CursorConfigTestCase(unittest.TestCase):
                 "trae-work-cn",
                 "workbuddy",
                 "workbuddy-ai",
+                "xiaomi-mimo",
             ),
         )
         with self.assertRaises(TypeError):
@@ -2353,6 +2355,19 @@ assert mcp_config.CLIENT_SPECS == registry.CLIENT_SPECS
                     {"local-display", "popup-followup", "audit-stop-panel"}
                 ),
             },
+            "deepseek-harness": {
+                "config_renderer": "cordis-yaml-v1",
+                "skills_project_paths": (),
+                "skill_delivery_mode": "managed-copy",
+                "routing_kind": "skill",
+                "launcher_capabilities": frozenset(
+                    {"core-mcp", "local-display", "audit-stop-panel"}
+                ),
+                "doctor_capabilities": frozenset({"mcp-entry", "skills"}),
+                "optional_features": frozenset(
+                    {"local-display", "audit-stop-panel"}
+                ),
+            },
             "qoder": {
                 "config_renderer": "json-mcp-v1",
                 "skills_project_paths": (".qoder/skills",),
@@ -2499,6 +2514,19 @@ assert mcp_config.CLIENT_SPECS == registry.CLIENT_SPECS
                     {"local-display", "audit-stop-panel"}
                 ),
             },
+            "xiaomi-mimo": {
+                "config_renderer": "mimocode-jsonc-mcp-v1",
+                "skills_project_paths": (),
+                "skill_delivery_mode": "managed-copy",
+                "routing_kind": "skill",
+                "launcher_capabilities": frozenset(
+                    {"core-mcp", "local-display", "audit-stop-panel"}
+                ),
+                "doctor_capabilities": frozenset({"mcp-entry", "skills"}),
+                "optional_features": frozenset(
+                    {"local-display", "audit-stop-panel"}
+                ),
+            },
         }
 
         for client, values in expected.items():
@@ -2519,6 +2547,7 @@ assert mcp_config.CLIENT_SPECS == registry.CLIENT_SPECS
                 "codebuddy",
                 "codex",
                 "cursor",
+                "deepseek-harness",
                 "qoder",
                 "qoder-cn",
                 "qoder-ide",
@@ -2529,6 +2558,7 @@ assert mcp_config.CLIENT_SPECS == registry.CLIENT_SPECS
                 "trae-work-cn",
                 "workbuddy",
                 "workbuddy-ai",
+                "xiaomi-mimo",
             ),
         )
         with self.assertRaisesRegex(ShellError, "unsupported Doctor capability"):
@@ -2756,6 +2786,7 @@ tool_timeout_sec = 660
                 "codebuddy",
                 "codex",
                 "cursor",
+                "deepseek-harness",
                 "qoder",
                 "qoder-cn",
                 "qoder-ide",
@@ -2766,6 +2797,7 @@ tool_timeout_sec = 660
                 "trae-work-cn",
                 "workbuddy",
                 "workbuddy-ai",
+                "xiaomi-mimo",
             },
         )
         self.assertTrue(
@@ -2787,6 +2819,7 @@ tool_timeout_sec = 660
                 "codebuddy": True,
                 "codex": False,
                 "cursor": True,
+                "deepseek-harness": True,
                 "qoder": True,
                 "qoder-cn": True,
                 "qoder-ide": True,
@@ -2797,6 +2830,7 @@ tool_timeout_sec = 660
                 "trae-work-cn": False,
                 "workbuddy": False,
                 "workbuddy-ai": False,
+                "xiaomi-mimo": True,
             },
         )
 

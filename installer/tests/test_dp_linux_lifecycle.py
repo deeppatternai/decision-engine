@@ -205,9 +205,9 @@ class LinuxInstallContractTests(unittest.TestCase):
             self.source, "preflight_linux_platform", "regular_app_has_bundle_id"
         )
         for floor in (
-            "ubuntu) linux_release_at_least 22.04",
-            "debian) linux_release_at_least 12",
-            "fedora) linux_release_at_least 44",
+            "linux_release_at_least 22.04",
+            "linux_release_at_least 12",
+            "linux_release_at_least 44",
         ):
             self.assertIn(floor, preflight)
         self.assertIn("x86_64|amd64|aarch64|arm64", preflight)
@@ -215,6 +215,54 @@ class LinuxInstallContractTests(unittest.TestCase):
         self.assertIn('user_id" != "0"', preflight)
         self.assertIn('DISPLAY:-', preflight)
         self.assertIn('WAYLAND_DISPLAY:-', preflight)
+
+    def test_arch_and_omarchy_detection_uses_os_release_family_fields(self) -> None:
+        reader = shell_function(
+            self.source, "read_linux_os_release", "linux_arch_family"
+        )
+        arch_family = shell_function(
+            self.source, "linux_arch_family", "linux_release_at_least"
+        )
+        for field in ("ID", "VERSION_ID", "ID_LIKE", "VARIANT_ID"):
+            self.assertIn(f"{field})", reader)
+
+        cases = (
+            ("arch", "", "", True),
+            ("omarchy", "arch", "omarchy", True),
+            ("custom", "arch linux", "", True),
+            ("custom", "", "omarchy", True),
+            ("custom", "linux", "desktop", False),
+        )
+        for distro, like, variant, accepted in cases:
+            with self.subTest(distro=distro, like=like, variant=variant):
+                result = subprocess.run(
+                    [
+                        self.bash,
+                        "--noprofile",
+                        "--norc",
+                        "-c",
+                        arch_family
+                        + "\n"
+                        + f"LINUX_DISTRO_ID={distro!r}\n"
+                        + f"LINUX_ID_LIKE={like!r}\n"
+                        + f"LINUX_VARIANT_ID={variant!r}\n"
+                        + "linux_arch_family",
+                    ],
+                    capture_output=True,
+                    text=True,
+                )
+                self.assertEqual(result.returncode == 0, accepted, result.stderr)
+
+    def test_arch_preflight_uses_trusted_pacman_and_both_architectures(self) -> None:
+        preflight = shell_function(
+            self.source, "preflight_linux_platform", "regular_app_has_bundle_id"
+        )
+        self.assertIn('LINUX_PACKAGE_MANAGER="pacman"', preflight)
+        self.assertIn('x86_64|amd64|aarch64|arm64', preflight)
+        self.assertIn('PACMAN_BIN="/usr/bin/pacman"', self.source)
+        self.assertIn('PACMAN_KEY_BIN="/usr/bin/pacman-key"', self.source)
+        self.assertIn('"$PACMAN_BIN" --version', preflight)
+        self.assertNotIn("command -v pacman", self.source)
 
     def test_newer_releases_enter_core_install_but_malformed_and_older_fail(self) -> None:
         version_check = shell_function(
@@ -250,7 +298,12 @@ class LinuxInstallContractTests(unittest.TestCase):
             self.source, "install_linux_apt_packages", "print_linux_dnf_manual_command"
         )
         dnf = shell_function(
-            self.source, "install_linux_dnf_packages", "linux_core_dependencies_ready"
+            self.source,
+            "install_linux_dnf_packages",
+            "print_linux_pacman_manual_command",
+        )
+        pacman = shell_function(
+            self.source, "install_linux_pacman_packages", "linux_core_dependencies_ready"
         )
         self.assertIn('confirm_dependency_install "$prompt"', apt)
         self.assertIn('"$DPKG_BIN" --audit', self.source)
@@ -266,6 +319,21 @@ class LinuxInstallContractTests(unittest.TestCase):
         self.assertIn('confirm_dependency_install "$prompt"', dnf)
         self.assertIn('"$RPM_BIN" --verifydb', self.source)
         self.assertIn("--setopt=install_weak_deps=False", dnf)
+        self.assertIn('confirm_dependency_install "$prompt"', pacman)
+        self.assertIn('"$PACMAN_BIN" -Dk', self.source)
+        self.assertIn('"$PACMAN_KEY_BIN" --list-keys', self.source)
+        self.assertIn('/var/lib/pacman/db.lck', self.source)
+        self.assertIn(
+            '"$SUDO_BIN" "$PACMAN_BIN" -S --needed --noconfirm "$@"', pacman
+        )
+        for package in (
+            "git",
+            "curl",
+            "ca-certificates",
+            "minizip",
+            "xcb-util-cursor",
+        ):
+            self.assertRegex(pacman, rf"(?:^|[| ]){re.escape(package)}(?:[| )])")
         for forbidden in (
             "add-apt-repository",
             "do-release-upgrade",
@@ -273,7 +341,34 @@ class LinuxInstallContractTests(unittest.TestCase):
             "apt-get dist-upgrade",
             "dnf system-upgrade",
         ):
-            self.assertNotIn(forbidden, apt + dnf)
+            self.assertNotIn(forbidden, apt + dnf + pacman)
+        self.assertNotRegex(
+            pacman,
+            r'clean_exec\s+"\$SUDO_BIN"\s+"\$PACMAN_BIN"\s+-Sy(?:\s|\")',
+        )
+        self.assertIn("sudo pacman -Syu --needed", self.source)
+
+    def test_arch_gui_dependencies_are_optional_after_core_prerequisites(self) -> None:
+        packages = shell_function(
+            self.source, "linux_arch_dependency_packages", "linux_pacman_state_ready"
+        )
+        prerequisite = shell_function(
+            self.source, "linux_git_prerequisite", "select_private_runtime_spec"
+        )
+        popup = shell_function(
+            self.source, "prepare_linux_popup_backend", "repair_managed_skill_routes"
+        )
+        self.assertIn('linux_shared_library_available "libminizip.so.1"', packages)
+        self.assertIn('packages="$packages minizip"', packages)
+        self.assertIn('linux_shared_library_available "libxcb-cursor.so.0"', packages)
+        self.assertIn('packages="$packages xcb-util-cursor"', packages)
+        self.assertIn(
+            "Core Linux prerequisites are ready; optional Arch native visual-window "
+            "dependencies remain unavailable.",
+            prerequisite,
+        )
+        self.assertIn('minizip_package="minizip"', popup)
+        self.assertIn('xcb_cursor_package="xcb-util-cursor"', popup)
 
     def test_linux_private_python_assets_are_pinned_for_both_architectures(self) -> None:
         runtime = shell_function(

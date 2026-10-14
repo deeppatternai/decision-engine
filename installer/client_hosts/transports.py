@@ -9,7 +9,13 @@ from typing import FrozenSet, Mapping
 _TRANSPORT_RENDERERS = MappingProxyType(
     {
         "stdio": frozenset(
-            {"json-mcp-v1", "cursor-json-mcp-v1", "codex-toml-v1"}
+            {
+                "json-mcp-v1",
+                "cursor-json-mcp-v1",
+                "codex-toml-v1",
+                "cordis-yaml-v1",
+                "mimocode-jsonc-mcp-v1",
+            }
         ),
     }
 )

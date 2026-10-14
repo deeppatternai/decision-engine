@@ -145,6 +145,32 @@ class WindowsIntegrityHardeningTests(unittest.TestCase):
         self.assertIn("Johannes Schindelin|Git for Windows", self.install)
         self.assertNotIn("Resolve-CurrentPowerShell", self.uninstall)
 
+    def test_bootstrap_source_requires_the_registered_windows_git_resolver(self) -> None:
+        self.assertIn('"installer\\updater.py"', self.install)
+        source_contract = self.install[
+            self.install.index('$updaterContract ='):
+            self.install.index('$sourceShaResult =', self.install.index('$updaterContract ='))
+        ]
+        for required in (
+            "def _windows_git_for_windows_install_roots",
+            "def _windows_git_authenticode_is_valid",
+            "SignatureStatus]::Valid",
+        ):
+            with self.subTest(required=required):
+                self.assertIn(required, source_contract)
+        self.assertIn("The downloaded installer source is stale", source_contract)
+
+    def test_bootstrap_source_commit_is_logged_before_install_mutation(self) -> None:
+        source_sha = self.install.index('$sourceSha =')
+        source_log = self.install.index('bootstrap-source={1}', source_sha)
+        host_snapshot = self.install.index('Get-InstalledAgentSnapshot', source_log)
+        aqg_mutation = self.install.index('Sync-AqgCheckout', source_log)
+        bootstrap = self.install.index('Invoke-ManagedBootstrapInstall', source_log)
+        self.assertLess(source_sha, source_log)
+        self.assertLess(source_log, host_snapshot)
+        self.assertLess(source_log, aqg_mutation)
+        self.assertLess(source_log, bootstrap)
+
     def test_uninstall_helper_receives_verified_tool_paths(self) -> None:
         helper = self.helper_source
         self.assertNotIn('["powershell.exe"', helper)

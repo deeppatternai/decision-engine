@@ -1,6 +1,6 @@
 # Decision Engine
 
-**English** · [简体中文](README.zh-CN.md) · **v0.2.103**
+**English** · [简体中文](README.zh-CN.md) · **v0.2.104**
 
 > **A second opinion you can actually trust — because it comes from many
 > independent minds, not one model agreeing with itself.**
@@ -197,18 +197,30 @@ forecasts, graphics, boards, and popup follow-up require device activation
 
 ### Supported AI tools, grouped by family
 
-All products below support MCP, native windows, popup follow-up, and Stop Panel.
-This table summarizes them by family; installation detects the current host and
-configures the MCP and Skills it supports.
+This table summarizes products by family; installation detects the current host
+and configures only the capabilities it supports. Unless a row says otherwise,
+the products below support MCP, native windows, popup follow-up, and Stop Panel.
 
 | Family | Supported products | Differences to note |
 |---|---|---|
 | Claude | Claude Code, Claude Desktop, Claude third-party provider profile | Claude Code also supports Skills; the third-party profile is an independent macOS MCP location. |
 | Codex | Codex | Supports Skills. |
+| DeepSeek | DeepSeek Harness | Supports core MCP, user Skills, native display windows, and Audit Stop Panel through Cordis `cordis.patch.yml`; popup follow-up is not exposed. |
+| Xiaomi | Xiaomi MiMo | Supports core MCP, user Skills, native display windows, and Audit Stop Panel through byte-preserving `mimocode.jsonc`; popup follow-up is not exposed. |
 | Cursor | Cursor | Supports Skills. |
 | Tencent | CodeBuddy Agent CLI, WorkBuddy Desktop, WorkBuddy AI Desktop | CodeBuddy support is limited to the standalone Agent CLI, not CodeBuddy Studio. |
 | Alibaba Qoder | Qoder Desktop, Qoder CN Desktop, Qoder IDE, Qoder CN IDE | Desktop/IDE and standard/CN variants are distinct; IDE variants have separate MCP identities and share Skills and audit hooks with the corresponding Qoder variant. |
 | TRAE | TRAE Desktop, TRAE CN Desktop, TRAE Work, TRAE Work CN | Desktop/Work and standard/CN variants are handled separately. |
+
+On macOS, a native `DeepSeek Harness.app` installation is sufficient for the
+installer to offer the DeepSeek Harness integration before Cordis configuration
+exists or `dsh` is added to `PATH`.
+
+On macOS, the installer recognizes the exact `Xiaomi MiMo.app` bundle identity.
+Across macOS, Linux, and Windows it also recognizes an existing MiMoCode config
+under `$MIMOCODE_HOME/config`, `$XDG_CONFIG_HOME/mimocode`, or
+`~/.config/mimocode`, in that order. Deep Pattern edits only its marked MCP
+member and does not copy or inspect provider credentials elsewhere in that file.
 
 ### Audit depth
 
@@ -290,26 +302,32 @@ The script does not accept command-line arguments.
 #### Linux desktop
 
 The same [dp-install.sh](dp-install.sh) entrypoint supports glibc desktop
-installations on Ubuntu 22.04/24.04 LTS, Debian 12, and Fedora 44, on both
-`x86_64` and `aarch64` where the selected runtime is available:
+installations on Ubuntu 22.04/24.04 LTS, Debian 12, Fedora 44, Arch Linux, and
+Omarchy. Ubuntu, Debian, and Fedora cover both `x86_64` and `aarch64` where the
+selected runtime is available. The Arch-family path is acceptance-tested on
+Omarchy `aarch64`; `x86_64` is implemented but remains pending native-device
+acceptance:
 
 ```bash
 bash ./dp-install.sh
 ```
 
 The installer must be run as the intended non-root desktop user. It may offer
-to install an explicit allowlist of missing dependencies through APT or DNF
-after `[Y/N]` confirmation and sudo authorization. It does not add repositories
-or run a full system/distribution upgrade. Decision Engine uses a verified
-private Python runtime and does not replace the system Python.
+to install an explicit allowlist of missing dependencies through APT, DNF, or
+pacman after `[Y/N]` confirmation and sudo authorization. It does not add
+repositories, run `pacman -Sy`, or silently run a full system/distribution
+upgrade. If an Arch package repair or synchronized upgrade is required, it
+prints a command for the system administrator instead. Decision Engine uses a
+verified private Python runtime and does not replace the system Python.
 
 Native diagram, comic, and discussion-board windows were acceptance-tested on
 Ubuntu 24.04 ARM64, Debian 12 ARM64 and x86_64, and Fedora 44 ARM64. Debian 12
-ARM64 uses GTK/WebKit; compatible Ubuntu, Debian x86_64, and Fedora targets use
-the pinned Qt/WebEngine runtime. Ubuntu 22.04 ARM64 retains core MCP and Stop
-Panel support but does not receive automatic native visual-window provisioning.
-Headless Linux, WSL, musl distributions, and other releases are not supported
-by this entrypoint.
+ARM64 uses GTK/WebKit; compatible Ubuntu, Debian x86_64, Fedora, and Arch-family
+targets use the pinned Qt/WebEngine runtime. Ubuntu 22.04 ARM64 retains core MCP
+and Stop Panel support but does not receive automatic native visual-window
+provisioning. Missing optional Arch-family visual-window packages do not block
+the core MCP installation. Headless Linux, WSL, musl distributions, and
+unrecognized non-Arch families are not supported by this entrypoint.
 
 #### Native Windows
 
@@ -371,21 +389,31 @@ Full details, including the fail-closed cleartext-credential rules, are in
 
 ## Check your setup
 
-`de doctor` — a one-shot diagnostic (like AQG's) that tells you, in one place,
-whether the client is ready and what to fix if not:
+Run the Doctor installed with Decision Engine to see, in one place, whether the
+client is ready and what to fix if not. It always uses the private Python
+environment prepared by the installer, so a system `python3` is not required.
+
+macOS or Linux:
 
 ```bash
-python3 -m installer.doctor          # human-readable report
-python3 -m installer.doctor --json   # machine-readable
+bash "$HOME/.deeppattern/decision-engine/dp-doctor.sh"
+bash "$HOME/.deeppattern/decision-engine/dp-doctor.sh" --json
+```
+
+Windows PowerShell:
+
+```powershell
+powershell.exe -NoProfile -ExecutionPolicy Bypass -File "$HOME\.deeppattern\decision-engine\dp-doctor.ps1"
+powershell.exe -NoProfile -ExecutionPolicy Bypass -File "$HOME\.deeppattern\decision-engine\dp-doctor.ps1" -Json
 ```
 
 It checks: Python is 3.12+, the skills are linked into your agent, the native
 popup backend (pywebview) can open a window, LibreOffice is available for Office
 conversion (a WARN if not — it's optional and installed on demand), and whether
 this device is activated. It exits `0` when everything is PASS or WARN, `1` when
-something is genuinely broken. It never prints your endpoint or activation
-secret — only whether they are set. Both supported installation methods run it
-at the end of an install.
+something is genuinely broken, and `2` for invalid arguments. It never prints
+your endpoint or activation secret — only whether they are set. Both supported
+installation methods run it at the end of an install.
 
 ## Installed copy and updates
 
@@ -397,39 +425,13 @@ originally downloaded one-click installer.
 
 Do not handle legacy installations, failed migrations, or recovery by manually
 overwriting the installation directory. Preserve existing files and follow the
-recovery instructions reported by Doctor or the installer. `python3 -m
-installer.doctor` reports installed, target, running, and last-result state, so
-a fetched version is not mistaken for the version actually serving.
+recovery instructions reported by Doctor or the installer. The installed Doctor
+reports installed, target, running, and last-result state, so a fetched version
+is not mistaken for the version actually serving.
 
-## Verify the shell is clean
-
-Source prepared for distribution must not contain real service addresses, secrets,
-or device tokens, or the hosted server's dedicated prompts, layout templates,
-orchestration, or GUI/ad source. The client's own window and display code belongs
-in the distribution; local configuration generated after installation is separate.
-These checks detect the leak patterns the scanner recognizes:
-
-```bash
-python3 -m installer.leak_scan                       # exit 0 = clean
-python3 -m unittest installer.tests.test_leak_scan
-```
-
-## Run the tests
-
-Run the unittest suite in the Python environment prepared above, with the declared
-package dependencies installed:
-
-```bash
-python3 -m unittest \
-  installer.tests.test_install \
-  installer.tests.test_shim \
-  installer.tests.test_activate \
-  installer.tests.test_mcp_config \
-  installer.tests.test_leak_scan \
-  installer.tests.test_stopper_fallback \
-  installer.tests.test_window_icon \
-  client.popup.tests.test_visual_capture
-```
+Source-checkout development and release validation commands are maintained in
+the [installer reference](installer/README.md); they are not installed-user
+diagnostic commands.
 
 ## License
 

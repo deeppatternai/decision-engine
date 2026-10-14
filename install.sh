@@ -383,7 +383,7 @@ install_de_dev_mode() {
     echo "==> Wiring the local decision-engine MCP into your agent(s) (--dev-root ${repo_root}):"
     ( cd "${repo_root}" && run_python -m installer.mcp_config --write --dev-root "${repo_root}" ) \
       || echo "install: NOTE — auto-wire found no agent or hit an error; run" \
-              "'${PYTHON_BIN} -m installer.mcp_config --write --dev-root ${repo_root} --client <claude-code|claude-desktop|claude-desktop-3p|codebuddy|codex|cursor|qoder|qoder-cn|qoder-ide|qoder-cn-ide|trae|trae-work|trae-cn|trae-work-cn|workbuddy|workbuddy-ai>'" \
+              "'${PYTHON_BIN} -m installer.mcp_config --write --dev-root ${repo_root} --client <claude-code|claude-desktop|claude-desktop-3p|codebuddy|codex|cursor|deepseek-harness|xiaomi-mimo|qoder|qoder-cn|qoder-ide|qoder-cn-ide|trae|trae-work|trae-cn|trae-work-cn|workbuddy|workbuddy-ai>'" \
               "or see installer/README.md." >&2
 
     # Current Codex releases route through skills.  This is a one-way migration only: it removes
@@ -556,6 +556,33 @@ run_aqg_client_phase() {
   esac
 }
 
+deepseek_harness_installed_for_de() {
+  local source_root
+  source_root="$(cd "$(dirname "${BASH_SOURCE[0]:-$0}")" && pwd)"
+  (
+    cd "${source_root}" &&
+      run_python -c \
+        'from installer import mcp_config; raise SystemExit(0 if mcp_config.client_present("deepseek-harness") else 1)'
+  ) </dev/null >/dev/null 2>&1
+}
+
+xiaomi_mimo_installed_for_de() {
+  local source_root
+  source_root="$(cd "$(dirname "${BASH_SOURCE[0]:-$0}")" && pwd)"
+  (
+    cd "${source_root}" &&
+      run_python -c \
+        'from installer import mcp_config; raise SystemExit(0 if mcp_config.client_present("xiaomi-mimo") else 1)'
+  ) </dev/null >/dev/null 2>&1
+}
+
+aqg_registry_supports_client() {
+  local client="$1"
+  run_python -c \
+    'from pathlib import Path; import sys; root = Path(sys.argv[1]).resolve(strict=True); sys.path.insert(0, str(root)); from scripts.aqg_client_registry import CLIENT_REGISTRY; raise SystemExit(0 if sys.argv[2] in CLIENT_REGISTRY else 1)' \
+    "${AQG_DEST}" "${client}" </dev/null >/dev/null 2>&1
+}
+
 install_de() {
   local aqg_ready="0"
   local status
@@ -563,6 +590,15 @@ install_de() {
     ensure_aqg_checkout_and_deps \
       || die "AQG could not be installed; Decision Engine was not installed." \
              "Review the AQG installation errors above, then retry this installer."
+
+    if deepseek_harness_installed_for_de \
+        && ! aqg_registry_supports_client "deepseek-harness"; then
+      echo "==> AQG does not expose a deepseek-harness adapter; continuing with DE-only DeepSeek Harness integration."
+    fi
+    if xiaomi_mimo_installed_for_de \
+        && ! aqg_registry_supports_client "xiaomi-mimo"; then
+      echo "==> AQG does not expose a xiaomi-mimo adapter; continuing with DE-only Xiaomi MiMo integration."
+    fi
 
     if run_aqg_client_phase apply --apply; then
       :

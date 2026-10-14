@@ -1426,8 +1426,30 @@ def known_windows_config_paths(home: Path) -> tuple[Path, ...]:
     )
 
 
+def known_windows_cordis_paths(home: Path) -> tuple[Path, ...]:
+    configured_path = os.getenv("DEEPSEEK_HARNESS_CONFIG", "").strip()
+    configured_home = os.getenv("DSH_HOME", "").strip()
+    if configured_path:
+        return (Path(configured_path).expanduser(),)
+    if configured_home:
+        return (Path(configured_home).expanduser() / "cordis.patch.yml",)
+    return (home / ".dsh" / "cordis.patch.yml",)
+
+
+def known_windows_mimocode_paths(home: Path) -> tuple[Path, ...]:
+    configured_home = os.getenv("MIMOCODE_HOME", "").strip()
+    configured_xdg = os.getenv("XDG_CONFIG_HOME", "").strip()
+    if configured_home:
+        root = Path(configured_home).expanduser() / "config"
+    elif configured_xdg:
+        root = Path(configured_xdg).expanduser() / "mimocode"
+    else:
+        root = home / ".config" / "mimocode"
+    return tuple(root / name for name in ("mimocode.jsonc", "mimocode.json", "config.json"))
+
+
 def known_windows_skill_roots(home: Path) -> tuple[Path, ...]:
-    return (
+    roots = [
         home / ".claude" / "skills",
         home / ".codex" / "skills",
         home / ".cursor" / "skills",
@@ -1437,7 +1459,25 @@ def known_windows_skill_roots(home: Path) -> tuple[Path, ...]:
         home / ".trae" / "skills",
         home / ".trae-cn" / "skills",
         home / ".workbuddy" / "skills",
-    )
+        home / ".dsh" / "skills",
+        home / ".config" / "mimocode" / "skills",
+    ]
+    configured_home = os.getenv("DSH_HOME", "").strip()
+    if configured_home:
+        configured = Path(configured_home).expanduser()
+        if configured.is_absolute():
+            roots.append(configured / "skills")
+    configured_mimo_home = os.getenv("MIMOCODE_HOME", "").strip()
+    configured_xdg = os.getenv("XDG_CONFIG_HOME", "").strip()
+    if configured_mimo_home:
+        configured = Path(configured_mimo_home).expanduser()
+        if configured.is_absolute():
+            roots.append(configured / "config" / "skills")
+    elif configured_xdg:
+        configured = Path(configured_xdg).expanduser()
+        if configured.is_absolute():
+            roots.append(configured / "mimocode" / "skills")
+    return tuple(roots)
 
 
 def _strip_windows_device_prefix(value: str) -> str:
@@ -2294,6 +2334,7 @@ class Inventory:
                 continue
             owned = False
             spec = mcp_config.CLIENT_SPECS[client]
+            writer = mcp_config.renderer_writer(spec.config_renderer)
             try:
                 record = client_host_ownership.read_record_if_present(
                     spec.host_family,
@@ -2318,11 +2359,11 @@ class Inventory:
                 owned = False
             if not owned:
                 try:
-                    desired = mcp_config._render_client_entry(
-                        client,
-                        python=actual.get("command"),
-                        cwd=self.de_root,
-                    )
+                    python = actual.get("command")
+                    if writer == "mimocode-jsonc-splice-v1":
+                        command = actual.get("command")
+                        python = command[0] if isinstance(command, list) and command else None
+                    desired = mcp_config._render_client_entry(client, python=python, cwd=self.de_root)
                     owned = (
                         client_host_ownership.managed_entry_sha256_v1(actual)
                         == client_host_ownership.managed_entry_sha256_v1(desired)
@@ -2342,7 +2383,12 @@ class Inventory:
                 if not path.is_file() or is_reparse(path):
                     self.blockers.append("owned host configuration is not a regular file: %s" % path)
                     continue
-                kind = "edit-toml" if path.suffix.lower() == ".toml" else "edit-json"
+                if writer == "cordis-managed-block-v1":
+                    kind = "edit-cordis-yaml"
+                elif writer == "mimocode-jsonc-splice-v1":
+                    kind = "edit-mimocode-jsonc"
+                else:
+                    kind = "edit-toml" if path.suffix.lower() == ".toml" else "edit-json"
                 self.add(
                     kind,
                     path,
@@ -2459,6 +2505,44 @@ class Inventory:
                     found = True
             except (OSError, UnicodeError, ValueError, TypeError, RecursionError):
                 self.blockers.append("host configuration cannot be inspected safely: %s" % path)
+                found = True
+        cordis_markers = (
+            b"# BEGIN DEEP PATTERN decision-engine (managed)",
+            b"# END DEEP PATTERN decision-engine (managed)",
+        )
+        for path in known_windows_cordis_paths(self.home):
+            if not path.is_file() or is_reparse(path):
+                continue
+            try:
+                raw = path.read_bytes()
+            except OSError:
+                self.blockers.append("Cordis configuration cannot be inspected safely: %s" % path)
+                found = True
+                continue
+            if any(marker in raw for marker in cordis_markers):
+                self.blockers.append(
+                    "Decision Engine root is unavailable while a managed Cordis marker remains: %s"
+                    % path
+                )
+                found = True
+        mimocode_markers = (
+            b"// BEGIN DEEP PATTERN decision-engine (managed)",
+            b"// END DEEP PATTERN decision-engine (managed)",
+        )
+        for path in known_windows_mimocode_paths(self.home):
+            if not path.is_file() or is_reparse(path):
+                continue
+            try:
+                raw = path.read_bytes()
+            except OSError:
+                self.blockers.append("MiMo configuration cannot be inspected safely: %s" % path)
+                found = True
+                continue
+            if any(marker in raw for marker in mimocode_markers):
+                self.blockers.append(
+                    "Decision Engine root is unavailable while a managed MiMo marker remains: %s"
+                    % path
+                )
                 found = True
         expected_skills = self.de_root / "skills"
         for skills_root in known_windows_skill_roots(self.home):
@@ -2871,8 +2955,46 @@ def apply_config(action: Action, managed_root: Path, backup: Path, manifest: Man
         )
         if not owned:
             raise RuntimeError("orphaned configuration ownership could not be re-proven: %s" % path)
+    if action.kind == "edit-mimocode-jsonc":
+        if action.client != "xiaomi-mimo":
+            raise RuntimeError("MiMo configuration action has an invalid client")
+        sys.path.insert(0, str(managed_root))
+        try:
+            from installer import mcp_config
+            if Path(mcp_config.__file__).resolve().parent.parent != managed_root.resolve():
+                raise RuntimeError("MiMo remover was not loaded from the managed root")
+            if path_key(mcp_config.agent_config_path("xiaomi-mimo")) != path_key(path):
+                raise RuntimeError("MiMo configuration path changed before apply")
+            result = mcp_config.remove_entry("xiaomi-mimo", create_backup=False)
+        finally:
+            try:
+                sys.path.remove(str(managed_root))
+            except ValueError:
+                pass
+        if result.get("action") != "removed":
+            raise RuntimeError("owned MiMo entry disappeared before apply: %s" % path)
+        manifest.add(path, None, "edit-mimocode-jsonc", None)
+        return
     copy_config_backup(path, backup, manifest, index)
-    if action.kind == "edit-json":
+    if action.kind == "edit-cordis-yaml":
+        if action.client != "deepseek-harness":
+            raise RuntimeError("Cordis configuration action has an invalid client")
+        sys.path.insert(0, str(managed_root))
+        try:
+            from installer import mcp_config
+            if Path(mcp_config.__file__).resolve().parent.parent != managed_root.resolve():
+                raise RuntimeError("Cordis remover was not loaded from the managed root")
+            if path_key(mcp_config.agent_config_path("deepseek-harness")) != path_key(path):
+                raise RuntimeError("Cordis configuration path changed before apply")
+            result = mcp_config.remove_entry("deepseek-harness", create_backup=False)
+        finally:
+            try:
+                sys.path.remove(str(managed_root))
+            except ValueError:
+                pass
+        if result.get("action") != "removed":
+            raise RuntimeError("owned Cordis entry disappeared before apply: %s" % path)
+    elif action.kind == "edit-json":
         data = read_json(path)
         servers = data.get("mcpServers")
         changed = False
@@ -3080,7 +3202,22 @@ def apply_inventory(inv: Inventory) -> Path:
     manifest = Manifest(backup, inv.home, inv.scope)
     manifest.write()
 
-    # Move the proven DE runtime out of service before touching any Agent
+    # Specialized host formats are removed by the managed DE renderer before
+    # its code root is quarantined. MiMo is intentionally not snapshotted
+    # because its config can contain provider credentials.
+    pre_root_config_actions = [
+        action
+        for action in inv.actions
+        if action.kind == "edit-cordis-yaml"
+        or action.kind == "edit-mimocode-jsonc"
+    ]
+    completed_keys: set[tuple[str, str, str | None]] = set()
+    for index, action in enumerate(pre_root_config_actions, 1):
+        apply_config(action, inv.de_root, backup, manifest, index)
+        completed_keys.add((action.kind, path_key(action.path), action.client))
+        manifest.write()
+
+    # Move the proven DE runtime out of service before touching any other Agent
     # integration. If Windows refuses the move, the uninstall stops with every
     # host route still intact and can be retried after the locking process exits.
     pre_aqg_root_actions = [
@@ -3089,7 +3226,6 @@ def apply_inventory(inv: Inventory) -> Path:
         if action.kind in {"quarantine-root", "quarantine-root-link"}
         and path_key(action.path) == path_key(inv.de_root)
     ]
-    completed_keys: set[tuple[str, str, str | None]] = set()
     for index, action in enumerate(pre_aqg_root_actions, 1):
         quarantine_path(action, backup, manifest, index)
         completed_keys.add((action.kind, path_key(action.path), action.client))
@@ -3125,7 +3261,10 @@ def apply_inventory(inv: Inventory) -> Path:
             deduplicated.append(action)
     effective_actions = deduplicated
 
-    config_actions = [a for a in effective_actions if a.kind in {"edit-json", "edit-toml"}]
+    config_actions = [
+        a for a in effective_actions
+        if a.kind in {"edit-json", "edit-toml", "edit-cordis-yaml", "edit-mimocode-jsonc"}
+    ]
     route_actions = [a for a in effective_actions if a.kind == "remove-skill-route"]
     record_actions = [a for a in effective_actions if a.kind == "quarantine-record"]
     popup_actions = [a for a in effective_actions if a.kind == "remove-popup-sessions"]

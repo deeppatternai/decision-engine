@@ -2323,6 +2323,16 @@ class MainTests(unittest.TestCase):
         self.assertEqual(payload["results"][0]["name"], "python")
         self.assertEqual(payload["cursor_states"], ["not_selected"])
 
+    def test_public_rerun_command_uses_installed_entrypoint(self):
+        with mock.patch.object(sys, "platform", "darwin"):
+            command = doctor._public_doctor_command()
+            self.assertIn("dp-doctor.sh", command)
+            self.assertNotIn("python3 -m", command)
+        with mock.patch.object(sys, "platform", "win32"):
+            command = doctor._public_doctor_command()
+            self.assertIn("dp-doctor.ps1", command)
+            self.assertNotIn("python3 -m", command)
+
     def test_cursor_version_json_stays_isolated_from_status_collector(self):
         result = doctor.CheckResult("PASS", "cursor-version", "supported")
         with (

@@ -267,6 +267,26 @@ class ManagedShimIdentityTests(unittest.TestCase):
         inventory.process_blockers = ["process a", "process b"]
         self.assertTrue(inventory.has_only_process_blockers())
 
+    def test_process_only_refresh_preserves_proven_development_root(self) -> None:
+        inventory = self._inventory()
+        development_root = Path(self.temp.name) / "candidate"
+        inventory.de_refs = (*inventory.de_refs, development_root)
+        original_inspect = self.module["Inventory"].inspect_processes
+        captured: list[tuple[Path, ...]] = []
+
+        def capture(candidate) -> None:
+            captured.append(candidate.de_refs)
+
+        self.module["Inventory"].inspect_processes = capture
+        try:
+            refreshed = self.module["process_only_inventory"](inventory)
+        finally:
+            self.module["Inventory"].inspect_processes = original_inspect
+
+        self.assertIsNot(refreshed, inventory)
+        self.assertEqual(captured, [inventory.de_refs])
+        self.assertEqual(refreshed.de_refs, inventory.de_refs)
+
     def test_apply_with_only_process_blockers_returns_pending_without_mutation(self) -> None:
         inventory = self._inventory()
         inventory.processes = [
@@ -376,6 +396,7 @@ class ManagedShimIdentityTests(unittest.TestCase):
 
         original_process_only = self.module["process_only_inventory"]
         original_prompt = self.module["prompt_tty"]
+        original_pause = self.module["pause_verified_supervisors"]
         original_terminate = self.module["terminate_verified_processes"]
         original_inventory = self.module["Inventory"]
         original_sleep = self.module["time"].sleep
@@ -383,6 +404,10 @@ class ManagedShimIdentityTests(unittest.TestCase):
         self.module["process_only_inventory"] = lambda _inventory: current
         self.module["prompt_tty"] = lambda message: (
             self.assertIn("[Y/N]", message) or "y"
+        )
+        paused = [{"pid": "201"}]
+        self.module["pause_verified_supervisors"] = (
+            lambda _inventory, items: paused if items == [eligible] else None
         )
         self.module["terminate_verified_processes"] = lambda _inventory, items: (
             captured.extend(items) or True
@@ -396,6 +421,7 @@ class ManagedShimIdentityTests(unittest.TestCase):
         finally:
             self.module["process_only_inventory"] = original_process_only
             self.module["prompt_tty"] = original_prompt
+            self.module["pause_verified_supervisors"] = original_pause
             self.module["terminate_verified_processes"] = original_terminate
             self.module["Inventory"] = original_inventory
             self.module["time"].sleep = original_sleep
@@ -403,6 +429,7 @@ class ManagedShimIdentityTests(unittest.TestCase):
         self.assertIs(result, refreshed)
         self.assertFalse(pending)
         self.assertEqual(captured, [eligible])
+        self.assertEqual(result.paused_supervisors, paused)
 
     def test_chatgpt_codex_parent_is_reported_as_known_host(self) -> None:
         inventory = self._inventory()
@@ -435,6 +462,29 @@ class ManagedShimIdentityTests(unittest.TestCase):
         )
         self.assertEqual(label, "Codex (ChatGPT.app)")
 
+    def test_unknown_verified_child_does_not_tell_user_to_quit_host(self) -> None:
+        inventory = self._inventory()
+        inventory.processes = [
+            {
+                "pid": "102",
+                "ppid": "201",
+                "family": "mcp-launcher",
+                "host": "Unknown Agent",
+                "term_eligible": "true",
+                "executable": sys.executable,
+            }
+        ]
+        output = io.StringIO()
+
+        with contextlib.redirect_stdout(output):
+            self.module["print_process_summary"](
+                inventory, "ACTIVE AGENT SESSIONS:"
+            )
+
+        rendered = output.getvalue()
+        self.assertIn("can be stopped after confirmation", rendered)
+        self.assertNotIn("Please quit the application", rendered)
+
     def test_term_target_is_revalidated_immediately_before_signal(self) -> None:
         candidates = [
             {
@@ -462,6 +512,107 @@ class ManagedShimIdentityTests(unittest.TestCase):
 
         self.assertFalse(result)
         self.assertIn("changed before TERM: identity changed", output.getvalue())
+
+    def test_verified_supervisors_are_paused_once_and_resumed_by_identity(self) -> None:
+        inventory = self._inventory()
+        candidates = [
+            {
+                "pid": "102",
+                "ppid": "201",
+                "family": "mcp-launcher",
+                "term_eligible": "true",
+            },
+            {
+                "pid": "103",
+                "ppid": "201",
+                "family": "mcp-launcher",
+                "term_eligible": "true",
+            },
+        ]
+        parent = {
+            "pid": "201",
+            "ppid": "1",
+            "uid": str(os.getuid()),
+            "start_time": "frozen-start",
+            "command_line": "/Applications/DeepSeek Harness.app/Contents/MacOS/DeepSeek Harness",
+        }
+        signals: list[tuple[int, int]] = []
+        original_revalidate = self.module["revalidate_term_target"]
+        original_read = self.module["read_process_identity"]
+        original_kill = self.module["os"].kill
+        self.module["revalidate_term_target"] = lambda *_args: (True, "")
+        self.module["read_process_identity"] = lambda _inv, process: (
+            dict(parent) if process.get("pid") == "201" else None
+        )
+        self.module["os"].kill = lambda pid, sig: signals.append((pid, sig))
+        try:
+            paused = self.module["pause_verified_supervisors"](
+                inventory, candidates
+            )
+            self.assertEqual(paused, [parent])
+            self.module["resume_paused_supervisors"](inventory, paused)
+        finally:
+            self.module["revalidate_term_target"] = original_revalidate
+            self.module["read_process_identity"] = original_read
+            self.module["os"].kill = original_kill
+
+        self.assertEqual(
+            signals,
+            [(201, self.module["signal"].SIGSTOP), (201, self.module["signal"].SIGCONT)],
+        )
+
+    def test_main_resumes_paused_supervisor_when_apply_fails(self) -> None:
+        initial = self._inventory()
+        initial.processes = [
+            {
+                "pid": "102",
+                "ppid": "201",
+                "family": "mcp-launcher",
+                "term_eligible": "true",
+            }
+        ]
+        initial.process_blockers = ["process"]
+        initial.blockers = ["process"]
+        refreshed = self._inventory()
+        refreshed.actions = [
+            {"kind": "remove-root", "path": str(refreshed.de), "detail": "de"}
+        ]
+        refreshed.paused_supervisors = [{"pid": "201"}]
+        resumed: list[dict[str, str]] = []
+
+        class InitialInventory:
+            def __init__(self, _home: Path, _scope: str) -> None:
+                pass
+
+            def collect(self):
+                return initial
+
+        originals = {
+            name: self.module[name]
+            for name in (
+                "Inventory",
+                "resolve_process_blockers",
+                "apply_inventory",
+                "resume_paused_supervisors",
+            )
+        }
+        self.module["Inventory"] = InitialInventory
+        self.module["resolve_process_blockers"] = lambda _inv: (refreshed, False)
+        self.module["apply_inventory"] = lambda _inv: (_ for _ in ()).throw(
+            RuntimeError("apply failed")
+        )
+        self.module["resume_paused_supervisors"] = (
+            lambda _inv, supervisors: resumed.extend(supervisors)
+        )
+        try:
+            result = self.module["main"](
+                ["--scope", "de", "--apply", "--home", str(self.home)]
+            )
+        finally:
+            self.module.update(originals)
+
+        self.assertEqual(result, self.module["EXIT_BLOCKED"])
+        self.assertEqual(resumed, [{"pid": "201"}])
 
     def test_absent_paths_are_not_reported_as_preserved(self) -> None:
         inventory = self._inventory()

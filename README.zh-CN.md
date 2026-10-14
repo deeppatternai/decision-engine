@@ -1,6 +1,6 @@
 # Decision Engine
 
-[English](README.md) · **简体中文** · **v0.2.103**
+[English](README.md) · **简体中文** · **v0.2.104**
 
 > **一个你真正敢信的第二意见 —— 因为它来自许多个彼此独立的头脑，而不是一个模型在自我认同。**
 
@@ -159,17 +159,27 @@ AQG 是本地、无需账户的工程纪律工具包。安装其中任一个，�
 
 ### 支持的 AI 工具（按系列汇总）
 
-下列产品均支持 MCP、原生窗口、弹窗追问和 Stop Panel。这里按系列汇总产品；安装流程会
-自动探测当前宿主并配置其支持的 MCP 和 Skills。
+这里按系列汇总产品；安装流程会自动探测当前宿主，并且只配置该宿主实际支持的能力。
+除非表格另有说明，下列产品支持 MCP、原生窗口、弹窗追问和 Stop Panel。
 
 | 系列 | 支持的产品 | 需要注意的区别 |
 |---|---|---|
 | Claude | Claude Code、Claude Desktop、Claude 第三方提供商配置 | Claude Code 另支持 Skills；第三方提供商配置仅 macOS，使用独立 MCP 配置。 |
 | Codex | Codex | 支持 Skills。 |
+| DeepSeek | DeepSeek Harness | 通过 Cordis `cordis.patch.yml` 支持 core MCP、user Skills、原生显示窗口与审计 Stop Panel；不暴露弹窗追问。 |
+| 小米 | Xiaomi MiMo | 通过保持原字节的 `mimocode.jsonc` 托管块支持 core MCP、user Skills、原生显示窗口与审计 Stop Panel；不暴露弹窗追问。 |
 | Cursor | Cursor | 支持 Skills。 |
 | 腾讯 | CodeBuddy Agent CLI、WorkBuddy Desktop、WorkBuddy AI Desktop | CodeBuddy 仅支持独立 Agent CLI，不支持 CodeBuddy Studio。 |
 | 阿里 Qoder | Qoder Desktop、Qoder CN Desktop、Qoder IDE、Qoder CN IDE | 区分 Desktop／IDE 和普通版／CN 版；IDE 使用独立 MCP 身份，共享对应版本的 Skills 与审计 hook。 |
 | TRAE | TRAE Desktop、TRAE CN Desktop、TRAE Work、TRAE Work CN | Desktop 与 Work、普通版与 CN 版分别处理。 |
+
+在 macOS 上，只要已安装原生 `DeepSeek Harness.app`，即使 Cordis 配置尚未
+生成且 `dsh` 尚未加入 `PATH`，安装器也会提供 DeepSeek Harness 集成选项。
+
+在 macOS 上，安装器会核验原生 `Xiaomi MiMo.app` 的精确 bundle identity；
+在 macOS、Linux 与 Windows 上，也会按顺序识别 `$MIMOCODE_HOME/config`、
+`$XDG_CONFIG_HOME/mimocode` 或 `~/.config/mimocode` 中已有的 MiMoCode 配置。
+Deep Pattern 只编辑自身带标记的 MCP 成员，不复制或检查文件中的 provider 凭据。
 
 ### 审计深度
 
@@ -235,23 +245,26 @@ bash ./dp-install.sh
 #### Linux 桌面
 
 同一份 [dp-install.sh](dp-install.sh) 支持采用 glibc 的 Ubuntu 22.04/24.04
-LTS、Debian 12 和 Fedora 44 桌面系统；在所选 Runtime 可用时同时覆盖
-`x86_64` 与 `aarch64`：
+LTS、Debian 12、Fedora 44、Arch Linux 和 Omarchy 桌面系统。Ubuntu、Debian
+与 Fedora 在所选 Runtime 可用时同时覆盖 `x86_64` 与 `aarch64`；Arch 系路径已在
+Omarchy `aarch64` 完成人工验收，`x86_64` 已实现但仍待对应原生设备验收：
 
 ```bash
 bash ./dp-install.sh
 ```
 
 必须以目标桌面普通用户运行安装器，不能整体使用 root。缺少系统依赖时，安装器会列出固定
-白名单，并在用户明确确认 `[Y/N]` 和 sudo 授权后使用 APT 或 DNF；不会添加软件源，也不会
-执行完整系统或发行版升级。Decision Engine 使用经过校验的私有 Python Runtime，不会替换
-系统 Python。
+白名单，并在用户明确确认 `[Y/N]` 和 sudo 授权后使用 APT、DNF 或 pacman；不会添加软件源、
+运行 `pacman -Sy`，也不会静默执行完整系统或发行版升级。如果 Arch 包状态需要修复或同步
+升级，安装器只向系统管理员显示建议命令。Decision Engine 使用经过校验的私有 Python
+Runtime，不会替换系统 Python。
 
 原生图解、漫解和讨论板窗口已在 Ubuntu 24.04 ARM64、Debian 12 ARM64/x86_64、
 Fedora 44 ARM64 完成人工验收。Debian 12 ARM64 使用 GTK/WebKit；兼容的 Ubuntu、
-Debian x86_64 和 Fedora 使用固定版本的 Qt/WebEngine Runtime。Ubuntu 22.04 ARM64
-保留核心 MCP 与审核 Stop Panel，但不会自动配置原生可视窗口。该入口不支持无桌面 Linux、
-WSL、musl 发行版或其它发行版版本。
+Debian x86_64、Fedora 与 Arch 系目标使用固定版本的 Qt/WebEngine Runtime。Ubuntu
+22.04 ARM64 保留核心 MCP 与审核 Stop Panel，但不会自动配置原生可视窗口；Arch 系缺少
+可选原生窗口依赖时也不会阻断核心 MCP 安装。该入口不支持无桌面 Linux、WSL、musl
+发行版或无法识别为 Arch 系的其它发行版。
 
 #### 原生 Windows
 
@@ -300,17 +313,27 @@ skills。普通的 agent 重启和自动更新不会新增宿主接入关系，�
 
 ## 检查你的环境
 
-`de doctor` —— 一个一次性诊断（和 AQG 一样），一处告诉你客户端是否就绪、不就绪该修什么：
+运行 Decision Engine 随安装提供的 Doctor，可以一次查看客户端是否就绪以及不就绪时该修什么。
+该入口固定使用安装器准备的私有 Python 环境，不要求系统提供 `python3`。
+
+macOS 或 Linux：
 
 ```bash
-python3 -m installer.doctor          # 人读报告
-python3 -m installer.doctor --json   # 机器可读
+bash "$HOME/.deeppattern/decision-engine/dp-doctor.sh"
+bash "$HOME/.deeppattern/decision-engine/dp-doctor.sh" --json
+```
+
+Windows PowerShell：
+
+```powershell
+powershell.exe -NoProfile -ExecutionPolicy Bypass -File "$HOME\.deeppattern\decision-engine\dp-doctor.ps1"
+powershell.exe -NoProfile -ExecutionPolicy Bypass -File "$HOME\.deeppattern\decision-engine\dp-doctor.ps1" -Json
 ```
 
 它检查：Python 是否 3.12+、skills 是否已 link 进你的 agent、原生弹窗后端（pywebview）
 能否开窗、LibreOffice 是否可用于 Office 转换（没有则 WARN —— 它可选、按需安装）、以及
-本设备是否已激活。全部 PASS 或 WARN 时退出 `0`，真正坏了才退出 `1`。它**绝不**打印你的
-endpoint 或激活码 —— 只报是否已设置。两种正式安装方式都会在安装结尾替你运行检查。
+本设备是否已激活。全部 PASS 或 WARN 时退出 `0`，真正坏了才退出 `1`，参数错误退出 `2`。
+它**绝不**打印你的 endpoint 或激活码 —— 只报是否已设置。两种正式安装方式都会在安装结尾替你运行检查。
 
 ## 安装副本与更新
 
@@ -319,36 +342,11 @@ endpoint 或激活码 —— 只报是否已设置。两种正式安装方式都
 `stable` 更新；用户无需保留最初下载的一键安装器。
 
 旧版安装、迁移失败或恢复场景不要通过手工覆盖安装目录处理；请保留现有文件，并按照 Doctor 或
-安装器给出的恢复提示操作。
-`python3 -m installer.doctor` 会分别显示 installed、target、running 和 last result，避免把
-“已下载”误报成“当前已经运行”。
+安装器给出的恢复提示操作。已安装的 Doctor 会分别显示 installed、target、running 和 last
+result，避免把“已下载”误报成“当前已经运行”。
 
-## 验证外壳是干净的
-
-待分发的源码不应包含真实服务地址、密钥或设备 token，也不应混入托管服务端的专用提示词、
-布局模板、任务编排或 GUI／广告源码。客户端自身的窗口和显示代码属于正常分发内容；安装后
-生成的本机配置也与待分发源码不同。可用以下检查发现扫描器能识别的泄漏：
-
-```bash
-python3 -m installer.leak_scan                       # exit 0 = 干净
-python3 -m unittest installer.tests.test_leak_scan
-```
-
-## 跑测试
-
-使用上面准备好的 Python 环境运行 unittest 测试，并确保已安装声明的包依赖：
-
-```bash
-python3 -m unittest \
-  installer.tests.test_install \
-  installer.tests.test_shim \
-  installer.tests.test_activate \
-  installer.tests.test_mcp_config \
-  installer.tests.test_leak_scan \
-  installer.tests.test_stopper_fallback \
-  installer.tests.test_window_icon \
-  client.popup.tests.test_visual_capture
-```
+源码 checkout 的开发与发布验证命令统一维护在
+[安装器参考文档](installer/README.md) 中；这些命令不是安装用户的诊断入口。
 
 ## 许可
 

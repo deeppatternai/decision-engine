@@ -278,7 +278,17 @@ def validate_host_specs(specs: Mapping[str, AgentHostSpec]) -> None:
                 client,
                 "host normalization tolerance requires owned JSON entries",
             )
-        if renderer_writer(spec.config_renderer) != "json-merge-v1" and (
+        writer = renderer_writer(spec.config_renderer)
+        if writer in {
+            "cordis-managed-block-v1",
+            "mimocode-jsonc-splice-v1",
+        }:
+            if spec.entry_ownership_policy != "replace-marked-de-v1":
+                _invalid_host_spec(
+                    client,
+                    "managed-block writer requires marked ownership",
+                )
+        elif writer != "json-merge-v1" and (
             spec.config_write_guard is not None
             or spec.config_write_guard_probe is not None
             or spec.entry_ownership_policy != "replace-existing-v1"

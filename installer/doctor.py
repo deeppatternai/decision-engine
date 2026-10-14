@@ -11,8 +11,9 @@ Exit codes:
     2 — usage error
 
 Usage:
-    python3 -m installer.doctor            # human-readable report
-    python3 -m installer.doctor --json     # machine-readable
+    macOS/Linux: bash "$HOME/.deeppattern/decision-engine/dp-doctor.sh" [--json]
+    Windows: powershell.exe -NoProfile -ExecutionPolicy Bypass -File
+             "$HOME\\.deeppattern\\decision-engine\\dp-doctor.ps1" [-Json]
 """
 
 from __future__ import annotations
@@ -46,6 +47,15 @@ DE_SKILLS = (
     "audit-forecast", "audit-market-research", "audit-writing-plans",
     "discussion-board", "graphic-explanation", "layer-check",
 )
+
+
+def _public_doctor_command() -> str:
+    if sys.platform == "win32":
+        return (
+            'powershell.exe -NoProfile -ExecutionPolicy Bypass -File '
+            '"$HOME\\.deeppattern\\decision-engine\\dp-doctor.ps1"'
+        )
+    return 'bash "$HOME/.deeppattern/decision-engine/dp-doctor.sh"'
 
 
 @dataclass
@@ -627,8 +637,8 @@ def check_popup_backend() -> CheckResult:
         return CheckResult(
             "WARN", "popup", "no desktop GUI session here — popup readiness not probed",
             fix=(
-                "Re-run Doctor from a normal desktop Terminal: \"%s\" -m installer.doctor"
-                % sys.executable
+                "Re-run Doctor from a normal desktop Terminal: %s"
+                % _public_doctor_command()
             ),
         )
     if inspection.state is popup_backend.WebviewState.BACKEND_UNAVAILABLE:
@@ -641,7 +651,8 @@ def check_popup_backend() -> CheckResult:
         )
     return CheckResult(
         "WARN", "popup", "pywebview probe failed before readiness could be determined",
-        fix="Re-run Doctor from a normal desktop terminal using: \"%s\" -m installer.doctor" % sys.executable,
+        fix="Re-run Doctor from a normal desktop terminal using: %s"
+        % _public_doctor_command(),
     )
 
 
@@ -1019,13 +1030,14 @@ def check_worktree() -> CheckResult:
     if os.path.normcase(os.path.abspath(str(root))) != os.path.normcase(os.path.abspath(str(config_root))):
         return CheckResult(
             "WARN", "worktree", "config root and managed install root differ",
-            fix="Use the canonical managed config path, then re-run: python3 -m installer.doctor",
+            fix="Use the canonical managed config path, then re-run: %s"
+            % _public_doctor_command(),
         )
     git = shutil.which("git")
     if not git:
         return CheckResult(
             "WARN", "worktree", "Git is not installed; managed update state cannot be checked",
-            fix="Install Git, then re-run: python3 -m installer.doctor",
+            fix="Install Git, then re-run: %s" % _public_doctor_command(),
         )
     # Minimal environment: do not let inherited GIT_* variables redirect the
     # repository/config/index or substitute helpers. Git's own executable path
@@ -1092,12 +1104,13 @@ def check_worktree() -> CheckResult:
     except FileNotFoundError:
         return CheckResult(
             "WARN", "worktree", "Git is not installed; managed update state cannot be checked",
-            fix="Install Git, then re-run: python3 -m installer.doctor",
+            fix="Install Git, then re-run: %s" % _public_doctor_command(),
         )
     except subprocess.TimeoutExpired:
         return CheckResult(
             "WARN", "worktree", "Git worktree inspection timed out after 10 seconds",
-            fix="Check the install disk and Git health, then re-run: python3 -m installer.doctor",
+            fix="Check the install disk and Git health, then re-run: %s"
+            % _public_doctor_command(),
         )
     except (OSError, subprocess.SubprocessError):
         return CheckResult("WARN", "worktree", "could not inspect managed checkout")
