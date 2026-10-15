@@ -1061,6 +1061,43 @@ class HttpChatTurnTests(unittest.TestCase):
         self.assertFalse(caught.exception.retryable)
         self.assertEqual(caught.exception.http_status, 429)
 
+    def test_submit_429_accepts_both_error_envelopes_and_preserves_business_codes(self):
+        expected = {
+            "free_budget_exhausted": (
+                "Free chat is temporarily unavailable while usage metering recovers.",
+                False,
+            ),
+            "free_quota_exceeded": (
+                "The free chat quota has been used up.",
+                False,
+            ),
+            "rate_limited": ("Too many chat requests were made.", True),
+        }
+
+        for envelope_key in ("error_code", "error"):
+            for code, (message, retryable) in expected.items():
+                with self.subTest(envelope_key=envelope_key, code=code):
+                    error = HttpChatSession._http_error(
+                        http_chat._HttpResponse(
+                            status=429,
+                            body=json.dumps({envelope_key: code}).encode("utf-8"),
+                        )
+                    )
+                    self.assertEqual(error.code, code)
+                    self.assertEqual(error.user_message, message)
+                    self.assertEqual(error.retryable, retryable)
+                    self.assertEqual(error.http_status, 429)
+
+    def test_submit_429_unknown_envelopes_use_rate_limit_fallback(self):
+        for body in (b"{}", b'{"error_code":"server_busy"}', b'{"error":"server_busy"}'):
+            with self.subTest(body=body):
+                error = HttpChatSession._http_error(
+                    http_chat._HttpResponse(status=429, body=body)
+                )
+                self.assertEqual(error.code, "rate_limited")
+                self.assertTrue(error.retryable)
+                self.assertEqual(error.http_status, 429)
+
     def test_submit_accepts_strict_terminal_idempotency_replays(self):
         expected = {
             "completed": {

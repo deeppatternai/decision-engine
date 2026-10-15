@@ -401,6 +401,8 @@ _CHAT_ERROR_CODES = frozenset(
         "conversation_busy",
         "conversation_expired",
         "rate_limited",
+        "free_budget_exhausted",
+        "free_quota_exceeded",
         "insufficient_credits",
         "model_unavailable",
         "timeout",
