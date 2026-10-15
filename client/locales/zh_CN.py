@@ -133,6 +133,8 @@ GE_CHAT = {
         "conversation_busy": "当前会话正忙，请稍后重试。",
         "conversation_expired": "当前追问会话已过期。",
         "rate_limited": "请求过于频繁，请稍后重试。",
+        "free_budget_exhausted": "免费追问的用量计量暂不可用，请稍后重试。",
+        "free_quota_exceeded": "免费追问额度已用完。",
         "insufficient_credits": "当前积分不足，无法追问。",
         "model_unavailable": "模型暂时不可用。",
         "timeout": "追问超时，请重试。",
