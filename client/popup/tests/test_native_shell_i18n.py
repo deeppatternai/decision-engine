@@ -70,13 +70,6 @@ class ShellCatalogTests(unittest.TestCase):
     def test_shell_keys_match_across_locales(self):
         self.assertEqual(set(i18n.shell("en-US")), set(i18n.shell("zh-CN")))
 
-    def test_ge_chat_free_admission_messages_are_present_and_distinct(self):
-        codes = ("free_budget_exhausted", "free_quota_exceeded", "rate_limited")
-        for locale in ("en-US", "zh-CN"):
-            with self.subTest(locale=locale):
-                messages = [i18n.ge_chat(locale)["error"][code] for code in codes]
-                self.assertEqual(len(set(messages)), len(codes))
-
 
 if __name__ == "__main__":
     unittest.main()

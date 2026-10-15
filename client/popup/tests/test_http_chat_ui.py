@@ -917,8 +917,7 @@ class HttpChatPageContractTestCase(unittest.TestCase):
           const errorCodes = ['capability_disabled', 'server_unsupported', 'client_unsupported',
             'auth_required', 'privacy_confirmation_required', 'invalid_request', 'input_too_large',
             'turn_in_flight', 'conversation_busy', 'conversation_expired', 'rate_limited',
-            'free_budget_exhausted', 'free_quota_exceeded', 'insufficient_credits',
-            'model_unavailable', 'timeout', 'init_timeout', 'cancelled',
+            'insufficient_credits', 'model_unavailable', 'timeout', 'init_timeout', 'cancelled',
             'network_error', 'bad_response', 'not_found', 'chat_unavailable', 'unknown_code'];
           const errors = {};
           errorCodes.forEach((code, index) => {
@@ -929,7 +928,7 @@ class HttpChatPageContractTestCase(unittest.TestCase):
           });
           window.geChat.bootstrap(server());
           window.geChat.submit('failed through state callback', [], null);
-          window.geChat.state(24, 'failed', {error_code: 'model_unavailable'});
+          window.geChat.state(22, 'failed', {error_code: 'model_unavailable'});
           const failedViaState = nodes['ge-chat-status'].textContent;
 
           const retry = {
@@ -958,12 +957,12 @@ class HttpChatPageContractTestCase(unittest.TestCase):
 
           window.geChat.bootstrap(server());
           window.geChat.submit('free', [], null);
-          window.geChat.state(25, 'submitting', {price_credits: 0});
+          window.geChat.state(23, 'submitting', {price_credits: 0});
           let bot = nodes['ge-chat-scroll'].children.find((node) => node.className === 'msg bot');
           const free = bot.children.find((node) => node.className.indexOf('ge-price') === 0).textContent;
-          window.geChat.done(25, 'done');
+          window.geChat.done(23, 'done');
           window.geChat.submit('paid', [], null);
-          window.geChat.state(26, 'submitting', {price_credits: 2});
+          window.geChat.state(24, 'submitting', {price_credits: 2});
           bot = nodes['ge-chat-scroll'].children.filter((node) => node.className === 'msg bot').slice(-1)[0];
           const paid = bot.children.find((node) => node.className.indexOf('ge-price') === 0).textContent;
           finish({initial, ready, send: nodes['composer-send'].textContent,
@@ -1006,8 +1005,6 @@ class HttpChatPageContractTestCase(unittest.TestCase):
                 "conversation_busy": "\u5f53\u524d\u4f1a\u8bdd\u6b63\u5fd9\uff0c\u8bf7\u7a0d\u540e\u91cd\u8bd5\u3002",
                 "conversation_expired": "\u5f53\u524d\u8ffd\u95ee\u4f1a\u8bdd\u5df2\u8fc7\u671f\u3002",
                 "rate_limited": "\u8bf7\u6c42\u8fc7\u4e8e\u9891\u7e41\uff0c\u8bf7\u7a0d\u540e\u91cd\u8bd5\u3002",
-                "free_budget_exhausted": "\u514d\u8d39\u8ffd\u95ee\u7684\u7528\u91cf\u8ba1\u91cf\u6682\u4e0d\u53ef\u7528\uff0c\u8bf7\u7a0d\u540e\u91cd\u8bd5\u3002",
-                "free_quota_exceeded": "\u514d\u8d39\u8ffd\u95ee\u989d\u5ea6\u5df2\u7528\u5b8c\u3002",
                 "insufficient_credits": "\u5f53\u524d\u79ef\u5206\u4e0d\u8db3\uff0c\u65e0\u6cd5\u8ffd\u95ee\u3002",
                 "model_unavailable": "\u6a21\u578b\u6682\u65f6\u4e0d\u53ef\u7528\u3002",
                 "timeout": "\u8ffd\u95ee\u8d85\u65f6\uff0c\u8bf7\u91cd\u8bd5\u3002",
