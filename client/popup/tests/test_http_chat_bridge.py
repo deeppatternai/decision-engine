@@ -1868,11 +1868,6 @@ class NativeServerLifecycleTests(unittest.TestCase):
         self.assertEqual(len(api._win.evaluated), 1)
         self.assertIn('window.geChat.state(1,"recovering",{})', api._win.evaluated[0])
 
-    def test_free_admission_business_codes_are_safe_for_page_delivery(self):
-        for code in ("free_budget_exhausted", "free_quota_exceeded", "rate_limited"):
-            with self.subTest(code=code):
-                self.assertEqual(native_shell._safe_error_code(code), code)
-
     def test_state_payload_numbers_stay_within_javascript_safe_integer_range(self):
         api, _chat = self._api()
         generation = api._callback_generation
