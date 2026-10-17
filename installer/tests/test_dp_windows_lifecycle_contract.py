@@ -110,6 +110,8 @@ class WindowsLifecycleContractTests(unittest.TestCase):
         backup_call = self.helper_source.index("copy_config_backup(path", mimo_branch)
         branch_return = self.helper_source.index("return", mimo_branch)
         self.assertLess(branch_return, backup_call)
+        self.assertIn("mcp_config.dev_root_from_args", self.helper_source)
+        self.assertIn("valid_development_root(root)", self.helper_source)
 
     def test_deepseek_harness_uninstall_uses_dedicated_cordis_action(self) -> None:
         self.assertIn('home / ".dsh" / "cordis.patch.yml"', self.helper_source)
@@ -129,6 +131,12 @@ class WindowsLifecycleContractTests(unittest.TestCase):
         cordis_branch = self.helper_source.index('action.kind == "edit-cordis-yaml"')
         json_branch = self.helper_source.index('action.kind == "edit-json"')
         self.assertNotEqual(cordis_branch, json_branch)
+
+    def test_formal_install_route_phase_supports_development_transition(self) -> None:
+        self.assertIn(
+            "install.complete_development_skill_route_root(", self.install
+        )
+        self.assertIn("replaceable_body_roots=replaceable_roots", self.install)
 
     def test_orphan_cordis_user_yaml_is_preserved_without_json_parsing(self) -> None:
         with tempfile.TemporaryDirectory() as temporary:
@@ -1549,6 +1557,209 @@ Write-Host "PASS"
             )
         self.assertEqual(result.returncode, 0, result.stdout + result.stderr)
         self.assertIn("PASS", result.stdout)
+
+    def test_windows_git_child_environment_is_minimal_and_pins_powershell_modules(
+        self,
+    ) -> None:
+        from installer import updater
+
+        with tempfile.TemporaryDirectory() as temporary:
+            root = Path(temporary)
+            system_root = root / "Windows"
+            candidate = root / "Program Files" / "Git" / "bin" / "git.exe"
+            ambient_modules = root / "Users" / "runner" / "Documents" / "PowerShell" / "Modules"
+            ambient = {
+                "SYSTEMROOT": str(system_root),
+                "WINDIR": str(system_root),
+                "PATH": str(system_root / "System32"),
+                "PSMODULEPATH": str(ambient_modules),
+                "PATHEXT": ".COM;.EXE;.BAT;.CMD",
+                "COMSPEC": str(system_root / "System32" / "cmd.exe"),
+                "USERPROFILE": str(root / "Users" / "runner"),
+                "LOCALAPPDATA": str(root / "Users" / "runner" / "AppData" / "Local"),
+                "APPDATA": str(root / "Users" / "runner" / "AppData" / "Roaming"),
+                "ProgramFiles": str(root / "Program Files"),
+                "GITHUB_TOKEN": "must-not-forward",
+                "TEMP": str(root / "Temp"),
+                "TMP": str(root / "Temp"),
+            }
+            pinned_modules = str(
+                system_root / "System32" / "WindowsPowerShell" / "v1.0" / "Modules"
+            )
+            calls = []
+
+            def emulated_powershell(argv, *, env, **_kwargs):
+                calls.append((argv, dict(env)))
+                return subprocess.CompletedProcess(argv, 0, stdout=b"VALID", stderr=b"")
+
+            with (
+                mock.patch.dict(os.environ, ambient, clear=True),
+                mock.patch.object(
+                    updater, "_windows_system_root", return_value=system_root
+                ),
+                mock.patch.object(
+                    updater.subprocess, "run", side_effect=emulated_powershell
+                ),
+            ):
+                self.assertTrue(updater._windows_git_authenticode_is_valid(candidate))
+
+            (argv, child_environment), = calls
+            self.assertEqual(
+                set(child_environment),
+                {
+                    "SYSTEMROOT",
+                    "WINDIR",
+                    "PATH",
+                    "PSMODULEPATH",
+                    "DE_GIT_SIGNATURE_PATH",
+                    "TEMP",
+                    "TMP",
+                },
+            )
+            self.assertEqual(child_environment["PSMODULEPATH"], pinned_modules)
+            self.assertNotIn(str(ambient_modules), child_environment.values())
+            for forbidden in (
+                "USERPROFILE",
+                "LOCALAPPDATA",
+                "APPDATA",
+                "ProgramFiles",
+                "PATHEXT",
+                "COMSPEC",
+                "GITHUB_TOKEN",
+            ):
+                self.assertNotIn(forbidden, child_environment)
+            self.assertEqual(child_environment["DE_GIT_SIGNATURE_PATH"], str(candidate))
+            self.assertEqual(argv[0], str(system_root / "System32" / "WindowsPowerShell" / "v1.0" / "powershell.exe"))
+
+    def test_windows_git_authenticode_verdict_maps_probe_status(self) -> None:
+        from installer import updater
+
+        with tempfile.TemporaryDirectory() as temporary:
+            root = Path(temporary)
+            system_root = root / "Windows"
+            candidate = root / "Tools" / "Git" / "cmd" / "git.exe"
+            cases = (
+                ("valid", subprocess.CompletedProcess([], 0, stdout=b"VALID", stderr=b"")),
+                ("unsigned", subprocess.CompletedProcess([], 3, stdout=b"", stderr=b"")),
+                ("wrong-publisher", subprocess.CompletedProcess([], 4, stdout=b"", stderr=b"")),
+                ("signature-invalid", subprocess.CompletedProcess([], 5, stdout=b"", stderr=b"")),
+                ("invalid-path", subprocess.CompletedProcess([], 2, stdout=b"", stderr=b"")),
+                ("probe-unavailable", subprocess.CompletedProcess([], 1, stdout=b"", stderr=b"")),
+                ("probe-unavailable", subprocess.CompletedProcess([], 0, stdout=b"", stderr=b"")),
+                ("probe-unavailable", subprocess.CompletedProcess([], 0, stdout=b"VALID ", stderr=b"")),
+                ("probe-unavailable", OSError("powershell missing")),
+                (
+                    "probe-unavailable",
+                    subprocess.TimeoutExpired(["powershell.exe"], 30),
+                ),
+            )
+            for expected, outcome in cases:
+                with self.subTest(expected=expected, outcome=repr(outcome)):
+                    side_effect = outcome if isinstance(outcome, BaseException) else None
+                    return_value = None if side_effect else outcome
+                    with (
+                        mock.patch.dict(os.environ, {"TEMP": str(root)}, clear=True),
+                        mock.patch.object(
+                            updater, "_windows_system_root", return_value=system_root
+                        ),
+                        mock.patch.object(
+                            updater.subprocess,
+                            "run",
+                            side_effect=side_effect,
+                            return_value=return_value,
+                        ),
+                    ):
+                        verdict = updater._windows_git_authenticode_verdict(candidate)
+                        boolean = updater._windows_git_authenticode_is_valid(candidate)
+                    self.assertEqual(verdict, expected)
+                    self.assertEqual(boolean, expected == "valid")
+
+    def test_windows_git_authenticode_script_exits_three_only_for_not_signed(self) -> None:
+        from installer import updater
+
+        with tempfile.TemporaryDirectory() as temporary:
+            root = Path(temporary)
+            system_root = root / "Windows"
+            candidate = root / "Tools" / "Git" / "cmd" / "git.exe"
+            completed = subprocess.CompletedProcess([], 0, stdout=b"VALID", stderr=b"")
+            with (
+                mock.patch.dict(os.environ, {"TEMP": str(root)}, clear=True),
+                mock.patch.object(
+                    updater, "_windows_system_root", return_value=system_root
+                ),
+                mock.patch.object(
+                    updater.subprocess, "run", return_value=completed
+                ) as run,
+            ):
+                self.assertEqual(
+                    updater._windows_git_authenticode_verdict(candidate), "valid"
+                )
+        script = run.call_args.args[0][-1]
+        self.assertIn(
+            "if($s.Status -eq [System.Management.Automation.SignatureStatus]::NotSigned){exit 3};",
+            script,
+        )
+        self.assertIn(
+            "if($s.Status -ne [System.Management.Automation.SignatureStatus]::Valid){exit 5};",
+            script,
+        )
+        self.assertEqual(script.count("exit 3"), 1)
+        self.assertEqual(script.count("exit 5"), 1)
+        self.assertLess(script.index("NotSigned){exit 3}"), script.index("exit 5"))
+
+    def test_windows_git_authenticode_fails_closed_and_keeps_custom_roots(self) -> None:
+        from installer import updater
+
+        with tempfile.TemporaryDirectory() as temporary:
+            root = Path(temporary)
+            system_root = root / "Windows"
+            base_environment = {
+                "SYSTEMROOT": str(system_root),
+                "WINDIR": str(system_root),
+                "PATH": str(system_root / "System32"),
+                "PSMODULEPATH": str(root / "ambient" / "Modules"),
+                "TEMP": str(root / "Temp"),
+            }
+            custom_root_git = root / "Tools" / "Git" / "cmd" / "git.exe"
+
+            with self.subTest(label="relative candidate never reaches PowerShell"):
+                with (
+                    mock.patch.dict(os.environ, base_environment, clear=True),
+                    mock.patch.object(
+                        updater, "_windows_system_root", return_value=system_root
+                    ),
+                    mock.patch.object(updater.subprocess, "run") as run,
+                ):
+                    self.assertEqual(
+                        updater._windows_git_authenticode_verdict(Path("git.exe")),
+                        "invalid-path",
+                    )
+                    self.assertFalse(
+                        updater._windows_git_authenticode_is_valid(Path("git.exe"))
+                    )
+                run.assert_not_called()
+
+            with self.subTest(label="valid custom absolute Git path"):
+                with (
+                    mock.patch.dict(os.environ, base_environment, clear=True),
+                    mock.patch.object(
+                        updater, "_windows_system_root", return_value=system_root
+                    ),
+                    mock.patch.object(
+                        updater.subprocess,
+                        "run",
+                        return_value=subprocess.CompletedProcess(
+                            [], 0, stdout=b"VALID", stderr=b""
+                        ),
+                    ) as run,
+                ):
+                    self.assertTrue(
+                        updater._windows_git_authenticode_is_valid(custom_root_git)
+                    )
+                self.assertEqual(
+                    run.call_args.kwargs["env"]["DE_GIT_SIGNATURE_PATH"],
+                    str(custom_root_git),
+                )
 
 
 if __name__ == "__main__":

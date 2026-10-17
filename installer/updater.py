@@ -43,6 +43,7 @@ UPDATE_STATE_RELATIVE_PATH = Path(".runtime") / "update-state.json"
 _MAX_STATE_BYTES = 64 * 1024
 _GIT_OUTPUT_LIMIT = 8 * 1024 * 1024
 _GIT_TIMEOUT_SECONDS = 10
+_WINDOWS_GIT_TRUST_TIMEOUT_SECONDS = 30
 _GIT_REAP_TIMEOUT_SECONDS = 2
 _INSPECTION_TIMEOUT_SECONDS = 60
 _MAX_GIT_PATHS = 250_000
@@ -585,22 +586,26 @@ def _windows_git_for_windows_install_roots(registry) -> Tuple[str, ...]:
     return tuple(roots)
 
 
-def _windows_git_authenticode_is_valid(candidate: Path) -> bool:
+_WINDOWS_GIT_TRUST_EXIT_REASONS = {
+    2: "invalid-path",
+    3: "unsigned",
+    4: "wrong-publisher",
+    5: "signature-invalid",
+}
+
+
+def _windows_git_authenticode_verdict(candidate: Path) -> str:
+    if not candidate.is_absolute():
+        return "invalid-path"
     try:
         system_root = _windows_system_root()
-        powershell = (
-            system_root
-            / "System32"
-            / "WindowsPowerShell"
-            / "v1.0"
-            / "powershell.exe"
-        )
-        if not candidate.is_absolute() or not powershell.is_absolute():
-            return False
+        powershell_root = system_root / "System32" / "WindowsPowerShell" / "v1.0"
+        powershell = powershell_root / "powershell.exe"
         environment = {
             "SYSTEMROOT": str(system_root),
             "WINDIR": str(system_root),
             "PATH": str(system_root / "System32"),
+            "PSMODULEPATH": str(powershell_root / "Modules"),
             "DE_GIT_SIGNATURE_PATH": str(candidate),
         }
         for name in ("TEMP", "TMP"):
@@ -613,8 +618,10 @@ def _windows_git_authenticode_is_valid(candidate: Path) -> bool:
             "if([string]::IsNullOrWhiteSpace($p) -or "
             "-not [IO.Path]::IsPathRooted($p)){exit 2};"
             "$s=Get-AuthenticodeSignature -LiteralPath $p -ErrorAction Stop;"
+            "if($s.Status -eq "
+            "[System.Management.Automation.SignatureStatus]::NotSigned){exit 3};"
             "if($s.Status -ne "
-            "[System.Management.Automation.SignatureStatus]::Valid){exit 3};"
+            "[System.Management.Automation.SignatureStatus]::Valid){exit 5};"
             "$subject=[string]$s.SignerCertificate.Subject;"
             "if($subject -notmatch '" + _WINDOWS_GIT_PUBLISHER_RE + "'){exit 4};"
             "[Console]::Out.Write('VALID')"
@@ -634,13 +641,19 @@ def _windows_git_authenticode_is_valid(candidate: Path) -> bool:
             stdin=subprocess.DEVNULL,
             stdout=subprocess.PIPE,
             stderr=subprocess.DEVNULL,
-            timeout=_GIT_TIMEOUT_SECONDS,
+            timeout=_WINDOWS_GIT_TRUST_TIMEOUT_SECONDS,
             check=False,
             shell=False,
         )
-    except (OSError, subprocess.SubprocessError):
-        return False
-    return completed.returncode == 0 and completed.stdout == b"VALID"
+    except (OSError, subprocess.SubprocessError, UpdateInspectionError):
+        return "probe-unavailable"
+    if completed.returncode == 0 and completed.stdout == b"VALID":
+        return "valid"
+    return _WINDOWS_GIT_TRUST_EXIT_REASONS.get(completed.returncode, "probe-unavailable")
+
+
+def _windows_git_authenticode_is_valid(candidate: Path) -> bool:
+    return _windows_git_authenticode_verdict(candidate) == "valid"
 
 
 def _trusted_git_candidates() -> Tuple[Path, ...]:

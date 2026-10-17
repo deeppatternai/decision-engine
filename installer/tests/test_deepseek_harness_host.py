@@ -454,6 +454,40 @@ class DeepSeekHarnessHostContractTests(unittest.TestCase):
                 install.repair_client_integration("deepseek-harness", managed)
         self.assertTrue(install._route_points_to(route, foreign))
 
+    def test_complete_developer_skill_routes_migrate_to_managed_root(self) -> None:
+        managed = self.tmp / "managed-de"
+        legacy = self.tmp / "developer-checkout"
+        for root in (managed, legacy):
+            (root / "skills" / "audit").mkdir(parents=True)
+            (root / "skills" / "layer-check").mkdir()
+        (legacy / ".git").write_text("gitdir: synthetic\n", encoding="utf-8")
+        (legacy / "installer").mkdir()
+        for name in ("launcher.py", "mcp_config.py"):
+            (legacy / "installer" / name).write_text("# synthetic\n", encoding="utf-8")
+        self.dsh_home.mkdir(parents=True)
+        self.config.write_text("[]\n", encoding="utf-8")
+        mcp_config.write_entry(
+            "deepseek-harness", python=sys.executable, dev_root=legacy
+        )
+        destination = self.dsh_home / "skills"
+        destination.mkdir()
+        for name in ("audit", "layer-check"):
+            (destination / name).symlink_to(legacy / "skills" / name)
+
+        with mock.patch.dict(
+            os.environ,
+            {"DEEPPATTERN_HOME": str(self.tmp / ".deeppattern")},
+            clear=False,
+        ):
+            result = install.repair_client_integration("deepseek-harness", managed)
+
+        self.assertEqual(result["mcp"]["action"], "updated")
+        self.assertEqual(set(result["routed_skills"]), {"audit", "layer-check"})
+        for name in ("audit", "layer-check"):
+            self.assertTrue(
+                install._route_points_to(destination / name, managed / "skills" / name)
+            )
+
     def test_observed_alias_matches_with_display_capabilities(self) -> None:
         identity = mcp_config.resolve_host_identity(
             "deepseek-harness",

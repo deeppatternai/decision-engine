@@ -146,6 +146,8 @@ GE_CHAT = {
         "conversation_busy": "This conversation is busy. Check again shortly.",
         "conversation_expired": "This follow-up conversation has expired.",
         "rate_limited": "Too many requests. Try again shortly.",
+        "free_quota_exceeded": "Today's free usage limit has been reached.",
+        "free_budget_exhausted": "The free service is temporarily limited. Please try again later.",
         "insufficient_credits": "There are not enough credits for this follow-up.",
         "model_unavailable": "The model is temporarily unavailable.",
         "timeout": "The follow-up timed out. Check again.",

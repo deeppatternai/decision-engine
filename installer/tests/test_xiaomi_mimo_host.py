@@ -60,6 +60,7 @@ class XiaomiMiMoHostContractTests(unittest.TestCase):
         self.assertTrue(spec.local_display_tools)
         self.assertFalse(spec.popup_followup)
         self.assertTrue(spec.audit_stop_panel)
+        self.assertEqual(spec.ge_progress_keepalive_s, 15.0)
         self.assertEqual(spec.skills_global_path(), self.config_root / "skills")
 
     def test_cross_platform_installers_offer_named_xiaomi_mimo_selection(self) -> None:
@@ -70,6 +71,9 @@ class XiaomiMiMoHostContractTests(unittest.TestCase):
         self.assertIn("xiaomi-mimo) printf '%s' 'Xiaomi MiMo [xiaomi-mimo]'", posix)
         self.assertIn('"xiaomi-mimo" = "Xiaomi MiMo [xiaomi-mimo]"', windows)
         self.assertIn('"xiaomi-mimo"', windows)
+        for source in (posix, windows):
+            self.assertIn("install.complete_development_skill_route_root(", source)
+            self.assertIn("replaceable_body_roots=replaceable_roots", source)
 
     def test_config_root_and_file_precedence(self) -> None:
         self.assertEqual(xiaomi_mimo.config_root(), self.config_root)
@@ -406,6 +410,165 @@ class XiaomiMiMoHostContractTests(unittest.TestCase):
                 install.repair_client_integration("xiaomi-mimo", managed)
         self.assertTrue(install._route_points_to(route, foreign))
 
+    def test_complete_developer_skill_routes_migrate_to_managed_root(self) -> None:
+        managed = self.tmp / "managed-de"
+        legacy = self.tmp / "developer-checkout"
+        for root in (managed, legacy):
+            (root / "skills" / "audit").mkdir(parents=True)
+            (root / "skills" / "layer-check").mkdir()
+        (legacy / ".git").write_text("gitdir: synthetic\n", encoding="utf-8")
+        (legacy / "installer").mkdir()
+        for name in ("launcher.py", "mcp_config.py"):
+            (legacy / "installer" / name).write_text("# synthetic\n", encoding="utf-8")
+        self._write(b"{}\n")
+        mcp_config.write_entry(
+            "xiaomi-mimo", python=sys.executable, dev_root=legacy
+        )
+        destination = self.config_root / "skills"
+        destination.mkdir()
+        for name in ("audit", "layer-check"):
+            (destination / name).symlink_to(legacy / "skills" / name)
+        retired = legacy / "skills" / "retired-de-skill"
+        retired.mkdir()
+        (destination / retired.name).symlink_to(retired)
+
+        with mock.patch.dict(
+            os.environ,
+            {"DEEPPATTERN_HOME": str(self.tmp / ".deeppattern")},
+            clear=False,
+        ):
+            result = install.repair_client_integration("xiaomi-mimo", managed)
+
+        self.assertEqual(result["mcp"]["action"], "updated")
+        self.assertEqual(set(result["routed_skills"]), {"audit", "layer-check"})
+        for name in ("audit", "layer-check"):
+            self.assertTrue(
+                install._route_points_to(destination / name, managed / "skills" / name)
+            )
+        self.assertFalse((destination / retired.name).exists())
+
+    def test_incomplete_developer_skill_routes_remain_fail_closed(self) -> None:
+        managed = self.tmp / "managed-de"
+        legacy = self.tmp / "developer-checkout"
+        for root in (managed, legacy):
+            (root / "skills" / "audit").mkdir(parents=True)
+            (root / "skills" / "layer-check").mkdir()
+        (legacy / ".git").write_text("gitdir: synthetic\n", encoding="utf-8")
+        (legacy / "installer").mkdir()
+        for name in ("launcher.py", "mcp_config.py"):
+            (legacy / "installer" / name).write_text("# synthetic\n", encoding="utf-8")
+        self._write(b"{}\n")
+        destination = self.config_root / "skills"
+        destination.mkdir()
+        (destination / "audit").symlink_to(legacy / "skills" / "audit")
+
+        with mock.patch.dict(
+            os.environ,
+            {"DEEPPATTERN_HOME": str(self.tmp / ".deeppattern")},
+            clear=False,
+        ), self.assertRaisesRegex(ShellError, "outside this install"):
+            install.repair_client_integration("xiaomi-mimo", managed)
+
+        self.assertTrue(
+            install._route_points_to(
+                destination / "audit", legacy / "skills" / "audit"
+            )
+        )
+
+    def test_mixed_managed_and_developer_routes_complete_interrupted_migration(self) -> None:
+        incoming = self.tmp / "decision-engine"
+        managed = self.tmp / ".deeppattern" / "decision-engine"
+        legacy = self.tmp / "developer-checkout"
+        for root in (incoming, managed, legacy):
+            (root / "skills" / "audit").mkdir(parents=True)
+            (root / "skills" / "layer-check").mkdir()
+        (legacy / ".git").write_text("gitdir: synthetic\n", encoding="utf-8")
+        (legacy / "installer").mkdir()
+        for name in ("launcher.py", "mcp_config.py"):
+            (legacy / "installer" / name).write_text("# synthetic\n", encoding="utf-8")
+        self._write(b"{}\n")
+        destination = self.config_root / "skills"
+        destination.mkdir()
+        (destination / "audit").symlink_to(managed / "skills" / "audit")
+        (destination / "layer-check").symlink_to(legacy / "skills" / "layer-check")
+
+        with mock.patch.dict(
+            os.environ,
+            {"DEEPPATTERN_HOME": str(self.tmp / ".deeppattern")},
+            clear=False,
+        ), mock.patch.object(
+            mcp_config,
+            "active_skill_routes",
+            return_value={"xiaomi-mimo": (destination, frozenset())},
+        ):
+            result = install.install_component("decision-engine", self.tmp)
+
+        self.assertFalse(result["routing_failures"])
+        for name in ("audit", "layer-check"):
+            self.assertTrue(
+                install._route_points_to(destination / name, managed / "skills" / name)
+            )
+
+    def test_symlinked_skill_in_developer_root_remains_fail_closed(self) -> None:
+        managed = self.tmp / "managed-de"
+        legacy = self.tmp / "developer-checkout"
+        foreign = self.tmp / "foreign-skill"
+        (managed / "skills" / "audit").mkdir(parents=True)
+        foreign.mkdir()
+        (legacy / "skills").mkdir(parents=True)
+        (legacy / "skills" / "audit").symlink_to(foreign)
+        (legacy / ".git").write_text("gitdir: synthetic\n", encoding="utf-8")
+        (legacy / "installer").mkdir()
+        for name in ("launcher.py", "mcp_config.py"):
+            (legacy / "installer" / name).write_text("# synthetic\n", encoding="utf-8")
+        self._write(b"{}\n")
+        destination = self.config_root / "skills"
+        destination.mkdir()
+        route = destination / "audit"
+        route.symlink_to(legacy / "skills" / "audit")
+
+        with mock.patch.dict(
+            os.environ,
+            {"DEEPPATTERN_HOME": str(self.tmp / ".deeppattern")},
+            clear=False,
+        ), self.assertRaisesRegex(ShellError, "outside this install"):
+            install.repair_client_integration("xiaomi-mimo", managed)
+
+        self.assertTrue(install._route_points_to(route, legacy / "skills" / "audit"))
+
+    def test_symlinked_parent_of_developer_root_remains_fail_closed(self) -> None:
+        managed = self.tmp / "managed-de"
+        actual_parent = self.tmp / "actual-parent"
+        linked_parent = self.tmp / "linked-parent"
+        legacy = linked_parent / "developer-checkout"
+        (managed / "skills" / "audit").mkdir(parents=True)
+        (actual_parent / "developer-checkout" / "skills" / "audit").mkdir(
+            parents=True
+        )
+        (actual_parent / "developer-checkout" / ".git").write_text(
+            "gitdir: synthetic\n", encoding="utf-8"
+        )
+        (actual_parent / "developer-checkout" / "installer").mkdir()
+        for name in ("launcher.py", "mcp_config.py"):
+            (actual_parent / "developer-checkout" / "installer" / name).write_text(
+                "# synthetic\n", encoding="utf-8"
+            )
+        linked_parent.symlink_to(actual_parent, target_is_directory=True)
+        self._write(b"{}\n")
+        destination = self.config_root / "skills"
+        destination.mkdir()
+        route = destination / "audit"
+        route.symlink_to(legacy / "skills" / "audit")
+
+        with mock.patch.dict(
+            os.environ,
+            {"DEEPPATTERN_HOME": str(self.tmp / ".deeppattern")},
+            clear=False,
+        ), self.assertRaisesRegex(ShellError, "outside this install"):
+            install.repair_client_integration("xiaomi-mimo", managed)
+
+        self.assertTrue(install._route_points_to(route, legacy / "skills" / "audit"))
+
     def test_two_initializes_keep_shared_display_tools_without_popup_followup(self) -> None:
         from installer.tests.test_shim import FakeForwarder, _run
 
@@ -497,6 +660,60 @@ class XiaomiMiMoHostContractTests(unittest.TestCase):
                 )
             ],
         )
+
+    def test_open_ge_worker_receives_mimo_progress_keepalive_policy(self) -> None:
+        from installer import shim
+        from installer.tests.test_shim import FakeForwarder, _run
+
+        captured = []
+
+        class _SyncThread:
+            def __init__(self, target=None, args=(), **kwargs):
+                self._target = target
+                self._args = args
+
+            def start(self):
+                self._target(*self._args)
+
+            def join(self, timeout=None):
+                return None
+
+        def dispatch(*args):
+            captured.append(args)
+
+        initialize = {
+            "jsonrpc": "2.0",
+            "id": 1,
+            "method": "initialize",
+            "params": {"clientInfo": {"name": "mimocode", "version": "26.1014"}},
+        }
+        request = {
+            "jsonrpc": "2.0",
+            "id": 17,
+            "method": "tools/call",
+            "params": {
+                "name": "open_ge",
+                "arguments": {"mode": "diagram", "spec": {}},
+                "_meta": {"progressToken": "mimo-progress-17"},
+            },
+        }
+        with mock.patch.object(shim, "_dispatch_display", side_effect=dispatch), mock.patch.object(
+            shim.threading, "Thread", _SyncThread
+        ):
+            _run(
+                FakeForwarder(
+                    responses={
+                        "initialize": {"jsonrpc": "2.0", "id": 1, "result": {}}
+                    }
+                ),
+                [json.dumps(initialize), json.dumps(request)],
+                client_host="xiaomi-mimo",
+            )
+
+        self.assertEqual(len(captured), 1)
+        self.assertEqual(captured[0][1], 17)
+        self.assertEqual(captured[0][2], request["params"])
+        self.assertEqual(captured[0][-1], 15.0)
 
     def test_audit_submit_reuses_shared_stop_panel(self) -> None:
         from installer import shim

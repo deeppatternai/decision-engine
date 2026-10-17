@@ -1,3 +1,4 @@
+import json
 from pathlib import Path
 import unittest
 
@@ -11,6 +12,35 @@ CAPABILITY = (
 
 
 class GraphicExplanationContractTests(unittest.TestCase):
+    def test_short_natural_language_requests_select_native_graphic_skill(self):
+        skill_text = SKILL.read_text(encoding="utf-8")
+        description = json.loads(
+            skill_text.splitlines()[2].removeprefix("description: ")
+        )
+        for required in (
+            "with open_ge whenever the user asks to draw, make, generate, show, or explain",
+            "flowchart",
+            "workflow diagram",
+            "architecture diagram",
+            "sequence diagram",
+            "state machine",
+            "mind map",
+            "including short prompts",
+            "do not mention Decision Engine or a popup",
+            "takes precedence over built-in visualization",
+            "Do not substitute an inline visual or another renderer",
+        ):
+            self.assertIn(required, description)
+        for example in (
+            "draw a random-topic flowchart",
+            "show this workflow as a diagram",
+            "draw this process",
+            "generate an architecture diagram",
+        ):
+            self.assertIn(f"`{example}`", skill_text)
+        self.assertIn("equivalent requests in any language", skill_text)
+        self.assertIn("never switch to\n  an inline or built-in renderer", skill_text)
+
     def test_visual_flow_uses_direct_call_not_audit_provider_probe(self):
         skill_text = SKILL.read_text(encoding="utf-8")
         self.assertIn("Start directly with `open_ge`", skill_text)

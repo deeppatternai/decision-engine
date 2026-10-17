@@ -37,7 +37,7 @@ import shutil
 import sys
 from dataclasses import dataclass
 from pathlib import Path
-from typing import Dict, FrozenSet, Iterator, List, Optional
+from typing import Dict, FrozenSet, Iterator, List, Optional, Sequence, Tuple
 
 from . import client_host_ownership, cursor_activation, mcp_config
 from .config import (
@@ -206,6 +206,117 @@ def _route_points_to(path: Path, target: Path) -> bool:
     return actual is not None and actual == _normalize_route_path(str(target))
 
 
+def _route_points_into_body(path: Path, body_root: Path, skill_name: str) -> bool:
+    """Whether one route points at ``<body_root>/skills/<skill_name>``."""
+
+    return _route_points_to(path, body_root / "skills" / skill_name)
+
+
+def _path_has_route_component(path: Path) -> bool:
+    """Whether an absolute path is reached through a symlink or junction."""
+
+    current = Path(_normalize_route_path(str(path)))
+    while current != current.parent:
+        if _skill_route_target(current) is not None:
+            return True
+        current = current.parent
+    return _skill_route_target(current) is not None
+
+
+def _valid_development_body_root(root: Path, skill_names: Sequence[str]) -> bool:
+    """Recognize the narrow checkout shape used by developer acceptance loads."""
+
+    required = (
+        root,
+        root / ".git",
+        root / "installer",
+        root / "installer" / "launcher.py",
+        root / "installer" / "mcp_config.py",
+        root / "skills",
+    )
+    if (
+        not root.is_absolute()
+        or _path_has_route_component(root)
+        or not all(path.exists() and _skill_route_target(path) is None for path in required)
+        or (
+            not (root / ".git").is_file()
+            and not (root / ".git").is_dir()
+        )
+        or not (root / "installer").is_dir()
+        or not (root / "installer" / "launcher.py").is_file()
+        or not (root / "installer" / "mcp_config.py").is_file()
+        or not (root / "skills").is_dir()
+    ):
+        return False
+    return all(
+        (root / "skills" / name).is_dir()
+        and _skill_route_target(root / "skills" / name) is None
+        for name in skill_names
+    )
+
+
+def complete_development_skill_route_root(
+    skills_src: Path,
+    dest_root: Path,
+    excluded_skills: FrozenSet[str] = frozenset(),
+    installed_skills_src: Optional[Path] = None,
+) -> Optional[Path]:
+    """Return one coherent old DE checkout behind a complete routed skill set.
+
+    This is the recovery proof for a developer-acceptance -> managed-install
+    transition, including a prior install that already rewrote MCP before skill
+    routing failed. Every expected skill must already be a route, and every
+    non-managed route must converge on one checkout-shaped DE body. Real
+    directories, missing routes, arbitrary links, and mixed old roots fail
+    closed.
+    """
+
+    if not skills_src.is_dir() or not dest_root.is_dir():
+        return None
+    legacy_roots: set[Path] = set()
+    expected = tuple(
+        path
+        for path in sorted(skills_src.iterdir())
+        if path.is_dir() and path.name not in excluded_skills
+    )
+    if not expected:
+        return None
+    path_module = _path_module()
+    managed_skill_roots = (skills_src,)
+    if installed_skills_src is not None and installed_skills_src != skills_src:
+        managed_skill_roots += (installed_skills_src,)
+    for skill_dir in expected:
+        route = dest_root / skill_dir.name
+        target = _skill_route_target(route)
+        if target is None:
+            return None
+        if any(
+            _route_points_to(route, managed_skills / skill_dir.name)
+            for managed_skills in managed_skill_roots
+        ):
+            continue
+        target_skills = path_module.dirname(target)
+        legacy_root_text = path_module.dirname(target_skills)
+        if (
+            path_module.basename(target_skills) != "skills"
+            or target
+            != _normalize_route_path(
+                path_module.join(legacy_root_text, "skills", skill_dir.name)
+            )
+        ):
+            return None
+        legacy_roots.add(Path(legacy_root_text))
+    if len(legacy_roots) != 1:
+        return None
+    legacy_root = next(iter(legacy_roots))
+    skill_names = tuple(path.name for path in expected)
+    return (
+        legacy_root
+        if _valid_development_body_root(legacy_root, skill_names)
+        else None
+    )
+
+
 def _create_windows_junction(link: Path, target: Path) -> None:
     """Create a junction through CPython's native Win32 wrapper.
 
@@ -253,6 +364,7 @@ def _preflight_skill_routes(
     installed_skills_src: Path,
     dest_root: Path,
     excluded_skills: FrozenSet[str] = frozenset(),
+    replaceable_body_roots: Sequence[Path] = (),
 ) -> None:
     """Refuse predictable destination conflicts before replacing the body.
 
@@ -271,7 +383,11 @@ def _preflight_skill_routes(
         target = dest_root / skill_dir.name
         expected_target = installed_skills_src / skill_dir.name
         if _is_skill_route(target):
-            if not _route_points_to(target, expected_target):
+            replaceable = any(
+                _route_points_into_body(target, root, skill_dir.name)
+                for root in replaceable_body_roots
+            )
+            if not _route_points_to(target, expected_target) and not replaceable:
                 raise SkillRouteConflict(
                     "refusing to replace existing skill route %s because it points "
                     "outside this install" % target
@@ -289,6 +405,7 @@ def _route_skills(
     *,
     dest_root: Optional[Path] = None,
     excluded_skills: FrozenSet[str] = frozenset(),
+    replaceable_body_roots: Sequence[Path] = (),
 ) -> List[str]:
     """Route each skill dir under ``<body>/skills/`` into the agent skills dir
     (symlink on POSIX, directory junction on Windows — see the note above).
@@ -310,10 +427,16 @@ def _route_skills(
         expected_target = skills_src / skill_dir.name
         if _is_skill_route(target):
             if not _route_points_to(target, expected_target):
-                raise SkillRouteConflict(
-                    "refusing to replace existing skill route %s because it points "
-                    "outside this install" % target
-                )
+                if not any(
+                    _route_points_into_body(target, root, skill_dir.name)
+                    for root in replaceable_body_roots
+                ):
+                    raise SkillRouteConflict(
+                        "refusing to replace existing skill route %s because it points "
+                        "outside this install" % target
+                    )
+                _remove_skill_route(target)
+                _create_skill_route(target, expected_target)
             # A correct route already follows managed updates automatically.
             # Leave it in place so every MCP startup can run the repair path
             # without churning symlinks/Junctions or racing another client.
@@ -327,8 +450,43 @@ def _route_skills(
             )
         _create_skill_route(target, expected_target)
         routed.append(skill_dir.name)
-    _prune_stale_routes(dest_root, skills_src, set(routed))
+    _prune_stale_routes(
+        dest_root,
+        skills_src,
+        set(routed),
+        replaceable_body_roots=replaceable_body_roots,
+    )
     return routed
+
+
+def retired_skill_routes(client: str, body_root: Path) -> List[Tuple[Path, str]]:
+    """Find exact DE routes left in one host's declared retired destinations."""
+
+    spec = mcp_config.CLIENT_SPECS.get(client)
+    if spec is None or spec.retired_skills_paths is None:
+        return []
+    skills_src = Path(body_root) / "skills"
+    if not skills_src.is_dir():
+        return []
+    current = spec.skills_global_path() if spec.skills_global_path else None
+    retired = tuple(
+        path for path in spec.retired_skills_paths() if path != current and path.is_dir()
+    )
+    return sorted(
+        (root, skill.name)
+        for root in retired
+        for skill in skills_src.iterdir()
+        if skill.is_dir() and _route_points_to(root / skill.name, skill)
+    )
+
+
+def retire_client_skill_routes(client: str, body_root: Path) -> List[str]:
+    """Remove only exact DE-managed links from declared retired destinations."""
+
+    routes = retired_skill_routes(client, body_root)
+    for root, skill_name in routes:
+        _remove_skill_route(root / skill_name)
+    return [skill_name for _root, skill_name in routes]
 
 
 def repair_codex_skill_routes(body_root: Path) -> List[str]:
@@ -415,19 +573,27 @@ def repair_detected_skill_routes(
             if client in excluded_clients:
                 continue
             try:
+                legacy_root = complete_development_skill_route_root(
+                    body_root / "skills", destination, excluded
+                )
+                replaceable_roots = (legacy_root,) if legacy_root else ()
                 _preflight_skill_routes(
                     "decision-engine",
                     body_root / "skills",
                     body_root / "skills",
                     destination,
                     excluded,
+                    replaceable_roots,
                 )
-                routed[client] = _route_skills(
+                client_routes = _route_skills(
                     "decision-engine",
                     body_root,
                     dest_root=destination,
                     excluded_skills=excluded,
+                    replaceable_body_roots=replaceable_roots,
                 )
+                retire_client_skill_routes(client, body_root)
+                routed[client] = client_routes
             except (ShellError, OSError) as exc:
                 failed[client] = _skill_route_failure_reason(exc)
         return SkillRouteRepairResult(routed, failed)
@@ -450,6 +616,10 @@ def repair_client_integration(client: str, body_root: Path) -> Dict[str, object]
         raise ShellError("client skill destination is unavailable")
     destination = spec.skills_global_path()
     with install_lock(blocking=False):
+        legacy_root = complete_development_skill_route_root(
+            body_root / "skills", destination, spec.excluded_skills
+        )
+        replaceable_roots = (legacy_root,) if legacy_root else ()
         # Refuse predictable user-owned skill conflicts before publishing the
         # MCP entry for this explicit single-host repair.
         _preflight_skill_routes(
@@ -458,6 +628,7 @@ def repair_client_integration(client: str, body_root: Path) -> Dict[str, object]
             body_root / "skills",
             destination,
             spec.excluded_skills,
+            replaceable_roots,
         )
         mcp_result = mcp_config.write_entry(client, cwd=body_root)
         try:
@@ -466,7 +637,9 @@ def repair_client_integration(client: str, body_root: Path) -> Dict[str, object]
                 body_root,
                 dest_root=destination,
                 excluded_skills=spec.excluded_skills,
+                replaceable_body_roots=replaceable_roots,
             )
+            retire_client_skill_routes(client, body_root)
         except (ShellError, OSError) as exc:
             return {
                 "client": client,
@@ -477,7 +650,13 @@ def repair_client_integration(client: str, body_root: Path) -> Dict[str, object]
     return {"client": client, "mcp": mcp_result, "routed_skills": routed}
 
 
-def _prune_stale_routes(dest_root: Path, skills_src: Path, current: set) -> None:
+def _prune_stale_routes(
+    dest_root: Path,
+    skills_src: Path,
+    current: set,
+    *,
+    replaceable_body_roots: Sequence[Path] = (),
+) -> None:
     """Remove our own symlinks for skills that were dropped from the bundle.
 
     A prior install may have routed skills that no longer exist in this
@@ -486,19 +665,27 @@ def _prune_stale_routes(dest_root: Path, skills_src: Path, current: set) -> None
     user's own links and other components' routes are never disturbed.
     """
     path_module = _path_module()
-    src_root = _normalize_route_path(str(skills_src))
+    owned_roots = {
+        _normalize_route_path(str(skills_src)),
+        *(
+            _normalize_route_path(str(root / "skills"))
+            for root in replaceable_body_roots
+        ),
+    }
     for entry in dest_root.iterdir():
         if entry.name in current:
             continue
         target = _skill_route_target(entry)
         if target is None:
             continue
-        try:
-            owned_root = path_module.commonpath([target, src_root])
-        except ValueError:
-            continue
-        if owned_root == src_root and target != src_root:
-            _remove_skill_route(entry)
+        for owned_root in owned_roots:
+            try:
+                common = path_module.commonpath([target, owned_root])
+            except ValueError:
+                continue
+            if common == owned_root and target != owned_root:
+                _remove_skill_route(entry)
+                break
 
 
 def install_component(component: str, bundle_root: Path) -> Dict[str, object]:
@@ -525,17 +712,22 @@ def install_component(component: str, bundle_root: Path) -> Dict[str, object]:
         if client in route_failures:
             continue
         try:
+            legacy_root = complete_development_skill_route_root(
+                src / "skills", destination, excluded, dst / "skills"
+            )
+            replaceable_roots = (legacy_root,) if legacy_root else ()
             _preflight_skill_routes(
                 component,
                 src / "skills",
                 dst / "skills",
                 destination,
                 excluded,
+                replaceable_roots,
             )
         except (ShellError, OSError) as exc:
             route_failures[client] = _skill_route_failure_reason(exc)
         else:
-            route_candidates[client] = (destination, excluded)
+            route_candidates[client] = (destination, excluded, replaceable_roots)
     if not in_place:
         # Defense-in-depth backstop (audit 50070df6 convergent grok/gemini): `_replace_tree` rmtrees
         # `dst`. A legitimate install target is a plain body — it must NOT contain `.git`. If it does,
@@ -548,14 +740,18 @@ def install_component(component: str, bundle_root: Path) -> Dict[str, object]:
             )
         _replace_tree(src, dst)
     routed_by_client: Dict[str, List[str]] = {}
-    for client, (destination, excluded) in route_candidates.items():
+    for client, (destination, excluded, replaceable_roots) in route_candidates.items():
         try:
-            routed_by_client[client] = _route_skills(
+            client_routes = _route_skills(
                 component,
                 dst,
                 dest_root=destination,
                 excluded_skills=excluded,
+                replaceable_body_roots=replaceable_roots,
             )
+            if component == "decision-engine":
+                retire_client_skill_routes(client, dst)
+            routed_by_client[client] = client_routes
         except (ShellError, OSError) as exc:
             # Close the preflight/write race without rolling back unrelated hosts.
             route_failures[client] = _skill_route_failure_reason(exc)

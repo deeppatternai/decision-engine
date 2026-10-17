@@ -1674,6 +1674,48 @@ class HttpChatPageContractTestCase(unittest.TestCase):
             [["retry_chat", "123e4567-e89b-42d3-a456-426614174000"]],
         )
 
+    def test_rate_quota_and_budget_codes_render_distinct_localized_messages(self):
+        expected = {
+            "zh-CN": {
+                "rate_limited": "请求过于频繁，请稍后重试。",
+                "free_quota_exceeded": "今日免费使用次数已用完。",
+                "free_budget_exhausted": "免费服务暂时受限，请稍后重试。",
+            },
+            "en-US": {
+                "rate_limited": "Too many requests. Try again shortly.",
+                "free_quota_exceeded": "Today's free usage limit has been reached.",
+                "free_budget_exhausted": "The free service is temporarily limited. Please try again later.",
+            },
+        }
+
+        for language, messages in expected.items():
+            for code, message in messages.items():
+                state = "recovering" if code == "rate_limited" else "failed"
+                scenario = f"""
+                  window.geChat.bootstrap({{
+                    ok: true, backend: 'server', state: 'ready',
+                    conversation: {{status: 'active', turn_count: 0, max_turns: 40, expires_at: 1787587200}},
+                    privacy_disclosure: {{version: 'privacy:v-errors', providers: [{{
+                      category: 'approved-category', data_region: 'approved-region', training_enabled: false,
+                      cache_ttl_seconds: 0, provider_retention_hours: 0, deletion_scope: 'contract-defined'
+                    }}]}}, history: []
+                  }});
+                  window.geChat.submit('Explain this', [], null);
+                  window.geChat.state(1, {json.dumps(state)}, {{error_code: {json.dumps(code)}}});
+                  finish({{
+                    status: nodes['ge-chat-status'].textContent,
+                    finalMessage: nodes['ge-chat-scroll'].children
+                      .filter((node) => node.className.indexOf('msg ') === 0)
+                      .map((node) => node.textContent).slice(-1)[0]
+                  }});
+                """
+
+                with self.subTest(language=language, code=code):
+                    result = _run_js(scenario, language=language)
+                    self.assertEqual(result["status"], message)
+                    if state == "failed":
+                        self.assertEqual(result["finalMessage"], message)
+
     def test_stale_callbacks_cannot_unlock_or_relock_a_newer_active_turn(self):
         result = _run_js(r"""
           function envelope() { return {ok: true, backend: 'server', state: 'ready',

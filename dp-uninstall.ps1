@@ -1699,6 +1699,28 @@ def de_checkout_has_product_remotes(root: Path) -> bool:
         return False
 
 
+def valid_development_root(root: Path) -> bool:
+    """Recognize a direct, checkout-shaped DE root used by acceptance loads."""
+    required = (
+        root,
+        root / ".git",
+        root / "installer",
+        root / "installer" / "launcher.py",
+        root / "installer" / "mcp_config.py",
+        root / "skills",
+    )
+    return (
+        root.is_absolute()
+        and bool(root.anchor)
+        and reject_reparse_components(root, Path(root.anchor)) is None
+        and all(path.exists() and not is_reparse(path) for path in required)
+        and (root / "installer").is_dir()
+        and (root / "installer" / "launcher.py").is_file()
+        and (root / "installer" / "mcp_config.py").is_file()
+        and (root / "skills").is_dir()
+    )
+
+
 def aqg_checkout_has_product_remote(root: Path) -> bool:
     try:
         return git_output(root, "remote", "get-url", "origin") == AQG_PRODUCT_REMOTE
@@ -2363,7 +2385,20 @@ class Inventory:
                     if writer == "mimocode-jsonc-splice-v1":
                         command = actual.get("command")
                         python = command[0] if isinstance(command, list) and command else None
-                    desired = mcp_config._render_client_entry(client, python=python, cwd=self.de_root)
+                    dev_root = mcp_config.dev_root_from_args(
+                        command[1:]
+                        if writer == "mimocode-jsonc-splice-v1" and isinstance(command, list)
+                        else actual.get("args")
+                    )
+                    root = Path(dev_root) if dev_root else self.de_root
+                    if dev_root and not valid_development_root(root):
+                        raise ValueError("development root is not a proven DE checkout")
+                    desired = mcp_config._render_client_entry(
+                        client,
+                        python=python,
+                        dev_root=root if dev_root else None,
+                        cwd=None if dev_root else self.de_root,
+                    )
                     owned = (
                         client_host_ownership.managed_entry_sha256_v1(actual)
                         == client_host_ownership.managed_entry_sha256_v1(desired)

@@ -2133,7 +2133,14 @@ class GitCommandPolicyTests(unittest.TestCase):
         self.assertNotIn(str(candidate), argv)
         self.assertEqual(kwargs["env"]["DE_GIT_SIGNATURE_PATH"], str(candidate))
         self.assertEqual(kwargs["shell"], False)
-        self.assertEqual(kwargs["timeout"], updater._GIT_TIMEOUT_SECONDS)
+        self.assertEqual(
+            kwargs["timeout"], updater._WINDOWS_GIT_TRUST_TIMEOUT_SECONDS
+        )
+        self.assertGreater(
+            updater._WINDOWS_GIT_TRUST_TIMEOUT_SECONDS,
+            updater._GIT_TIMEOUT_SECONDS,
+        )
+        self.assertLessEqual(updater._WINDOWS_GIT_TRUST_TIMEOUT_SECONDS, 60)
 
     def test_posix_git_path_accepts_root_owned_non_writable_system_git(self):
         git = Path("/usr/bin/git")

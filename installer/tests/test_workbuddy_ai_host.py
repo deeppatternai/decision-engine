@@ -95,7 +95,7 @@ class WorkBuddyAIHostTestCase(unittest.TestCase):
                 Path("/Users/test/.workbuddy-ai/settings.json"),
             )
 
-    def test_workbuddy_ai_skills_path_tracks_562_layout_migration(self):
+    def test_workbuddy_ai_skills_path_stays_on_daemon_scanned_root(self):
         from installer.client_hosts.hosts import workbuddy_ai
 
         with tempfile.TemporaryDirectory() as tmp:
@@ -109,17 +109,194 @@ class WorkBuddyAIHostTestCase(unittest.TestCase):
             with mock.patch.object(Path, "home", return_value=home), mock.patch.dict(
                 os.environ, environment, clear=False
             ):
-                self._write_bundle(app_root, version="5.5.2")
-                self.assertEqual(
-                    workbuddy_ai._workbuddy_ai_skills_path(),
-                    home / ".workbuddy-ai" / "skills",
-                )
+                for version in ("5.5.2", "5.6.2", "5.7.6"):
+                    self._write_bundle(app_root, version=version)
+                    self.assertEqual(
+                        workbuddy_ai._workbuddy_ai_skills_path(),
+                        home / ".workbuddy-ai" / "skills",
+                    )
+                    self.assertEqual(
+                        workbuddy_ai._workbuddy_ai_retired_skills_paths(),
+                        (home / ".workbuddy" / "skills",),
+                    )
 
-                self._write_bundle(app_root, version="5.6.2")
-                self.assertEqual(
-                    workbuddy_ai._workbuddy_ai_skills_path(),
-                    home / ".workbuddy" / "skills",
-                )
+    def test_workbuddy_ai_skills_override_disables_default_root_migration(self):
+        from installer.client_hosts.hosts import workbuddy_ai
+
+        with mock.patch.dict(
+            os.environ,
+            {"WORKBUDDY_AI_SKILLS_DIR": "/custom/workbuddy-ai/skills"},
+            clear=False,
+        ):
+            self.assertEqual(
+                workbuddy_ai._workbuddy_ai_skills_path(),
+                Path("/custom/workbuddy-ai/skills"),
+            )
+            self.assertEqual(workbuddy_ai._workbuddy_ai_retired_skills_paths(), ())
+
+    def test_workbuddy_ai_repair_migrates_only_exact_managed_wrong_root_links(self):
+        from installer import install
+        from installer.client_hosts.hosts import workbuddy, workbuddy_ai
+
+        with tempfile.TemporaryDirectory() as tmp:
+            root = Path(tmp)
+            home = root / "home"
+            body = root / "managed"
+            correct = home / ".workbuddy-ai" / "skills"
+            wrong = home / ".workbuddy" / "skills"
+            for name in ("audit", "graphic-explanation", "third-party"):
+                (body / "skills" / name).mkdir(parents=True)
+            wrong.mkdir(parents=True)
+            install._create_skill_route(wrong / "audit", body / "skills" / "audit")
+            foreign = root / "foreign"
+            foreign.mkdir()
+            install._create_skill_route(wrong / "graphic-explanation", foreign)
+            protected = wrong / "third-party"
+            protected.mkdir()
+            (protected / "keep.txt").write_text("keep", encoding="utf-8")
+            environment = {
+                "DEEPPATTERN_HOME": str(root / "deeppattern"),
+                "WORKBUDDY_AI_SKILLS_DIR": "",
+                "WORKBUDDY_SKILLS_DIR": "",
+            }
+            with (
+                mock.patch.object(Path, "home", return_value=home),
+                mock.patch.dict(os.environ, environment, clear=False),
+                mock.patch.object(workbuddy, "_workbuddy_skills_in_use", return_value=False),
+                mock.patch.object(workbuddy, "_workbuddy_skills_configured", return_value=False),
+                mock.patch.object(mcp_config, "write_entry", return_value={"action": "updated"}),
+            ):
+                result = install.repair_client_integration("workbuddy-ai", body)
+                repeated = install.repair_client_integration("workbuddy-ai", body)
+
+            self.assertIn("audit", result["routed_skills"])
+            self.assertEqual(result["routed_skills"], repeated["routed_skills"])
+            self.assertTrue(install._route_points_to(correct / "audit", body / "skills" / "audit"))
+            self.assertFalse(wrong.joinpath("audit").exists())
+            self.assertTrue(install._route_points_to(wrong / "graphic-explanation", foreign))
+            self.assertEqual((protected / "keep.txt").read_text(encoding="utf-8"), "keep")
+
+    def test_workbuddy_ai_migration_preserves_legacy_workbuddy_routes(self):
+        from installer import install
+        from installer.client_hosts.hosts import workbuddy
+
+        with tempfile.TemporaryDirectory() as tmp:
+            root = Path(tmp)
+            home = root / "home"
+            body = root / "managed"
+            source = body / "skills" / "audit"
+            source.mkdir(parents=True)
+            wrong = home / ".workbuddy" / "skills"
+            wrong.mkdir(parents=True)
+            install._create_skill_route(wrong / "audit", source)
+            with (
+                mock.patch.object(Path, "home", return_value=home),
+                mock.patch.dict(os.environ, {"WORKBUDDY_AI_SKILLS_DIR": ""}, clear=False),
+                mock.patch.object(workbuddy, "_workbuddy_skills_in_use", return_value=True),
+            ):
+                self.assertEqual(install.retire_client_skill_routes("workbuddy-ai", body), [])
+
+            self.assertTrue(install._route_points_to(wrong / "audit", source))
+
+    def test_workbuddy_ai_migration_honors_legacy_config_override(self):
+        from installer import install
+        from installer.client_hosts.hosts import workbuddy
+
+        with tempfile.TemporaryDirectory() as tmp:
+            root = Path(tmp)
+            home = root / "home"
+            body = root / "managed"
+            source = body / "skills" / "audit"
+            source.mkdir(parents=True)
+            wrong = home / ".workbuddy" / "skills"
+            wrong.mkdir(parents=True)
+            install._create_skill_route(wrong / "audit", source)
+            config_path = root / "configured" / "workbuddy.json"
+            config_path.parent.mkdir(parents=True)
+            config_path.write_text(
+                json.dumps(
+                    {"mcpServers": {"decision-engine": {"command": "python"}}}
+                ),
+                encoding="utf-8",
+            )
+            environment = {
+                "WORKBUDDY_AI_SKILLS_DIR": "",
+                "WORKBUDDY_CONFIG": str(config_path),
+            }
+            with (
+                mock.patch.object(Path, "home", return_value=home),
+                mock.patch.dict(os.environ, environment, clear=False),
+                mock.patch.object(workbuddy, "_workbuddy_skills_in_use", return_value=False),
+            ):
+                self.assertTrue(workbuddy._workbuddy_skills_configured())
+                self.assertFalse((home / ".workbuddy" / "mcp.json").exists())
+                self.assertEqual(install.retire_client_skill_routes("workbuddy-ai", body), [])
+
+            self.assertTrue(install._route_points_to(wrong / "audit", source))
+
+    def test_workbuddy_ai_migration_preserves_unreadable_legacy_config_root(self):
+        from installer import install
+        from installer.client_hosts.hosts import workbuddy
+
+        with tempfile.TemporaryDirectory() as tmp:
+            root = Path(tmp)
+            home = root / "home"
+            body = root / "managed"
+            source = body / "skills" / "audit"
+            source.mkdir(parents=True)
+            wrong = home / ".workbuddy" / "skills"
+            wrong.mkdir(parents=True)
+            install._create_skill_route(wrong / "audit", source)
+            config_path = home / ".workbuddy" / "mcp.json"
+            config_path.write_bytes(b"not-json")
+            with (
+                mock.patch.object(Path, "home", return_value=home),
+                mock.patch.dict(os.environ, {"WORKBUDDY_AI_SKILLS_DIR": ""}, clear=False),
+                mock.patch.object(workbuddy, "_workbuddy_skills_in_use", return_value=False),
+            ):
+                self.assertEqual(install.retire_client_skill_routes("workbuddy-ai", body), [])
+
+            self.assertEqual(config_path.read_bytes(), b"not-json")
+            self.assertTrue(install._route_points_to(wrong / "audit", source))
+
+    def test_workbuddy_ai_doctor_rejects_exact_managed_links_in_wrong_root(self):
+        from installer import doctor, install
+        from installer.client_hosts.hosts import workbuddy
+
+        with tempfile.TemporaryDirectory() as tmp:
+            root = Path(tmp)
+            home = root / "home"
+            managed = root / "managed"
+            correct = home / ".workbuddy-ai" / "skills"
+            wrong = home / ".workbuddy" / "skills"
+            for name in doctor.DE_SKILLS:
+                source = managed / "skills" / name
+                source.mkdir(parents=True)
+                correct.mkdir(parents=True, exist_ok=True)
+                install._create_skill_route(correct / name, source)
+            wrong.mkdir(parents=True)
+            install._create_skill_route(
+                wrong / "audit", managed / "skills" / "audit"
+            )
+            environment = {
+                "DE_CONFIG_PATH": str(managed / "config.json"),
+                "WORKBUDDY_AI_SKILLS_DIR": "",
+            }
+            with (
+                mock.patch.object(Path, "home", return_value=home),
+                mock.patch.dict(os.environ, environment, clear=False),
+                mock.patch.object(workbuddy, "_workbuddy_skills_in_use", return_value=False),
+                mock.patch.object(workbuddy, "_workbuddy_skills_configured", return_value=False),
+                mock.patch.object(
+                    mcp_config,
+                    "active_skill_routes",
+                    return_value={"workbuddy-ai": (correct, frozenset())},
+                ),
+            ):
+                result = doctor.check_skills()
+
+            self.assertEqual(result.status, "FAIL")
+            self.assertIn("wrong-root:audit", result.detail)
 
     def test_workbuddy_ai_guard_checks_exact_bundle_identity_and_version(self):
         from installer.client_hosts.hosts import workbuddy_ai

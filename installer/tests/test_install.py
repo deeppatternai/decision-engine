@@ -1497,6 +1497,48 @@ class InstallerTestCase(unittest.TestCase):
         self.assertEqual(result.routed, {})
         self.assertEqual(sentinel.read_text(encoding="utf-8"), "keep")
 
+    def test_explicit_repair_migrates_deepseek_and_retained_mimo_routes(self):
+        body = self.deeppattern / "decision-engine"
+        base = Path(self.tmp.name)
+        destinations = {
+            "deepseek-harness": base / "dsh-skills",
+            "xiaomi-mimo": base / "mimo-skills",
+        }
+        for skill in ("audit", "layer-check"):
+            (body / "skills" / skill).mkdir(parents=True)
+        for client, destination in destinations.items():
+            legacy = base / (client + "-developer-checkout")
+            legacy.mkdir()
+            (legacy / ".git").write_text("gitdir: synthetic\n", encoding="utf-8")
+            (legacy / "installer").mkdir(parents=True)
+            for name in ("launcher.py", "mcp_config.py"):
+                (legacy / "installer" / name).write_text(
+                    "# synthetic\n", encoding="utf-8"
+                )
+            destination.mkdir()
+            for skill in ("audit", "layer-check"):
+                (legacy / "skills" / skill).mkdir(parents=True)
+                (destination / skill).symlink_to(legacy / "skills" / skill)
+
+        routes = {
+            client: (destination, frozenset())
+            for client, destination in destinations.items()
+        }
+        with mock.patch.object(
+            install.mcp_config, "active_skill_routes", return_value=routes
+        ):
+            result = install.repair_detected_skill_routes(body)
+
+        self.assertEqual(result.failed, {})
+        self.assertEqual(set(result.routed), set(destinations))
+        for destination in destinations.values():
+            for skill in ("audit", "layer-check"):
+                self.assertTrue(
+                    install._route_points_to(
+                        destination / skill, body / "skills" / skill
+                    )
+                )
+
     def test_explicit_cursor_repair_reports_only_cursor_failure(self):
         body = self.deeppattern / "decision-engine"
         for skill in ("audit", "layer-check"):
@@ -1531,7 +1573,14 @@ class InstallerTestCase(unittest.TestCase):
             "codex": (self.codex_skills, frozenset()),
         }
 
-        def route(_component, _root, *, dest_root, excluded_skills):
+        def route(
+            _component,
+            _root,
+            *,
+            dest_root,
+            excluded_skills,
+            replaceable_body_roots=(),
+        ):
             if dest_root == self.cursor_skills:
                 raise OSError("C:/private/profile/cursor/skills: access denied")
             return ["audit"]

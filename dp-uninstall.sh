@@ -631,6 +631,19 @@ def expected_mimocode_entry(
         or environment.get("DE_MCP_CLIENT_HOST") != "xiaomi-mimo"
     ):
         return None
+    dev_root = mcp_config.dev_root_from_args(command[1:])
+    if dev_root is not None:
+        if (
+            not dev_root
+            or not Path(dev_root).is_absolute()
+            or lex(Path(dev_root)) != module_root
+        ):
+            return None
+        return mcp_config._render_client_entry(
+            "xiaomi-mimo",
+            python=command[0],
+            dev_root=module_root,
+        )
     return mcp_config._render_client_entry(
         "xiaomi-mimo",
         python=command[0],

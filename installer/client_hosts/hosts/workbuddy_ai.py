@@ -13,7 +13,6 @@ from installer.config import ShellError
 
 _MINIMUM_VERSION = (5, 5, 2)
 _TESTED_VERSION = (5, 5, 2)
-_WORKBUDDY_SKILLS_LAYOUT_VERSION = (5, 6, 2)
 
 
 def _workbuddy_ai_config_path() -> Path:
@@ -31,14 +30,29 @@ def _workbuddy_ai_skills_path() -> Path:
     configured = os.getenv("WORKBUDDY_AI_SKILLS_DIR")
     if configured and configured.strip():
         return Path(configured).expanduser()
-    probe = _workbuddy_ai_product_metadata()
-    if (
-        probe.status == "matched"
-        and probe.version is not None
-        and probe.version >= _WORKBUDDY_SKILLS_LAYOUT_VERSION
-    ):
-        return Path.home() / ".workbuddy" / "skills"
     return Path.home() / ".workbuddy-ai" / "skills"
+
+
+def _workbuddy_ai_retired_skills_paths() -> tuple[Path, ...]:
+    """Return retired destinations that are safe to inspect for DE links."""
+
+    configured = os.getenv("WORKBUDDY_AI_SKILLS_DIR")
+    if configured and configured.strip():
+        return ()
+    from installer import mcp_config
+    from installer.client_hosts.hosts import workbuddy
+
+    # This directory is still the supported legacy WorkBuddy destination.
+    # Any product/config evidence makes the whole root ineligible for cleanup.
+    # Preserve both the default path and the supported per-process override:
+    # either may identify a legacy installation outside the current invocation.
+    if (
+        workbuddy._workbuddy_skills_in_use()
+        or workbuddy._workbuddy_config_path().exists()
+        or mcp_config.agent_config_path("workbuddy").exists()
+    ):
+        return ()
+    return (Path.home() / ".workbuddy" / "skills",)
 
 
 def _workbuddy_ai_settings_path() -> Path:
@@ -160,6 +174,7 @@ WORKBUDDY_AI = AgentHostSpec(
     json_include_cwd=False,
     skills_path=_workbuddy_ai_skills_path,
     skills_global_path=_workbuddy_ai_skills_path,
+    retired_skills_paths=_workbuddy_ai_retired_skills_paths,
     skill_delivery_mode="managed-copy",
     routing_kind="skill",
     skills_in_use=lambda: _workbuddy_ai_skills_in_use(),

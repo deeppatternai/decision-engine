@@ -1868,6 +1868,26 @@ class NativeServerLifecycleTests(unittest.TestCase):
         self.assertEqual(len(api._win.evaluated), 1)
         self.assertIn('window.geChat.state(1,"recovering",{})', api._win.evaluated[0])
 
+    def test_free_limit_codes_survive_failed_state_bridge_sanitization(self):
+        for code in ("free_quota_exceeded", "free_budget_exhausted"):
+            with self.subTest(code=code):
+                api, _chat = self._api()
+                generation = api._callback_generation
+
+                api._emit_chat(
+                    generation,
+                    "state",
+                    1,
+                    "failed",
+                    {"error_code": code},
+                )
+
+                self.assertEqual(len(api._win.evaluated), 1)
+                self.assertIn('window.geChat.state(1,"failed"', api._win.evaluated[0])
+                self.assertIn(f'"error_code": "{code}"', api._win.evaluated[0])
+                self.assertNotIn('"error_code": "rate_limited"', api._win.evaluated[0])
+                self.assertNotIn('"error_code": "network_error"', api._win.evaluated[0])
+
     def test_state_payload_numbers_stay_within_javascript_safe_integer_range(self):
         api, _chat = self._api()
         generation = api._callback_generation

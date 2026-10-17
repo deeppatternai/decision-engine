@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+import math
 import re
 from dataclasses import dataclass
 from pathlib import Path, PurePosixPath, PureWindowsPath
@@ -86,6 +87,7 @@ class AgentHostSpec:
     config_path: Optional[Callable[[], Path]] = None
     config_renderer: str = ""
     skills_global_path: Optional[Callable[[], Path]] = None
+    retired_skills_paths: Optional[Callable[[], Tuple[Path, ...]]] = None
     skills_project_paths: Tuple[str, ...] = ()
     skill_delivery_mode: str = "none"
     routing_kind: str = "mcp-only"
@@ -124,6 +126,7 @@ class AgentHostSpec:
     # written, and both require the fail-closed marked-DE ownership policy.
     host_normalized_entry_fields: FrozenSet[str] = frozenset()
     legacy_registration_host_families: FrozenSet[str] = frozenset()
+    ge_progress_keepalive_s: Optional[float] = None
 
 
 # Compatibility for callers/tests that imported the pre-WP1 type name.
@@ -140,6 +143,13 @@ def validate_host_specs(specs: Mapping[str, AgentHostSpec]) -> None:
     for client, spec in specs.items():
         if spec.id != client:
             _invalid_host_spec(client, "registry id does not match its key")
+        if spec.ge_progress_keepalive_s is not None and (
+            isinstance(spec.ge_progress_keepalive_s, bool)
+            or not isinstance(spec.ge_progress_keepalive_s, (int, float))
+            or not math.isfinite(spec.ge_progress_keepalive_s)
+            or spec.ge_progress_keepalive_s <= 0
+        ):
+            _invalid_host_spec(client, "GE progress keepalive must be finite and positive")
         if not transport_supports_renderer(spec.transport, spec.config_renderer):
             _invalid_host_spec(client, "transport or renderer is unsupported")
         if spec.detection not in _SUPPORTED_DETECTION_POLICIES:
@@ -215,6 +225,10 @@ def validate_host_specs(specs: Mapping[str, AgentHostSpec]) -> None:
             _invalid_host_spec(client, "JSON config transform is invalid")
         if spec.post_mcp_write is not None and not callable(spec.post_mcp_write):
             _invalid_host_spec(client, "post-MCP-write companion is invalid")
+        if spec.retired_skills_paths is not None and not callable(
+            spec.retired_skills_paths
+        ):
+            _invalid_host_spec(client, "retired skills path probe is invalid")
         if (
             spec.config_write_guard is not None
             and spec.config_write_guard_probe is not None

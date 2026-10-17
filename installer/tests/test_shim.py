@@ -4636,6 +4636,7 @@ class _GeFakeForwarder:
         self.endpoint = "https://hub.example"
         self.token = "synthetic-device-token"
         self.sent = []
+        self.timeouts = []
         self._statuses = list(statuses)
         self._run_id = run_id
         self._submit_run_id = submit_run_id
@@ -4646,6 +4647,7 @@ class _GeFakeForwarder:
 
     def forward(self, message, *, timeout_s=None):
         self.sent.append(message)
+        self.timeouts.append(timeout_s)
         name = (message.get("params") or {}).get("name")
         if name == "visual_render":
             if self._raise_on_submit:
@@ -4741,6 +4743,184 @@ class OpenGeDisplayTestCase(unittest.TestCase):
             shim._GE_RENDER_POLL_DEADLINE_S,
             shim._GE_OPEN_TOTAL_BUDGET_S - shim._GE_MIN_FETCH_RESERVE_S,
         )
+
+    def test_status_poll_timeout_is_clipped_to_remaining_foreground_budget(self):
+        fwd = mock.Mock()
+        with mock.patch.object(
+            shim, "_mcp_call_tool", return_value={"status": "completed"}
+        ) as call, mock.patch.object(shim.time, "monotonic", return_value=10.0):
+            status = shim._poll_ge_terminal(
+                fwd,
+                "ge_clipped",
+                deadline=12.0,
+                call_timeout_s=8.0,
+            )
+
+        self.assertEqual(status, "completed")
+        call.assert_called_once_with(
+            fwd,
+            "visual_status",
+            {"run_id": "ge_clipped"},
+            timeout_s=2.0,
+        )
+
+    def test_progress_keepalive_emits_standard_notification_until_stopped(self):
+        emit = mock.Mock()
+        stop = mock.Mock()
+        stop.wait.side_effect = [False, False, True]
+
+        shim._run_mcp_progress_keepalive(emit, "progress-17", stop, 15.0)
+
+        self.assertEqual(stop.wait.call_args_list, [mock.call(15.0)] * 3)
+        self.assertEqual(
+            emit.call_args_list,
+            [
+                mock.call({
+                    "jsonrpc": "2.0",
+                    "method": "notifications/progress",
+                    "params": {"progressToken": "progress-17", "progress": 1},
+                }),
+                mock.call({
+                    "jsonrpc": "2.0",
+                    "method": "notifications/progress",
+                    "params": {"progressToken": "progress-17", "progress": 2},
+                }),
+            ],
+        )
+
+    def test_progress_keepalive_contains_notification_write_failure(self):
+        stop = mock.Mock()
+        stop.wait.return_value = False
+        emit = mock.Mock(side_effect=BrokenPipeError("host closed stdout"))
+
+        with mock.patch.object(shim, "_log") as log:
+            shim._run_mcp_progress_keepalive(emit, "progress-17", stop, 15.0)
+
+        emit.assert_called_once()
+        log.assert_called_once()
+
+    def test_progress_keepalive_thread_start_failure_is_fail_open(self):
+        worker = mock.Mock()
+        worker.start.side_effect = RuntimeError("thread unavailable")
+
+        with mock.patch.object(shim.threading, "Thread", return_value=worker), \
+                mock.patch.object(shim, "_log") as log:
+            handle = shim._start_mcp_progress_keepalive(
+                mock.Mock(), "progress-17", 15.0
+            )
+
+        self.assertIsNone(handle)
+        log.assert_called_once()
+
+    def test_dispatch_keeps_mimo_open_ge_foreground_with_progress(self):
+        events = []
+
+        def emit(payload):
+            events.append(("emit", payload))
+
+        sem = mock.Mock()
+        keepalive = object()
+        with mock.patch.object(shim, "_start_mcp_progress_keepalive", return_value=keepalive) as start, mock.patch.object(
+            shim, "_stop_mcp_progress_keepalive",
+            side_effect=lambda handle: events.append(("stop", handle)),
+        ) as stop, mock.patch.object(
+            shim, "_handle_display_call", return_value={"status": "opened", "run_id": "ge_mimo_slow"}
+        ) as handle:
+            shim._dispatch_display(
+                mock.Mock(),
+                17,
+                {
+                    "name": "open_ge",
+                    "arguments": {"mode": "diagram", "spec": {}},
+                    "_meta": {"progressToken": "progress-17"},
+                },
+                emit,
+                sem,
+                "xiaomi-mimo",
+                False,
+                "legacy",
+                15.0,
+            )
+
+        start.assert_called_once_with(emit, "progress-17", 15.0)
+        stop.assert_called_once_with(keepalive)
+        handle.assert_called_once_with(
+            mock.ANY,
+            "open_ge",
+            {"mode": "diagram", "spec": {}},
+            client_host="xiaomi-mimo",
+            popup_followup=False,
+            popup_api_profile="legacy",
+        )
+        self.assertEqual([event[0] for event in events], ["stop", "emit"])
+        response = events[1][1]
+        self.assertEqual(response["id"], 17)
+        payload = json.loads(response["result"]["content"][0]["text"])
+        self.assertEqual(payload, {"status": "opened", "run_id": "ge_mimo_slow"})
+        sem.release.assert_called_once_with()
+
+    def test_dispatch_ignores_ineligible_progress_requests(self):
+        with mock.patch.object(shim, "_start_mcp_progress_keepalive") as start, mock.patch.object(
+            shim, "_handle_display_call", return_value={"status": "open"}
+        ):
+            cases = (
+                ("open_ge", True, 15.0, {"progressToken": True}),
+                ("open_ge", None, 15.0, {}),
+                ("open_ge", "valid-token", None, {"progressToken": "valid-token"}),
+                ("open_ge_popup", "valid-token", 15.0, {"progressToken": "valid-token"}),
+            )
+            for name, token, interval, metadata in cases:
+                with self.subTest(name=name, token=token, interval=interval):
+                    shim._dispatch_display(
+                        mock.Mock(),
+                        18,
+                        {"name": name, "arguments": {}, "_meta": metadata},
+                        mock.Mock(),
+                        mock.Mock(),
+                        "xiaomi-mimo",
+                        False,
+                        "legacy",
+                        interval,
+                    )
+        start.assert_not_called()
+
+    def test_dispatch_stops_keepalive_before_single_handler_error_response(self):
+        events = []
+
+        def emit(payload):
+            events.append(("emit", payload))
+
+        keepalive = object()
+        sem = mock.Mock()
+        with mock.patch.object(
+            shim, "_start_mcp_progress_keepalive", return_value=keepalive
+        ), mock.patch.object(
+            shim,
+            "_stop_mcp_progress_keepalive",
+            side_effect=lambda handle: events.append(("stop", handle)),
+        ), mock.patch.object(
+            shim, "_handle_display_call", side_effect=RuntimeError("render failed")
+        ):
+            shim._dispatch_display(
+                mock.Mock(),
+                19,
+                {
+                    "name": "open_ge",
+                    "arguments": {},
+                    "_meta": {"progressToken": 19},
+                },
+                emit,
+                sem,
+                "xiaomi-mimo",
+                False,
+                "legacy",
+                15.0,
+            )
+
+        self.assertEqual([event[0] for event in events], ["stop", "emit"])
+        self.assertEqual(events[1][1]["id"], 19)
+        self.assertEqual(events[1][1]["error"]["code"], -32603)
+        sem.release.assert_called_once_with()
 
     def test_open_ge_schema_covers_every_mode_and_bounds_the_retry_key(self):
         # STRUCTURE lives on the base constant (enum / bounds); DESCRIPTION prose is overlaid per

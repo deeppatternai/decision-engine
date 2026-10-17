@@ -654,6 +654,7 @@ _ADAPTER_CAPABILITY_FIELDS = (
     "audit_stop_panel",
     "runtime_display_policy",
     "popup_api_profile",
+    "ge_progress_keepalive_s",
     "require_observed_identity",
     "launcher_capabilities",
     "optional_features",

@@ -1061,6 +1061,76 @@ class HttpChatTurnTests(unittest.TestCase):
         self.assertFalse(caught.exception.retryable)
         self.assertEqual(caught.exception.http_status, 429)
 
+    def test_http_429_preserves_recognized_codes_from_both_error_envelopes(self):
+        cases = (
+            (b'{"error":"free_budget_exhausted"}', "free_budget_exhausted"),
+            (b'{"error":"free_quota_exceeded"}', "free_quota_exceeded"),
+            (b'{"error":"rate_limited"}', "rate_limited"),
+            (b'{"error_code":"free_budget_exhausted"}', "free_budget_exhausted"),
+            (
+                b'{"error_code":"free_quota_exceeded","error":"free_budget_exhausted"}',
+                "free_quota_exceeded",
+            ),
+            (
+                b'{"error_code":"provider_private_detail","error":"free_budget_exhausted"}',
+                "free_budget_exhausted",
+            ),
+        )
+
+        for body, expected in cases:
+            with self.subTest(body=body):
+                error = HttpChatSession._http_error(
+                    http_chat._HttpResponse(status=429, body=body)
+                )
+
+                self.assertEqual(error.code, expected)
+                self.assertEqual(error.http_status, 429)
+
+    def test_http_429_falls_back_to_rate_limit_only_without_a_recognized_code(self):
+        sentinel = "provider-private-detail-must-not-escape"
+        bodies = (
+            b"",
+            b"not-json",
+            json.dumps({"error": sentinel}).encode("utf-8"),
+            json.dumps({"error_code": sentinel}).encode("utf-8"),
+            b'{"error":42}',
+        )
+
+        for body in bodies:
+            with self.subTest(body=body):
+                error = HttpChatSession._http_error(
+                    http_chat._HttpResponse(status=429, body=body)
+                )
+
+                self.assertEqual(error.code, "rate_limited")
+                self.assertTrue(error.retryable)
+                self.assertEqual(error.http_status, 429)
+                self.assertNotIn(sentinel, repr(error))
+                self.assertNotIn(sentinel, error.user_message)
+
+    def test_current_error_envelope_does_not_override_non_429_status_mappings(self):
+        cases = (
+            (400, "rate_limited", "bad_response", False),
+            (401, "free_quota_exceeded", "auth_required", False),
+            (408, "free_budget_exhausted", "timeout", True),
+            (500, "rate_limited", "network_error", True),
+            (503, "free_quota_exceeded", "network_error", True),
+            (504, "free_budget_exhausted", "timeout", True),
+        )
+
+        for status, server_code, expected_code, retryable in cases:
+            with self.subTest(status=status, server_code=server_code):
+                error = HttpChatSession._http_error(
+                    http_chat._HttpResponse(
+                        status=status,
+                        body=json.dumps({"error": server_code}).encode("utf-8"),
+                    )
+                )
+
+                self.assertEqual(error.code, expected_code)
+                self.assertEqual(error.retryable, retryable)
+                self.assertEqual(error.http_status, status)
+
     def test_submit_accepts_strict_terminal_idempotency_replays(self):
         expected = {
             "completed": {
@@ -1854,6 +1924,46 @@ class HttpChatTurnTests(unittest.TestCase):
             )
         )
         self.assertEqual(done, ["new key accepted"])
+
+    def test_free_limit_rejections_keep_their_codes_in_terminal_state(self):
+        for code in ("free_quota_exceeded", "free_budget_exhausted"):
+            with self.subTest(code=code):
+                transport = _ScriptedTransport(
+                    (200, json.dumps(_conversation_response()).encode("utf-8")),
+                    (429, json.dumps({"error": code}).encode("utf-8")),
+                )
+                session = self._session(
+                    transport,
+                    sleep=lambda _seconds: None,
+                    rng=_FixedRng(),
+                )
+                states = []
+                errors = []
+
+                asyncio.run(
+                    session.run_turn(
+                        "question",
+                        [],
+                        lambda _text: None,
+                        lambda _text: None,
+                        errors.append,
+                        lambda _action: None,
+                        client_turn_id=_TURN_KEY,
+                        privacy_version="sha256:test",
+                        on_state=lambda state, payload: states.append((state, payload)),
+                    )
+                )
+
+                self.assertEqual(
+                    states,
+                    [
+                        ("submitting", {}),
+                        ("failed", {"error_code": code}),
+                    ],
+                )
+                self.assertEqual(errors, [code])
+                self.assertNotIn("recovering", [state for state, _payload in states])
+                self.assertIsNone(session._active)
 
     def test_auth_required_makes_session_unavailable_and_releases_active_key(self):
         transport = _ScriptedTransport(

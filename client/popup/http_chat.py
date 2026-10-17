@@ -64,6 +64,8 @@ _STABLE_CODES = frozenset(
         "conversation_busy",
         "conversation_expired",
         "rate_limited",
+        "free_quota_exceeded",
+        "free_budget_exhausted",
         "insufficient_credits",
         "model_unavailable",
         "timeout",
@@ -87,6 +89,8 @@ _MESSAGES = {
     "client_unsupported": "This client does not support popup chat.",
     "conversation_busy": "The conversation is busy.",
     "conversation_expired": "The conversation has expired.",
+    "free_budget_exhausted": "The free service is temporarily limited. Please try again later.",
+    "free_quota_exceeded": "Today's free usage limit has been reached.",
     "insufficient_credits": "There are not enough credits for this turn.",
     "input_too_large": "The chat input is too large.",
     "invalid_request": "The chat request is invalid.",
@@ -716,10 +720,18 @@ class HttpChatSession:
             return _error("server_unsupported", http_status=status)
         try:
             error_value = json.loads(response.body.decode("utf-8"))
-            server_code = error_value.get("error_code") if isinstance(error_value, dict) else None
+            server_code = None
+            if isinstance(error_value, dict):
+                legacy_code = error_value.get("error_code")
+                if isinstance(legacy_code, str) and legacy_code in _STABLE_CODES:
+                    server_code = legacy_code
+                elif status == 429:
+                    current_code = error_value.get("error")
+                    if isinstance(current_code, str) and current_code in _STABLE_CODES:
+                        server_code = current_code
         except (UnicodeDecodeError, json.JSONDecodeError, RecursionError, ValueError):
             server_code = None
-        if isinstance(server_code, str) and server_code in _STABLE_CODES:
+        if server_code is not None:
             return _error(
                 server_code,
                 retryable=server_code in {"network_error", "rate_limited", "timeout"},

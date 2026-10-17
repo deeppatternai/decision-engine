@@ -1251,6 +1251,9 @@ class DetectAndCliTestCase(unittest.TestCase):
                         "QODER_CN_IDE_APP_ROOT", "TRAE_CONFIG", "TRAE_SKILLS_DIR",
                         "TRAE_APP_ROOT", "TRAE_CN_CONFIG", "TRAE_CN_SKILLS_DIR",
                         "TRAE_CN_APP_ROOT",
+                        "DEEPSEEK_HARNESS_CONFIG", "DSH_HOME",
+                        "MIMOCODE_HOME", "XDG_CONFIG_HOME",
+                        "XIAOMI_MIMO_APP_DIRS",
                         "DE_UI_LOCALE")}
         # point every client at this temp tree; none exist yet
         os.environ["CLAUDE_CODE_CONFIG"] = str(self.tmp / "cc" / ".claude.json")
@@ -1343,11 +1346,30 @@ class DetectAndCliTestCase(unittest.TestCase):
         os.environ["CODEBUDDY_CLI"] = str(
             self.tmp / "no-codebuddy" / "bin" / "codebuddy"
         )
+        os.environ["DEEPSEEK_HARNESS_CONFIG"] = str(
+            self.tmp / "no-deepseek" / "cordis.patch.yml"
+        )
+        os.environ["DSH_HOME"] = str(self.tmp / "no-deepseek")
+        os.environ["MIMOCODE_HOME"] = str(self.tmp / "no-mimo")
+        os.environ["XDG_CONFIG_HOME"] = str(self.tmp / "no-xdg")
+        os.environ["XIAOMI_MIMO_APP_DIRS"] = str(self.tmp / "no-mimo-apps")
         os.environ["DE_UI_LOCALE"] = "en-US"
         self._root = mock.patch.object(mcp_config, "registration_root", return_value=self.tmp)
         self._root.start()
+        self._deepseek_cli = mock.patch(
+            "installer.client_hosts.hosts.deepseek_harness._cli_path",
+            return_value=None,
+        )
+        self._deepseek_apps = mock.patch(
+            "installer.client_hosts.hosts.deepseek_harness._macos_application_roots",
+            return_value=(self.tmp / "no-deepseek-apps",),
+        )
+        self._deepseek_cli.start()
+        self._deepseek_apps.start()
 
     def tearDown(self):
+        self._deepseek_apps.stop()
+        self._deepseek_cli.stop()
         self._root.stop()
         for k, v in self._saved.items():
             if v is None:

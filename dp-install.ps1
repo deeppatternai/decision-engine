@@ -3658,18 +3658,24 @@ with install.install_lock(blocking=False):
             continue
         try:
             destination = spec.skills_global_path()
+            legacy_root = install.complete_development_skill_route_root(
+                body_root / "skills", destination, spec.excluded_skills
+            )
+            replaceable_roots = (legacy_root,) if legacy_root else ()
             install._preflight_skill_routes(
                 "decision-engine",
                 body_root / "skills",
                 body_root / "skills",
                 destination,
                 spec.excluded_skills,
+                replaceable_roots,
             )
             routed_skills = install._route_skills(
                 "decision-engine",
                 body_root,
                 dest_root=destination,
                 excluded_skills=spec.excluded_skills,
+                replaceable_body_roots=replaceable_roots,
             )
             expected_skills = sorted(
                 skill.name

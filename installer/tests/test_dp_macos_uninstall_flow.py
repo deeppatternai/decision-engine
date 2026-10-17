@@ -794,7 +794,7 @@ class UninstallScriptTests(unittest.TestCase):
             mcp_config.write_entry(
                 "xiaomi-mimo",
                 python=sys.executable,
-                cwd=SCRIPT.parent,
+                dev_root=SCRIPT.parent,
             )
 
         skills = config_root / "skills"

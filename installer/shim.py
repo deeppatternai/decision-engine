@@ -2034,9 +2034,12 @@ def _poll_ge_terminal(forwarder: "Forwarder", run_id: str, *, deadline: float,
     while True:
         if stop_event is not None and stop_event.is_set():
             return "superseded"
+        remaining = deadline - time.monotonic()
+        if remaining <= 0:
+            return "pending"
         try:
             env = _mcp_call_tool(forwarder, "visual_status", {"run_id": run_id},
-                                 timeout_s=call_timeout_s)
+                                 timeout_s=min(call_timeout_s, remaining))
         except ShellError as exc:
             _log("open_ge status poll error (retrying until deadline): %s" % exc)
             env = None   # transient → fall through to the deadline check + retry, never crash
@@ -2506,6 +2509,67 @@ def _display_capability_disabled() -> Dict[str, Any]:
     return result
 
 
+def _run_mcp_progress_keepalive(
+    emit,
+    progress_token: Any,
+    stop_event: threading.Event,
+    interval_s: float,
+) -> None:
+    """Reset a progress-aware host's MCP request timer while a GE call is active."""
+    progress = 0
+    while not stop_event.wait(interval_s):
+        progress += 1
+        try:
+            emit({
+                "jsonrpc": "2.0",
+                "method": "notifications/progress",
+                "params": {
+                    "progressToken": progress_token,
+                    "progress": progress,
+                },
+            })
+        except Exception as exc:
+            _log("GE progress keepalive notification failed: %r" % exc)
+            return
+
+
+def _start_mcp_progress_keepalive(
+    emit,
+    progress_token: Any,
+    interval_s: Optional[float],
+):
+    if (
+        interval_s is None
+        or isinstance(progress_token, bool)
+        or not isinstance(progress_token, (str, int))
+    ):
+        return None
+    stop_event = threading.Event()
+    worker = threading.Thread(
+        target=_run_mcp_progress_keepalive,
+        args=(emit, progress_token, stop_event, interval_s),
+        daemon=True,
+        name="de-ge-progress-keepalive",
+    )
+    try:
+        worker.start()
+    except Exception as exc:  # aqg: optional compatibility signal must not break the tool call
+        _log("GE progress keepalive failed to start: %r" % exc)
+        return None
+    return stop_event, worker
+
+
+def _stop_mcp_progress_keepalive(handle) -> None:
+    if handle is None:
+        return
+    stop_event, worker = handle
+    stop_event.set()
+    try:
+        worker.join(timeout=1.0)
+    except Exception as exc:  # aqg: optional compatibility signal must not mask the tool result
+        _log("GE progress keepalive failed to stop cleanly: %r" % exc)
+
+
 def _dispatch_display(
     forwarder: "Forwarder",
     rid: Any,
@@ -2515,11 +2579,26 @@ def _dispatch_display(
     client_host: Optional[str],
     popup_followup: bool,
     popup_api_profile: str,
+    ge_progress_keepalive_s: Optional[float] = None,
 ) -> None:
     """Worker-thread body: run a local display tool and emit its response under the stdout lock,
     then release the concurrency slot. A display handler must NEVER take down the shim, so
     everything is contained here."""
+    response: Dict[str, Any]
+    keepalive = None
     try:
+        if params.get("name") == "open_ge" and ge_progress_keepalive_s is not None:
+            metadata = params.get("_meta")
+            progress_token = (
+                metadata.get("progressToken") if isinstance(metadata, dict) else None
+            )
+            if (
+                not isinstance(progress_token, bool)
+                and isinstance(progress_token, (str, int))
+            ):
+                keepalive = _start_mcp_progress_keepalive(
+                    emit, progress_token, ge_progress_keepalive_s
+                )
         handler_kwargs = {"client_host": client_host}
         if not popup_followup or popup_api_profile != "legacy":
             handler_kwargs.update(
@@ -2532,10 +2611,14 @@ def _dispatch_display(
             params.get("arguments") or {},
             **handler_kwargs,
         )
-        emit({"jsonrpc": "2.0", "id": rid, "result": _tool_content(payload)})
+        response = {"jsonrpc": "2.0", "id": rid, "result": _tool_content(payload)}
     except Exception as exc:  # aqg: worker boundary — contain everything, reply an error not silence
         _log("display handler crashed: %r" % exc)
-        emit(_jsonrpc_error(rid, -32603, "display handler failed"))
+        response = _jsonrpc_error(rid, -32603, "display handler failed")
+    finally:
+        _stop_mcp_progress_keepalive(keepalive)
+    try:
+        emit(response)
     finally:
         sem.release()
 
@@ -3428,6 +3511,7 @@ def serve(
                 emit({"jsonrpc": "2.0", "id": message.get("id"),
                       "result": _tool_content({"status": "failed", "reason": "busy"})})
                 continue
+            display_adapter = mcp_config.host_adapter(resolved_client_host)
             worker = threading.Thread(
                 target=_dispatch_display,
                 args=(
@@ -3442,9 +3526,14 @@ def serve(
                         and transport_gate.followup_enabled
                     ),
                     (
-                        mcp_config.host_adapter(resolved_client_host).popup_api_profile
-                        if mcp_config.host_adapter(resolved_client_host) is not None
+                        display_adapter.popup_api_profile
+                        if display_adapter is not None
                         else "legacy"
+                    ),
+                    (
+                        display_adapter.ge_progress_keepalive_s
+                        if display_adapter is not None
+                        else None
                     ),
                 ),
                 daemon=True,

@@ -2993,6 +2993,7 @@ tool_timeout_sec = 660
             self.assertTrue(adapter.local_display_tools)
             self.assertTrue(adapter.popup_followup)
             self.assertTrue(adapter.audit_stop_panel)
+            self.assertIsNone(adapter.ge_progress_keepalive_s)
             self.assertIsNone(adapter.runtime_display_policy)
             self.assertEqual(adapter.popup_api_profile, "legacy")
         self.assertIsNone(cursor.lifecycle_adapter)
@@ -3001,6 +3002,7 @@ tool_timeout_sec = 660
         first = mcp_config.CLIENT_SPECS["claude-code"]
         conflicting_values = (
             replace(first, popup_followup=not first.popup_followup),
+            replace(first, ge_progress_keepalive_s=15.0),
             replace(
                 first,
                 require_observed_identity=not first.require_observed_identity,
@@ -3019,6 +3021,19 @@ tool_timeout_sec = 660
                 ),
             ):
                 mcp_config.host_adapter(first.host_family)
+
+    def test_ge_progress_keepalive_interval_must_be_finite_and_positive(self):
+        first = mcp_config.CLIENT_SPECS["claude-code"]
+        for value in (True, 0, -1.0, float("inf"), float("nan"), "15"):
+            with (
+                self.subTest(value=value),
+                self.assertRaisesRegex(
+                    ShellError, "GE progress keepalive must be finite and positive"
+                ),
+            ):
+                mcp_config.validate_host_specs(
+                    {"claude-code": replace(first, ge_progress_keepalive_s=value)}
+                )
 
     def test_cursor_explicit_setup_no_longer_excludes_m2_skills(self):
         spec = mcp_config.CLIENT_SPECS["cursor"]

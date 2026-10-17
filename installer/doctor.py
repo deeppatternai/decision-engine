@@ -535,6 +535,13 @@ def _skill_route_snapshot():
         for client, (directory, _excluded) in destinations.items()
     }
     missing = {client: skills for client, skills in missing.items() if skills}
+    for client in destinations:
+        misrouted = install.retired_skill_routes(client, managed_skills.parent)
+        if misrouted:
+            missing.setdefault(client, []).extend(
+                "wrong-root:%s" % skill_name
+                for _root, skill_name in misrouted
+            )
     return destinations, expected, missing
 
 

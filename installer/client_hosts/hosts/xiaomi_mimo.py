@@ -141,6 +141,7 @@ XIAOMI_MIMO = AgentHostSpec(
     local_display_tools=True,
     popup_followup=False,
     audit_stop_panel=True,
+    ge_progress_keepalive_s=15.0,
     launcher_capabilities=frozenset(
         {"core-mcp", "local-display", "audit-stop-panel"}
     ),
