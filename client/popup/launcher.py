@@ -922,12 +922,24 @@ _GE_CHAT_JS = """
     return false;
   }
   function setPrice(turnId, payload) {
-    if (!payload || !Number.isSafeInteger(payload.price_credits) || payload.price_credits < 0) return;
+    if (!payload) return;
+    var rawPrice = payload.price_credits;
+    var priceText = null, priceMicros = null;
+    if (typeof rawPrice === 'number') {
+      if (!Number.isSafeInteger(rawPrice) || rawPrice < 0 || Object.is(rawPrice, -0)) return;
+      priceText = String(rawPrice); priceMicros = BigInt(rawPrice) * 1000000n;
+    } else if (typeof rawPrice === 'string' && /^(?:0|[1-9][0-9]*)(?:\\.[0-9]{1,6})?$/.test(rawPrice)) {
+      var priceParts = rawPrice.split('.');
+      var fraction = (priceParts[1] || '').padEnd(6, '0');
+      priceMicros = BigInt(priceParts[0]) * 1000000n + BigInt(fraction || '0');
+      priceText = rawPrice;
+    } else return;
+    if (priceMicros > 9007199254740991n) return;
     if (prices[turnId]) return;              // price is frozen from the first (submit) state payload
-    var free = payload.price_credits === 0;
+    var free = priceMicros === 0n;
     var price = document.createElement('span'); price.className = 'ge-price' + (free ? ' is-free' : '');
     prices[turnId] = price;
-    price.textContent = free ? S.free : String(payload.price_credits) + ' ' + S.credits;
+    price.textContent = free ? S.free : priceText + ' ' + S.credits;
     var bubble = bubbles[turnId]; if (bubble) bubble.appendChild(price);
   }
   function refreshComposer() {

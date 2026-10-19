@@ -1897,7 +1897,7 @@ class NativeServerLifecycleTests(unittest.TestCase):
             "state",
             1,
             "running",
-            {"price_credits": native_shell._MAX_DISPLAY_TURN_ID},
+            {"price_credits": "9007199254.740991"},
         )
         api._emit_chat(
             generation,
@@ -1916,7 +1916,7 @@ class NativeServerLifecycleTests(unittest.TestCase):
             "state",
             1,
             "running",
-            {"price_credits": native_shell._MAX_DISPLAY_TURN_ID + 1},
+            {"price_credits": "9007199254.740992"},
         )
         api._emit_chat(
             generation,
@@ -1931,6 +1931,52 @@ class NativeServerLifecycleTests(unittest.TestCase):
 
         self.assertEqual(len(delivered), 2)
         self.assertEqual(api._win.evaluated, delivered)
+
+    def test_decimal_usd_prices_survive_bridge_validation_and_unsafe_values_do_not(self):
+        for price, expected in (
+            (0, 0),
+            ("0", "0"),
+            ("0.000001", "0.000001"),
+            ("1.234567", "1.234567"),
+            ("10", "10"),
+            ("100", "100"),
+            ("1000", "1000"),
+        ):
+            with self.subTest(valid_price=price):
+                api, _chat = self._api()
+                api._emit_chat(
+                    api._callback_generation,
+                    "state",
+                    1,
+                    "running",
+                    {"price_credits": price},
+                )
+
+                self.assertEqual(len(api._win.evaluated), 1)
+                self.assertIn(f'"price_credits": {json.dumps(expected)}', api._win.evaluated[0])
+
+        unsafe_prices = (
+            True,
+            -0.000001,
+            -0.0,
+            0.0,
+            float("nan"),
+            float("inf"),
+            "0.0000001",
+            "9007199254.740992",
+        )
+        for price in unsafe_prices:
+            with self.subTest(unsafe_price=price):
+                api, _chat = self._api()
+                api._emit_chat(
+                    api._callback_generation,
+                    "state",
+                    1,
+                    "running",
+                    {"price_credits": price},
+                )
+
+                self.assertEqual(api._win.evaluated, [])
 
     def test_server_ask_is_keyed_and_mid_turn_failure_has_no_cli_fallback(self):
         api, chat = self._api()

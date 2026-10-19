@@ -16,7 +16,7 @@ import unittest
 from pathlib import Path
 from unittest import mock
 
-from client.popup import launcher
+from client.popup import launcher, native_shell
 
 
 _SVG = "<svg xmlns=\"http://www.w3.org/2000/svg\"><rect width=\"10\" height=\"10\"/></svg>"
@@ -1292,23 +1292,53 @@ class HttpChatPageContractTestCase(unittest.TestCase):
               data_region: 'safe', training_enabled: false, cache_ttl_seconds: 0,
               provider_retention_hours: 0, deletion_scope: 'safe'}]}, history: []});
           const turnIds = ['123e4567-e89b-42d3-a456-426614174001',
-                           '123e4567-e89b-42d3-a456-426614174002'];
+                           '123e4567-e89b-42d3-a456-426614174002',
+                           '123e4567-e89b-42d3-a456-426614174003'];
           window.crypto.randomUUID = () => turnIds.shift();
           window.geChat.submit('free', [], null);
-          window.geChat.state(1, 'submitting', {price_credits: 0});
+          window.geChat.state(1, 'submitting', {price_credits: '0'});
           let bot = nodes['ge-chat-scroll'].children.filter((node) => node.className === 'msg bot')[0];
           const free = bot.children.find((node) => node.className.indexOf('ge-price') === 0);
           window.geChat.done(1, 'free answer');
           window.geChat.submit('paid', [], null);
-          window.geChat.state(2, 'submitting', {price_credits: 2});
+          window.geChat.state(2, 'submitting', {price_credits: '1.234567'});
           bot = nodes['ge-chat-scroll'].children.filter((node) => node.className === 'msg bot')[1];
           const paid = bot.children.find((node) => node.className.indexOf('ge-price') === 0);
+          window.geChat.done(2, 'paid answer');
+          window.geChat.submit('unsafe', [], null);
+          window.geChat.state(3, 'submitting', {price_credits: '0.0000001'});
+          bot = nodes['ge-chat-scroll'].children.filter((node) => node.className === 'msg bot')[2];
+          const unsafePrices = bot.children.filter((node) => node.className.indexOf('ge-price') === 0);
           finish({free: {text: free.textContent, cls: free.className},
-            paid: {text: paid.textContent, cls: paid.className}});
+            paid: {text: paid.textContent, cls: paid.className}, unsafePriceCount: unsafePrices.length});
         """)
 
         self.assertEqual(result["free"], {"text": "Free", "cls": "ge-price is-free"})
-        self.assertEqual(result["paid"], {"text": "2 credits", "cls": "ge-price"})
+        self.assertEqual(result["paid"], {"text": "1.234567 credits", "cls": "ge-price"})
+        self.assertEqual(result["unsafePriceCount"], 0)
+
+    def test_native_bridge_decimal_price_renders_exactly_in_page(self):
+        payload = native_shell._safe_state_payload(
+            "submitting", {"price_credits": "1.234567"}
+        )
+        self.assertEqual(payload, {"price_credits": "1.234567"})
+        result = _run_js(
+            r"""
+              window.geChat.bootstrap({ok: true, backend: 'server', state: 'ready',
+                conversation: {status: 'active', turn_count: 0, max_turns: 40, expires_at: 1},
+                privacy_disclosure: {version: 'v:bridge-price', providers: [{category: 'safe',
+                  data_region: 'safe', training_enabled: false, cache_ttl_seconds: 0,
+                  provider_retention_hours: 0, deletion_scope: 'safe'}]}, history: []});
+              window.geChat.submit('priced', [], null);
+              window.geChat.state(1, 'submitting', BRIDGE_PRICE_PAYLOAD);
+              const bot = nodes['ge-chat-scroll'].children.find((node) => node.className === 'msg bot');
+              const price = bot.children.find((node) => node.className.indexOf('ge-price') === 0);
+              finish({price: price && price.textContent});
+            """,
+            preamble="const BRIDGE_PRICE_PAYLOAD = " + json.dumps(payload) + ";\n",
+        )
+
+        self.assertEqual(result["price"], "1.234567 credits")
 
     def test_image_preview_stacks_above_native_window_controls(self):
         rendered = _render()

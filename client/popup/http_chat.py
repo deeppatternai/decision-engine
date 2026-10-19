@@ -18,13 +18,17 @@ import time
 import urllib.error
 import urllib.request
 from dataclasses import dataclass, field
+from decimal import Decimal
 from urllib.parse import quote, urlencode, urlsplit
 
 from client import i18n
 from client.http_safety import NoRedirect, read_within_budget
 from client.version import USER_AGENT
 
+from .chat_price import validate_chat_price
+
 _C0 = frozenset(chr(value) for value in range(32)) | {chr(127)}
+_GE_CHAT_CONTRACT = "decimal-v1"
 _RESPONSE_BUDGET_S = 15.0
 _SMALL_RESPONSE_BYTES = 256 * 1024
 _PRIVACY_VERSION = re.compile(r"^[A-Za-z0-9._:-]{1,128}$")
@@ -440,7 +444,7 @@ class _TurnRecord:
     payload_digest: bytes
     started_at: float
     turn_code: str | None = None
-    price_credits: int | None = None
+    price_credits: int | str | None = None
     pending_cancel: bool = False
     cancel_sent: bool = False
     cancel_in_flight: bool = False
@@ -665,6 +669,7 @@ class HttpChatSession:
             "Accept": "application/json",
             "Accept-Language": i18n.accept_language(),
             "Authorization": "Bearer " + self._token,
+            "X-GE-Chat-Contract": _GE_CHAT_CONTRACT,
             "User-Agent": USER_AGENT,
         }
         if body is not None:
@@ -767,7 +772,7 @@ class HttpChatSession:
     def _decode_object(response: _HttpResponse) -> dict:
         invalid_json = False
         try:
-            value = json.loads(response.body.decode("utf-8"))
+            value = json.loads(response.body.decode("utf-8"), parse_float=Decimal)
         except (UnicodeDecodeError, json.JSONDecodeError, RecursionError, ValueError):
             invalid_json = True
             value = None
@@ -1166,7 +1171,10 @@ class HttpChatSession:
         phase = value["phase"]
         if not isinstance(status, str) or not isinstance(phase, str):
             raise _error("bad_response")
-        price = _nonnegative_int(value["price_credits"], maximum=_MAX_SAFE_INTEGER)
+        try:
+            price = validate_chat_price(value["price_credits"])
+        except ValueError:
+            raise _error("bad_response") from None
         common = {
             "turn_code": turn_code,
             "status": status,

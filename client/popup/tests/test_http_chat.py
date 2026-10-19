@@ -126,6 +126,7 @@ class HttpChatPublicContractTests(unittest.TestCase):
 
         self.assertEqual(session.get_capabilities(), {"ge_chat_v1": True})
         self.assertEqual(transport.calls[0]["headers"]["User-Agent"], runner.USER_AGENT)
+        self.assertEqual(transport.calls[0]["headers"]["X-GE-Chat-Contract"], "decimal-v1")
 
 
 class HttpChatTransportSafetyTests(unittest.TestCase):
@@ -974,9 +975,114 @@ class HttpChatTurnTests(unittest.TestCase):
         for call in submit_calls:
             self.assertEqual(call["method"], "POST")
             self.assertEqual(call["headers"]["Idempotency-Key"], _TURN_KEY)
+            self.assertEqual(call["headers"]["X-GE-Chat-Contract"], "decimal-v1")
             self.assertEqual(call["headers"]["User-Agent"], runner.USER_AGENT)
             self.assertEqual(json.loads(call["body"]), {"text": "question", "images": []})
             self.assertEqual(call["timeout_s"], 120.0)
+
+    def test_all_authenticated_chat_requests_advertise_decimal_contract(self):
+        transport = _ScriptedTransport(
+            (200, json.dumps(_conversation_response()).encode("utf-8")),
+            (200, json.dumps({"turns": [], "has_more": False}).encode("utf-8")),
+        )
+        session = HttpChatSession(
+            endpoint="https://example.test",
+            token="token",
+            run_id="run",
+            transport=transport,
+        )
+
+        session.create_or_restore_conversation()
+        session.get_history()
+
+        self.assertGreaterEqual(len(transport.calls), 2)
+        self.assertTrue(
+            all(
+                call["headers"]["X-GE-Chat-Contract"] == "decimal-v1"
+                for call in transport.calls
+            )
+        )
+
+    def test_submit_accepts_legacy_and_decimal_usd_prices(self):
+        cases = (
+            (0, 0),
+            (0.0, "0"),
+            (0.000001, "0.000001"),
+            (1.234567, "1.234567"),
+            ("10", "10"),
+            ("100", "100"),
+            ("1000", "1000"),
+        )
+        for price, expected in cases:
+            with self.subTest(price=price):
+                session = self._session(
+                    _ScriptedTransport(
+                        (200, json.dumps(_conversation_response()).encode("utf-8")),
+                        (200, json.dumps(_submit_response(price=price)).encode("utf-8")),
+                    ),
+                    sleep=lambda _seconds: None,
+                )
+
+                result = session.submit_turn("question", [], _TURN_KEY)
+
+                self.assertEqual(result["price_credits"], expected)
+
+    def test_submit_rejects_unsafe_decimal_usd_prices(self):
+        unsafe_prices = (
+            True,
+            -0.000001,
+            float("nan"),
+            float("inf"),
+            0.0000001,
+            9_007_199_255,
+        )
+        for price in unsafe_prices:
+            with self.subTest(price=price):
+                session = self._session(
+                    _ScriptedTransport(
+                        (200, json.dumps(_conversation_response()).encode("utf-8")),
+                        (200, json.dumps(_submit_response(price=price)).encode("utf-8")),
+                    ),
+                    sleep=lambda _seconds: None,
+                )
+
+                with self.assertRaises(ChatClientError) as caught:
+                    session.submit_turn("question", [], _TURN_KEY)
+
+                self.assertEqual(caught.exception.code, "bad_response")
+
+    def test_submit_validates_original_decimal_literal_before_float_conversion(self):
+        cases = (
+            ("1e-324", None),
+            ("-0.0", None),
+            ('"10"', "10"),
+            ('"100"', "100"),
+            ('"1000"', "1000"),
+            ("9007199254.000001", "9007199254.000001"),
+            ("9007199254.740991", "9007199254.740991"),
+            ("9007199254.740992", None),
+        )
+        for price_literal, expected in cases:
+            with self.subTest(price_literal=price_literal):
+                body = (
+                    '{"turn_code":"turn-test","status":"queued","phase":"queued",'
+                    f'"price_credits":{price_literal},"poll_after_ms":250}}'
+                ).encode("ascii")
+                session = self._session(
+                    _ScriptedTransport(
+                        (200, json.dumps(_conversation_response()).encode("utf-8")),
+                        (200, body),
+                    ),
+                    sleep=lambda _seconds: None,
+                )
+
+                if expected is None:
+                    with self.assertRaises(ChatClientError) as caught:
+                        session.submit_turn("question", [], _TURN_KEY)
+                    self.assertEqual(caught.exception.code, "bad_response")
+                else:
+                    result = session.submit_turn("question", [], _TURN_KEY)
+                    self.assertEqual(result["price_credits"], expected)
 
     def test_submit_429_rate_limit_error_code_is_retryable(self):
         transport = _ScriptedTransport(
@@ -1501,7 +1607,7 @@ class HttpChatTurnTests(unittest.TestCase):
     def test_run_turn_clamps_and_jitters_poll_delays_without_poll_idempotency_header(self):
         transport = _ScriptedTransport(
             (200, json.dumps(_conversation_response()).encode("utf-8")),
-            (200, json.dumps(_submit_response(price=0, poll_after_ms=0)).encode("utf-8")),
+            (200, json.dumps(_submit_response(price=0.0, poll_after_ms=0)).encode("utf-8")),
             (
                 200,
                 json.dumps(
@@ -1550,6 +1656,8 @@ class HttpChatTurnTests(unittest.TestCase):
         self.assertEqual([state for state, _payload in states], [
             "submitting", "queued", "calling_model", "completed"
         ])
+        self.assertEqual(states[1], ("queued", {"price_credits": "0"}))
+        self.assertEqual(states[2], ("calling_model", {"price_credits": "0"}))
         poll_calls = transport.calls[2:]
         self.assertTrue(all("Idempotency-Key" not in call["headers"] for call in poll_calls))
 

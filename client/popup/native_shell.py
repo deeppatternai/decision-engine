@@ -54,6 +54,8 @@ from pathlib import Path
 from typing import Any, Dict, Optional
 from urllib.parse import urlsplit
 
+from .chat_price import validate_chat_price
+
 try:
     # GE follow-up chat backend (pywebview-free core). Optional: a missing backend degrades the popup
     # to display-only (chat_ready() → False, the composer stays disabled), never a hard failure.
@@ -489,12 +491,9 @@ def _safe_state_payload(state: Any, payload: Any) -> Optional[Dict[str, Any]]:
             return {}
         if set(payload) != {"price_credits"}:
             return None
-        price = payload.get("price_credits")
-        if (
-            isinstance(price, bool)
-            or not isinstance(price, int)
-            or not 0 <= price <= _MAX_DISPLAY_TURN_ID
-        ):
+        try:
+            price = validate_chat_price(payload.get("price_credits"))
+        except ValueError:
             return None
         return {"price_credits": price}
     if state == "completed":
