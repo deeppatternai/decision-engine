@@ -85,7 +85,6 @@ PANEL = {
         "partial": "%s · 部分完成（仅参考） · %s",
         "unknown": "%s · 状态未知（仅参考） ⏱",
     },
-    "hub_stale": "%s · 连接中断 · 最后已知 %s ⚠",
     "hub_queued": "%s · 排队中 ⏱",
     "hub": {
         "completed": "%s · 已完成 · %s ✓",
@@ -93,6 +92,7 @@ PANEL = {
         "failed": "%s · 失败 · %s ✗",
         "cancelling": "%s · 停止中 · %s ⏱",
         "cancelled": "%s · 已取消 · %s",
+        "connection_timeout": "%s · 连接超时 · %s ✗",
         "reviewing": "%s · 审核中 · %s ⏱",
     },
     "auditor_status": {

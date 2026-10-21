@@ -187,7 +187,7 @@ class LinuxAuditWebViewTests(unittest.TestCase):
         self.assertEqual(payload["rows"][0]["run_id"], "aud_中文测试")
         self.assertTrue(payload["rows"][0]["action"]["enabled"])
 
-    def test_only_running_de_lite_and_verified_healthy_hosted_details_shimmer(self):
+    def test_running_details_keep_shimmer_during_connectivity_interruption(self):
         from client.stopper import webview_panel
 
         app, _window, _events = _audit_webview_app(webview_panel)
@@ -216,9 +216,9 @@ class LinuxAuditWebViewTests(unittest.TestCase):
         self.assertTrue(shimmers("lite", lite))
         self.assertTrue(shimmers("hosted", running, verified=True))
         self.assertFalse(shimmers("hosted", running))
-        self.assertFalse(shimmers("hosted", running, verified=True, poll_failure=True))
+        self.assertTrue(shimmers("hosted", running, verified=True, poll_failure=True))
         self.assertFalse(shimmers("hosted", running, verified=True, gone=True))
-        self.assertFalse(
+        self.assertTrue(
             shimmers("hosted", {**running, "last_ok_at": 1.0}, verified=True)
         )
 
@@ -263,6 +263,30 @@ class LinuxAuditWebViewTests(unittest.TestCase):
         _args, kwargs = eligible.call_args
         self.assertEqual(kwargs["run_id"], "hosted")
         self.assertEqual(kwargs["server_verified"], {"hosted"})
+
+    def test_disconnected_payload_keeps_running_action_and_normal_layout(self):
+        from client.stopper import panel, webview_panel
+
+        app, _window, _events = _audit_webview_app(webview_panel)
+        app.runs = {
+            "hosted": {
+                "run_id": "hosted", "status": "running", "profile": "standard",
+                "ui_locale": "en-US",
+                "started_at": 1.0, "last_ok_at": 1.0,
+                "auditors": [{"status": "running"}],
+            }
+        }
+        app._server_verified = {"hosted"}
+        app._poll_failures = {"hosted": 1}
+        with mock.patch.object(webview_panel.time, "time", return_value=100.0):
+            row = app._payload()["rows"][0]
+
+        self.assertEqual(row["detail"]["text"], "Standard · Auditing · 1m 39s ⏱")
+        self.assertEqual(row["detail"]["color"], panel.FG_MUTED)
+        self.assertTrue(row["detail"]["shimmer"])
+        self.assertEqual(row["action"]["text"], "Running")
+        self.assertEqual(row["action"]["background"], panel.FG_RED)
+        self.assertFalse(row["action"]["enabled"])
 
     def test_missing_optional_native_window_events_do_not_block_startup(self):
         from client.stopper import webview_panel

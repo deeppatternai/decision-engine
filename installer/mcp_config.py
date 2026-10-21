@@ -2199,6 +2199,65 @@ def _is_marked_de_entry(
     return True
 
 
+def codex_managed_entry_targets_root(
+    root: Path,
+    server_name: str = DEFAULT_SERVER_NAME,
+) -> bool:
+    """Return whether the generated Codex entry launches from exactly ``root``.
+
+    Codex setup predates client-host ownership sidecars, so exact generated MCP
+    shapes are the compatibility proof for historical installs. The accepted
+    key sets cover only published Codex generations: untagged legacy, tagged
+    before startup timeouts, and current. Timeout values remain user-configurable
+    but must be positive integers. This read-only migration gate never creates,
+    updates, or adopts an MCP entry; missing, foreign, developer, and
+    previous-root registrations fail closed.
+    """
+
+    target = os.fspath(root)
+    if not os.path.isabs(target):
+        return False
+    actual = read_entry("codex", server_name)
+    if actual is None:
+        return False
+    desired = expected_entry("codex", server_name, cwd=Path(root))
+    current_keys = set(desired)
+    accepted_keys = {
+        frozenset(current_keys),
+        frozenset(current_keys - {"startup_timeout_sec"}),
+        frozenset(current_keys - {"env", "startup_timeout_sec"}),
+    }
+    if not (
+        frozenset(actual) in accepted_keys
+        and isinstance(actual.get("command"), str)
+        and os.path.isabs(actual["command"])
+        and actual["command"] == desired.get("command")
+        and actual.get("args") == desired.get("args")
+        and actual.get("cwd") == desired.get("cwd")
+        and ("env" not in actual or actual.get("env") == desired.get("env"))
+        and (
+            "startup_timeout_sec" not in actual
+            or (
+                type(actual["startup_timeout_sec"]) is int
+                and actual["startup_timeout_sec"] > 0
+            )
+        )
+        and all(
+            type(actual.get(key)) is int and actual[key] > 0
+            for key in ("tool_timeout_sec",)
+        )
+    ):
+        return False
+    configured_root = _managed_launcher_root(
+        actual.get("args"), actual.get("cwd")
+    )
+    if configured_root is None:
+        return False
+    return os.path.normcase(os.path.normpath(configured_root)) == os.path.normcase(
+        os.path.normpath(target)
+    )
+
+
 def _write_json_client(
     client: str,
     path: Path,

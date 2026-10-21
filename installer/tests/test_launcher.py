@@ -14,7 +14,7 @@ import unittest
 from pathlib import Path
 from unittest import mock
 
-from installer import launcher, update_coordination, update_transaction
+from installer import launcher, mcp_config, update_coordination, update_transaction
 
 
 class LauncherTests(unittest.TestCase):
@@ -651,6 +651,9 @@ class LauncherTests(unittest.TestCase):
                 launcher, "_repair_codex_skill_routes", return_value=True
             ),
             mock.patch.object(
+                launcher, "_codex_skill_repair_allowed", return_value=True
+            ),
+            mock.patch.object(
                 launcher,
                 "_retire_codex_global_routing",
                 side_effect=lambda _root: events.append("retire-codex-global-routing"),
@@ -821,12 +824,49 @@ class LauncherTests(unittest.TestCase):
             mock.patch.object(launcher, "_verify_managed_candidate"),
             mock.patch.object(launcher.update_coordination, "shim_session_lease"),
             mock.patch.object(launcher.update_transaction, "mark_running_release"),
-            mock.patch.object(launcher, "_repair_codex_skill_routes", return_value=True),
+            mock.patch.object(
+                launcher, "_repair_codex_skill_routes", return_value=True
+            ) as repair,
             mock.patch.object(launcher, "_retire_codex_global_routing") as retire,
         ):
             launcher._serve_shim(self.root, shim=shim, client_host="claude-code")
 
+        repair.assert_not_called()
         retire.assert_not_called()
+
+    def test_codex_and_legacy_owned_entries_run_skill_repair(self):
+        for client_host in ("codex", None):
+            with self.subTest(client_host=client_host):
+                shim = mock.Mock()
+                shim.Forwarder.from_config.return_value = mock.sentinel.forwarder
+                shim.serve.return_value = 0
+                with (
+                    mock.patch.dict(
+                        launcher.os.environ,
+                        {launcher.CLIENT_HOST_ENV: ""},
+                        clear=False,
+                    ),
+                    mock.patch.object(
+                        launcher, "_head_commit", return_value="2" * 40
+                    ),
+                    mock.patch.object(launcher, "_version", return_value="0.2.3"),
+                    mock.patch.object(launcher, "_verify_managed_candidate"),
+                    mock.patch.object(
+                        launcher.update_coordination, "shim_session_lease"
+                    ),
+                    mock.patch.object(
+                        launcher, "_codex_skill_repair_allowed", return_value=True
+                    ) as allowed,
+                    mock.patch.object(
+                        launcher, "_repair_codex_skill_routes", return_value=True
+                    ) as repair,
+                ):
+                    launcher._serve_shim(
+                        self.root, shim=shim, client_host=client_host
+                    )
+
+                allowed.assert_called_once_with(self.root, client_host)
+                repair.assert_called_once_with(self.root)
 
     def test_missing_replacement_skill_never_runs_global_routing_cleanup(self):
         shim = mock.Mock()
@@ -838,6 +878,9 @@ class LauncherTests(unittest.TestCase):
             mock.patch.object(launcher, "_verify_managed_candidate"),
             mock.patch.object(launcher.update_coordination, "shim_session_lease"),
             mock.patch.object(launcher.update_transaction, "mark_running_release"),
+            mock.patch.object(
+                launcher, "_codex_skill_repair_allowed", return_value=True
+            ),
             mock.patch.object(launcher, "_repair_codex_skill_routes", return_value=False),
             mock.patch.object(launcher, "_retire_codex_global_routing") as retire,
         ):
@@ -968,6 +1011,9 @@ class LauncherTests(unittest.TestCase):
                 launcher.update_coordination, "shim_session_lease", side_effect=lease
             ),
             mock.patch.object(
+                launcher, "_codex_skill_repair_allowed", return_value=True
+            ),
+            mock.patch.object(
                 launcher, "_repair_codex_skill_routes",
                 side_effect=lambda _root: events.append("repair-codex-skills") or False,
             ),
@@ -995,6 +1041,55 @@ class LauncherTests(unittest.TestCase):
         ):
             self.assertFalse(launcher._repair_codex_skill_routes(self.root))
 
+    def test_codex_skill_repair_gate_accepts_owned_current_root_for_codex_and_legacy(self):
+        config_path = self.root / "codex" / "config.toml"
+        config_path.parent.mkdir()
+        config_path.write_text(
+            mcp_config.render_codex_toml(cwd=self.root), encoding="utf-8"
+        )
+        with mock.patch.dict(
+            launcher.os.environ, {"CODEX_CONFIG": str(config_path)}, clear=False
+        ):
+            self.assertTrue(
+                launcher._codex_skill_repair_allowed(self.root, "codex")
+            )
+            self.assertTrue(launcher._codex_skill_repair_allowed(self.root, None))
+
+    def test_codex_skill_repair_gate_rejects_missing_foreign_and_wrong_root_entries(self):
+        config_path = self.root / "codex" / "config.toml"
+        config_path.parent.mkdir()
+        with mock.patch.dict(
+            launcher.os.environ, {"CODEX_CONFIG": str(config_path)}, clear=False
+        ):
+            self.assertFalse(
+                launcher._codex_skill_repair_allowed(self.root, "codex")
+            )
+            foreign = mcp_config.render_codex_entry(cwd=self.root)
+            foreign["command"] = "/foreign/server"
+            config_path.write_text(
+                mcp_config._render_toml_entry_block("decision-engine", foreign),
+                encoding="utf-8",
+            )
+            self.assertFalse(
+                launcher._codex_skill_repair_allowed(self.root, "codex")
+            )
+            config_path.write_text(
+                mcp_config.render_codex_toml(cwd=self.root / "other-root"),
+                encoding="utf-8",
+            )
+            self.assertFalse(
+                launcher._codex_skill_repair_allowed(self.root, "codex")
+            )
+
+    def test_codex_skill_repair_gate_rejects_explicit_non_codex_without_config_probe(self):
+        with mock.patch.object(
+            mcp_config, "codex_managed_entry_targets_root"
+        ) as probe:
+            self.assertFalse(
+                launcher._codex_skill_repair_allowed(self.root, "workbuddy")
+            )
+        probe.assert_not_called()
+
     def test_codex_skill_route_refusal_does_not_block_managed_serving(self):
         shim = mock.Mock()
         shim.Forwarder.from_config.return_value = mock.sentinel.forwarder
@@ -1004,6 +1099,9 @@ class LauncherTests(unittest.TestCase):
             mock.patch.object(launcher, "_version", return_value="0.2.23"),
             mock.patch.object(launcher, "_verify_managed_candidate"),
             mock.patch.object(launcher.update_coordination, "shim_session_lease"),
+            mock.patch.object(
+                launcher, "_codex_skill_repair_allowed", return_value=True
+            ),
             mock.patch(
                 "installer.install.repair_codex_skill_routes",
                 side_effect=launcher.ShellError("foreign route"),

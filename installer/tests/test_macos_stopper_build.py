@@ -106,7 +106,8 @@ extension DecisionEngineStopper {
             precondition(!shouldShimmerDepthLine(run), "Auditor overrode \(status)")
         }
         pollFailures["hosted"] = 1
-        precondition(!shouldShimmerDepthLine(running), "Stale polling state shimmered")
+        precondition(shouldShimmerDepthLine(running),
+            "Connectivity failure changed a verified running audit's shimmer")
         pollFailures.removeValue(forKey: "hosted")
         precondition(shouldShimmerDepthLine(running))
         let duration = ShimmerStatusLabel.duration
@@ -183,6 +184,12 @@ extension DecisionEngineStopper {
         let pending: [String: Any] = ["model_id": "model-c", "status": "pending"]
         run["auditors"] = [pending]
         precondition(debugAuditorRows(run) == ["model-c · pending · 0s"])
+        let terminalRunID = "hub-terminal"
+        let terminal: [String: Any] = ["run_id": terminalRunID, "status": "completed",
+            "started_at": 940.0, "completed_at": 1000.0]
+        finishedElapsedByRun[terminalRunID] = 999.0
+        precondition(depthElapsedSeconds(terminal) == 60.0,
+            "Overall terminal duration did not use Hub timestamps")
         print("Native model rows OK")
     }
 }

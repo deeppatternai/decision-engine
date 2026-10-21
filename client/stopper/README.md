@@ -73,12 +73,17 @@ A *running* row has no `completed_at` yet, so it must tick from the local clock 
 an estimate of something still in flight, and it is replaced by the hub's answer the moment the run
 finishes.
 
-But a poll failure leaves the previous view in place, so a running row must not keep ticking a
-confident timer while the panel is blind — the run may already be finished. Rows go
-`Connection interrupted · Last known <t>` after `STALE_AFTER_S` without a successful poll, anchored to the last real
-poll rather than to now. **Terminal rows are never stale**: their duration is hub-derived, cannot
-change, and needs no network to stay correct. An outage of any length therefore self-heals — on
-reconnect the hub's timestamps give the exact answer, with no catch-up logic anywhere.
+Connectivity and audit lifecycle are separate facts. A temporary outage never replaces the running
+status token: the row keeps `Auditing`, its live elapsed clock, model clocks, running action, shimmer,
+colors, and layout. The first failed detail poll persists a local outage start, and any later valid
+detail response clears it. If the continuous outage reaches `CONNECTION_TIMEOUT_S` (30 minutes), the
+local monitor enters `connection_timeout`, freezes elapsed from `finished_at`, lingers for 30 seconds,
+then stops polling and removes its registry row. This does not cancel or otherwise alter the Hub run.
+
+Detail polls have an explicit short timeout. The panel keeps a bounded diagnostic history and emits
+fixed redacted fields for slow in-flight requests, transport, authentication, rate-limit, server 5xx,
+invalid payload, recovery, and local timeout events. It never records tokens, endpoints, titles,
+audit content, model output, response bodies, or exception text.
 
 ## Enforcement
 

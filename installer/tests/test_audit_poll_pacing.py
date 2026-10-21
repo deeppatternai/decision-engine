@@ -245,7 +245,14 @@ class AuditStatusPathTests(unittest.TestCase):
 
     def test_the_panel_polls_the_detail_route_because_it_renders_per_voice_state(self):
         source = (ROOT / "client" / "stopper" / "panel.py").read_text(encoding="utf-8")
-        self.assertIn('runner.request_json("GET", runner.audit_detail_path(run_id))', source)
+        self.assertIn(
+            'runner.request_json(\n'
+            '                "GET", runner.audit_detail_path(run_id), timeout_s=DETAIL_POLL_TIMEOUT_S,\n'
+            '            )',
+            source,
+        )
+        self.assertLess(panel.POLL_SLOW_AFTER_S, panel.DETAIL_POLL_TIMEOUT_S)
+        self.assertLess(panel.DETAIL_POLL_TIMEOUT_S, panel.CONNECTION_TIMEOUT_S)
         # Not merely "the detail call exists" — the panel must name the status route NOWHERE.
         self.assertNotIn("audit_status_path", source)
 
@@ -714,6 +721,188 @@ class PanelPollGateTests(_PanelAppMixin, unittest.TestCase):
             self.assertGreater(later, earlier, "each consecutive failure must wait longer")
         self.assertIn("r1", app.runs, "a transient failure must not drop the row")
 
+    def test_first_failure_persists_one_outage_start_and_retries_do_not_reset_it(self):
+        app = self._app(started_at=10.0)
+        with mock.patch.object(runner, "save_active_run") as save, self._clock(100.0):
+            app._defer_poll("r1", category="transport")
+        started = app.runs["r1"]["connection_outage_started_at"]
+        self.assertEqual(started, 100.0)
+        save.assert_called_once_with(app.runs["r1"], existing_only=True)
+
+        with mock.patch.object(runner, "save_active_run") as save, self._clock(200.0):
+            app._defer_poll("r1", category="server_5xx", status_code=503)
+        self.assertEqual(app.runs["r1"]["connection_outage_started_at"], started)
+        save.assert_not_called()
+
+    def test_successful_same_status_poll_clears_and_persists_outage_marker(self):
+        app = self._app(connection_outage_started_at=40.0)
+        app._polling.add("r1")
+        with mock.patch.object(
+            runner, "request_json", return_value={"status": "running", "profile": "standard"}
+        ), mock.patch.object(runner, "save_active_run") as save, self._clock(100.0):
+            app._poll("r1")
+
+        self.assertNotIn("connection_outage_started_at", app.runs["r1"])
+        save.assert_called_once_with(app.runs["r1"], existing_only=True)
+
+    def test_failed_outage_persistence_retries_on_the_next_tick(self):
+        app = self._app()
+        with mock.patch.object(
+            runner, "save_active_run", side_effect=[OSError("busy"), None]
+        ) as save, self._clock(100.0):
+            app._defer_poll("r1")
+            self.assertIn("r1", app._pending_run_persistence)
+            app._retry_pending_run_persistence()
+        self.assertEqual(save.call_count, 2)
+        self.assertNotIn("r1", app._pending_run_persistence)
+
+    def test_recovery_replaces_a_failed_outage_marker_write(self):
+        app = self._app()
+        with mock.patch.object(runner, "save_active_run", side_effect=OSError("busy")), \
+             self._clock(100.0):
+            app._defer_poll("r1")
+        self.assertIn("r1", app._pending_run_persistence)
+
+        app._polling.add("r1")
+        with mock.patch.object(
+            runner, "request_json", return_value={"status": "running", "profile": "standard"}
+        ), mock.patch.object(runner, "save_active_run") as save, self._clock(101.0):
+            app._poll("r1")
+
+        persisted = save.call_args.args[0]
+        self.assertNotIn("connection_outage_started_at", persisted)
+        self.assertNotIn("r1", app._pending_run_persistence)
+
+    def test_continuous_outage_times_out_at_exact_boundary_and_stops_polling(self):
+        app = self._app(
+            started_at=10.0,
+            auditors=[{"status": "running"}],
+            connection_outage_started_at=100.0,
+        )
+        app._polling.add("r1")
+        app._cancel_inflight.add("r1")
+        app._server_verified.add("r1")
+        old_epoch = app._state_epochs.get("r1", 0)
+
+        with mock.patch.object(runner, "save_active_run") as save, self._clock(
+            100.0 + panel.CONNECTION_TIMEOUT_S
+        ):
+            app._expire_connection_outages(100.0 + panel.CONNECTION_TIMEOUT_S)
+
+        timed_out = app.runs["r1"]
+        self.assertEqual(timed_out["status"], "connection_timeout")
+        self.assertEqual(timed_out["finished_at"], 100.0 + panel.CONNECTION_TIMEOUT_S)
+        self.assertEqual(
+            timed_out["hidden_after"],
+            100.0 + panel.CONNECTION_TIMEOUT_S + panel.FINISHED_LINGER_S,
+        )
+        self.assertNotIn("connection_outage_started_at", timed_out)
+        self.assertNotIn("r1", app._polling)
+        self.assertNotIn("r1", app._cancel_inflight)
+        self.assertNotIn("r1", app._server_verified)
+        self.assertEqual(app._state_epochs["r1"], old_epoch + 1)
+        save.assert_called_once_with(timed_out, existing_only=True)
+        self.assertEqual(self._tick(app, now=1901.0), [])
+
+    def test_continuous_outage_remains_active_one_second_before_boundary(self):
+        app = self._app(connection_outage_started_at=100.0)
+        with mock.patch.object(runner, "save_active_run") as save:
+            app._expire_connection_outages(100.0 + panel.CONNECTION_TIMEOUT_S - 1.0)
+        self.assertEqual(app.runs["r1"]["status"], "running")
+        self.assertIn("connection_outage_started_at", app.runs["r1"])
+        save.assert_not_called()
+
+    def test_persisted_outage_survives_reload_then_expires_and_prunes(self):
+        persisted = runner.active_run_payload({
+            "run_id": "r1",
+            "status": "running",
+            "profile": "standard",
+            "started_at": 10.0,
+            "connection_outage_started_at": 100.0,
+        })
+        app = self._app()
+        app.runs = {}
+        with mock.patch.object(
+            runner, "load_active_runs_registry",
+            return_value={"schema_version": 1, "runs": {"r1": persisted}},
+        ):
+            app._merge_disk()
+        self.assertEqual(app.runs["r1"]["connection_outage_started_at"], 100.0)
+
+        with mock.patch.object(runner, "save_active_run"), self._clock(1900.0):
+            app._expire_connection_outages(1900.0)
+        self.assertEqual(app.runs["r1"]["status"], "connection_timeout")
+
+        with mock.patch.object(panel.threading, "Thread") as thread:
+            app._prune(1900.0 + panel.FINISHED_LINGER_S)
+        self.assertNotIn("r1", app.runs)
+        self.assertIn("r1", app._retired)
+        thread.assert_called_once()
+
+    def test_reload_clamps_corrupt_connection_timeout_linger(self):
+        app = self._app()
+        app.runs = {}
+        with mock.patch.object(
+            runner, "load_active_runs_registry",
+            return_value={
+                "schema_version": 1,
+                "runs": {
+                    "r1": {
+                        "run_id": "r1",
+                        "status": "connection_timeout",
+                        "finished_at": float("inf"),
+                        "hidden_after": 10**12,
+                    }
+                },
+            },
+        ), mock.patch.object(panel.time, "time", return_value=500.0):
+            app._merge_disk()
+        self.assertEqual(app.runs["r1"]["finished_at"], 500.0)
+        self.assertEqual(app.runs["r1"]["hidden_after"], 500.0 + panel.FINISHED_LINGER_S)
+
+    def test_local_timeout_never_sends_a_hub_cancel_request(self):
+        app = self._app(connection_outage_started_at=100.0)
+        with mock.patch.object(runner, "request_json") as request, \
+             mock.patch.object(runner, "save_active_run"), self._clock(1900.0):
+            app._expire_connection_outages(1900.0)
+        request.assert_not_called()
+
+    def test_invalid_outage_timestamp_is_rebased_instead_of_timing_out(self):
+        for invalid in (10_000.0, float("nan"), float("inf"), -1.0):
+            with self.subTest(invalid=invalid):
+                app = self._app(connection_outage_started_at=invalid)
+                with mock.patch.object(runner, "save_active_run") as save, self._clock(100.0):
+                    app._defer_poll("r1")
+                self.assertEqual(app.runs["r1"]["connection_outage_started_at"], 100.0)
+                save.assert_called_once()
+
+    def test_forward_wall_clock_jump_does_not_bypass_monotonic_duration(self):
+        app = self._app(connection_outage_started_at=100.0)
+        app._poll_outage_started_at = {"r1": 100.0}
+        with mock.patch.object(runner, "save_active_run") as save, \
+             mock.patch.object(panel.time, "monotonic", return_value=200.0):
+            app._expire_connection_outages(10_000.0)
+        self.assertEqual(app.runs["r1"]["status"], "running")
+        save.assert_not_called()
+
+    def test_late_poll_cannot_revive_a_connection_timeout(self):
+        app = self._app(
+            started_at=10.0,
+            connection_outage_started_at=100.0,
+            auditors=[{"status": "running"}],
+        )
+        old_epoch = app._state_epochs.get("r1", 0)
+        with mock.patch.object(runner, "save_active_run"), self._clock(
+            100.0 + panel.CONNECTION_TIMEOUT_S
+        ):
+            app._expire_connection_outages(100.0 + panel.CONNECTION_TIMEOUT_S)
+        with mock.patch.object(
+            runner, "request_json", return_value={"status": "completed"}
+        ), mock.patch.object(runner, "save_active_run") as save, self._clock(2000.0):
+            app._poll("r1", expected_epoch=old_epoch)
+        self.assertEqual(app.runs["r1"]["status"], "connection_timeout")
+        save.assert_not_called()
+
     def test_a_transport_failure_with_no_status_code_also_backs_off(self):
         app = self._app()
         app._polling.add("r1")
@@ -856,7 +1045,7 @@ class PanelPollGateTests(_PanelAppMixin, unittest.TestCase):
         with mock.patch.object(runner, "request_json", side_effect=_err(401)), \
              self._clock(100.0):
             app._poll("r1")
-        self.assertEqual(self._tick(app, now=10_000.0), ["r1"])
+        self.assertEqual(self._tick(app, now=200.0), ["r1"])
 
     def test_poll_scheduling_survives_the_wall_clock_jumping_backwards(self):
         # An NTP correction, a VM resume or a user changing the system clock must not suspend

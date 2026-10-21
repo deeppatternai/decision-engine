@@ -343,6 +343,27 @@ class RenderReconciliationTests(unittest.TestCase):
         self.assertEqual(button.cget("disabledforeground"), "#FFFFFF")
         self.assertEqual(button.canvas.items[1]["options"]["state"], "hidden")
 
+    def test_disconnected_running_row_keeps_button_color_and_shimmer(self):
+        app = self._app()
+        app.runs["registry-real"].update(
+            status="running", auditors=[{"status": "running"}],
+            started_at=1.0, last_ok_at=1.0,
+        )
+        app._poll_failures["registry-real"] = 1
+
+        with mock.patch.object(panel, "reduce_motion_enabled", return_value=False), \
+             mock.patch.object(panel.time, "time", return_value=100.0), \
+             mock.patch.object(panel.time, "monotonic", return_value=5.25):
+            app._render()
+
+        widgets = app._rows["registry-real"]
+        self.assertEqual(widgets["button"].button.cget("text"), "Running")
+        self.assertEqual(widgets["button"].cget("bg"), panel.FG_RED)
+        self.assertEqual(widgets["detail"].cget("fg"), panel.FG_MUTED)
+        self.assertIn("Auditing", widgets["detail"].cget("text"))
+        self.assertNotIn("Connection interrupted", widgets["detail"].cget("text"))
+        self.assertTrue(widgets["detail_shimmer"].eligible)
+
     def test_shimmer_is_limited_to_the_whole_running_detail_line(self):
         app = self._app()
         app.runs["registry-real"].update(
@@ -1127,11 +1148,10 @@ class RenderHelperTests(unittest.TestCase):
             "Fast · Queued ⏱",
         )
 
-    def test_shimmer_predicate_matches_running_trust_and_failure_boundaries(self):
+    def test_shimmer_predicate_keeps_verified_running_rows_active_during_disconnect(self):
         lite = {
             "run_id": "local-lite", "local": True, "local_surface": "de_lite",
             "status": "running", "auditors": [{"status": "running"}],
-            "last_ok_at": self.NOW - panel.STALE_AFTER_S - 1,
         }
         hosted = {
             "run_id": "hosted", "status": "running",
@@ -1145,18 +1165,17 @@ class RenderHelperTests(unittest.TestCase):
         self.assertFalse(panel.should_shimmer_depth_line(
             hosted, run_id="hosted", server_verified=set(), now=self.NOW,
         ), "an unverified Hosted disk seed must stay static")
-        self.assertFalse(panel.should_shimmer_depth_line(
+        self.assertTrue(panel.should_shimmer_depth_line(
             hosted, run_id="hosted", server_verified={"hosted"},
             poll_failures={"hosted": 1}, now=self.NOW,
-        ))
+        ), "a connectivity failure does not stop a still-running audit shimmer")
         self.assertFalse(panel.should_shimmer_depth_line(
             hosted, run_id="hosted", server_verified={"hosted"},
             not_found_polls={"hosted": 1}, now=self.NOW,
         ), "404/410 grace is not a trusted running view")
-        stale = {**hosted, "last_ok_at": self.NOW - panel.STALE_AFTER_S - 1}
-        self.assertFalse(panel.should_shimmer_depth_line(
-            stale, run_id="hosted", server_verified={"hosted"}, now=self.NOW,
-        ))
+        self.assertTrue(panel.should_shimmer_depth_line(
+            hosted, run_id="hosted", server_verified={"hosted"}, now=self.NOW,
+        ), "connectivity does not replace the running lifecycle presentation")
 
         for status in (
             "completed", "partial", "failed", "cancelled", "cancelling", "timeout", "queued",
@@ -1501,6 +1520,27 @@ class RenderHelperTests(unittest.TestCase):
         self.assertNotIn("hidden_after", runner.active_run_payload(
             {"run_id": "r1", "status": "running"}))
 
+    def test_active_run_payload_persists_connection_outage_and_timeout_terminal(self):
+        running = runner.active_run_payload({
+            "run_id": "r1",
+            "status": "running",
+            "connection_outage_started_at": 1234.0,
+        })
+        self.assertEqual(running["connection_outage_started_at"], 1234.0)
+
+        with mock.patch.object(runner.time, "time", return_value=2000.0):
+            timed_out = runner.active_run_payload({
+                "run_id": "r1",
+                "status": "connection_timeout",
+                "started_at": 100.0,
+                "finished_at": 1900.0,
+                "hidden_after": 999999.0,
+            })
+        self.assertNotIn("connection_timeout", runner.TERMINAL_STATUSES)
+        self.assertIn("connection_timeout", runner.ACTIVE_RUN_TERMINAL_STATUSES)
+        self.assertEqual(timed_out["finished_at"], 1900.0)
+        self.assertEqual(timed_out["hidden_after"], 1930.0)
+
     def test_overall_status_surfaces_cancel_over_auditors(self):
         # cancel is a run-level state; it must win over the auditor-derived status so the pill and
         # the depth line agree (a cancelled run must not read as "completed" off its voices).
@@ -1744,6 +1784,194 @@ class CancelContractTests(unittest.TestCase):
                 self.assertEqual(app.runs["r1"]["status"], status)
                 self.assertNotIn("r1", app._server_verified)
                 save.assert_not_called()
+
+
+class PollDiagnosticsTests(unittest.TestCase):
+    def _app(self, run_id="aud_1234567890"):
+        app = object.__new__(panel.StopPanelApp)
+        panel.initialize_panel_state(app)
+        app.runs = {
+            run_id: {
+                "run_id": run_id,
+                "status": "running",
+                "profile": "standard",
+                "started_at": 100.0,
+                "last_ok_at": 101.0,
+            }
+        }
+        app._polling.add(run_id)
+        return app
+
+    @staticmethod
+    def _error(status_code=None, message="sensitive endpoint token title body"):
+        error = runner.AuditError(message)
+        if status_code is not None:
+            error.status_code = status_code
+        return error
+
+    @staticmethod
+    def _invalid_json_error():
+        try:
+            try:
+                json.loads("{")
+            except json.JSONDecodeError as exc:
+                raise runner.AuditError("sensitive malformed response") from exc
+        except runner.AuditError as error:
+            return error
+
+    def test_detail_poll_uses_a_bounded_timeout_below_the_connection_timeout(self):
+        app = self._app()
+        with mock.patch.object(runner, "request_json", return_value={"status": "running"}) as request:
+            app._poll("aud_1234567890")
+
+        request.assert_called_once_with(
+            "GET",
+            runner.audit_detail_path("aud_1234567890"),
+            timeout_s=panel.DETAIL_POLL_TIMEOUT_S,
+        )
+        self.assertGreater(panel.DETAIL_POLL_TIMEOUT_S, 0)
+        self.assertLess(panel.POLL_SLOW_AFTER_S, panel.DETAIL_POLL_TIMEOUT_S)
+        self.assertLess(panel.DETAIL_POLL_TIMEOUT_S, panel.CONNECTION_TIMEOUT_S)
+
+    def test_failures_are_classified_without_retaining_sensitive_exception_text(self):
+        cases = (
+            (None, "transport"),
+            (401, "auth"),
+            (403, "auth"),
+            (429, "rate_limit"),
+            (500, "server_5xx"),
+            (503, "server_5xx"),
+        )
+        for status_code, expected in cases:
+            with self.subTest(status_code=status_code):
+                app = self._app()
+                with mock.patch.object(
+                    runner, "request_json", side_effect=self._error(status_code)
+                ), mock.patch.object(panel.sys, "stderr"):
+                    app._poll("aud_1234567890")
+
+                diagnostic = app._poll_diagnostics[-1]
+                self.assertEqual(diagnostic["event"], "failure")
+                self.assertEqual(diagnostic["category"], expected)
+                self.assertEqual(diagnostic["run"], "aud_1234")
+                rendered = repr(diagnostic)
+                for secret in ("sensitive", "endpoint", "token", "title", "body"):
+                    self.assertNotIn(secret, rendered)
+
+    def test_invalid_payload_is_a_failed_poll_not_a_successful_recovery(self):
+        app = self._app()
+        app._poll_failure_categories["aud_1234567890"] = "transport"
+        app._poll_outage_started_at["aud_1234567890"] = 99.0
+        with mock.patch.object(
+            runner, "request_json", return_value={"data": ["response body"]}
+        ), \
+             mock.patch.object(panel.sys, "stderr"):
+            app._poll("aud_1234567890")
+
+        self.assertEqual(app._poll_diagnostics[-1]["category"], "invalid_payload")
+        self.assertNotIn("aud_1234567890", app._server_verified)
+        self.assertEqual(app.runs["aud_1234567890"]["last_ok_at"], 101.0)
+        self.assertEqual(app._poll_failure_categories["aud_1234567890"], "invalid_payload")
+        self.assertEqual(app._poll_outage_started_at["aud_1234567890"], 99.0)
+        self.assertNotIn("recovery", [item["event"] for item in app._poll_diagnostics])
+
+    def test_local_or_unknown_status_from_hub_is_an_invalid_payload(self):
+        for status in ("connection_timeout", "future_status", ""):
+            with self.subTest(status=status):
+                app = self._app()
+                with mock.patch.object(
+                    runner, "request_json", return_value={"status": status}
+                ), mock.patch.object(panel.sys, "stderr"):
+                    app._poll("aud_1234567890")
+                self.assertEqual(app._poll_diagnostics[-1]["category"], "invalid_payload")
+                self.assertNotIn("aud_1234567890", app._server_verified)
+
+    def test_mismatched_hub_run_id_is_an_invalid_payload(self):
+        app = self._app()
+        with mock.patch.object(
+            runner, "request_json",
+            return_value={"run_id": "aud_other", "status": "running"},
+        ), mock.patch.object(panel.sys, "stderr"):
+            app._poll("aud_1234567890")
+        self.assertEqual(app._poll_diagnostics[-1]["category"], "invalid_payload")
+        self.assertNotIn("aud_1234567890", app._server_verified)
+
+    def test_malformed_json_is_classified_as_invalid_payload(self):
+        app = self._app()
+        with mock.patch.object(
+            runner, "request_json", side_effect=self._invalid_json_error()
+        ), mock.patch.object(panel.sys, "stderr"):
+            app._poll("aud_1234567890")
+
+        diagnostic = app._poll_diagnostics[-1]
+        self.assertEqual(diagnostic["category"], "invalid_payload")
+        self.assertNotIn("sensitive", repr(diagnostic))
+        self.assertNotIn("aud_1234567890", app._server_verified)
+        self.assertEqual(app.runs["aud_1234567890"]["last_ok_at"], 101.0)
+
+    def test_slow_inflight_poll_and_recovery_are_recorded_once_and_bounded(self):
+        app = self._app()
+        app._poll_started_at["aud_1234567890"] = 10.0
+        with app._lock, mock.patch.object(panel.sys, "stderr"):
+            app._record_slow_polls_locked(10.0 + panel.POLL_SLOW_AFTER_S + 0.1)
+            app._record_slow_polls_locked(10.0 + panel.POLL_SLOW_AFTER_S + 5.0)
+        self.assertEqual(
+            [item["category"] for item in app._poll_diagnostics], ["slow_in_flight"]
+        )
+
+        with mock.patch.object(runner, "request_json", return_value={"status": "running"}), \
+             mock.patch.object(panel.sys, "stderr"):
+            app._poll("aud_1234567890")
+        self.assertEqual(app._poll_diagnostics[-1]["event"], "recovery")
+        self.assertEqual(app._poll_diagnostics[-1]["category"], "slow_in_flight")
+
+        with app._lock, mock.patch.object(panel.sys, "stderr"):
+            for index in range(panel.POLL_DIAGNOSTIC_LIMIT + 10):
+                app._record_poll_diagnostic_locked(
+                    "aud_1234567890", "failure",
+                    "transport" if index % 2 else "server_5xx", failures=index + 1,
+                )
+        self.assertEqual(len(app._poll_diagnostics), panel.POLL_DIAGNOSTIC_LIMIT)
+
+    def test_multiple_runs_keep_independent_redacted_failure_and_recovery_evidence(self):
+        app = self._app("aud_first-secret")
+        app.runs["aud_second-secret"] = {
+            "run_id": "aud_second-secret", "status": "running", "started_at": 100.0,
+        }
+        for run_id, status_code in (("aud_first-secret", 429), ("aud_second-secret", 503)):
+            app._polling.add(run_id)
+            with mock.patch.object(
+                runner, "request_json", side_effect=self._error(status_code)
+            ), mock.patch.object(panel.sys, "stderr"):
+                app._poll(run_id)
+
+        self.assertEqual(
+            [(item["run"], item["category"]) for item in app._poll_diagnostics],
+            [("aud_firs", "rate_limit"), ("aud_seco", "server_5xx")],
+        )
+        app._polling.add("aud_first-secret")
+        with mock.patch.object(runner, "request_json", return_value={"status": "running"}), \
+             mock.patch.object(panel.sys, "stderr"):
+            app._poll("aud_first-secret")
+        self.assertEqual(app._poll_diagnostics[-1]["event"], "recovery")
+        self.assertEqual(app._poll_diagnostics[-1]["run"], "aud_firs")
+
+    def test_gone_grace_clears_only_the_completed_attempt_timing(self):
+        run_id = "aud_1234567890"
+        app = self._app(run_id)
+        app._poll_started_at[run_id] = 10.0
+        app._poll_slow_reported.add(run_id)
+
+        with mock.patch.object(
+            runner, "request_json", side_effect=self._error(404)
+        ):
+            app._poll(run_id)
+
+        self.assertEqual(app._not_found_polls[run_id], 1)
+        self.assertIn(run_id, app.runs)
+        self.assertNotIn(run_id, app._retired)
+        self.assertNotIn(run_id, app._poll_started_at)
+        self.assertNotIn(run_id, app._poll_slow_reported)
 
 
 class LaunchWiringTests(unittest.TestCase):
@@ -2145,8 +2373,7 @@ class ProdElapsedRegressionTests(unittest.TestCase):
 
 
 class DisconnectTests(unittest.TestCase):
-    """A poll failure leaves the previous view in place, so a running row must not keep ticking a
-    confident timer while the panel is blind — the run may already be finished server-side."""
+    """Connectivity stays diagnostic until the local 30-minute terminal boundary."""
     T0 = 2_000_000.0
 
     def setUp(self):
@@ -2160,23 +2387,56 @@ class DisconnectTests(unittest.TestCase):
         return {"run_id": "r1", "profile": "standard", "status": "running", "started_at": self.T0,
                 "last_ok_at": last_ok, "auditors": [{"status": "running"}]}
 
-    def test_fresh_polls_are_not_stale(self):
+    def test_fresh_polls_keep_reviewing(self):
         run = self._running(self.T0 + 100.0)
-        self.assertFalse(panel.is_stale(run, self.T0 + 105.0))
         self.assertIn("Auditing", panel.depth_line_text(run, self.T0 + 105.0, {}))
 
-    def test_silence_past_the_threshold_says_disconnected_not_a_live_timer(self):
+    def test_disconnect_keeps_reviewing_text_and_live_time_until_timeout(self):
         run = self._running(self.T0 + 100.0)
-        now = self.T0 + 100.0 + panel.STALE_AFTER_S + 1.0
-        self.assertTrue(panel.is_stale(run, now))
-        text = panel.depth_line_text(run, now, {})
-        self.assertIn("Connection interrupted", text)
-        self.assertIn("Last known 1m 40s", text)   # anchored to the last real poll, not to `now`
-        self.assertEqual(panel.depth_line_color(run, now), panel.FG_AMBER)
+        for outage_s in (20.0, 15 * 60.0, panel.CONNECTION_TIMEOUT_S - 1.0):
+            now = self.T0 + 100.0 + outage_s
+            with self.subTest(outage_s=outage_s):
+                text = panel.depth_line_text(run, now, {})
+                self.assertIn("Auditing", text)
+                self.assertNotIn("Connection interrupted", text)
+                self.assertEqual(panel.depth_line_color(run, now), panel.FG_MUTED)
 
-    def test_never_polled_row_is_not_reported_as_disconnected(self):
+    def test_disconnected_chinese_line_keeps_reviewing(self):
+        run = {**self._running(self.T0 + 100.0), "ui_locale": "zh-CN"}
+        now = self.T0 + 100.0 + 15 * 60.0
+        self.assertEqual(panel.depth_line_text(run, now, {}), "标准 · 审核中 · 16m 40s ⏱")
+
+    def test_connection_timeout_is_terminal_and_uses_finished_at(self):
+        run = {
+            **self._running(self.T0 + 100.0),
+            "status": "connection_timeout",
+            "finished_at": self.T0 + 1900.0,
+        }
+        self.assertEqual(panel.overall_status(run), "connection_timeout")
+        self.assertEqual(
+            panel.depth_line_text(run, self.T0 + 9999.0, {}),
+            "Standard · Connection timed out · 31m 40s ✗",
+        )
+        self.assertEqual(
+            panel.depth_line_text({**run, "ui_locale": "zh-CN"}, self.T0 + 9999.0, {}),
+            "标准 · 连接超时 · 31m 40s ✗",
+        )
+        self.assertEqual(panel.depth_line_color(run), panel.FG_RED)
+
+    def test_model_child_elapsed_continues_unchanged_during_disconnect(self):
+        run = {
+            **self._running(self.T0 + 100.0),
+            "debug_authorized": True,
+            "auditors": [{"status": "running", "model_id": "model-a", "started_at": self.T0}],
+        }
+        first = panel._debug_auditor_lines(run, self.T0 + 121.0, {})
+        second = panel._debug_auditor_lines(run, self.T0 + 126.0, {})
+        self.assertEqual(first, ["model-a · Auditing · 2m 1s"])
+        self.assertEqual(second, ["model-a · Auditing · 2m 6s"])
+
+    def test_never_polled_row_still_uses_reviewing_text(self):
         run = self._running(0.0)              # just seeded by the shim; no poll has run yet
-        self.assertFalse(panel.is_stale(run, self.T0 + 9999.0))
+        self.assertIn("Auditing", panel.depth_line_text(run, self.T0 + 9999.0, {}))
 
     def test_terminal_row_is_never_stale_and_self_heals_after_reconnect(self):
         # Offline through the whole audit; on reconnect the hub's timestamps give the exact answer.
@@ -2184,13 +2444,47 @@ class DisconnectTests(unittest.TestCase):
                "completed_at": self.T0 + 180.0, "last_ok_at": self.T0 + 1.0,
                "auditors": [{"status": "completed"}]}
         far_later = self.T0 + 7200.0
-        self.assertFalse(panel.is_stale(run, far_later))
         self.assertAlmostEqual(panel.elapsed_seconds(run, far_later, {}), 180.0, places=1)
         self.assertIn("Completed · 3m 0s", panel.depth_line_text(run, far_later, {}))
 
     def test_successful_poll_stamps_last_ok_at(self):
         merged = panel.merge_poll_view({"run_id": "r1"}, {"status": "running"}, "r1", self.T0)
         self.assertEqual(merged["last_ok_at"], self.T0)
+
+    def test_successful_reconnect_restores_auditing_without_resetting_elapsed(self):
+        disconnected = self._running(self.T0 + 1.0)
+        reconnect_at = self.T0 + 121.0
+        self.assertIn("Auditing", panel.depth_line_text(disconnected, reconnect_at, {}))
+
+        recovered = panel.merge_poll_view(
+            disconnected,
+            {"status": "running", "auditors": [{"status": "running"}]},
+            "r1",
+            reconnect_at,
+        )
+
+        self.assertEqual(recovered["started_at"], self.T0)
+        self.assertEqual(
+            panel.depth_line_text(recovered, reconnect_at + 5.0, {}),
+            "Standard · Auditing · 2m 6s ⏱",
+        )
+
+    def test_terminal_states_keep_existing_style_and_hub_duration_after_disconnect(self):
+        expected = {
+            "completed": ("Standard · Completed · 3m 0s ✓", panel.FG_GREEN),
+            "partial": ("Standard · Partially complete · 3m 0s ⚠", panel.FG_AMBER),
+            "failed": ("Standard · Failed · 3m 0s ✗", panel.FG_RED),
+            "cancelled": ("Standard · Cancelled · 3m 0s", panel.FG_AMBER),
+        }
+        for status, (line, color) in expected.items():
+            with self.subTest(status=status):
+                run = {
+                    "run_id": "r1", "profile": "standard", "status": status,
+                    "started_at": self.T0, "completed_at": self.T0 + 180.0,
+                    "last_ok_at": self.T0 + 1.0, "auditors": [],
+                }
+                self.assertEqual(panel.depth_line_text(run, self.T0 + 7200.0, {}), line)
+                self.assertEqual(panel.depth_line_color(run, self.T0 + 7200.0), color)
 
 
 class DiskResurrectionTests(unittest.TestCase):

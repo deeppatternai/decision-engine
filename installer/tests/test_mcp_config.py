@@ -172,6 +172,96 @@ class McpConfigTestCase(unittest.TestCase):
 
 
 class CodexConfigTestCase(unittest.TestCase):
+    def test_codex_managed_entry_targets_root_requires_generated_current_target(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            base = Path(tmp)
+            root = base / "decision-engine"
+            wrong_root = base / "old-decision-engine"
+            config_path = base / ".codex" / "config.toml"
+            config_path.parent.mkdir()
+            with mock.patch.dict(
+                os.environ, {"CODEX_CONFIG": str(config_path)}, clear=False
+            ):
+                self.assertFalse(
+                    mcp_config.codex_managed_entry_targets_root(root)
+                )
+                foreign = mcp_config.render_codex_entry(cwd=root)
+                foreign["command"] = "/foreign/server"
+                config_path.write_text(
+                    mcp_config._render_toml_entry_block(
+                        "decision-engine", foreign
+                    ),
+                    encoding="utf-8",
+                )
+                self.assertFalse(
+                    mcp_config.codex_managed_entry_targets_root(root)
+                )
+                config_path.write_text(
+                    mcp_config.render_codex_toml(cwd=wrong_root), encoding="utf-8"
+                )
+                self.assertFalse(
+                    mcp_config.codex_managed_entry_targets_root(root)
+                )
+                config_path.write_text(
+                    mcp_config.render_codex_toml(cwd=root), encoding="utf-8"
+                )
+                current_bytes = config_path.read_bytes()
+                self.assertTrue(
+                    mcp_config.codex_managed_entry_targets_root(root)
+                )
+                self.assertEqual(config_path.read_bytes(), current_bytes)
+
+                current_toml = mcp_config.render_codex_toml(cwd=root)
+                legacy_toml = "\n".join(
+                    line
+                    for line in current_toml.splitlines()
+                    if not line.startswith(("env = ", "startup_timeout_sec = "))
+                ) + "\n"
+                config_path.write_text(
+                    legacy_toml,
+                    encoding="utf-8",
+                )
+                legacy_bytes = config_path.read_bytes()
+                self.assertTrue(
+                    mcp_config.codex_managed_entry_targets_root(root)
+                )
+                self.assertEqual(config_path.read_bytes(), legacy_bytes)
+
+                config_path.write_text(
+                    legacy_toml.replace(
+                        "cwd = ",
+                        'env = { DE_MCP_CLIENT_HOST = "workbuddy-ai" }\ncwd = ',
+                    ),
+                    encoding="utf-8",
+                )
+                self.assertFalse(
+                    mcp_config.codex_managed_entry_targets_root(root)
+                )
+
+                custom_timeouts = mcp_config.render_codex_entry(cwd=root)
+                custom_timeouts["startup_timeout_sec"] = 45
+                custom_timeouts["tool_timeout_sec"] = 900
+                config_path.write_text(
+                    mcp_config._render_toml_entry_block(
+                        "decision-engine", custom_timeouts
+                    ),
+                    encoding="utf-8",
+                )
+                self.assertTrue(
+                    mcp_config.codex_managed_entry_targets_root(root)
+                )
+
+                custom_timeouts["tool_timeout_sec"] = 0
+                config_path.write_text(
+                    mcp_config._render_toml_entry_block(
+                        "decision-engine", custom_timeouts
+                    ),
+                    encoding="utf-8",
+                )
+                self.assertFalse(
+                    mcp_config.codex_managed_entry_targets_root(root)
+                )
+
     def test_codex_entry_is_resolved_with_timeout(self):
         dev_root = mcp_config.shell_root()
         entry = mcp_config.render_codex_entry(dev_root=dev_root)

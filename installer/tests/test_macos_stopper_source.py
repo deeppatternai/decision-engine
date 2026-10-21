@@ -35,13 +35,44 @@ _BINARIES = tuple(
 
 
 class MacOSStopperSourceContractTests(unittest.TestCase):
+    def test_connection_outage_timeout_is_persisted_terminal_and_keeps_reviewing_text(self):
+        terminal_line = _SOURCE.split("terminalStatuses", 1)[1].split("\n", 1)[0]
+        self.assertIn('"connection_timeout"', terminal_line)
+        self.assertIn("connectionOutageTimeoutSeconds: TimeInterval = 1800", _SOURCE)
+        self.assertIn("hubDetailStatuses", _SOURCE)
+        self.assertIn('run["connection_outage_started_at"]', _SOURCE)
+        self.assertIn("started.isFinite", _SOURCE)
+        self.assertIn("outageStartedAtUptime", _SOURCE)
+        self.assertIn("normalizedConnectionTimeoutRun", _SOURCE)
+        self.assertIn("expireConnectionOutages", _SOURCE)
+        self.assertIn('case "connection_timeout"', _SOURCE)
+        self.assertIn("Connection timed out", _SOURCE)
+        self.assertIn("连接超时", _SOURCE)
+        self.assertNotIn("Connection interrupted", _SOURCE)
+        self.assertNotIn("连接中断", _SOURCE)
+
+    def test_terminal_overall_elapsed_prefers_hub_timestamps(self):
+        elapsed = _SOURCE.split("private func depthElapsedSeconds", 1)[1].split(
+            "private func elapsedString", 1
+        )[0]
+        self.assertIn('let completed = numeric(run["completed_at"])', elapsed)
+        self.assertIn("return max(0, completed - started)", elapsed)
+        self.assertLess(
+            elapsed.index("return max(0, completed - started)"),
+            elapsed.index("finishedElapsedByRun[runID]"),
+        )
+
     def test_hosted_shimmer_requires_confirmed_run_without_gone_grace(self):
         predicate = _SOURCE.split("private func shouldShimmerDepthLine", 1)[1].split(
             "private func depthElapsedSeconds", 1
         )[0]
         self.assertIn("serverVerifiedRunIDs.contains(runID)", predicate)
         self.assertIn("notFoundPolls[runID] == nil", predicate)
-        self.assertIn("pollFailures[runID] == nil", predicate)
+        self.assertNotIn(
+            "pollFailures[runID] == nil",
+            predicate,
+            "connectivity failure must not stop a verified running audit's shimmer",
+        )
         self.assertIn("isLocalRun(run)", predicate)
 
     def test_missing_hosted_poll_config_revokes_shimmer_confirmation(self):

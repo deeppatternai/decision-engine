@@ -33,6 +33,8 @@ Honors the same env overrides as runner (DE_CONFIG_PATH / DE_ACTIVE_RUNS / DE_AC
 
 from __future__ import annotations
 
+import json
+import math
 import os
 import sys
 import threading
@@ -43,17 +45,20 @@ from client import i18n, runner, tk_icon
 from client.tk_fonts import resolve_linux_tk_fonts
 
 # ── constants (mirror the Swift panel) ───────────────────────────────────────────────────────
-TERMINAL_STATUSES = {"completed", "partial", "failed", "cancelled"}
+TERMINAL_STATUSES = {"completed", "partial", "failed", "cancelled", "connection_timeout"}
 FINISHED_LINGER_S = 30.0     # keep a finished run visible this long before pruning
 IDLE_EXIT_S = 2.0            # quit the app this long after the last run disappears
 POLL_INTERVAL_MS = 1000
 SCROLL_MAX_SCREEN_FRACTION = 0.618
 SHIMMER_DURATION_S = 1.75
 SHIMMER_FRAME_MS = 33
-# A running row goes "连接中断" after this long with no successful poll. Polls run at 1 Hz, so this
-# tolerates a long burst of failures (transient drop / hub restart / laptop resume) before we admit
-# we're blind — but stays far under the minutes a real outage lasts.
-STALE_AFTER_S = 20.0
+# A hosted row stays visually "reviewing" during an outage. Only a continuous outage reaching this
+# local monitor ceiling becomes the explicit `connection_timeout` terminal state.
+CONNECTION_TIMEOUT_S = 30 * 60.0
+# Detail polls finish quickly enough to feed the outage clock and retry ladder.
+DETAIL_POLL_TIMEOUT_S = 10
+POLL_SLOW_AFTER_S = 5.0
+POLL_DIAGNOSTIC_LIMIT = 64
 # How many CONSECUTIVE hub 404s (run_not_found) retire a run. A submit-seeded run whose hub state
 # is gone (purged, or never registered) 404s every poll and can never reach a terminal status, so
 # nothing would ever prune it — the row shows "排队中" forever and stacks on each later start. But
@@ -68,6 +73,37 @@ NOT_FOUND_FORGET_THRESHOLD = 3
 # bug this reap fixes. Every OTHER code (401/403/5xx/…) stays transient → left as-is and retried.
 _GONE_STATUS_CODES = frozenset({404, 410})
 _SYNCHRONOUS_WORKFLOW_ERROR_CODE = "synchronous_workflow_id"
+_HUB_DETAIL_STATUSES = frozenset(runner.TERMINAL_STATUSES | {"queued", "running"})
+
+
+def _poll_failure_category(
+    status_code: Optional[int], error: Optional[BaseException] = None,
+) -> str:
+    if status_code in runner.POLL_AUTH_STATUS_CODES:
+        return "auth"
+    if status_code == 429:
+        return "rate_limit"
+    if isinstance(status_code, int) and 500 <= status_code < 600:
+        return "server_5xx"
+    if isinstance(status_code, int):
+        return "client_4xx"
+    if isinstance(getattr(error, "__context__", None), json.JSONDecodeError):
+        return "invalid_payload"
+    return "transport"
+
+
+def _is_valid_detail_view(view: Any, run_id: str) -> bool:
+    """Return whether a decoded response satisfies the minimum audit-detail contract."""
+    if not isinstance(view, dict):
+        return False
+    status = view.get("status")
+    response_run_id = view.get("run_id")
+    return (
+        isinstance(status, str)
+        and status.strip().lower() in _HUB_DETAIL_STATUSES
+        and (response_run_id is None or response_run_id == run_id)
+    )
+
 
 # Dark palette (A-repo BG_MAIN #262624 etc.) — same values the Swift panel uses.
 BG = "#262624"
@@ -103,6 +139,13 @@ def _num(value: Any) -> float:
     if isinstance(value, (int, float)):
         return float(value)
     return 0.0
+
+
+def _valid_outage_start(value: Any, now: float) -> float:
+    started = _num(value)
+    if not math.isfinite(started) or started <= 0 or started > now:
+        return 0.0
+    return started
 
 
 def depth_label(run: Dict[str, Any]) -> str:
@@ -141,7 +184,7 @@ def overall_status(run: Dict[str, Any]) -> str:
     # cancel is a run-level state the voices don't carry — surface it directly so the depth line and
     # the action pill agree (a cancelled run must not read as "completed" off its auditors).
     run_status = str(run.get("status") or "").lower()
-    if run_status in ("cancelling", "cancelled"):
+    if run_status in ("cancelling", "cancelled", "connection_timeout"):
         return run_status
     auditors = run.get("auditors")
     if not isinstance(auditors, list) or not auditors:
@@ -189,6 +232,10 @@ def elapsed_seconds(run: Dict[str, Any], now: float, frozen: Dict[str, float]) -
     completed = _num(run.get("completed_at"))
     run_id = str(run.get("run_id") or "")
     status = overall_status(run)
+    if status == "connection_timeout":
+        finished = _num(run.get("finished_at"))
+        if started > 0 and finished > 0:
+            return max(0.0, finished - started)
     if status not in ("running", "queued") and started > 0 and completed > 0:
         return max(0.0, completed - started)
     live = max(0.0, now - started) if started > 0 else 0.0
@@ -201,20 +248,6 @@ def elapsed_seconds(run: Dict[str, Any], now: float, frozen: Dict[str, float]) -
     return live
 
 
-def is_stale(run: Dict[str, Any], now: float) -> bool:
-    """True when a still-running row's last successful poll is old enough that we no longer know
-    what the hub is doing (network down / hub unreachable). A poll failure leaves the last view in
-    place, so without this the row would keep ticking a confident timer while blind — and the run
-    may well have finished. Terminal rows are never stale: their duration is already hub-derived
-    and cannot change."""
-    if overall_status(run) not in ("running", "queued"):
-        return False
-    last_ok = _num(run.get("last_ok_at"))
-    if last_ok <= 0:
-        return False                      # never polled yet (just seeded) — not a disconnect
-    return (now - last_ok) > STALE_AFTER_S
-
-
 def should_shimmer_depth_line(
     run: Dict[str, Any], *, run_id: Optional[str] = None,
     server_verified: Optional[set] = None,
@@ -222,23 +255,21 @@ def should_shimmer_depth_line(
     not_found_polls: Optional[Dict[str, int]] = None,
     now: Optional[float] = None,
 ) -> bool:
-    """Whether the collapsed detail line is a trusted, live running state.
+    """Whether the collapsed detail line represents an audit that is still running.
 
     Disk discovery is not proof that a Hosted audit still exists. Hosted rows therefore animate
-    only after a successful poll, and stop immediately during poll failure or gone-response grace.
-    Local rows have no Hub poll; their own running state is authoritative.
+    only after a successful poll. Once verified, connectivity failures do not change the Hub audit
+    lifecycle, so the running shimmer continues; a gone-response grace is different because the
+    Hub may have retired the run. Local rows have no Hub poll and are authoritative themselves.
     """
     if str(run.get("status") or "").lower() != "running" or overall_status(run) != "running":
         return False
     if run.get("local"):
         return True
-    if now is not None and is_stale(run, now):
-        return False
     authoritative_id = str(run_id or run.get("run_id") or "")
     return bool(
         authoritative_id
         and authoritative_id in (server_verified or set())
-        and authoritative_id not in (poll_failures or {})
         and authoritative_id not in (not_found_polls or {})
     )
 
@@ -273,7 +304,7 @@ def _local_advisory_line(run: Dict[str, Any], now: float, frozen: Dict[str, floa
     """One-line render for a LOCAL advisory run (design §11/§17). Deliberately uses words a real
     cross-vendor panel never uses — 分饰中 / 完成（仅参考） — and NEVER the ✓ / 已完成 pass mark, so
     a single-model sanity read cannot read as an audit that passed. No hub poll backs a local run,
-    so it is never `连接中断` (is_stale needs a hub `last_ok_at` it never has)."""
+    so it never participates in hosted connection timeout tracking."""
     elapsed = elapsed_string(elapsed_seconds(run, now, frozen))
     status = overall_status(run)
     strings = _panel(run)
@@ -312,12 +343,6 @@ def _collapsed_depth_line_text(run: Dict[str, Any], now: float, frozen: Dict[str
     elapsed = elapsed_string(elapsed_seconds(run, now, frozen))
     status = overall_status(run)
     strings = _panel(run)
-    if is_stale(run, now):
-        # Blind: say so and show the last time we actually heard from the hub, instead of a live
-        # number that pretends we still know. The audit itself keeps running server-side; when the
-        # network returns, a terminal row's duration comes back hub-derived and exact.
-        return strings["hub_stale"] % (
-            depth, elapsed_string(_num(run.get("last_ok_at")) - _num(run.get("started_at"))))
     if status == "queued":
         return strings["hub_queued"] % depth
     return strings["hub"].get(status, strings["hub"]["reviewing"]) % (depth, elapsed)
@@ -368,14 +393,12 @@ def depth_line_color(run: Dict[str, Any], now: Optional[float] = None) -> str:
         if local_status == "failed":
             return FG_RED
         return FG_AMBER
-    if now is not None and is_stale(run, now):
-        return FG_AMBER            # unknown ≠ healthy-running; don't render a blind row as normal
     status = overall_status(run)
     if status == "completed":
         return FG_GREEN
     if status in ("partial", "cancelled"):
         return FG_AMBER
-    if status == "failed":
+    if status in ("failed", "connection_timeout"):
         return FG_RED
     return FG_MUTED
 
@@ -430,7 +453,7 @@ def merge_poll_view(
     merged = dict(existing)
     merged.update({k: v for k, v in view.items() if v is not None})
     merged["run_id"] = run_id
-    merged["last_ok_at"] = now      # local clock: when the hub last answered (drives is_stale)
+    merged["last_ok_at"] = now      # local clock: retained for diagnostics and compatibility
     if str(merged.get("status") or "") in TERMINAL_STATUSES:
         merged.setdefault("hidden_after", now + FINISHED_LINGER_S)
     return merged
@@ -1067,6 +1090,14 @@ def initialize_panel_state(app: Any) -> None:
     app._next_poll_at = {}
     app._poll_failures = {}
     app._auth_failures = {}
+    app._poll_started_at = {}
+    app._poll_slow_reported = set()
+    app._poll_failure_categories = {}
+    app._poll_outage_started_at = {}
+    app._poll_diagnostics = []
+    app._registry_persist_lock = threading.Lock()
+    app._pending_run_persistence = {}
+    app._persistence_sequence = 0
     app._retired = set()
     app._lock = threading.Lock()
     app._no_runs_since = None
@@ -1264,6 +1295,7 @@ class StopPanelApp:
         disk = registry.get("runs") if isinstance(registry, dict) else None
         if not isinstance(disk, dict):
             return
+        observed_at = time.time()
         with self._lock:
             for run_id, run in disk.items():
                 if not isinstance(run, dict):
@@ -1297,6 +1329,12 @@ class StopPanelApp:
                     # what grew the displayed elapsed without bound.
                     continue
                 run = dict(run)
+                if str(run.get("status") or "").lower() == "connection_timeout":
+                    finished_at = _num(run.get("finished_at"))
+                    if not math.isfinite(finished_at) or finished_at <= 0 or finished_at > observed_at:
+                        finished_at = observed_at
+                    run["finished_at"] = finished_at
+                    run["hidden_after"] = finished_at + FINISHED_LINGER_S
                 # The registry key is the authoritative identity. A stale payload id must never
                 # redirect a poll or a STOP click to another run.
                 run["run_id"] = run_id
@@ -1319,16 +1357,23 @@ class StopPanelApp:
         — a transport AuditError with no status_code, or a 401/429/5xx) leaves state as-is and is
         retried later, each consecutive failure waiting longer (`_defer_poll`); a run answering
         401/403 that many times in a row leaves the normal cadence for one slow probe per
-        POLL_AUTH_PROBE_INTERVAL_S, so its row goes stale but still heals if the token is fixed."""
+        POLL_AUTH_PROBE_INTERVAL_S, so its row stays reviewing and still heals if the token is fixed."""
+        self._ensure_poll_diagnostic_state()
         if expected_epoch is None:
             with self._lock:
                 expected_epoch = self._state_epochs.get(run_id, 0)
+        persist_run = None
+        persist_epoch = None
+        with self._lock:
+            self._poll_started_at.setdefault(run_id, time.monotonic())
         try:
             # The DETAIL view, deliberately not the lighter status route: `overall_status`
             # derives the displayed state from `auditors[]` (including `partial`, which the
             # run-level status cannot express) and `_debug_auditor_details` renders per-voice
             # lines from it. The status route carries neither, nor `debug_authorized`.
-            view = runner.request_json("GET", runner.audit_detail_path(run_id))
+            view = runner.request_json(
+                "GET", runner.audit_detail_path(run_id), timeout_s=DETAIL_POLL_TIMEOUT_S,
+            )
         except runner.AuditError as exc:
             status_code = getattr(exc, "status_code", None)
             is_synchronous_workflow = (
@@ -1347,11 +1392,17 @@ class StopPanelApp:
                     # Auth gets the streak budget below; any OTHER definitive 4xx is the hub's
                     # final answer on this request and drops to the probe rate at once.
                     transient=is_auth or runner.poll_failure_is_transient(status_code),
+                    category=_poll_failure_category(status_code, exc),
+                    status_code=status_code,
                 )
             return
         except Exception:  # aqg: top-level boundary — no client-side defect may stop the panel
-            self._defer_poll(run_id)
+            self._defer_poll(run_id, category="transport")
             return
+        if not _is_valid_detail_view(view, run_id):
+            self._defer_poll(run_id, category="invalid_payload")
+            return
+        view = {**view, "status": str(view["status"]).strip().lower()}
         with self._lock:
             # `finally`, not a tail statement: anything raising in here — a hostile payload field,
             # a merge defect — would otherwise leave run_id in `_polling` forever and that run
@@ -1359,32 +1410,52 @@ class StopPanelApp:
             try:
                 if run_id in self._retired or self._state_epochs.get(run_id, 0) != expected_epoch:
                     return
+                recovery_category = self._poll_failure_categories.get(run_id)
+                outage_started = self._poll_outage_started_at.get(run_id)
+                if recovery_category is not None:
+                    self._record_poll_diagnostic_locked(
+                        run_id,
+                        "recovery",
+                        recovery_category,
+                        duration_s=(
+                            max(0.0, time.monotonic() - outage_started)
+                            if outage_started is not None else None
+                        ),
+                    )
                 self._not_found_polls.pop(run_id, None)   # a live view resets the reap streak
                 self._poll_failures.pop(run_id, None)     # …and the backoff and auth streaks
                 self._auth_failures.pop(run_id, None)
                 self._next_poll_at[run_id] = time.monotonic() + runner.poll_delay_s(
-                    view.get("poll_after_ms") if isinstance(view, dict) else None
+                    view.get("poll_after_ms")
                 )
                 existing = self.runs.get(run_id, {})
-                if isinstance(view, dict):
-                    self._server_verified.add(run_id)
-                    merged = merge_poll_view(
-                        existing, view, run_id, time.time(),
-                        preserve_cancelling=run_id in self._cancel_inflight,
-                    )
-                    self.runs[run_id] = merged
-                    if str(merged.get("status") or "") in TERMINAL_STATUSES:
-                        self._cancel_inflight.discard(run_id)
-                    if merged.get("status") != existing.get("status"):
-                        try:
-                            runner.save_active_run(merged, existing_only=True)
-                        except Exception:  # aqg: top-level boundary — registry persistence is best-effort UI state
-                            pass
+                had_outage_marker = "connection_outage_started_at" in existing
+                self._server_verified.add(run_id)
+                merged = merge_poll_view(
+                    existing, view, run_id, time.time(),
+                    preserve_cancelling=run_id in self._cancel_inflight,
+                )
+                merged.pop("connection_outage_started_at", None)
+                self.runs[run_id] = merged
+                if str(merged.get("status") or "") in TERMINAL_STATUSES:
+                    self._cancel_inflight.discard(run_id)
+                if had_outage_marker:
+                    self._state_epochs[run_id] = self._state_epochs.get(run_id, 0) + 1
+                if had_outage_marker or merged.get("status") != existing.get("status"):
+                    persist_run = dict(merged)
+                    persist_epoch = self._state_epochs.get(run_id, 0)
             finally:
                 self._polling.discard(run_id)
+                self._poll_started_at.pop(run_id, None)
+                self._poll_slow_reported.discard(run_id)
+                self._poll_failure_categories.pop(run_id, None)
+                self._poll_outage_started_at.pop(run_id, None)
+        if persist_run is not None and persist_epoch is not None:
+            self._persist_run_state(persist_run, persist_epoch)
 
     def _defer_poll(
-        self, run_id: str, *, auth_failure: bool = False, transient: bool = True
+        self, run_id: str, *, auth_failure: bool = False, transient: bool = True,
+        category: str = "transport", status_code: Optional[int] = None,
     ) -> None:
         """Release the in-flight flag and push the next poll for `run_id` further out.
 
@@ -1394,33 +1465,239 @@ class StopPanelApp:
         streak — drops to one probe per POLL_AUTH_PROBE_INTERVAL_S instead of stopping dead:
         a revoked token cannot be repaired by asking again at 1 Hz, but a token the user fixes
         on disk IS picked up by the next request, so the row heals itself rather than needing a
-        panel restart. Meanwhile the row just goes stale — reaping it would claim the run is
-        gone, which a 401 does not say."""
+        panel restart. Meanwhile the row remains visually reviewing until the local connection
+        timeout expires — reaping it earlier would claim the run is gone, which a 401 does not say."""
+        persist_run = None
+        persist_epoch = None
         with self._lock:
+            self._ensure_poll_diagnostic_state()
+            now = time.monotonic()
+            wall_now = time.time()
+            started = self._poll_started_at.pop(run_id, now)
             self._polling.discard(run_id)
             # A worker that started before the run was retired or pruned must not re-create the
             # bookkeeping `_forget_poll_state` just dropped: nothing would ever forget it again.
-            if run_id in self._retired or run_id not in self.runs:
+            current = self.runs.get(run_id)
+            if (
+                run_id in self._retired
+                or not isinstance(current, dict)
+                or not _entry_is_active(run_id, current)
+            ):
                 return
+            outage_started = _valid_outage_start(
+                current.get("connection_outage_started_at"), wall_now
+            )
+            if outage_started <= 0:
+                updated = {**current, "connection_outage_started_at": wall_now}
+                self.runs[run_id] = updated
+                persist_run = dict(updated)
+                persist_epoch = self._state_epochs.get(run_id, 0)
             if auth_failure:
                 self._auth_failures[run_id] = self._auth_failures.get(run_id, 0) + 1
             else:
                 self._auth_failures.pop(run_id, None)   # "consecutive" means consecutive
             failures = self._poll_failures.get(run_id, 0) + 1
             self._poll_failures[run_id] = failures
+            self._poll_failure_categories[run_id] = category
+            self._poll_outage_started_at.setdefault(run_id, started)
+            self._poll_slow_reported.discard(run_id)
+            self._record_poll_diagnostic_locked(
+                run_id, "failure", category, status_code=status_code,
+                failures=failures, duration_s=max(0.0, now - started),
+            )
             exhausted = self._auth_failures.get(run_id, 0) >= runner.POLL_AUTH_FAILURE_LIMIT
             if exhausted or not transient:
                 delay = runner.POLL_AUTH_PROBE_INTERVAL_S
             else:
                 delay = runner.poll_backoff_delay_s(failures)
             self._next_poll_at[run_id] = time.monotonic() + delay
+        if persist_run is not None and persist_epoch is not None:
+            self._persist_run_state(persist_run, persist_epoch)
+
+    def _expire_connection_outages(self, now: float) -> None:
+        """Locally finish hosted runs whose continuous unobservable period reached 30 minutes."""
+        timed_out = []
+        monotonic_now = time.monotonic()
+        with self._lock:
+            self._ensure_poll_diagnostic_state()
+            for run_id, run in list(self.runs.items()):
+                if not _entry_is_active(run_id, run) or not should_hub_poll(run):
+                    continue
+                outage_started = _valid_outage_start(
+                    run.get("connection_outage_started_at"), now
+                )
+                if outage_started <= 0:
+                    continue
+                monotonic_started = self._poll_outage_started_at.get(run_id)
+                if (
+                    isinstance(monotonic_started, (int, float))
+                    and math.isfinite(monotonic_started)
+                    and 0 <= monotonic_started <= monotonic_now
+                ):
+                    outage_elapsed = monotonic_now - monotonic_started
+                else:
+                    outage_elapsed = now - outage_started
+                if outage_elapsed < CONNECTION_TIMEOUT_S:
+                    continue
+                self._record_poll_diagnostic_locked(
+                    run_id,
+                    "timeout",
+                    self._poll_failure_categories.get(run_id, "transport"),
+                    failures=self._poll_failures.get(run_id, 0),
+                    duration_s=max(0.0, outage_elapsed),
+                )
+                self._state_epochs[run_id] = self._state_epochs.get(run_id, 0) + 1
+                updated = {
+                    **run,
+                    "status": "connection_timeout",
+                    "finished_at": now,
+                    "hidden_after": now + FINISHED_LINGER_S,
+                }
+                updated.pop("connection_outage_started_at", None)
+                self.runs[run_id] = updated
+                self._polling.discard(run_id)
+                self._cancel_inflight.discard(run_id)
+                self._server_verified.discard(run_id)
+                self._forget_poll_state(run_id)
+                timed_out.append((dict(updated), self._state_epochs[run_id]))
+        for run, epoch in timed_out:
+            self._persist_run_state(run, epoch)
+
+    def _ensure_registry_persistence_state(self) -> None:
+        if not hasattr(self, "_registry_persist_lock"):
+            self._registry_persist_lock = threading.Lock()
+        if not hasattr(self, "_pending_run_persistence"):
+            self._pending_run_persistence = {}
+        if not hasattr(self, "_persistence_sequence"):
+            self._persistence_sequence = 0
+
+    def _persist_run_state(self, run: Dict[str, Any], epoch: int) -> None:
+        """Serialize panel-owned registry writes and retain the newest failed write for retry."""
+        run_id = str(run.get("run_id") or "")
+        if not run_id:
+            return
+        with self._lock:
+            self._ensure_registry_persistence_state()
+            self._persistence_sequence += 1
+            sequence = self._persistence_sequence
+            self._pending_run_persistence[run_id] = (sequence, int(epoch), dict(run))
+        self._flush_pending_run_persistence(run_id)
+
+    def _flush_pending_run_persistence(self, run_id: str) -> None:
+        self._ensure_registry_persistence_state()
+        with self._registry_persist_lock:
+            with self._lock:
+                pending = self._pending_run_persistence.get(run_id)
+                if pending is None:
+                    return
+                sequence, epoch, run = pending
+                if (
+                    run_id not in self.runs
+                    or self._state_epochs.get(run_id, 0) != epoch
+                ):
+                    self._pending_run_persistence.pop(run_id, None)
+                    return
+            try:
+                runner.save_active_run(run, existing_only=True)
+            except Exception:  # aqg: top-level boundary — retried by the next panel tick
+                return
+            with self._lock:
+                current = self._pending_run_persistence.get(run_id)
+                if current is not None and current[0] == sequence:
+                    self._pending_run_persistence.pop(run_id, None)
+
+    def _retry_pending_run_persistence(self) -> None:
+        self._ensure_registry_persistence_state()
+        with self._lock:
+            run_ids = tuple(self._pending_run_persistence)
+        for run_id in run_ids:
+            self._flush_pending_run_persistence(run_id)
+
+    def _ensure_poll_diagnostic_state(self) -> None:
+        """Lazily initialize fields for test doubles and older renderer subclasses."""
+        if not hasattr(self, "_poll_started_at"):
+            self._poll_started_at = {}
+        if not hasattr(self, "_poll_slow_reported"):
+            self._poll_slow_reported = set()
+        if not hasattr(self, "_poll_failure_categories"):
+            self._poll_failure_categories = {}
+        if not hasattr(self, "_poll_outage_started_at"):
+            self._poll_outage_started_at = {}
+        if not hasattr(self, "_poll_diagnostics"):
+            self._poll_diagnostics = []
+
+    def _record_poll_diagnostic_locked(
+        self, run_id: str, event: str, category: str, *,
+        status_code: Optional[int] = None, failures: int = 0,
+        duration_s: Optional[float] = None,
+    ) -> None:
+        """Retain and emit only fixed, bounded fields; never exception text or request content."""
+        self._ensure_poll_diagnostic_state()
+        diagnostic = {
+            "at": int(time.time()),
+            "event": event,
+            "run": str(run_id)[:8],
+            "category": category,
+            "status": int(status_code) if isinstance(status_code, int) else None,
+            "failures": max(0, int(failures)),
+            "duration_ms": (
+                max(0, min(999_999, int(duration_s * 1000)))
+                if isinstance(duration_s, (int, float)) else None
+            ),
+        }
+        previous = next(
+            (item for item in reversed(self._poll_diagnostics) if item["run"] == diagnostic["run"]),
+            None,
+        )
+        if (
+            event == "failure" and previous is not None
+            and previous["event"] == event and previous["category"] == category
+        ):
+            previous.update(diagnostic)
+            return
+        self._poll_diagnostics.append(diagnostic)
+        del self._poll_diagnostics[:-POLL_DIAGNOSTIC_LIMIT]
+        try:
+            sys.stderr.write(
+                "stop panel poll: at=%d event=%s run=%s category=%s status=%s failures=%d duration_ms=%s\n"
+                % (
+                    diagnostic["at"],
+                    diagnostic["event"], diagnostic["run"], diagnostic["category"],
+                    diagnostic["status"] if diagnostic["status"] is not None else "none",
+                    diagnostic["failures"],
+                    diagnostic["duration_ms"] if diagnostic["duration_ms"] is not None else "none",
+                )
+            )
+        except Exception:  # aqg: top-level boundary — diagnostics must never break the panel
+            pass
+
+    def _record_slow_polls_locked(self, now: float) -> None:
+        self._ensure_poll_diagnostic_state()
+        for run_id in tuple(self._polling):
+            started = self._poll_started_at.get(run_id)
+            if (
+                started is None or now - started < POLL_SLOW_AFTER_S
+                or run_id in self._poll_slow_reported
+            ):
+                continue
+            self._poll_slow_reported.add(run_id)
+            self._poll_failure_categories[run_id] = "slow_in_flight"
+            self._poll_outage_started_at.setdefault(run_id, started)
+            self._record_poll_diagnostic_locked(
+                run_id, "failure", "slow_in_flight", duration_s=max(0.0, now - started),
+            )
 
     def _forget_poll_state(self, run_id: str) -> None:
         """Drop a retired run's poll bookkeeping. Caller holds `self._lock`."""
+        self._ensure_poll_diagnostic_state()
         self._next_poll_at.pop(run_id, None)
         self._poll_failures.pop(run_id, None)
         self._auth_failures.pop(run_id, None)
         self._not_found_polls.pop(run_id, None)
+        self._poll_started_at.pop(run_id, None)
+        self._poll_slow_reported.discard(run_id)
+        self._poll_failure_categories.pop(run_id, None)
+        self._poll_outage_started_at.pop(run_id, None)
 
     def _on_run_vanished(self, run_id: str) -> None:
         """Count a hub 404 for run_id; once the streak reaches the grace threshold, retire the run
@@ -1428,11 +1705,15 @@ class StopPanelApp:
         `_merge_disk` cannot re-seed it, and reap the on-disk registry entry off the Tk thread."""
         with self._lock:
             self._polling.discard(run_id)
+            self._poll_started_at.pop(run_id, None)
+            self._poll_slow_reported.discard(run_id)
             count = self._not_found_polls.get(run_id, 0) + 1
             self._not_found_polls[run_id] = count
             if count < NOT_FOUND_FORGET_THRESHOLD:
                 return
             self._forget_poll_state(run_id)
+            self._ensure_registry_persistence_state()
+            self._pending_run_persistence.pop(run_id, None)
             self.runs.pop(run_id, None)
             self._cancel_inflight.discard(run_id)
             self._server_verified.discard(run_id)
@@ -1447,6 +1728,8 @@ class StopPanelApp:
                 hidden_after = self.runs[run_id].get("hidden_after")
                 if isinstance(hidden_after, (int, float)) and hidden_after <= now:
                     self._forget_poll_state(run_id)
+                    self._ensure_registry_persistence_state()
+                    self._pending_run_persistence.pop(run_id, None)
                     self.runs.pop(run_id, None)
                     self._cancel_inflight.discard(run_id)
                     self._server_verified.discard(run_id)
@@ -1564,13 +1847,16 @@ class StopPanelApp:
 
     # -- loop --------------------------------------------------------------------------------
     def _tick(self) -> None:
+        self._ensure_poll_diagnostic_state()
         now = time.time()
         # Poll scheduling is an INTERVAL, so it reads the monotonic clock: an NTP correction, a
         # VM resume or a user changing the system clock backwards would otherwise silently
         # suspend every poll for the size of the jump while the 1 Hz repaint kept running.
-        # Wall-clock `now` stays for the display/staleness values, which are wall-clock facts.
+        # Wall-clock `now` stays for elapsed display and the persisted outage deadline.
         scheduled = time.monotonic()
         self._merge_disk()
+        self._retry_pending_run_persistence()
+        self._expire_connection_outages(now)
         with self._lock:
             # This tick also drives the live elapsed clock, so it keeps running at 1 Hz; the
             # REQUEST is what the per-run gate paces. A run is asked again only once its
@@ -1581,6 +1867,9 @@ class StopPanelApp:
                        and run_id not in self._polling
                        and self._next_poll_at.get(run_id, 0.0) <= scheduled]
             self._polling.update(to_poll)
+            for run_id in to_poll:
+                self._poll_started_at[run_id] = scheduled
+            self._record_slow_polls_locked(scheduled)
             poll_epochs = {run_id: self._state_epochs.get(run_id, 0) for run_id in to_poll}
         for run_id in to_poll:
             threading.Thread(

@@ -51,6 +51,7 @@ from client.version import CLIENT_VERSION, USER_AGENT  # single source of truth 
 # `audit` CLI and the shim (Owner ruling 2026-07-07). Both resolve the SAME file.
 DEFAULT_CONFIG_PATH = Path.home() / ".deeppattern" / "decision-engine" / "config.json"
 TERMINAL_STATUSES = {"completed", "partial", "failed", "cancelled"}
+ACTIVE_RUN_TERMINAL_STATUSES = TERMINAL_STATUSES | {"connection_timeout"}
 FINISHED_LINGER_S = 30.0
 ACTIVE_RUNS_SCHEMA_VERSION = 1
 LOCAL_TERMINAL_TOMBSTONE_TTL_S = 24 * 60 * 60.0
@@ -707,9 +708,25 @@ def active_run_payload(run: Dict[str, Any]) -> Dict[str, Any]:
             payload["degrade_reason"] = run.get("degrade_reason")
         if run.get("degrade_action") is not None:
             payload["degrade_action"] = run.get("degrade_action")
-    if status in TERMINAL_STATUSES:
-        payload["finished_at"] = now
-        payload["hidden_after"] = now + FINISHED_LINGER_S
+    outage_started = run.get("connection_outage_started_at")
+    if (
+        isinstance(outage_started, (int, float))
+        and not isinstance(outage_started, bool)
+        and math.isfinite(outage_started)
+        and outage_started > 0
+    ):
+        payload["connection_outage_started_at"] = float(outage_started)
+    if status in ACTIVE_RUN_TERMINAL_STATUSES:
+        finished_at = run.get("finished_at") if status == "connection_timeout" else now
+        if (
+            not isinstance(finished_at, (int, float))
+            or isinstance(finished_at, bool)
+            or not math.isfinite(finished_at)
+            or finished_at <= 0
+        ):
+            finished_at = now
+        payload["finished_at"] = float(finished_at)
+        payload["hidden_after"] = float(finished_at + FINISHED_LINGER_S)
     elif run.get("hidden_after") is not None:
         # A non-terminal caller-set TTL — a local advisory run's safety hidden_after (see
         # save_local_advisory_run). Existing hub runs never set this, so they are unchanged.
@@ -901,17 +918,17 @@ def _save_active_run_locked(
     registry = registry_loader() if registry is None else registry
     previous = registry.get("runs", {}).get(run_id)
     registry = prune_active_runs(registry)
-    if (isinstance(previous, dict) and previous.get("status") in TERMINAL_STATUSES
+    if (isinstance(previous, dict) and previous.get("status") in ACTIVE_RUN_TERMINAL_STATUSES
             and run_id not in registry["runs"]):
         registry["updated_at"] = time.time()
         registry_writer(registry)
         return
     if existing_only and run_id not in registry["runs"]:
         return
-    if isinstance(previous, dict) and previous.get("status") in TERMINAL_STATUSES:
+    if isinstance(previous, dict) and previous.get("status") in ACTIVE_RUN_TERMINAL_STATUSES:
         # Concurrent panel polls and repeated result reads cannot restart the terminal linger
         # or move a finished run back to running. Preserve only LOCAL persisted deadlines.
-        if payload.get("status") not in TERMINAL_STATUSES:
+        if payload.get("status") not in ACTIVE_RUN_TERMINAL_STATUSES:
             return
         payload["status"] = previous["status"]
         if payload.get("completed_at") is None:
@@ -1418,7 +1435,7 @@ def clear_active_run(run_id: str) -> None:
         run = runs.get(run_id) if run_id and isinstance(runs, dict) else None
         if isinstance(run, dict):
             hidden_after = run.get("hidden_after")
-            if run.get("status") not in TERMINAL_STATUSES or not isinstance(hidden_after, (int, float)):
+            if run.get("status") not in ACTIVE_RUN_TERMINAL_STATUSES or not isinstance(hidden_after, (int, float)):
                 runs.pop(run_id, None)
         registry["updated_at"] = time.time()
         _write_active_runs_registry(registry)

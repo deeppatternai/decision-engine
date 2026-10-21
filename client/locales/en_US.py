@@ -96,7 +96,6 @@ PANEL = {
         "partial": "%s · Partially complete (reference only) · %s",
         "unknown": "%s · Unknown status (reference only) ⏱",
     },
-    "hub_stale": "%s · Connection interrupted · Last known %s ⚠",
     "hub_queued": "%s · Queued ⏱",
     "hub": {
         "completed": "%s · Completed · %s ✓",
@@ -104,6 +103,7 @@ PANEL = {
         "failed": "%s · Failed · %s ✗",
         "cancelling": "%s · Stopping · %s ⏱",
         "cancelled": "%s · Cancelled · %s",
+        "connection_timeout": "%s · Connection timed out · %s ✗",
         "reviewing": "%s · Auditing · %s ⏱",
     },
     "auditor_status": {

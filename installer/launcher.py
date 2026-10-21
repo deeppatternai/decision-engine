@@ -188,6 +188,24 @@ def _repair_codex_skill_routes(root: Path) -> bool:
         return False
 
 
+def _codex_skill_repair_allowed(
+    root: Path, client_host: Optional[str]
+) -> bool:
+    """Gate historical Codex Skill repair on an existing DE Codex entry."""
+
+    if _resolved_client_host(client_host) not in {None, "codex"}:
+        return False
+    try:
+        # Reading the entry is intentionally the only registration operation
+        # allowed here. Skill migration must never onboard Codex MCP implicitly.
+        from . import mcp_config
+
+        return mcp_config.codex_managed_entry_targets_root(root)
+    except Exception:  # aqg: top-level boundary — optional repair must never gate MCP
+        _log("Codex skill repair skipped: MCP registration could not be verified")
+        return False
+
+
 def _retire_codex_global_routing(root: Path) -> None:
     """Best-effort one-way cleanup after a managed release is confirmed running."""
 
@@ -419,7 +437,9 @@ def _serve_shim(
                 attempt=_attempt + 1,
                 outcome="success",
             )
-            codex_skills_ready = _repair_codex_skill_routes(root)
+            codex_skills_ready = False
+            if _codex_skill_repair_allowed(root, client_host):
+                codex_skills_ready = _repair_codex_skill_routes(root)
             selected = shim if shim is not None else _load_candidate_shim(root)
             forwarder = _forwarder_from_config(selected)
             forwarder_kind = _forwarder_kind(selected, forwarder)

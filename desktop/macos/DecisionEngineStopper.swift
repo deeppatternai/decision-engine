@@ -2,9 +2,12 @@ import AppKit
 import Foundation
 import Darwin
 
-let terminalStatuses: Set<String> = ["completed", "partial", "failed", "cancelled"]
+let hubTerminalStatuses: Set<String> = ["completed", "partial", "failed", "cancelled"]
+let terminalStatuses: Set<String> = hubTerminalStatuses.union(["connection_timeout"])
+let hubDetailStatuses: Set<String> = hubTerminalStatuses.union(["queued", "running"])
 let finishedLingerSeconds: TimeInterval = 30
 let idleExitSeconds: TimeInterval = 2
+let connectionOutageTimeoutSeconds: TimeInterval = 1800
 
 func homePath(_ suffix: String) -> String {
     return FileManager.default.homeDirectoryForCurrentUser.appendingPathComponent(suffix).path
@@ -193,6 +196,7 @@ final class DecisionEngineStopper: NSObject, NSApplicationDelegate {
     // A cancel transition bumps this generation so an older GET cannot overwrite its outcome.
     private var stateGenerations: [String: Int] = [:]
     private var lastPollStartedAt: [String: TimeInterval] = [:]
+    private var outageStartedAtUptime: [String: TimeInterval] = [:]
     // HTTP codes that mean "this run is definitively gone" (not a transient blip) — mirrors
     // client/stopper/panel.py's `_GONE_STATUS_CODES`.
     private let goneStatusCodes: Set<Int> = [404, 410]
@@ -316,6 +320,7 @@ final class DecisionEngineStopper: NSObject, NSApplicationDelegate {
 
     @objc private func refresh() {
         mergeRunsFromDisk()
+        expireConnectionOutages(now: Date().timeIntervalSince1970)
         pruneExpiredRuns()
         // Scheduling is an INTERVAL, so it reads the monotonic clock: an NTP correction, a lid-open
         // resume or a user changing the system clock backwards must not suspend every poll for the
@@ -359,15 +364,26 @@ final class DecisionEngineStopper: NSObject, NSApplicationDelegate {
     /// Release the in-flight flag and push this run's next poll further out. A run answering
     /// 401/403 `pollAuthFailureLimit` times IN A ROW — any other answer resets that streak — drops
     /// to one probe per `pollAuthProbeInterval` rather than stopping dead, so a token the user
-    /// repairs on disk is noticed without restarting the panel; the row meanwhile goes stale rather
-    /// than being reaped, because a 401 does not say the run is gone. Mirrors panel.py's
+    /// repairs on disk is noticed without restarting the panel; the row meanwhile stays reviewing
+    /// rather than being reaped, because a 401 does not say the run is gone. Mirrors panel.py's
     /// `_defer_poll`.
     private func deferPoll(runID: String, authFailure: Bool, transient: Bool = true) {
         pollingRunIDs.remove(runID)
         lastPollStartedAt.removeValue(forKey: runID)
         // A reply that lands after the run was retired or pruned must not re-create the
         // bookkeeping `forgetPollState` just dropped: nothing would ever forget it again.
-        guard runsByID[runID] != nil else { return }
+        guard var run = runsByID[runID], isActive(run) else { return }
+        let wallNow = Date().timeIntervalSince1970
+        let outageStarted = validOutageStart(run["connection_outage_started_at"], now: wallNow)
+        if outageStarted <= 0 {
+            run["connection_outage_started_at"] = wallNow
+            run["updated_at"] = wallNow
+            runsByID[runID] = run
+            saveRunsRegistry()
+        }
+        if outageStartedAtUptime[runID] == nil {
+            outageStartedAtUptime[runID] = ProcessInfo.processInfo.systemUptime
+        }
         if authFailure {
             authFailures[runID] = (authFailures[runID] ?? 0) + 1
         } else {
@@ -382,12 +398,46 @@ final class DecisionEngineStopper: NSObject, NSApplicationDelegate {
         nextPollAllowedAt[runID] = ProcessInfo.processInfo.systemUptime + delay
     }
 
+    private func expireConnectionOutages(now: TimeInterval) {
+        var changed = false
+        let uptimeNow = ProcessInfo.processInfo.systemUptime
+        for (runID, run) in runsByID {
+            guard isActive(run), !isLocalRun(run) else { continue }
+            let outageStarted = validOutageStart(run["connection_outage_started_at"], now: now)
+            guard outageStarted > 0 else { continue }
+            let uptimeStarted = outageStartedAtUptime[runID]
+            let elapsed = uptimeStarted != nil && uptimeStarted!.isFinite
+                && uptimeStarted! >= 0 && uptimeStarted! <= uptimeNow
+                ? uptimeNow - uptimeStarted!
+                : now - outageStarted
+            guard elapsed >= connectionOutageTimeoutSeconds else { continue }
+            stateGenerations[runID, default: 0] += 1
+            var updated = run
+            updated["status"] = "connection_timeout"
+            updated["finished_at"] = now
+            updated["hidden_after"] = now + finishedLingerSeconds
+            updated["updated_at"] = now
+            updated.removeValue(forKey: "connection_outage_started_at")
+            runsByID[runID] = updated
+            pollingRunIDs.remove(runID)
+            lastPollStartedAt.removeValue(forKey: runID)
+            cancelRequestsInFlight.remove(runID)
+            serverVerifiedRunIDs.remove(runID)
+            forgetPollState(runID: runID)
+            changed = true
+        }
+        if changed {
+            saveRunsRegistry()
+        }
+    }
+
     /// Drop a retired run's poll bookkeeping. Mirrors panel.py's `_forget_poll_state`.
     private func forgetPollState(runID: String) {
         nextPollAllowedAt.removeValue(forKey: runID)
         pollFailures.removeValue(forKey: runID)
         authFailures.removeValue(forKey: runID)
         notFoundPolls.removeValue(forKey: runID)
+        outageStartedAtUptime.removeValue(forKey: runID)
     }
 
     private func mergeRunsFromDisk() {
@@ -399,7 +449,7 @@ final class DecisionEngineStopper: NSObject, NSApplicationDelegate {
             for (runID, value) in runs {
                 if var run = value as? [String: Any] {
                     run["run_id"] = (run["run_id"] as? String) ?? runID
-                    merged[runID] = run
+                    merged[runID] = normalizedConnectionTimeoutRun(run, now: now)
                 }
             }
         }
@@ -407,7 +457,7 @@ final class DecisionEngineStopper: NSObject, NSApplicationDelegate {
         if let legacy = readJSON(path: activeRunPath),
            let runID = legacy["run_id"] as? String,
            !runID.isEmpty {
-            merged[runID] = legacy
+            merged[runID] = normalizedConnectionTimeoutRun(legacy, now: now)
         }
 
         for (runID, run) in runsByID {
@@ -735,6 +785,8 @@ final class DecisionEngineStopper: NSObject, NSApplicationDelegate {
               let token = config["access_token"] as? String,
               let url = URL(string: serverURL + "/v1/audits/" + runID) else {
             serverVerifiedRunIDs.remove(runID)
+            deferPoll(runID: runID, authFailure: false, transient: false)
+            render()
             return
         }
 
@@ -777,7 +829,12 @@ final class DecisionEngineStopper: NSObject, NSApplicationDelegate {
                 return
             }
             guard let data = data,
-                  let payload = (try? JSONSerialization.jsonObject(with: data)) as? [String: Any] else {
+                  let payload = (try? JSONSerialization.jsonObject(with: data)) as? [String: Any],
+                  let payloadStatus = payload["status"] as? String,
+                  hubDetailStatuses.contains(
+                      payloadStatus.trimmingCharacters(in: .whitespacesAndNewlines).lowercased()
+                  ),
+                  payload["run_id"] == nil || (payload["run_id"] as? String) == runID else {
                 DispatchQueue.main.async {
                     self.deferPoll(runID: runID, authFailure: false)
                     self.render()
@@ -797,13 +854,13 @@ final class DecisionEngineStopper: NSObject, NSApplicationDelegate {
                     + self.pollDelay(pollAfterMS: payload["poll_after_ms"])
                 self.serverVerifiedRunIDs.insert(runID)
                 var updated = self.runsByID[runID] ?? [:]
-                var status = payload["status"] as? String ?? (updated["status"] as? String) ?? "unknown"
+                var status = payloadStatus.trimmingCharacters(in: .whitespacesAndNewlines).lowercased()
                 // `cancelling` is a client-only intermediate state set the instant the user clicks STOP.
                 // A poll may race the request response. Keep the transient pill only while that request
                 // is in flight; the response then supplies the authoritative queued-only outcome.
                 if self.cancelRequestsInFlight.contains(runID)
                     && (updated["status"] as? String) == "cancelling"
-                    && !terminalStatuses.contains(status) {
+                    && !hubTerminalStatuses.contains(status) {
                     status = "cancelling"
                 }
                 updated["run_id"] = runID
@@ -812,6 +869,8 @@ final class DecisionEngineStopper: NSObject, NSApplicationDelegate {
                 updated["profile"] = payload["profile"] as? String ?? updated["profile"] ?? ""
                 updated["auditors"] = payload["auditors"] as? [[String: Any]] ?? updated["auditors"] ?? []
                 updated["debug_authorized"] = payload["debug_authorized"] as? Bool ?? false
+                updated.removeValue(forKey: "connection_outage_started_at")
+                self.outageStartedAtUptime.removeValue(forKey: runID)
                 // Carry the server's run timestamps forward — the live elapsed clock reads `started_at`,
                 // so dropping it here (as this poll used to) froze the panel timer at 0s. A JSON null
                 // arrives as NSNull, which must NOT overwrite a value we already have; only copy a real
@@ -822,7 +881,7 @@ final class DecisionEngineStopper: NSObject, NSApplicationDelegate {
                     }
                 }
                 updated["updated_at"] = Date().timeIntervalSince1970
-                if terminalStatuses.contains(status) {
+                if hubTerminalStatuses.contains(status) {
                     self.cancelRequestsInFlight.remove(runID)
                     updated["finished_at"] = updated["finished_at"] ?? Date().timeIntervalSince1970
                     updated["hidden_after"] = Date().timeIntervalSince1970 + finishedLingerSeconds
@@ -931,7 +990,7 @@ final class DecisionEngineStopper: NSObject, NSApplicationDelegate {
     private func statusIconColor(_ status: String) -> NSColor {
         switch status {
         case "completed": return paletteGreen
-        case "failed", "cancelled", "cancelling": return paletteRed
+        case "failed", "cancelled", "cancelling", "connection_timeout": return paletteRed
         case "queued", "advisory": return .systemOrange
         case "running": return paletteBlue
         default: return color(75, 85, 99)
@@ -1361,7 +1420,9 @@ final class DecisionEngineStopper: NSObject, NSApplicationDelegate {
         // cancel is a run-level state the voices don't carry — surface it directly so the depth line
         // and the action pill agree (a cancelled run must not read as "已完成" off its auditors).
         let runStatus = (run["status"] as? String ?? "").lowercased()
-        if runStatus == "cancelling" || runStatus == "cancelled" { return runStatus }
+        if runStatus == "cancelling" || runStatus == "cancelled" || runStatus == "connection_timeout" {
+            return runStatus
+        }
         let auditors = (run["auditors"] as? [[String: Any]]) ?? []
         if auditors.isEmpty { return runStatus.isEmpty ? "queued" : runStatus }
         let statuses = auditors.map { ($0["status"] as? String ?? "pending").lowercased() }
@@ -1379,20 +1440,29 @@ final class DecisionEngineStopper: NSObject, NSApplicationDelegate {
         if isLocalRun(run) { return true }
         guard let runID = run["run_id"] as? String, !runID.isEmpty else { return false }
         return serverVerifiedRunIDs.contains(runID)
-            && pollFailures[runID] == nil
             && notFoundPolls[runID] == nil
     }
 
-    /// Live elapsed seconds from `started_at`, FROZEN once the panel is terminal (so a finished run stops
-    /// ticking during its 30s linger). Recomputed every 1s tick while running → the seconds count up.
+    /// Live elapsed seconds from `started_at`; Hub terminal duration uses the Hub's two timestamps.
+    /// The local-only connection timeout freezes at its persisted local `finished_at` boundary.
     private func depthElapsedSeconds(_ run: [String: Any]) -> Double {
         let started = numeric(run["started_at"])
+        let completed = numeric(run["completed_at"])
         let live = started > 0 ? max(0, Date().timeIntervalSince1970 - started) : 0
         let overall = overallVoiceStatus(run)
         guard let runID = run["run_id"] as? String else { return live }
         if overall == "running" || overall == "queued" {
             finishedElapsedByRun.removeValue(forKey: runID)
             return live
+        }
+        if overall == "connection_timeout" {
+            let finished = numeric(run["finished_at"])
+            if started > 0 && finished > 0 {
+                return max(0, finished - started)
+            }
+        }
+        if started > 0 && completed > 0 {
+            return max(0, completed - started)
         }
         if let frozen = finishedElapsedByRun[runID] { return frozen }
         finishedElapsedByRun[runID] = live
@@ -1465,6 +1535,7 @@ final class DecisionEngineStopper: NSObject, NSApplicationDelegate {
             case "failed":     return "\(depth) · Failed · \(elapsed) ✗"
             case "cancelling": return "\(depth) · Stopping · \(elapsed) ⏱"
             case "cancelled":  return "\(depth) · Cancelled · \(elapsed)"
+            case "connection_timeout": return "\(depth) · Connection timed out · \(elapsed) ✗"
             case "queued":     return "\(depth) · Queued ⏱"
             default:           return "\(depth) · Reviewing · \(elapsed) ⏱"
             }
@@ -1475,6 +1546,7 @@ final class DecisionEngineStopper: NSObject, NSApplicationDelegate {
         case "failed":     return "\(depth) · 失败 · \(elapsed) ✗"
         case "cancelling": return "\(depth) · 停止中 · \(elapsed) ⏱"
         case "cancelled":  return "\(depth) · 已取消 · \(elapsed)"
+        case "connection_timeout": return "\(depth) · 连接超时 · \(elapsed) ✗"
         case "queued":     return "\(depth) · 排队中 ⏱"
         default:           return "\(depth) · 审核中 · \(elapsed) ⏱"
         }
@@ -1493,7 +1565,7 @@ final class DecisionEngineStopper: NSObject, NSApplicationDelegate {
         case "completed": return paletteGreen
         case "partial":   return paletteAmber
         case "cancelled": return paletteAmber
-        case "failed":    return paletteRed
+        case "failed", "connection_timeout": return paletteRed
         default:          return paletteMuted
         }
     }
@@ -1703,6 +1775,28 @@ final class DecisionEngineStopper: NSObject, NSApplicationDelegate {
         return 0
     }
 
+    private func validOutageStart(_ value: Any?, now: TimeInterval) -> TimeInterval {
+        let started = numeric(value)
+        guard started.isFinite, started > 0, started <= now else { return 0 }
+        return started
+    }
+
+    private func normalizedConnectionTimeoutRun(
+        _ run: [String: Any], now: TimeInterval
+    ) -> [String: Any] {
+        guard (run["status"] as? String)?.lowercased() == "connection_timeout" else {
+            return run
+        }
+        var normalized = run
+        var finished = numeric(run["finished_at"])
+        if !finished.isFinite || finished <= 0 || finished > now {
+            finished = now
+        }
+        normalized["finished_at"] = finished
+        normalized["hidden_after"] = finished + finishedLingerSeconds
+        return normalized
+    }
+
     private func formatElapsed(_ seconds: Double) -> String {
         let total = max(0, Int(seconds.rounded()))
         if total >= 3600 {
@@ -1723,6 +1817,7 @@ final class DecisionEngineStopper: NSObject, NSApplicationDelegate {
             case "completed": return "已完成"
             case "failed": return "失败"
             case "cancelled": return "已取消"
+            case "connection_timeout": return "连接超时"
             case "advisory": return "本地参考"
             default: return status
             }
@@ -1734,6 +1829,7 @@ final class DecisionEngineStopper: NSObject, NSApplicationDelegate {
         case "completed": return "Completed"
         case "failed": return "Failed"
         case "cancelled": return "Cancelled"
+        case "connection_timeout": return "Connection timed out"
         case "advisory": return "Local reference"
         default: return status.prefix(1).uppercased() + status.dropFirst()
         }
@@ -1799,10 +1895,10 @@ final class DecisionEngineStopper: NSObject, NSApplicationDelegate {
                     updated["hidden_after"] = now + finishedLingerSeconds
                 } else {
                     let reported = (payload?["status"] as? String)?.lowercased() ?? ""
-                    let allowed = terminalStatuses.contains(reported)
+                    let allowed = hubTerminalStatuses.contains(reported)
                         || reported == "running" || reported == "cancelling"
                     updated["status"] = allowed ? reported : "unknown"
-                    if terminalStatuses.contains(updated["status"] as? String ?? "") {
+                    if hubTerminalStatuses.contains(updated["status"] as? String ?? "") {
                         updated["finished_at"] = updated["finished_at"] ?? now
                         updated["hidden_after"] = now + finishedLingerSeconds
                     }
