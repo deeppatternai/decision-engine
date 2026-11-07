@@ -15,7 +15,7 @@ MANAGED_PYTHON_MARKER="$MANAGED_PYTHON_ROOT/.deeppattern-python-environment"
 DOCTOR_MODULE="$MANAGED_ROOT/installer/doctor.py"
 
 usage() {
-  printf 'Usage: bash "$HOME/.deeppattern/decision-engine/dp-doctor.sh" [--json]\n' >&2
+  printf 'Usage: bash "$HOME/.deeppattern/decision-engine/dp-doctor.sh" [--json] [--client <name>]\n' >&2
 }
 
 fail() {
@@ -24,8 +24,14 @@ fail() {
 }
 
 case "$#:${1:-}" in
-  0:) ;;
-  1:--json) ;;
+  0:|1:--json) ;;
+  2:--client) [ -n "${2:-}" ] || { usage; exit 2; } ;;
+  3:--json)
+    [ "${2:-}" = "--client" ] && [ -n "${3:-}" ] || { usage; exit 2; }
+    ;;
+  3:--client)
+    [ -n "${2:-}" ] && [ "${3:-}" = "--json" ] || { usage; exit 2; }
+    ;;
   *) usage; exit 2 ;;
 esac
 

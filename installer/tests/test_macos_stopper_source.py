@@ -231,6 +231,27 @@ class MacOSStopperSourceContractTests(unittest.TestCase):
         )
         self.assertRegex(local_colors, r'case\s+"failed":\s*return\s+paletteRed')
 
+    def test_terminal_poll_preserves_auditor_timing_without_defaulting_debug_access(self):
+        poll_body = _SOURCE.split("private func poll(runID: String)", 1)[1].split(
+            "private func render()", 1
+        )[0]
+        self.assertIn("mergeTerminalAuditors", poll_body)
+        self.assertEqual(poll_body.count('updated["auditors"] = self.mergeTerminalAuditors('), 2)
+        self.assertIn("hubTerminalStatuses.contains(status)", poll_body)
+        self.assertIn("incomingDebugAuthorized = payload[\"debug_authorized\"] as? Bool", poll_body)
+        self.assertNotIn('updated["auditors"] = incomingAuditors', poll_body)
+        self.assertNotIn(
+            'payload["debug_authorized"] as? Bool ?? false',
+            poll_body,
+        )
+        merge_body = _SOURCE.split("private func mergeTerminalAuditors", 1)[1].split(
+            "private func validOutageStart", 1
+        )[0]
+        self.assertIn("incoming.count == existing.count", merge_body)
+        self.assertIn("incoming.count <= 64", merge_body)
+        self.assertIn("debugAuthorized", merge_body)
+        self.assertIn('"duration_ms", "started_at", "completed_at"', merge_body)
+
     def test_native_row_renders_the_local_registry_title(self):
         detail_body = _SOURCE.split("private func makeRunDetailStack", 1)[1].split(
             "private func depthLabel", 1

@@ -665,6 +665,34 @@ def main(args):
         first_host_mutation = self.install.index("\n    Repair-AqgBackupResidue", selection)
         self.assertLess(selection, first_host_mutation)
 
+    def test_windows_product_diagnostics_use_registry_platform_support(self) -> None:
+        supported = powershell_function(
+            self.install, "Get-PlatformSupportedAgentSnapshot"
+        )
+        self.assertIn("mcp_config.clients_supporting_platform", supported)
+        self.assertIn("ConvertFrom-Json", supported)
+        self.assertIn("$ValidClients", supported)
+
+        diagnostics = self.install[
+            self.install.index("$windowsSupportedClients = @(") :
+        ]
+        for client in (
+            "qoder",
+            "qoder-cn",
+            "trae",
+            "trae-cn",
+            "trae-work",
+            "trae-work-cn",
+            "workbuddy",
+            "workbuddy-ai",
+        ):
+            self.assertIn(f'Client = "{client}"', diagnostics)
+        self.assertIn("$windowsSupportedClients -contains $product.Client", diagnostics)
+        self.assertEqual(
+            diagnostics.count("Windows DE adapter unavailable in the current signed release"),
+            1,
+        )
+
     def test_unscoped_aqg_doctor_cannot_fail_clients_outside_frozen_targets(self) -> None:
         verify = self.install.index("$aqgVerifyCode = Invoke-AqgClientWrapper")
         doctor = self.install.index("$aqgGlobalDoctorClients", verify)

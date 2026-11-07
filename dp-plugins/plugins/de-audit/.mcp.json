@@ -1,0 +1,11 @@
+{
+  "mcpServers": {
+    "audit": {
+      "type": "http",
+      "url": "https://endpoint.deeppattern.ai/plugin/mcp/v1/audit",
+      "headers": {
+        "X-DeepPattern-MCP-Auth-Mode": "transport"
+      }
+    }
+  }
+}

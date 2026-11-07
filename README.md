@@ -1,6 +1,6 @@
 # Decision Engine
 
-**English** · [简体中文](README.zh-CN.md) · **v0.2.107**
+**English** · [简体中文](README.zh-CN.md) · **v0.2.108**
 
 > **A second opinion you can actually trust — because it comes from many
 > independent minds, not one model agreeing with itself.**
@@ -398,6 +398,7 @@ macOS or Linux:
 ```bash
 bash "$HOME/.deeppattern/decision-engine/dp-doctor.sh"
 bash "$HOME/.deeppattern/decision-engine/dp-doctor.sh" --json
+bash "$HOME/.deeppattern/decision-engine/dp-doctor.sh" --client cursor
 ```
 
 Windows PowerShell:
@@ -405,6 +406,7 @@ Windows PowerShell:
 ```powershell
 powershell.exe -NoProfile -ExecutionPolicy Bypass -File "$HOME\.deeppattern\decision-engine\dp-doctor.ps1"
 powershell.exe -NoProfile -ExecutionPolicy Bypass -File "$HOME\.deeppattern\decision-engine\dp-doctor.ps1" -Json
+powershell.exe -NoProfile -ExecutionPolicy Bypass -File "$HOME\.deeppattern\decision-engine\dp-doctor.ps1" -Client cursor
 ```
 
 It checks: Python is 3.12+, the skills are linked into your agent, the native
@@ -414,14 +416,19 @@ this device is activated. It exits `0` when everything is PASS or WARN, `1` when
 something is genuinely broken, and `2` for invalid arguments. It never prints
 your endpoint or activation secret — only whether they are set. Both supported
 installation methods run it at the end of an install.
+Use `--client NAME` (PowerShell: `-Client NAME`) to limit host-specific checks
+to one configured Agent while retaining the common Decision Engine checks.
 
 ## Installed copy and updates
 
 A supported installation places the signed managed copy at the fixed path
 `~/.deeppattern/decision-engine`. The MCP entry runs that copy through
-`installer.launcher`, which checks and applies signed `stable` updates before
-startup under the bounded GitHub→Gitee policy. Users do not need to keep the
-originally downloaded one-click installer.
+`installer.launcher`. **Managed auto-update is off by default.** Set
+`"auto_update": true` in `~/.deeppattern/decision-engine/config.json` to opt in;
+when enabled, signed `stable` discovery/staging runs in the background under the
+bounded GitHub→Gitee policy (no HEAD apply while MCP is live); install happens
+after the session so the next start picks it up, and first-connect is not
+blocked. Users do not need to keep the originally downloaded one-click installer.
 
 Do not handle legacy installations, failed migrations, or recovery by manually
 overwriting the installation directory. Preserve existing files and follow the

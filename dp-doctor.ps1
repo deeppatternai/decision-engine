@@ -8,7 +8,7 @@ $ProgramName = "dp-doctor"
 function Stop-Doctor {
     param([Parameter(Mandatory = $true)][string]$Message)
 
-    [Console]::Error.WriteLine("{0}: ERROR: {1}" -f $ProgramName, $Message)
+    [Console]::Error.WriteLine(("{0}: ERROR: {1}" -f $ProgramName, $Message))
     exit 1
 }
 
@@ -33,12 +33,34 @@ function Test-TrustedFile {
 }
 
 $doctorArguments = @()
-if ($args.Count -eq 1 -and ([string]$args[0]) -ieq "-Json") {
-    $doctorArguments = @("--json")
+$seenJson = $false
+$seenClient = $false
+$argumentIndex = 0
+while ($argumentIndex -lt $args.Count) {
+    $argument = [string]$args[$argumentIndex]
+    if ($argument -ieq "-Json" -and -not $seenJson) {
+        $doctorArguments += "--json"
+        $seenJson = $true
+        $argumentIndex += 1
+        continue
+    }
+    if ($argument -ieq "-Client" -and -not $seenClient) {
+        if ($argumentIndex + 1 -ge $args.Count -or
+            [string]::IsNullOrWhiteSpace([string]$args[$argumentIndex + 1])) {
+            $argumentIndex = $args.Count + 1
+            break
+        }
+        $doctorArguments += @("--client", [string]$args[$argumentIndex + 1])
+        $seenClient = $true
+        $argumentIndex += 2
+        continue
+    }
+    $argumentIndex = $args.Count + 1
+    break
 }
-elseif ($args.Count -ne 0) {
+if ($argumentIndex -ne $args.Count) {
     [Console]::Error.WriteLine(
-        'Usage: powershell.exe -NoProfile -ExecutionPolicy Bypass -File "$HOME\.deeppattern\decision-engine\dp-doctor.ps1" [-Json]'
+        'Usage: powershell.exe -NoProfile -ExecutionPolicy Bypass -File "$HOME\.deeppattern\decision-engine\dp-doctor.ps1" [-Json] [-Client <name>]'
     )
     exit 2
 }
@@ -93,6 +115,6 @@ if ($LASTEXITCODE -ne 0) {
     Stop-Doctor "the private Deep Pattern Python environment is invalid; re-run the official installer, then retry Doctor"
 }
 
-$runner = 'import runpy, sys; root = sys.argv.pop(1); sys.path.insert(0, root); runpy.run_module("installer.doctor", run_name="__main__")'
+$runner = "import runpy, sys; root = sys.argv.pop(1); sys.path.insert(0, root); runpy.run_module('installer.doctor', run_name='__main__')"
 & $managedPython -I -X utf8 -c $runner $managedRoot @doctorArguments
 exit $LASTEXITCODE

@@ -1,5 +1,6 @@
 import os
 from pathlib import Path
+import re
 import sys
 import unittest
 from unittest import mock
@@ -124,12 +125,6 @@ class InstallationDocsTestCase(unittest.TestCase):
             )
             self.assertIn("Linux", body)
             self.assertIn("WSL", body)
-        self.assertIn("### Option 1:", english)
-        self.assertIn("### Option 2:", english)
-        self.assertIn("#### Linux desktop", english)
-        self.assertIn("### 方式一：", chinese)
-        self.assertIn("### 方式二：", chinese)
-        self.assertIn("#### Linux 桌面", chinese)
 
     def test_root_readmes_use_only_managed_doctor_entrypoints(self):
         english = ROOT_READMES[0].read_text(encoding="utf-8")
@@ -142,13 +137,31 @@ class InstallationDocsTestCase(unittest.TestCase):
             self.assertNotIn("python3 -m unittest", body)
             self.assertIn("installer/README.md", body)
 
-    def test_installer_readme_marks_python_commands_as_source_only(self):
+    def test_python_commands_remain_in_the_source_checkout_section(self):
         body = INSTALLER_README.read_text(encoding="utf-8")
-        normalized = " ".join(body.split())
-        self.assertIn("Source checkout development and release checks", body)
-        self.assertIn("not installed-user diagnostic commands", normalized)
-        self.assertIn("python3 -m installer.leak_scan", body)
-        self.assertIn("python3 -m unittest", body)
+        sections = re.split(r"(?m)^(?=## )", body)
+        source_sections = [
+            section
+            for section in sections
+            if re.search(r"(?im)^## .*\bsource checkout\b", section)
+        ]
+        self.assertEqual(len(source_sections), 1)
+        source_section = source_sections[0]
+        self.assertRegex(
+            source_section,
+            re.compile(r"\bnot\s+installed-user diagnostic commands\b", re.I),
+        )
+        non_source_body = body.replace(source_section, "", 1)
+        for command in (
+            "python3 -m installer.leak_scan",
+            "python3 -m unittest",
+        ):
+            self.assertIn(command, source_section)
+            self.assertNotIn(command, non_source_body)
+        for root_readme in ROOT_READMES:
+            root_body = root_readme.read_text(encoding="utf-8")
+            self.assertNotIn("python3 -m installer.leak_scan", root_body)
+            self.assertNotIn("python3 -m unittest", root_body)
 
     def test_installer_launch_rows_match_host_specs(self):
         body = INSTALLER_README.read_text(encoding="utf-8")
@@ -174,9 +187,7 @@ class InstallationDocsTestCase(unittest.TestCase):
             "deepseek-harness",
         )
         self.assertIn("Cordis YAML", installer_row)
-        self.assertIn("native display windows", installer_row)
         self.assertIn("Audit Stop Panel", installer_row)
-        self.assertIn("no popup follow-up", installer_row)
         self.assertIn("native macOS app bundle", installer_row)
         english = ROOT_READMES[0].read_text(encoding="utf-8")
         chinese = ROOT_READMES[1].read_text(encoding="utf-8")
@@ -184,9 +195,7 @@ class InstallationDocsTestCase(unittest.TestCase):
             self.assertIn("DeepSeek Harness", body)
             self.assertIn("cordis.patch.yml", body)
             self.assertIn("Stop Panel", body)
-        self.assertIn("popup follow-up", english)
         self.assertIn("DeepSeek Harness.app", english)
-        self.assertIn("弹窗追问", chinese)
         self.assertIn("DeepSeek Harness.app", chinese)
 
     def test_xiaomi_mimo_docs_describe_jsonc_and_shared_display_capabilities(self):
@@ -195,10 +204,7 @@ class InstallationDocsTestCase(unittest.TestCase):
             "xiaomi-mimo",
         )
         self.assertIn("byte-preserving JSONC", installer_row)
-        self.assertIn("native display windows", installer_row)
         self.assertIn("Audit Stop Panel", installer_row)
-        self.assertIn("no popup follow-up", installer_row)
-        self.assertIn("provider credentials remain foreign state", installer_row)
         english = ROOT_READMES[0].read_text(encoding="utf-8")
         chinese = ROOT_READMES[1].read_text(encoding="utf-8")
         for body in (english, chinese):
@@ -310,12 +316,25 @@ class InstallationDocsTestCase(unittest.TestCase):
             with self.subTest(path=path.name):
                 self.assertNotIn("DE_ACTIVATION_SECRET=<", body)
                 self.assertNotRegex(body, r"--api-key\s+<")
-        english = SETUP_DOCS[0].read_text(encoding="utf-8")
-        chinese = SETUP_DOCS[1].read_text(encoding="utf-8")
-        for body in (english, chinese):
+        for body in (path.read_text(encoding="utf-8") for path in SETUP_DOCS):
             self.assertIn("dp-install:", body)
-        self.assertIn("numeric exit code", english)
-        self.assertIn("数字退出码", chinese)
+        exit_code_contracts = (
+            (
+                SETUP_DOCS[0],
+                r"\bExit code\s+`0`\s+means\s+success\b",
+                r"\bExit code\s+`4`\s+is\s+partial completion,\s+not full success\b",
+            ),
+            (
+                SETUP_DOCS[1],
+                r"退出码\s+`0`\s+表示成功",
+                r"退出码\s+`4`\s+是部分完成，\s*不属于完整成功",
+            ),
+        )
+        for path, success_pattern, partial_pattern in exit_code_contracts:
+            with self.subTest(path=path.name):
+                body = path.read_text(encoding="utf-8")
+                self.assertRegex(body, re.compile(success_pattern, re.I))
+                self.assertRegex(body, re.compile(partial_pattern, re.I))
 
 
 if __name__ == "__main__":

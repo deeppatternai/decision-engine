@@ -867,8 +867,24 @@ final class DecisionEngineStopper: NSObject, NSApplicationDelegate {
                 updated["status"] = status
                 updated["title"] = payload["title"] as? String ?? updated["title"] ?? ""
                 updated["profile"] = payload["profile"] as? String ?? updated["profile"] ?? ""
-                updated["auditors"] = payload["auditors"] as? [[String: Any]] ?? updated["auditors"] ?? []
-                updated["debug_authorized"] = payload["debug_authorized"] as? Bool ?? false
+                let incomingDebugAuthorized = payload["debug_authorized"] as? Bool
+                let effectiveDebugAuthorized = incomingDebugAuthorized
+                    ?? ((updated["debug_authorized"] as? Bool) == true)
+                if let incomingAuditors = payload["auditors"] as? [[String: Any]] {
+                    let existingAuditors = (updated["auditors"] as? [[String: Any]]) ?? []
+                    updated["auditors"] = self.mergeTerminalAuditors(
+                        existingAuditors, incomingAuditors,
+                        debugAuthorized: effectiveDebugAuthorized
+                    )
+                } else if incomingDebugAuthorized == false,
+                          let existingAuditors = updated["auditors"] as? [[String: Any]] {
+                    updated["auditors"] = self.mergeTerminalAuditors(
+                        existingAuditors, existingAuditors, debugAuthorized: false
+                    )
+                }
+                if let incomingDebugAuthorized {
+                    updated["debug_authorized"] = incomingDebugAuthorized
+                }
                 updated.removeValue(forKey: "connection_outage_started_at")
                 self.outageStartedAtUptime.removeValue(forKey: runID)
                 // Carry the server's run timestamps forward — the live elapsed clock reads `started_at`,
@@ -1773,6 +1789,61 @@ final class DecisionEngineStopper: NSObject, NSApplicationDelegate {
         if let number = value as? Double { return number }
         if let number = value as? Int { return Double(number) }
         return 0
+    }
+
+    private func validAuditorNumber(_ value: Any?) -> Bool {
+        if value is Bool { return false }
+        if let number = value as? Int { return number >= 0 }
+        if let number = value as? Double {
+            return number.isFinite && number >= 0 && number <= Double(Int64.max)
+        }
+        return false
+    }
+
+    private func boundedAuditorString(_ value: Any?) -> String? {
+        guard let text = value as? String, !text.isEmpty else { return nil }
+        return String(text.prefix(256))
+    }
+
+    private func mergeTerminalAuditors(
+        _ existing: [[String: Any]], _ incoming: [[String: Any]], debugAuthorized: Bool
+    ) -> [[String: Any]] {
+        let validStatuses = hubTerminalStatuses.union(["pending", "queued", "running"])
+        let canReuseExisting = incoming.count == existing.count && incoming.count <= 64
+            && incoming.allSatisfy {
+                guard let rawStatus = $0["status"] as? String else { return false }
+                return validStatuses.contains(rawStatus.lowercased())
+            }
+        var output: [[String: Any]] = []
+        for (index, item) in incoming.prefix(64).enumerated() {
+            guard let rawStatus = item["status"] as? String else { continue }
+            let status = rawStatus.lowercased()
+            guard validStatuses.contains(status) else { continue }
+            let prior: [String: Any] = canReuseExisting && index < existing.count
+                ? existing[index] : [:]
+            var entry: [String: Any] = ["status": status]
+            for source in [prior, item] {
+                if let voice = boundedAuditorString(source["voice"]) {
+                    entry["voice"] = voice
+                }
+            }
+            if debugAuthorized {
+                for source in [prior, item] {
+                    for field in ["model_id", "model_alias", "model", "provider"] {
+                        if let value = boundedAuditorString(source[field]) {
+                            entry[field] = value
+                        }
+                    }
+                    for field in ["duration_ms", "started_at", "completed_at"] {
+                        if validAuditorNumber(source[field]) {
+                            entry[field] = source[field]!
+                        }
+                    }
+                }
+            }
+            output.append(entry)
+        }
+        return output
     }
 
     private func validOutageStart(_ value: Any?, now: TimeInterval) -> TimeInterval {

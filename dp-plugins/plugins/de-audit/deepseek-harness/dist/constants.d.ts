@@ -1,0 +1,16 @@
+export declare const PLUGIN_NAME = "deep-pattern-audit";
+export declare const PLUGIN_VERSION = "0.2.13-remote.11";
+export declare const SERVER_NAME = "audit";
+export declare const CLIENT_ID = "deep-pattern-audit-harness";
+export declare const RESOURCE_URL = "https://endpoint.deeppattern.ai/plugin/mcp/v1/audit";
+export declare const CALLBACK_HOST = "127.0.0.1";
+export declare const CALLBACK_PATH = "/deeppattern/oauth/callback";
+export declare const AUTH_SCOPES = "audit:submit audit:read audit:events";
+export declare const CREDENTIAL_RECORD_ID = "oauth";
+export declare const TRANSPORT_AUTH_HEADER = "X-DeepPattern-MCP-Auth-Mode";
+export declare const TRANSPORT_AUTH_VALUE = "transport";
+export declare const CALLBACK_TIMEOUT_MS: number;
+export declare const STATUS_WAIT_MAX_MS: number;
+export declare const TOOL_CALL_TIMEOUT_MS: number;
+export declare const AUDIT_TOOL_NAMES: readonly ["audit_skill_submit", "audit_skill_status", "audit_skill_result", "audit_skill_events"];
+export type AuditToolName = (typeof AUDIT_TOOL_NAMES)[number];

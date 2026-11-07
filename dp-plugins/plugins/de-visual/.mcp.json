@@ -1,0 +1,9 @@
+{
+  "mcpServers": {
+    "visual": {
+      "type": "http",
+      "url": "https://endpoint.deeppattern.ai/plugin/mcp/v1/visual",
+      "headers": {"X-DeepPattern-MCP-Auth-Mode": "transport"}
+    }
+  }
+}

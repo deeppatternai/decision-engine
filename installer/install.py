@@ -814,6 +814,8 @@ def write_de_config(
     # a code property, never a user-editable config value), so a stale config can't leave the server's
     # version-gated GE byte-isolation dormant.
     config["client_version"] = CLIENT_VERSION
+    # Opt-in only: managed auto-update stays off unless the user explicitly enables it.
+    config.setdefault("auto_update", False)
     atomic_write_json(path, config)
     return path
 

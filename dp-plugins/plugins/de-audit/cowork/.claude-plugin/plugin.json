@@ -1,0 +1,8 @@
+{
+  "name": "audit",
+  "version": "0.2.13-remote",
+  "description": "Hosted Deep Pattern audits over an isolated remote MCP connection.",
+  "author": {
+    "name": "Deep Pattern"
+  }
+}

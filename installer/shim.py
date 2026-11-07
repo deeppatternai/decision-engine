@@ -30,7 +30,6 @@ import re
 import secrets
 import socket
 import ssl
-import subprocess
 import sys
 import threading
 import time
@@ -1908,66 +1907,6 @@ _GE_AUTO_OPEN_SLOTS = threading.BoundedSemaphore(_MAX_DISPLAY_WORKERS)
 _GE_AUTO_OPEN_LOCK = threading.Lock()
 _GE_AUTO_OPEN_CANCEL: Dict[str, threading.Event] = {}
 _GE_POPUP_IN_FLIGHT = set()
-
-
-def _git_env() -> Dict[str, str]:
-    """A sanitized environment for the self-update git calls. Strips inherited ``GIT_*`` vars —
-    a ``GIT_DIR`` / ``GIT_WORK_TREE`` from the launching shell would override ``-C`` and make git
-    operate on the WRONG repo (audit 53a171e5 gemini CRITICAL). Forces NON-INTERACTIVE: no terminal
-    / SSH host-key / credential prompt may hang the launch — a promptable git would sit until the
-    timeout on every start (grok f3 / gemini)."""
-    env = {k: v for k, v in os.environ.items() if not k.startswith("GIT_")}
-    env["GIT_TERMINAL_PROMPT"] = "0"
-    env["GIT_SSH_COMMAND"] = "ssh -oBatchMode=yes -oStrictHostKeyChecking=accept-new"
-    env["GIT_ASKPASS"] = ""
-    return env
-
-
-def _self_update_once(root: Path) -> None:
-    """Fast-forward the client checkout in place. `--ff-only` NEVER creates a merge or rewrites
-    history. We ALSO skip a dirty checkout (a `git status --porcelain` pre-check) so a customer's
-    hand-edit is never touched and behaviour is a true no-op unless the tree is clean — `--ff-only`
-    alone can still fast-forward non-conflicting files of a dirty tree (audit 53a171e5 gpt/grok).
-
-    The pulled code applies on the NEXT launch — the running shim keeps its already-imported modules,
-    and the popup runs as a fresh subprocess that reads from disk anyway. Fully best-effort: every
-    failure (offline, git absent, diverged, dirty) is swallowed + logged to stderr, never fatal.
-    `start_new_session=True` puts git in its own group so a launch-time kill can't strand it."""
-    env = _git_env()
-    kw = dict(stdin=subprocess.DEVNULL, stderr=subprocess.DEVNULL, timeout=30,
-              env=env, start_new_session=True)
-    try:
-        status = subprocess.run(["git", "-C", str(root), "status", "--porcelain"],
-                                stdout=subprocess.PIPE, **kw)
-        if status.returncode != 0 or (status.stdout or b"").strip():
-            _log("self-update: skipped (worktree not clean or not a git repo)")
-            return
-        result = subprocess.run(["git", "-C", str(root), "pull", "--ff-only", "--quiet"],
-                                stdout=subprocess.DEVNULL, **kw)
-        _log("self-update: git pull --ff-only rc=%d" % result.returncode)
-    except Exception as exc:  # aqg: top-level boundary — auto-update is best-effort, never fatal
-        _log("self-update: skipped (%s)" % type(exc).__name__)
-
-
-def _autoupdate_disabled() -> bool:
-    # opt-out only on an affirmative value — `DE_NO_AUTOUPDATE=0` must NOT disable updates
-    # (any non-empty string is truthy in Python; audit 53a171e5 gemini).
-    return os.getenv("DE_NO_AUTOUPDATE", "").strip().lower() in ("1", "true", "yes", "on")
-
-
-def _maybe_self_update(root: Optional[Path] = None) -> None:
-    """Kick off a background, non-blocking self-update so the customer gets fixes just by reopening
-    the app — no commands, ever. Skips when this isn't a git checkout, or when DE_NO_AUTOUPDATE is
-    set (air-gapped / pinned installs). Runs in a daemon thread so it can't delay the MCP handshake."""
-    if _autoupdate_disabled():
-        return
-    root = root or Path(__file__).resolve().parent.parent   # the shell root = the client checkout
-    if not (root / ".git").exists():   # `.exists()` not `.is_dir()` — a worktree/submodule .git is a FILE
-        return
-    try:
-        threading.Thread(target=_self_update_once, args=(root,), daemon=True, name="de-self-update").start()
-    except Exception:  # aqg: top-level boundary — a thread-start failure must never break transport
-        pass
 
 
 def _log(message: str) -> None:

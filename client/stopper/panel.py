@@ -452,6 +452,22 @@ def merge_poll_view(
         view = {**view, "status": "cancelling"}
     merged = dict(existing)
     merged.update({k: v for k, v in view.items() if v is not None})
+    incoming_auditors = view.get("auditors")
+    debug_authorized = view.get("debug_authorized")
+    effective_debug = (
+        debug_authorized if isinstance(debug_authorized, bool)
+        else merged.get("debug_authorized") is True
+    )
+    if isinstance(incoming_auditors, list):
+        merged["auditors"] = runner._merge_terminal_auditors(
+            existing.get("auditors"), incoming_auditors,
+            debug_authorized=effective_debug,
+        )
+    elif debug_authorized is False and isinstance(existing.get("auditors"), list):
+        merged["auditors"] = runner._merge_terminal_auditors(
+            existing["auditors"], existing["auditors"],
+            debug_authorized=False,
+        )
     merged["run_id"] = run_id
     merged["last_ok_at"] = now      # local clock: retained for diagnostics and compatibility
     if str(merged.get("status") or "") in TERMINAL_STATUSES:

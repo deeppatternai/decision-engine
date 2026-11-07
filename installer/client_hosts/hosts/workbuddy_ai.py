@@ -196,6 +196,7 @@ WORKBUDDY_AI = AgentHostSpec(
     host_owned_entry_fields=frozenset({"disabled"}),
     unverified_lite_stopper=False,
     post_mcp_write=_workbuddy_ai_post_mcp_write,
+    supported_platforms=frozenset({"darwin"}),
 )
 
 HOST_SPECS = (WORKBUDDY_AI,)

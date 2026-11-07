@@ -1,8 +1,9 @@
-"""TRAE international desktop host declaration for macOS."""
+"""TRAE international desktop host declaration for Windows and macOS."""
 
 from __future__ import annotations
 
 import os
+import shutil
 import sys
 from pathlib import Path
 
@@ -15,11 +16,34 @@ from installer.client_hosts.product_metadata import (
 from installer.config import ShellError
 
 
-_MINIMUM_VERSION = (3, 5, 81)
-_TESTED_VERSION = (3, 5, 81)
+_MACOS_MINIMUM_VERSION = (3, 5, 81)
+_MACOS_TESTED_VERSION = (3, 5, 81)
+_WINDOWS_MINIMUM_VERSION = (3, 5, 81)
+_WINDOWS_TESTED_VERSION = (3, 5, 81)
+_SUPPORTED_PLATFORMS = {"darwin", "win32"}
+_WINDOWS_PRODUCT_METADATA = Path("resources") / "app" / "product.json"
+
+
+def _minimum_version() -> tuple[int, int, int]:
+    return (
+        _WINDOWS_MINIMUM_VERSION
+        if sys.platform == "win32"
+        else _MACOS_MINIMUM_VERSION
+    )
+
+
+def _tested_version() -> tuple[int, int, int]:
+    return (
+        _WINDOWS_TESTED_VERSION
+        if sys.platform == "win32"
+        else _MACOS_TESTED_VERSION
+    )
 
 
 def _config_path() -> Path:
+    if sys.platform == "win32":
+        base = os.getenv("APPDATA") or str(Path.home() / "AppData" / "Roaming")
+        return Path(base) / "Trae" / "User" / "mcp.json"
     return (
         Path.home()
         / "Library"
@@ -30,10 +54,59 @@ def _config_path() -> Path:
     )
 
 
+def _windows_default_app_roots() -> tuple[Path, ...]:
+    roots: list[Path] = []
+    local = os.getenv("LOCALAPPDATA") or str(Path.home() / "AppData" / "Local")
+    roots.append(Path(local) / "Programs" / "Trae")
+    for env_name in ("ProgramFiles", "ProgramFiles(x86)"):
+        configured = os.getenv(env_name)
+        if configured and configured.strip():
+            roots.append(Path(configured) / "Trae")
+    return tuple(roots)
+
+
+def _windows_product_metadata(root: Path) -> ProductMetadataProbe:
+    return bounded_product_metadata(
+        root / _WINDOWS_PRODUCT_METADATA,
+        expected_application_name="trae",
+    )
+
+
+def _windows_app_root_is_supported(root: Path) -> bool:
+    probe = _windows_product_metadata(root)
+    return (
+        probe.status == "matched"
+        and probe.version is not None
+        and probe.version >= _WINDOWS_MINIMUM_VERSION
+    )
+
+
+def _windows_cli_app_root() -> Path | None:
+    candidate = shutil.which("trae")
+    if not candidate:
+        return None
+    path = Path(candidate).expanduser()
+    for depth, parent in enumerate(path.parents):
+        if depth > 3:
+            break
+        if _windows_app_root_is_supported(parent):
+            return parent
+    return None
+
+
 def _app_root() -> Path:
     configured = os.getenv("TRAE_APP_ROOT")
     if configured and configured.strip():
         return Path(configured).expanduser()
+    if sys.platform == "win32":
+        cli_root = _windows_cli_app_root()
+        if cli_root is not None:
+            return cli_root
+        default_roots = _windows_default_app_roots()
+        for candidate in default_roots:
+            if _windows_app_root_is_supported(candidate):
+                return candidate
+        return default_roots[0]
     return Path("/Applications/Trae.app")
 
 
@@ -46,6 +119,8 @@ def _skills_path() -> Path:
 
 def _product_metadata() -> ProductMetadataProbe:
     root = _app_root()
+    if sys.platform == "win32":
+        return _windows_product_metadata(root)
     product = bounded_product_metadata(
         root / "Contents" / "Resources" / "app" / "product.json",
         expected_application_name="trae",
@@ -70,18 +145,18 @@ def _version():
 
 
 def _installed() -> bool:
-    if sys.platform != "darwin":
+    if sys.platform not in _SUPPORTED_PLATFORMS:
         return False
     probe = _product_metadata()
     return (
         probe.status == "matched"
         and probe.version is not None
-        and probe.version >= _MINIMUM_VERSION
+        and probe.version >= _minimum_version()
     )
 
 
 def _skills_in_use() -> bool:
-    if sys.platform != "darwin":
+    if sys.platform not in _SUPPORTED_PLATFORMS:
         return False
     configured = os.getenv("TRAE_SKILLS_DIR")
     if configured and configured.strip() and not _skills_path().parent.exists():
@@ -99,10 +174,10 @@ def _skills_configured() -> bool:
 
 
 def _config_write_guard():
-    if sys.platform != "darwin":
+    if sys.platform not in _SUPPORTED_PLATFORMS:
         raise ShellError(
-            "unsupported_trae_platform: only the macOS Trae Desktop build is "
-            "supported; nothing was written"
+            "unsupported_trae_platform: only Windows and macOS Trae Desktop "
+            "builds are supported; nothing was written"
         )
     probe = _product_metadata()
     if probe.status == "unavailable":
@@ -120,12 +195,15 @@ def _config_write_guard():
             "trae_metadata_invalid: Trae Desktop product metadata is malformed; "
             "nothing was written"
         )
-    if probe.version < _MINIMUM_VERSION:
+    minimum = _minimum_version()
+    tested = _tested_version()
+    if probe.version < minimum:
+        version_label = ".".join(map(str, minimum))
         raise ShellError(
             "unsupported_trae_version: Trae Desktop is below the tested "
-            "3.5.81 support floor; nothing was written"
+            f"{version_label} support floor; nothing was written"
         )
-    if probe.version > _TESTED_VERSION:
+    if probe.version > tested:
         return "trae_version_newer_than_tested"
     return None
 
@@ -172,6 +250,7 @@ TRAE = AgentHostSpec(
     ),
     optional_features=frozenset({"local-display", "audit-stop-panel"}),
     onboarding_evidence=("skill",),
+    supported_platforms=frozenset(_SUPPORTED_PLATFORMS),
 )
 
 HOST_SPECS = (TRAE,)

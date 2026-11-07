@@ -334,6 +334,7 @@ WORKBUDDY = AgentHostSpec(
     doctor_capabilities=frozenset({"mcp-entry", "skills"}),
     optional_features=frozenset({"local-display", "audit-stop-panel"}),
     onboarding_evidence=("skill",),
+    supported_platforms=frozenset({"darwin", "win32"}),
 )
 
 HOST_SPECS = (WORKBUDDY,)

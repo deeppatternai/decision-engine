@@ -58,6 +58,12 @@ def _claude_code_skills_in_use() -> bool:
     return mcp_config.client_present("claude-code")
 
 
+def _claude_code_skills_configured() -> bool:
+    from installer import mcp_config
+
+    return mcp_config._client_skills_configured("claude-code")
+
+
 CLAUDE_CODE = AgentHostSpec(
     id="claude-code",
     transport="stdio",
@@ -87,7 +93,7 @@ CLAUDE_CODE = AgentHostSpec(
     skill_delivery_mode="managed-copy",
     routing_kind="skill",
     skills_in_use=_claude_code_skills_in_use,
-    skills_check_in_use=_claude_code_skills_in_use,
+    skills_check_in_use=_claude_code_skills_configured,
     skill_route_name="claude",
     repair_skills_on_setup=True,
     client_name_patterns=(
@@ -176,6 +182,7 @@ CLAUDE_DESKTOP_3P = AgentHostSpec(
     # ordinary Claude Desktop marker. Recognize it so an upgrade repairs the
     # entry in place instead of failing closed against our own past write.
     legacy_registration_host_families=frozenset({"claude"}),
+    supported_platforms=frozenset({"darwin"}),
 )
 
 HOST_SPECS = (CLAUDE_CODE, CLAUDE_DESKTOP, CLAUDE_DESKTOP_3P)

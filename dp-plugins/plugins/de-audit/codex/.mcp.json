@@ -1,0 +1,24 @@
+{
+  "mcpServers": {
+    "audit": {
+      "type": "http",
+      "url": "https://endpoint.deeppattern.ai/plugin/mcp/v1/audit",
+      "extensions": {
+        "com.openai": {
+          "auth": {
+            "type": "oauth",
+            "client": {
+              "mode": "cimd"
+            },
+            "resource": "https://endpoint.deeppattern.ai/plugin/mcp/v1/audit",
+            "baseScopes": [
+              "audit:submit",
+              "audit:read",
+              "audit:events"
+            ]
+          }
+        }
+      }
+    }
+  }
+}

@@ -162,6 +162,23 @@ extension DecisionEngineStopper {
         run["auditors"] = [failed, completed]
         precondition(debugAuditorRows(run) == ["model-a · failed · 1m0s ×",
             "model-b · completed · 12s ✓"])
+        let cached: [[String: Any]] = [
+            ["status": "running", "model_id": "model-a", "started_at": 940.0],
+            ["status": "completed", "model_id": "model-b", "duration_ms": 12000],
+        ]
+        let statusOnly: [[String: Any]] = [
+            ["status": "completed"], ["status": "completed"],
+        ]
+        let preserved = mergeTerminalAuditors(cached, statusOnly, debugAuthorized: true)
+        precondition((preserved[0]["model_id"] as? String) == "model-a")
+        precondition((preserved[1]["duration_ms"] as? Int) == 12000)
+        let mismatched = mergeTerminalAuditors(cached, [["status": "completed"]], debugAuthorized: true)
+        precondition(mismatched.count == 1)
+        precondition(mismatched[0]["model_id"] == nil)
+        let revoked = mergeTerminalAuditors(cached, cached, debugAuthorized: false)
+        precondition(revoked.allSatisfy { $0["model_id"] == nil && $0["duration_ms"] == nil })
+        let oversized = Array(repeating: ["status": "running"] as [String: Any], count: 65)
+        precondition(mergeTerminalAuditors([], oversized, debugAuthorized: true).count == 64)
         for status in ["completed", "failed"] {
             let runID = "legacy-\(status)"
             let cacheKey = "\(runID):0:legacy"

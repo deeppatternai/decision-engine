@@ -1,0 +1,6 @@
+{
+  "name": "visual",
+  "version": "0.1.0-remote.1",
+  "description": "Hosted Deep Pattern diagrams, infographics, and comics over an isolated remote MCP connection.",
+  "author": {"name": "Deep Pattern"}
+}

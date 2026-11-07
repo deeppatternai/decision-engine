@@ -19,6 +19,7 @@ SUPPORTED_DOCTOR_CAPABILITIES = frozenset(
 )
 
 _SUPPORTED_CONFIG_SCOPES = frozenset({"user-global"})
+SUPPORTED_HOST_PLATFORMS = frozenset({"darwin", "linux", "win32"})
 _SUPPORTED_DETECTION_POLICIES = frozenset(
     {"file-or-parent", "file-or-sibling-dir", "installation-probe"}
 )
@@ -127,6 +128,7 @@ class AgentHostSpec:
     host_normalized_entry_fields: FrozenSet[str] = frozenset()
     legacy_registration_host_families: FrozenSet[str] = frozenset()
     ge_progress_keepalive_s: Optional[float] = None
+    supported_platforms: FrozenSet[str] = SUPPORTED_HOST_PLATFORMS
 
 
 # Compatibility for callers/tests that imported the pre-WP1 type name.
@@ -143,6 +145,11 @@ def validate_host_specs(specs: Mapping[str, AgentHostSpec]) -> None:
     for client, spec in specs.items():
         if spec.id != client:
             _invalid_host_spec(client, "registry id does not match its key")
+        if (
+            not spec.supported_platforms
+            or not spec.supported_platforms.issubset(SUPPORTED_HOST_PLATFORMS)
+        ):
+            _invalid_host_spec(client, "supported platforms are invalid")
         if spec.ge_progress_keepalive_s is not None and (
             isinstance(spec.ge_progress_keepalive_s, bool)
             or not isinstance(spec.ge_progress_keepalive_s, (int, float))

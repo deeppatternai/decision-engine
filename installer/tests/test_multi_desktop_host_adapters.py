@@ -543,6 +543,52 @@ class TraeDesktopHostTestCase(unittest.TestCase):
             self.assertTrue(skills_in_use)
             self.assertTrue((home / ".trae-cn" / "hooks.json").is_file())
 
+    def test_trae_windows_writes_appdata_mcp_config(self):
+        from installer.client_hosts.hosts import trae
+
+        with tempfile.TemporaryDirectory() as tmp:
+            root = Path(tmp)
+            home = root / "home"
+            appdata = root / "roaming"
+            localappdata = root / "local"
+            managed = root / "managed"
+            app_root = localappdata / "Programs" / "Trae"
+            self._write_windows_product(
+                app_root, application_name="trae", version="3.5.81"
+            )
+            with mock.patch.object(Path, "home", return_value=home), mock.patch.object(
+                trae.sys, "platform", "win32"
+            ), mock.patch.dict(
+                os.environ,
+                {
+                    "APPDATA": str(appdata),
+                    "LOCALAPPDATA": str(localappdata),
+                    "TRAE_CONFIG": "",
+                    "TRAE_APP_ROOT": str(app_root),
+                },
+                clear=False,
+            ):
+                self.assertTrue(mcp_config.client_present("trae"))
+                with mock.patch.object(
+                    mcp_config,
+                    "CLIENT_SPECS",
+                    {"trae": mcp_config.CLIENT_SPECS["trae"]},
+                ):
+                    self.assertEqual(mcp_config.detect_clients(), ["trae"])
+                result = mcp_config.write_entry("trae", dev_root=managed)
+                skills_path = mcp_config.CLIENT_SPECS["trae"].skills_global_path()
+                skills_in_use = trae._skills_in_use()
+
+            mcp_path = appdata / "Trae" / "User" / "mcp.json"
+            data = json.loads(mcp_path.read_text(encoding="utf-8"))
+            self.assertEqual(result["path"], str(mcp_path))
+            entry = data["mcpServers"]["decision-engine"]
+            self.assertEqual(entry["cwd"], str(managed))
+            self.assertEqual(entry["env"][mcp_config.CLIENT_HOST_ENV], "trae")
+            self.assertNotIn("type", entry)
+            self.assertEqual(skills_path, home / ".trae" / "skills")
+            self.assertTrue(skills_in_use)
+
     def test_trae_cn_windows_writes_cn_hook_without_touching_international_hook(
         self,
     ):
@@ -601,6 +647,45 @@ class TraeDesktopHostTestCase(unittest.TestCase):
             ), mock.patch("shutil.which", return_value=str(cli)):
                 self.assertEqual(trae_cn._app_root(), app_root)
                 self.assertTrue(trae_cn._installed())
+
+    def test_trae_windows_app_root_discovers_cli_install_location(self):
+        from installer.client_hosts.hosts import trae
+
+        with tempfile.TemporaryDirectory() as tmp:
+            root = Path(tmp)
+            app_root = root / "portable" / "Trae"
+            cli = app_root / "bin" / "trae.cmd"
+            cli.parent.mkdir(parents=True)
+            cli.write_text("@echo off\n", encoding="utf-8")
+            self._write_windows_product(
+                app_root, application_name="trae", version="3.5.81"
+            )
+            with mock.patch.object(trae.sys, "platform", "win32"), mock.patch.dict(
+                os.environ,
+                {"TRAE_APP_ROOT": "", "LOCALAPPDATA": str(root / "local")},
+            ), mock.patch("shutil.which", return_value=str(cli)):
+                self.assertEqual(trae._app_root(), app_root)
+                self.assertTrue(trae._installed())
+
+    def test_trae_windows_cli_shim_falls_back_to_localappdata_app_root(self):
+        from installer.client_hosts.hosts import trae
+
+        with tempfile.TemporaryDirectory() as tmp:
+            root = Path(tmp)
+            localappdata = root / "local"
+            default_root = localappdata / "Programs" / "Trae"
+            shim = root / "bin" / "trae.cmd"
+            shim.parent.mkdir(parents=True)
+            shim.write_text("@echo off\n", encoding="utf-8")
+            self._write_windows_product(
+                default_root, application_name="trae", version="3.5.81"
+            )
+            with mock.patch.object(trae.sys, "platform", "win32"), mock.patch.dict(
+                os.environ,
+                {"TRAE_APP_ROOT": "", "LOCALAPPDATA": str(localappdata)},
+            ), mock.patch("shutil.which", return_value=str(shim)):
+                self.assertEqual(trae._app_root(), default_root)
+                self.assertTrue(trae._installed())
 
     def test_trae_cn_windows_skips_invalid_cli_root_for_valid_default(self):
         from installer.client_hosts.hosts import trae_cn
@@ -661,6 +746,29 @@ class TraeDesktopHostTestCase(unittest.TestCase):
                 self.assertEqual(trae_cn._app_root(), app_root)
                 self.assertTrue(trae_cn._installed())
 
+    def test_trae_windows_app_root_discovers_program_files_default(self):
+        from installer.client_hosts.hosts import trae
+
+        with tempfile.TemporaryDirectory() as tmp:
+            root = Path(tmp)
+            program_files = root / "Program Files"
+            app_root = program_files / "Trae"
+            self._write_windows_product(
+                app_root, application_name="trae", version="3.5.81"
+            )
+            with mock.patch.object(trae.sys, "platform", "win32"), mock.patch.dict(
+                os.environ,
+                {
+                    "TRAE_APP_ROOT": "",
+                    "LOCALAPPDATA": str(root / "local"),
+                    "ProgramFiles": str(program_files),
+                    "ProgramFiles(x86)": str(root / "Program Files (x86)"),
+                },
+                clear=False,
+            ), mock.patch("shutil.which", return_value=None):
+                self.assertEqual(trae._app_root(), app_root)
+                self.assertTrue(trae._installed())
+
     def test_trae_cn_windows_skips_invalid_default_for_valid_program_files(
         self,
     ):
@@ -687,6 +795,34 @@ class TraeDesktopHostTestCase(unittest.TestCase):
                 self.assertEqual(trae_cn._app_root(), valid_program_files)
                 self.assertIsNone(trae_cn._config_write_guard())
 
+    def test_trae_windows_skips_invalid_default_for_valid_program_files(self):
+        from installer.client_hosts.hosts import trae
+
+        with tempfile.TemporaryDirectory() as tmp:
+            root = Path(tmp)
+            localappdata = root / "local"
+            program_files = root / "Program Files"
+            stale_local = localappdata / "Programs" / "Trae"
+            valid_program_files = program_files / "Trae"
+            self._write_windows_product(
+                stale_local, application_name="trae-cn", version="3.5.81"
+            )
+            self._write_windows_product(
+                valid_program_files, application_name="trae", version="3.5.81"
+            )
+            with mock.patch.object(trae.sys, "platform", "win32"), mock.patch.dict(
+                os.environ,
+                {
+                    "TRAE_APP_ROOT": "",
+                    "LOCALAPPDATA": str(localappdata),
+                    "ProgramFiles": str(program_files),
+                    "ProgramFiles(x86)": str(root / "Program Files (x86)"),
+                },
+                clear=False,
+            ), mock.patch("shutil.which", return_value=None):
+                self.assertEqual(trae._app_root(), valid_program_files)
+                self.assertIsNone(trae._config_write_guard())
+
     def test_trae_cn_windows_guard_rejects_international_product_metadata(self):
         from installer.client_hosts.hosts import trae_cn
 
@@ -698,6 +834,44 @@ class TraeDesktopHostTestCase(unittest.TestCase):
             ):
                 with self.assertRaisesRegex(ShellError, "trae_cn_identity_mismatch"):
                     trae_cn._config_write_guard()
+
+    def test_trae_windows_guard_rejects_cn_product_metadata(self):
+        from installer.client_hosts.hosts import trae
+
+        with tempfile.TemporaryDirectory() as tmp:
+            app_root = Path(tmp) / "Trae"
+            self._write_windows_product(
+                app_root, application_name="trae-cn", version="3.5.81"
+            )
+            with mock.patch.object(trae.sys, "platform", "win32"), mock.patch.dict(
+                os.environ, {"TRAE_APP_ROOT": str(app_root)}, clear=False
+            ):
+                with self.assertRaisesRegex(ShellError, "trae_identity_mismatch"):
+                    trae._config_write_guard()
+
+    def test_trae_windows_version_bounds_are_independent_from_macos(self):
+        from installer.client_hosts.hosts import trae
+
+        self.assertEqual(trae._MACOS_TESTED_VERSION, (3, 5, 81))
+        self.assertEqual(trae._WINDOWS_TESTED_VERSION, (3, 5, 81))
+        with tempfile.TemporaryDirectory() as tmp:
+            app_root = Path(tmp) / "Trae"
+            with mock.patch.object(trae.sys, "platform", "win32"), mock.patch.dict(
+                os.environ, {"TRAE_APP_ROOT": str(app_root)}, clear=False
+            ):
+                self._write_windows_product(
+                    app_root, application_name="trae", version="3.5.80"
+                )
+                with self.assertRaisesRegex(ShellError, "3\\.5\\.81 support floor"):
+                    trae._config_write_guard()
+
+                self._write_windows_product(
+                    app_root, application_name="trae", version="3.5.82"
+                )
+                self.assertEqual(
+                    trae._config_write_guard(),
+                    "trae_version_newer_than_tested",
+                )
 
     def test_trae_cn_windows_version_bounds_are_independent_from_macos(self):
         from installer.client_hosts.hosts import trae_cn
@@ -743,7 +917,7 @@ class TraeDesktopHostTestCase(unittest.TestCase):
                 config = root / client / "mcp.json"
                 config.parent.mkdir(parents=True)
                 config.write_text("{}", encoding="utf-8")
-                for platform in ("darwin", "linux"):
+                for platform in ("darwin", "linux", "win32"):
                     with self.subTest(client=client, platform=platform), mock.patch.object(
                         module.sys, "platform", platform
                     ), mock.patch.dict(

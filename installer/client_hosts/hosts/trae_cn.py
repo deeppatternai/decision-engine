@@ -285,6 +285,7 @@ TRAE_CN = AgentHostSpec(
     optional_features=frozenset({"local-display", "audit-stop-panel"}),
     onboarding_evidence=("skill",),
     post_mcp_write=_post_mcp_write,
+    supported_platforms=frozenset(_SUPPORTED_PLATFORMS),
 )
 
 HOST_SPECS = (TRAE_CN,)

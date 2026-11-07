@@ -1,0 +1,18 @@
+{
+  "mcpServers": {
+    "visual": {
+      "type": "http",
+      "url": "https://endpoint.deeppattern.ai/plugin/mcp/v1/visual",
+      "extensions": {
+        "com.openai": {
+          "auth": {
+            "type": "oauth",
+            "client": {"mode": "cimd"},
+            "resource": "https://endpoint.deeppattern.ai/plugin/mcp/v1/visual",
+            "baseScopes": ["visual:submit", "visual:read", "visual:cancel"]
+          }
+        }
+      }
+    }
+  }
+}

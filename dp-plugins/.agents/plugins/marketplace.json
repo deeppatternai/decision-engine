@@ -1,0 +1,33 @@
+{
+  "$schema": "https://agent-plugins.org/schemas/1.0.0/marketplace.schema.json",
+  "name": "deeppattern",
+  "interface": {
+    "displayName": "Deep Pattern"
+  },
+  "plugins": [
+    {
+      "name": "audit",
+      "source": {
+        "source": "local",
+        "path": "./plugins/de-audit/codex"
+      },
+      "policy": {
+        "installation": "AVAILABLE",
+        "authentication": "ON_INSTALL"
+      },
+      "category": "Productivity"
+    },
+    {
+      "name": "visual",
+      "source": {
+        "source": "local",
+        "path": "./plugins/de-visual/codex"
+      },
+      "policy": {
+        "installation": "AVAILABLE",
+        "authentication": "ON_INSTALL"
+      },
+      "category": "Productivity"
+    }
+  ]
+}

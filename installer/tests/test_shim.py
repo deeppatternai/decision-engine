@@ -36,88 +36,6 @@ from installer import config, mcp_config, shim
 from installer.client_host_runtime import CapabilityStage, PreflightResult, TransportCapabilityGate
 
 
-class SelfUpdateTestCase(unittest.TestCase):
-    def test_clean_checkout_runs_ff_only_pull_with_safe_kwargs(self):
-        root = Path("/some/clone")
-        with mock.patch.object(shim.subprocess, "run") as run:
-            run.return_value = mock.Mock(returncode=0, stdout=b"")   # clean status, then pull
-            shim._self_update_once(root)
-        # first call = status --porcelain, last = the ff-only pull
-        self.assertIn("status", run.call_args_list[0].args[0])
-        pull = run.call_args_list[-1]
-        self.assertEqual(pull.args[0][:3], ["git", "-C", str(root)])
-        self.assertIn("--ff-only", pull.args[0])
-        self.assertIn("pull", pull.args[0])
-        # load-bearing safety kwargs: timeout, silenced stdio, sanitized non-interactive env
-        self.assertEqual(pull.kwargs["timeout"], 30)
-        self.assertEqual(pull.kwargs["stdout"], shim.subprocess.DEVNULL)
-        self.assertEqual(pull.kwargs["stdin"], shim.subprocess.DEVNULL)
-        self.assertTrue(pull.kwargs["start_new_session"])
-        self.assertEqual(pull.kwargs["env"]["GIT_TERMINAL_PROMPT"], "0")
-        self.assertNotIn("GIT_DIR", pull.kwargs["env"])   # inherited GIT_* stripped
-
-    def test_dirty_checkout_is_not_pulled(self):
-        with mock.patch.object(shim.subprocess, "run") as run:
-            run.return_value = mock.Mock(returncode=0, stdout=b" M installer/shim.py\n")  # dirty
-            shim._self_update_once(Path("/x"))
-        self.assertEqual(len(run.call_args_list), 1)   # only status; NO pull on a dirty tree
-        self.assertIn("status", run.call_args_list[0].args[0])
-
-    def test_git_env_strips_inherited_git_vars(self):
-        with mock.patch.dict(os.environ, {"GIT_DIR": "/evil/.git", "GIT_WORK_TREE": "/evil"}):
-            env = shim._git_env()
-        self.assertNotIn("GIT_DIR", env)          # a hostile GIT_DIR can't redirect the pull
-        self.assertNotIn("GIT_WORK_TREE", env)
-        self.assertEqual(env["GIT_TERMINAL_PROMPT"], "0")
-
-    def test_self_update_swallows_all_errors(self):
-        with mock.patch.object(shim.subprocess, "run", side_effect=OSError("git missing")):
-            shim._self_update_once(Path("/x"))     # must not raise — best-effort
-
-    def test_opt_out_only_on_affirmative_value(self):
-        for val, disabled in (("1", True), ("true", True), ("YES", True), ("on", True),
-                              ("0", False), ("false", False), ("", False)):
-            with mock.patch.dict(os.environ, {"DE_NO_AUTOUPDATE": val}):
-                self.assertEqual(shim._autoupdate_disabled(), disabled, "DE_NO_AUTOUPDATE=%r" % val)
-
-    def test_maybe_self_update_opts_out(self):
-        with tempfile.TemporaryDirectory() as tmp:
-            (Path(tmp) / ".git").mkdir()
-            with mock.patch.dict(os.environ, {"DE_NO_AUTOUPDATE": "1"}):
-                with mock.patch.object(shim.threading, "Thread") as thread:
-                    shim._maybe_self_update(Path(tmp))
-            thread.assert_not_called()
-
-    def test_maybe_self_update_skips_a_non_git_dir(self):
-        with tempfile.TemporaryDirectory() as tmp:   # no .git
-            with mock.patch.dict(os.environ, {}, clear=False):
-                os.environ.pop("DE_NO_AUTOUPDATE", None)
-                with mock.patch.object(shim.threading, "Thread") as thread:
-                    shim._maybe_self_update(Path(tmp))
-            thread.assert_not_called()
-
-    def test_maybe_self_update_accepts_a_dotgit_file_worktree(self):
-        # a linked worktree / submodule stores .git as a FILE, not a dir — must still update
-        with tempfile.TemporaryDirectory() as tmp:
-            (Path(tmp) / ".git").write_text("gitdir: /somewhere/.git/worktrees/x\n")
-            with mock.patch.dict(os.environ, {}, clear=False):
-                os.environ.pop("DE_NO_AUTOUPDATE", None)
-                with mock.patch.object(shim.threading, "Thread") as thread:
-                    shim._maybe_self_update(Path(tmp))
-            thread.assert_called_once()
-
-    def test_maybe_self_update_spawns_a_daemon_thread_for_a_checkout(self):
-        with tempfile.TemporaryDirectory() as tmp:
-            (Path(tmp) / ".git").mkdir()
-            with mock.patch.dict(os.environ, {}, clear=False):
-                os.environ.pop("DE_NO_AUTOUPDATE", None)
-                with mock.patch.object(shim.threading, "Thread") as thread:
-                    shim._maybe_self_update(Path(tmp))
-            thread.assert_called_once()
-            self.assertTrue(thread.call_args.kwargs.get("daemon"))   # never blocks shutdown
-            thread.return_value.start.assert_called_once()
-
-
 class FakeForwarder:
     def __init__(self, responses=None, raise_on=None):
         self.sent = []
@@ -135,13 +53,9 @@ class FakeForwarder:
 def _run(forwarder, lines, *, background_stopper=False, **serve_kwargs):
     stdin = io.StringIO("".join(l + "\n" for l in lines))
     stdout = io.StringIO()
-    # Neutralize the launch self-update in transport tests — it would otherwise spawn a real
-    # `git pull` from this checkout. Its own behavior is covered by SelfUpdateTestCase.
     completion = shim._schedule_stopper_completion if background_stopper else shim._sync_stopper_completion
     with mock.patch.object(shim, "_schedule_stopper_completion", side_effect=completion), \
-            mock.patch.object(shim, "_maybe_self_update"), mock.patch.dict(
-        os.environ, {"DE_SKIP_STOPPER_LAUNCH": "1"}
-    ):
+            mock.patch.dict(os.environ, {"DE_SKIP_STOPPER_LAUNCH": "1"}):
         shim.serve(forwarder, stdin=stdin, stdout=stdout, **serve_kwargs)
     out = [json.loads(l) for l in stdout.getvalue().splitlines() if l.strip()]
     return out
@@ -1365,8 +1279,6 @@ class ShimServeTestCase(unittest.TestCase):
                 "token_hex",
                 side_effect=("qodercn", "qodercn2"),
             ), mock.patch.object(
-                shim, "_maybe_self_update"
-            ), mock.patch.object(
                 shim.threading, "Thread", _SyncThread
             ), mock.patch(
                 "client.runner.launch_stopper_if_available",
@@ -1579,11 +1491,11 @@ class ShimServeTestCase(unittest.TestCase):
             "cursor",
         )
 
-    def test_serve_never_starts_the_legacy_background_self_update(self):
+    def test_serve_never_starts_a_background_git_update(self):
         # Only installer.launcher may update, before this serve loop and under its lease.
-        with mock.patch.object(shim, "_maybe_self_update") as mu:
+        with mock.patch("subprocess.run") as run:
             shim.serve(FakeForwarder(), stdin=io.StringIO(""), stdout=io.StringIO())
-        mu.assert_not_called()
+        run.assert_not_called()
 
     def test_request_is_forwarded_verbatim_and_response_emitted(self):
         fwd = FakeForwarder(responses={"tools/call": {"jsonrpc": "2.0", "id": 7, "result": {"ok": True}}})

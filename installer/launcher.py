@@ -5,6 +5,10 @@ shim itself is imported only while its session lease is held.  When recovery or
 an update changes HEAD, a fresh child interpreter inherits MCP stdio and serves
 the selected checkout, avoiding a mixed old/new ``installer`` module graph
 without requiring an Agent restart.
+
+Managed auto-update is opt-in via ``config.json`` ``auto_update: true`` (default
+off). When enabled, network discovery runs in a background thread so MCP
+``initialize`` is not blocked on the full startup update budget.
 """
 
 from __future__ import annotations
@@ -16,6 +20,7 @@ import inspect
 import os
 import subprocess
 import sys
+import threading
 import time
 from pathlib import Path
 from types import ModuleType
@@ -39,6 +44,7 @@ from .release_acquisition import load_trusted_release_keys
 STARTUP_UPDATE_BUDGET_SECONDS = 60.0
 STARTUP_LEADER_GRACE_SECONDS = 5.0
 CLIENT_HOST_ENV = "DE_MCP_CLIENT_HOST"
+AUTO_UPDATE_CONFIG_KEY = "auto_update"
 _DISCARD_STAGED_STATUSES = frozenset({
     "rolled_back", "update_failed", "signature_failed", "incompatible_runtime",
     "quarantined",
@@ -223,12 +229,28 @@ def _finalize_journal(root: Path) -> Optional[update_transaction.UpdateResult]:
     return update_transaction.finalize_present_journal(root, lock_timeout_seconds=0.0)
 
 
+def _auto_update_requested(root: Path) -> bool:
+    """Return True only when config.json sets ``auto_update`` to boolean true.
+
+    Missing keys, non-booleans, and unreadable config fail closed to off so a
+    managed install never silently opts the user into network updates.
+    """
+
+    try:
+        payload = config.load_json(Path(root) / "config.json")
+    except (ShellError, OSError):
+        return False
+    return payload.get(AUTO_UPDATE_CONFIG_KEY, False) is True
+
+
 def _updates_enabled(root: Path) -> bool:
+    """Managed updates require a ready protocol marker AND an explicit opt-in."""
+
     try:
         update_transaction._require_protocol_ready(Path(root))
     except (ShellError, OSError, ValueError):
         return False
-    return True
+    return _auto_update_requested(root)
 
 
 def _managed_control_present(root: Path) -> bool:
@@ -259,15 +281,17 @@ def _configured_official_remote_names(root: Path) -> tuple:
     )
 
 
-def _attempt_update(
+def _discover_release(
     root: Path,
     trusted_keys: Mapping[str, object],
     *,
     deadline: float,
-) -> update_transaction.UpdateResult:
+):
+    """Resolve the authorized release, preferring anonymous mirrors."""
+
     state = updater._read_update_state(root)
     try:
-        acquired = release_acquisition.discover_release(
+        return release_acquisition.discover_release(
             state, trusted_keys, deadline=deadline
         )
     except release_acquisition.ReleaseTransportError:
@@ -282,10 +306,55 @@ def _attempt_update(
             "anonymous HTTPS mirrors unreachable — falling back to locally "
             "configured git credentials to check for an update"
         )
-        acquired = release_acquisition.discover_release_via_git(
+        return release_acquisition.discover_release_via_git(
             root, _configured_official_remote_names(root), state, trusted_keys,
             deadline=deadline,
         )
+
+
+def _discover_and_stage_only(
+    root: Path,
+    trusted_keys: Mapping[str, object],
+    *,
+    deadline: float,
+) -> update_transaction.UpdateResult:
+    """Network discover/fetch/stage only — never mutate HEAD / apply."""
+
+    state = updater._read_update_state(root)
+    acquired = _discover_release(root, trusted_keys, deadline=deadline)
+    if (
+        acquired.manifest.commit == state.last_release_commit
+        and release_contract.manifest_sha256(acquired.manifest)
+        == state.last_manifest_sha256
+    ):
+        return update_transaction.UpdateResult(
+            "up_to_date",
+            state.last_release_commit,
+            state.last_release_commit,
+            None,
+            None,
+        )
+    release_acquisition.fetch_release_objects(root, acquired, deadline=deadline)
+    update_staging.stage_release(root, acquired, state, trusted_keys)
+    return update_transaction.UpdateResult(
+        "candidate_ready",
+        state.last_release_commit,
+        acquired.manifest.commit,
+        None,
+        None,
+    )
+
+
+def _attempt_update(
+    root: Path,
+    trusted_keys: Mapping[str, object],
+    *,
+    deadline: float,
+) -> update_transaction.UpdateResult:
+    """Legacy sync path: discover/stage then apply (tests + recovery helpers)."""
+
+    state = updater._read_update_state(root)
+    acquired = _discover_release(root, trusted_keys, deadline=deadline)
     if not (
         acquired.manifest.commit == state.last_release_commit
         and release_contract.manifest_sha256(acquired.manifest)
@@ -326,6 +395,237 @@ def _update_outcome(status: str) -> str:
     if status == "skipped_locked":
         return "skipped"
     return "refused"
+
+
+def _apply_staged_release_if_present(
+    root: Path,
+    trusted_keys: Mapping[str, object],
+    *,
+    deadline: float,
+    client_host: Optional[str],
+) -> Optional[update_transaction.UpdateResult]:
+    """Apply a previously staged signed release without network discovery."""
+
+    state = updater._read_update_state(root)
+    if _head_commit(root) != state.last_release_commit:
+        raise ShellError("managed HEAD differs from the protected release state")
+    try:
+        staged = update_staging.load_release(root, state, trusted_keys)
+    except update_staging.UpdateStagingError as exc:
+        _log(str(exc))
+        _clear_staged_best_effort(root)
+        return None
+    if staged is None:
+        return None
+    update_started = time.monotonic()
+    startup_diagnostics.append_event(
+        root,
+        "update_started",
+        "update",
+        client_host=_resolved_client_host(client_host),
+        outcome="started",
+    )
+    attempt_id = update_staging.begin_attempt(root)
+    release_acquisition._remaining(deadline)
+    try:
+        result = update_transaction.apply_present_update(
+            root,
+            staged.manifest,
+            staged.signature,
+            trusted_keys,
+            source=staged.source.name,
+            lock_timeout_seconds=0.0,
+        )
+    except (ShellError, OSError, ValueError):
+        _clear_staged_best_effort(root)
+        raise
+    if result.status in _FINISHED_UPDATE_STATUSES | _DISCARD_STAGED_STATUSES:
+        _clear_staged_best_effort(root)
+    _finish_attempt_best_effort(root, attempt_id, result.status)
+    startup_diagnostics.append_event(
+        root,
+        "update_completed",
+        "update",
+        client_host=_resolved_client_host(client_host),
+        elapsed_ms=int((time.monotonic() - update_started) * 1000),
+        outcome=_update_outcome(result.status),
+        update_status=result.status,
+        blocker_count=len(result.blockers),
+    )
+    return result
+
+
+def _run_background_discover_and_stage(
+    root: Path,
+    *,
+    client_host: Optional[str],
+    startup_budget_seconds: float,
+    completion_before: Optional[object] = None,
+) -> Optional[update_transaction.UpdateResult]:
+    """Background path: discover/fetch/stage only. Never apply / mutate HEAD."""
+
+    update_started = time.monotonic()
+    startup_diagnostics.append_event(
+        root,
+        "update_started",
+        "update",
+        client_host=_resolved_client_host(client_host),
+        outcome="started",
+    )
+    deadline = time.monotonic() + max(0.0, float(startup_budget_seconds))
+    state = updater._read_update_state(root)
+    if _head_commit(root) != state.last_release_commit:
+        raise ShellError("managed HEAD differs from the protected release state")
+    # Skip redundant work if another checker already finished while we were
+    # scheduled (completion sampled before this worker started network I/O).
+    completion_now = update_staging.read_completion(root)
+    if (
+        completion_before is not None
+        and completion_now is not None
+        and completion_now != completion_before
+    ):
+        startup_diagnostics.append_event(
+            root,
+            "update_completed",
+            "update",
+            client_host=_resolved_client_host(client_host),
+            elapsed_ms=int((time.monotonic() - update_started) * 1000),
+            outcome="skipped",
+            update_status=None,
+            blocker_count=None,
+        )
+        return None
+    trusted_keys = load_trusted_release_keys(
+        root,
+        deadline=deadline,
+        expected_commit=state.last_release_commit,
+    )
+    result = None
+    if trusted_keys:
+        attempt_id = update_staging.begin_attempt(root)
+        result = _discover_and_stage_only(root, trusted_keys, deadline=deadline)
+        _finish_attempt_best_effort(root, attempt_id, result.status)
+    startup_diagnostics.append_event(
+        root,
+        "update_completed",
+        "update",
+        client_host=_resolved_client_host(client_host),
+        elapsed_ms=int((time.monotonic() - update_started) * 1000),
+        outcome=_update_outcome(result.status) if result else "skipped",
+        update_status=result.status if result else None,
+        blocker_count=len(result.blockers) if result else None,
+    )
+    return result
+
+
+def _schedule_background_update(
+    root: Path,
+    *,
+    client_host: Optional[str] = None,
+    startup_budget_seconds: float = STARTUP_UPDATE_BUDGET_SECONDS,
+    completion_before: Optional[object] = None,
+) -> threading.Thread:
+    """Discover/stage in the background without holding the pre-serve startup gate.
+
+    Returns the worker thread so the caller can join it before post-session apply.
+    """
+
+    managed_root = Path(root)
+    host = _resolved_client_host(client_host)
+    budget = float(startup_budget_seconds)
+    sampled_completion = (
+        completion_before
+        if completion_before is not None
+        else update_staging.read_completion(managed_root)
+    )
+
+    def worker() -> None:
+        try:
+            if not _updates_enabled(managed_root):
+                return
+            try:
+                _run_background_discover_and_stage(
+                    managed_root,
+                    client_host=host,
+                    startup_budget_seconds=budget,
+                    completion_before=sampled_completion,
+                )
+            except (ShellError, OSError, ValueError) as exc:
+                _log(str(exc))
+                startup_diagnostics.append_event(
+                    managed_root,
+                    "update_refused",
+                    "update",
+                    client_host=host,
+                    outcome="refused",
+                    reason_code=startup_diagnostics.classify_exception(exc),
+                    error_type=type(exc).__name__,
+                )
+        except Exception as exc:  # aqg: top-level boundary — never break the MCP session
+            _log("background auto-update failed: %s" % type(exc).__name__)
+
+    thread = threading.Thread(
+        target=worker, daemon=True, name="de-auto-update"
+    )
+    thread.start()
+    return thread
+
+
+def _join_background_update(
+    thread: Optional[threading.Thread],
+    *,
+    timeout_seconds: float,
+) -> None:
+    """Wait briefly for staging to finish before post-session apply.
+
+    If the worker is still running after the bound, skip apply this session —
+    a later launch can pick up a completed staged candidate.
+    """
+
+    if thread is None:
+        return
+    thread.join(timeout=max(0.0, float(timeout_seconds)))
+    if thread.is_alive():
+        _log("post-session staged apply deferred: background staging still running")
+
+
+def _apply_staged_after_session(
+    root: Path,
+    *,
+    client_host: Optional[str],
+    startup_budget_seconds: float = STARTUP_UPDATE_BUDGET_SECONDS,
+) -> None:
+    """Owner policy B: install a staged release only after MCP serve returns."""
+
+    if not _updates_enabled(root):
+        return
+    try:
+        deadline = time.monotonic() + max(0.0, float(startup_budget_seconds))
+        with update_coordination.startup_update_gate(
+            root, timeout_seconds=STARTUP_LEADER_GRACE_SECONDS
+        ):
+            state = updater._read_update_state(root)
+            if _head_commit(root) != state.last_release_commit:
+                return
+            trusted_keys = load_trusted_release_keys(
+                root,
+                deadline=deadline,
+                expected_commit=state.last_release_commit,
+            )
+            if not trusted_keys:
+                return
+            _apply_staged_release_if_present(
+                root,
+                trusted_keys,
+                deadline=deadline,
+                client_host=client_host,
+            )
+    except update_coordination.InstallTransactionBusy:
+        _log("post-session staged apply skipped: startup update gate busy")
+    except (ShellError, OSError, ValueError) as exc:
+        _log("post-session staged apply refused: %s" % exc)
+    except Exception as exc:  # aqg: top-level boundary — session already finished
+        _log("post-session staged apply failed: %s" % type(exc).__name__)
 
 
 def _load_candidate_shim(root: Path) -> ModuleType:
@@ -534,7 +834,12 @@ def launch(
     startup_budget_seconds: float = STARTUP_UPDATE_BUDGET_SECONDS,
     client_host: Optional[str] = None,
 ) -> int:
-    """Recover, update within one budget, then serve the selected known-good shim."""
+    """Recover locally, serve MCP immediately, then optionally install staged.
+
+    Owner policy B: never install before first-connect. Opt-in auto-update only
+    discovers/stages in a background thread (no HEAD apply), then applies a
+    staged release after ``serve`` returns so the next Agent start picks it up.
+    """
 
     managed_root = Path(root or config.managed_component_root("decision-engine"))
     managed_install._require_fixed_managed_root(managed_root)
@@ -553,9 +858,9 @@ def launch(
             stdout=stdout,
             client_host=client_host,
         )
-    initial_commit = _head_commit(managed_root)
-    completion_before = update_staging.read_completion(managed_root)
-    wait_budget = max(0.0, float(startup_budget_seconds)) + STARTUP_LEADER_GRACE_SECONDS
+    updates_on = _updates_enabled(managed_root)
+    # Pre-serve gate is local recovery only — never wait on the network budget.
+    wait_budget = STARTUP_LEADER_GRACE_SECONDS
     startup_diagnostics.append_event(
         managed_root,
         "startup_gate_entered",
@@ -563,10 +868,13 @@ def launch(
         client_host=_resolved_client_host(client_host),
         outcome="started",
     )
+    suppress_update = False
+    completion_before = None
+    background_update = None
     try:
         with update_coordination.startup_update_gate(
             managed_root, timeout_seconds=wait_budget
-        ) as startup_gate:
+        ):
             startup_diagnostics.append_event(
                 managed_root,
                 "startup_gate_acquired",
@@ -591,98 +899,9 @@ def launch(
                 "deferred_active_session",
                 "skipped_locked",
             }
-            # A waited lock proves only that another process held it.  That
-            # process may have died before finishing discovery or application.
-            if not suppress_update:
-                if _updates_enabled(managed_root):
-                    try:
-                        update_started = time.monotonic()
-                        startup_diagnostics.append_event(
-                            managed_root,
-                            "update_started",
-                            "update",
-                            client_host=_resolved_client_host(client_host),
-                            outcome="started",
-                        )
-                        deadline = time.monotonic() + max(
-                            0.0, float(startup_budget_seconds)
-                        )
-                        state = updater._read_update_state(managed_root)
-                        if _head_commit(managed_root) != state.last_release_commit:
-                            raise ShellError(
-                                "managed HEAD differs from the protected release state"
-                            )
-                        trusted_keys = load_trusted_release_keys(
-                            managed_root,
-                            deadline=deadline,
-                            expected_commit=state.last_release_commit,
-                        )
-                        result = None
-                        if trusted_keys:
-                            try:
-                                staged = update_staging.load_release(
-                                    managed_root, state, trusted_keys
-                                )
-                            except update_staging.UpdateStagingError as exc:
-                                _log(str(exc))
-                                _clear_staged_best_effort(managed_root)
-                                staged = None
-                            if staged is not None:
-                                attempt_id = update_staging.begin_attempt(managed_root)
-                                release_acquisition._remaining(deadline)
-                                try:
-                                    result = update_transaction.apply_present_update(
-                                        managed_root, staged.manifest, staged.signature,
-                                        trusted_keys, source=staged.source.name,
-                                        lock_timeout_seconds=0.0,
-                                    )
-                                except (ShellError, OSError, ValueError):
-                                    _clear_staged_best_effort(managed_root)
-                                    raise
-                                if result.status in _FINISHED_UPDATE_STATUSES | _DISCARD_STAGED_STATUSES:
-                                    _clear_staged_best_effort(managed_root)
-                                _finish_attempt_best_effort(
-                                    managed_root, attempt_id, result.status
-                                )
-                            elif (
-                                getattr(startup_gate, "waited", False)
-                                and (completion := update_staging.read_completion(managed_root))
-                                != completion_before
-                                and completion is not None
-                            ):
-                                pass
-                            else:
-                                attempt_id = update_staging.begin_attempt(managed_root)
-                                result = _attempt_update(
-                                    managed_root, trusted_keys, deadline=deadline
-                                )
-                                _finish_attempt_best_effort(
-                                    managed_root, attempt_id, result.status
-                                )
-                        startup_diagnostics.append_event(
-                            managed_root,
-                            "update_completed",
-                            "update",
-                            client_host=_resolved_client_host(client_host),
-                            elapsed_ms=int((time.monotonic() - update_started) * 1000),
-                            outcome=_update_outcome(result.status) if result else "skipped",
-                            update_status=result.status if result else None,
-                            blocker_count=len(result.blockers) if result else None,
-                        )
-                    except (ShellError, OSError, ValueError) as exc:
-                        # MCP stdout is protocol-only. The current known-good
-                        # release remains available after a bounded refusal.
-                        _log(str(exc))
-                        startup_diagnostics.append_event(
-                            managed_root,
-                            "update_refused",
-                            "update",
-                            client_host=_resolved_client_host(client_host),
-                            elapsed_ms=int((time.monotonic() - update_started) * 1000),
-                            outcome="refused",
-                            reason_code=startup_diagnostics.classify_exception(exc),
-                            error_type=type(exc).__name__,
-                        )
+            # Sample after recovery so the worker does not skip based on a
+            # pre-finalize completion receipt that finalize itself may rewrite.
+            completion_before = update_staging.read_completion(managed_root)
     except update_coordination.InstallTransactionBusy as exc:
         startup_diagnostics.append_event(
             managed_root,
@@ -694,25 +913,37 @@ def launch(
             error_type=type(exc).__name__,
         )
         raise ShellError("startup update coordination timed out") from exc
-    if _head_commit(managed_root) != initial_commit:
-        startup_diagnostics.append_event(
+    if not suppress_update and updates_on:
+        background_update = _schedule_background_update(
             managed_root,
-            "handoff_started",
-            "handoff",
-            client_host=_resolved_client_host(client_host),
-            outcome="started",
+            client_host=client_host,
+            startup_budget_seconds=startup_budget_seconds,
+            completion_before=completion_before,
         )
-        if client_host:
-            return _handoff_to_fresh_launcher(
-                managed_root, client_host=client_host
+    try:
+        return _serve_shim(
+            managed_root,
+            stdin=stdin,
+            stdout=stdout,
+            client_host=client_host,
+        )
+    finally:
+        # Session-end semantics (Owner B): apply after serve exits, including
+        # abnormal serve failure — but never when recovery suppressed updates.
+        if updates_on and not suppress_update:
+            _join_background_update(
+                background_update,
+                timeout_seconds=min(
+                    STARTUP_LEADER_GRACE_SECONDS,
+                    max(0.0, float(startup_budget_seconds)),
+                ),
             )
-        return _handoff_to_fresh_launcher(managed_root)
-    return _serve_shim(
-        managed_root,
-        stdin=stdin,
-        stdout=stdout,
-        client_host=client_host,
-    )
+            if background_update is None or not background_update.is_alive():
+                _apply_staged_after_session(
+                    managed_root,
+                    client_host=client_host,
+                    startup_budget_seconds=startup_budget_seconds,
+                )
 
 
 def _serve_dev_shim(

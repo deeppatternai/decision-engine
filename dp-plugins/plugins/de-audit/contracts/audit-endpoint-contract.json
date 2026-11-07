@@ -1,0 +1,139 @@
+{
+  "schema_version": "0.5.0",
+  "product": {
+    "plugin_id": "audit@deeppattern",
+    "internal_directory": "de-audit",
+    "display_name": "Deep Pattern Audit"
+  },
+  "endpoint": {
+    "resource": "https://endpoint.deeppattern.ai/plugin/mcp/v1/audit",
+    "path": "/plugin/mcp/v1/audit",
+    "transport": "streamable-http",
+    "protocol_versions": ["2025-06-18"]
+  },
+  "authorization": {
+    "mode": "oauth_2_1_pkce",
+    "issuer": "https://endpoint.deeppattern.ai/plugin/oauth",
+    "protected_resource_metadata": "/.well-known/oauth-protected-resource/plugin/mcp/v1/audit",
+    "authorization_server_metadata": "/.well-known/oauth-authorization-server/plugin/oauth",
+    "activation_page": "/plugin/oauth/activate",
+    "activation_owner": "a_remote_oauth",
+    "plugin_transport": "http",
+    "credential_owner": "host_oauth_store",
+    "plugin_contains_credential": false,
+    "plugin_contains_runtime": false,
+    "legacy_device_token_fallback": false,
+    "activation_trigger": "host_authentication_on_install_explicit_setup_or_first_tool_call",
+    "manifest_authentication": {
+      "hosts": ["codex"],
+      "type": "oauth",
+      "client_mode": "cimd",
+      "resource": "https://endpoint.deeppattern.ai/plugin/mcp/v1/audit",
+      "base_scopes": ["audit:submit", "audit:read", "audit:events"]
+    },
+    "installation_credential_policy": "host_managed_on_install_no_plugin_credential_introspection",
+    "unauthenticated_discovery_methods": [
+      "initialize",
+      "tools/list",
+      "resources/list",
+      "resources/read",
+      "ping",
+      "notifications/initialized"
+    ],
+    "tool_authentication_challenge": "mcp/www_authenticate",
+    "transport_authentication": {
+      "hosts": ["claude_code", "claude_cowork"],
+      "request_header": {
+        "name": "X-DeepPattern-MCP-Auth-Mode",
+        "value": "transport"
+      },
+      "challenge": "http_401_www_authenticate",
+      "authenticated_dispatch": "shared_oauth_principal_and_scope_checks"
+    },
+    "deepseek_harness_native_authentication": {
+      "client_id": "deep-pattern-audit-harness",
+      "client_type": "preconfigured_public_pkce",
+      "registered_redirect_uri": "http://127.0.0.1/deeppattern/oauth/callback",
+      "actual_redirect_port": "ephemeral_loopback",
+      "credential_owner": "harness_opaque_grant_store",
+      "credential_storage_claim": "private_user_store_not_os_keychain",
+      "request_header": {
+        "name": "X-DeepPattern-MCP-Auth-Mode",
+        "value": "transport"
+      },
+      "dcr_required": false
+    },
+    "oauth_continuation": "resume_original_tool_call_with_same_idempotency_key",
+    "scopes": ["audit:submit", "audit:read", "audit:events"]
+  },
+  "distribution": {
+    "controlled_installation": "supported_candidate",
+    "strategy": "single_runtime_free_package_with_host_specific_entries",
+    "claude_code_entry": ".",
+    "claude_cowork_entry": "cowork/",
+    "deepseek_harness_entry": "deepseek-harness/",
+    "deepseek_harness_artifact": "de-audit-harness-0.2.13-remote.11.tgz",
+    "claude_installation_and_oauth_domains_are_separate": true,
+    "runtime_required": false,
+    "python_required": false,
+    "git_required_after_install": false,
+    "platform_artifact_required": false
+  },
+  "presentation": {
+    "mode": "remote_https_webui",
+    "schema_version": "audit-progress.v1",
+    "platforms": ["macos", "linux", "windows"],
+    "delivery": "mcp_app_with_resource_link_browser_fallback",
+    "mcp_app_resource_uri": "ui://deeppattern/audit-progress-v1.html",
+    "mcp_app_mime_type": "text/html;profile=mcp-app",
+    "mcp_app_rendering_tools": ["audit_skill_submit", "audit_skill_status"],
+    "mcp_app_callable_tools": ["audit_skill_status", "audit_skill_result"],
+    "resource_tools": ["audit_skill_submit", "audit_skill_status"],
+    "ticket_is_single_use": true,
+    "ticket_transport": "url_fragment_not_sent_on_get",
+    "ticket_exchange_method": "same_origin_post",
+    "ticket_exchange_redirect": "303_without_ticket",
+    "browser_close_keeps_audit_running": true,
+    "stop_policy": "owned_unclaimed_queued_only",
+    "local_runtime_required": false,
+    "mcp_app_required": false,
+    "mcp_app_metadata_available_before_authentication": true,
+    "model_polling_after_non_terminal_submit": "claude_desktop_code_and_cowork_bounded_wait_only",
+    "bounded_status_wait_seconds": 20,
+    "bounded_status_wait_max_seconds": 25,
+    "mcp_app_polling_owner": "embedded_app",
+    "mcp_app_host_delivery": "submit_then_app_owned_polling_and_followup",
+    "terminal_result_delivery": "app_calls_result_once_updates_model_context_and_sends_followup",
+    "reviewer_identity_policy": "model_name_only_for_server_debug_authorized_subject",
+    "claude_desktop_code_delivery": "resource_link_then_bounded_status_wait_then_terminal_result",
+    "claude_cowork_delivery": "resource_link_then_bounded_status_wait_then_terminal_result",
+    "deepseek_harness_delivery": "resource_link_then_bounded_status_wait_then_terminal_result",
+    "deepseek_harness_continuation": "plugin_deferred_context_after_submit_and_status_until_single_terminal_result",
+    "deepseek_harness_native_tool_cards": "replay_safe_per_tool_call_hcar_1",
+    "deepseek_harness_inline_mcp_app_required": false,
+    "non_mcp_apps_delivery": "host_specific_with_exact_resource_link_fallback"
+  },
+  "tools": [
+    "audit_skill_submit",
+    "audit_skill_status",
+    "audit_skill_result",
+    "audit_skill_events"
+  ],
+  "policies": {
+    "tools_list_is_allowlisted": true,
+    "tools_call_is_allowlisted": true,
+    "task_is_subject_bound": true,
+    "submit_requires_idempotency_key": true,
+    "oauth_retry_reuses_original_idempotency_key": true,
+    "oauth_continuation_submits_exactly_once": true,
+    "retry_with_same_subject_and_key_is_single_task": true,
+    "retry_with_same_subject_and_key_is_at_most_one_charge": true,
+    "billing_timing": "a_store_authorize_then_settle_or_refund",
+    "legacy_routes_unchanged": ["/v1/devices/activate", "/mcp", "/mcp/v1/audit"],
+    "forbidden_capabilities": ["visual", "discussion", "local-native-popup", "legacy", "aqg"]
+  },
+  "errors": {
+    "forbidden_tool": -32003,
+    "task_not_owned_by_subject": -32004
+  }
+}

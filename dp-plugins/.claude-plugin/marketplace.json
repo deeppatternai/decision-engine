@@ -1,0 +1,26 @@
+{
+  "$schema": "https://anthropic.com/claude-code/marketplace.schema.json",
+  "name": "deeppattern",
+  "owner": {
+    "name": "Deep Pattern"
+  },
+  "description": "Deep Pattern capability plugins.",
+  "plugins": [
+    {
+      "name": "audit",
+      "source": "./plugins/de-audit",
+      "displayName": "Deep Pattern Audit",
+      "description": "Run Hosted Deep Pattern audits.",
+      "version": "0.2.13-remote",
+      "strict": true
+    },
+    {
+      "name": "visual",
+      "source": "./plugins/de-visual",
+      "displayName": "Deep Pattern Visual",
+      "description": "Create hosted diagrams, infographics, and comics.",
+      "version": "0.1.0-remote.1",
+      "strict": true
+    }
+  ]
+}

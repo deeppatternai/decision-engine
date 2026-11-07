@@ -1,0 +1,26 @@
+{
+  "$schema": "https://cursor.com/schemas/marketplace.json",
+  "name": "deeppattern-plugins",
+  "owner": {
+    "name": "Deep Pattern"
+  },
+  "metadata": {
+    "description": "Git-backed Cursor acceptance candidates for Deep Pattern plugins."
+  },
+  "plugins": [
+    {
+      "name": "audit",
+      "source": "dp-plugins/plugins/de-audit",
+      "description": "Run a hosted Deep Pattern audit with browser OAuth activation and Web progress.",
+      "version": "0.2.13-remote",
+      "category": "developer-tools"
+    },
+    {
+      "name": "visual",
+      "source": "dp-plugins/plugins/de-visual",
+      "description": "Create hosted diagrams, infographics, and comics with browser OAuth and a protected viewer.",
+      "version": "0.1.0-remote.1",
+      "category": "developer-tools"
+    }
+  ]
+}

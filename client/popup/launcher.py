@@ -33,6 +33,7 @@ import os
 import plistlib
 import re
 import shlex
+import shutil
 import subprocess
 import sys
 import tempfile
@@ -67,26 +68,6 @@ def _prefixed_popup_title(title: str) -> str:
     if stripped.startswith("Decision Engine - "):
         return stripped
     return "Decision Engine - " + stripped
-
-
-def _json_for_script(obj: Any) -> str:
-    """json.dumps that is safe to drop verbatim inside a <script> block.
-
-    Plain ``json.dumps`` is NOT: a ``</script>`` (or a lone ``<`` / U+2028) inside a
-    string value would close the block / break the parser. Escape the HTML/JS-significant
-    characters to their ``\\uXXXX`` form — still valid JSON, no breakout surface."""
-    text = json.dumps(obj, ensure_ascii=False)
-    # Needles written as escape sequences (not literal separators) so the source
-    # stays ASCII-visible — a raw U+2028/U+2029 in source is invisible + corruptible.
-    for needle, escape in (
-        ("<", "\\u003c"),
-        (">", "\\u003e"),
-        ("&", "\\u0026"),
-        ("\u2028", "\\u2028"),
-        ("\u2029", "\\u2029"),
-    ):
-        text = text.replace(needle, escape)
-    return text
 
 
 @dataclass
@@ -2425,8 +2406,6 @@ def _ensure_macos_popup_app(python: str) -> Optional[Path]:
             plistlib.dump(info, handle, sort_keys=True)
         icon = Path(__file__).resolve().parents[2] / "desktop" / "icons" / "AppIcon.icns"
         if icon.is_file():
-            import shutil
-
             shutil.copy2(icon, resources / "AppIcon.icns")
         executable = _mac_popup_executable_path(app_path)
         _write_macos_popup_wrapper(source, executable)

@@ -1,0 +1,10 @@
+- insert:
+    - id: deeppattern-audit-harness
+      name: '@deeppattern/de-audit-harness'
+
+    - id: deeppattern-audit-harness-skills
+      name: '@deepseek-ai/dsh-skill-filesystem'
+      config:
+        providerName: deeppattern-audit
+        includeDefaultRoots: false
+        bundledSkillDir: !!js process.getBuiltinModule('node:path').join(process.getBuiltinModule('node:path').dirname(process.getBuiltinModule('node:module').createRequire(baseUrl).resolve('@deeppattern/de-audit-harness/package.json')), 'skills')

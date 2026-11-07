@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+import hashlib
 import json
 import os
 import subprocess
@@ -318,6 +319,178 @@ class ReleaseAcquisitionTests(unittest.TestCase):
             trust_store_only=True,
         )
 
+    @unittest.skipUnless(
+        __import__("shutil").which("git"), "git is required for this fixture"
+    )
+    def test_repository_trust_store_admits_only_the_current_stable_key(self):
+        source_root = Path(__file__).resolve().parents[2]
+        source_path = source_root / release_acquisition.TRUST_STORE_RELATIVE_PATH
+        payload = source_path.read_bytes()
+        trust_store = json.loads(payload.decode("utf-8"))
+        entries = {item["key_id"]: item for item in trust_store["keys"]}
+
+        self.assertEqual(
+            set(entries), {"test-stable-2026-07", "stable-2026-08"}
+        )
+        self.assertIs(entries["test-stable-2026-07"]["revoked"], True)
+        self.assertIs(entries["stable-2026-08"]["revoked"], False)
+
+        with tempfile.TemporaryDirectory() as tmp:
+            fixture_root = Path(tmp)
+            root = fixture_root / "repository"
+            path = root / release_acquisition.TRUST_STORE_RELATIVE_PATH
+            path.parent.mkdir(parents=True)
+            path.write_bytes(payload)
+            template = _empty_git_template(fixture_root)
+            environment = _isolated_git_environment(fixture_root)
+            subprocess.run(
+                [
+                    "git",
+                    "init",
+                    "-q",
+                    "-b",
+                    "stable",
+                    "--template",
+                    str(template),
+                    str(root),
+                ],
+                check=True,
+                env=environment,
+            )
+            _run_git(
+                ["config", "user.email", "fixture@example.test"],
+                root,
+                env=environment,
+            )
+            _run_git(
+                ["config", "user.name", "Fixture"], root, env=environment
+            )
+            _run_git(
+                ["add", "installer/release-trust.json"],
+                root,
+                env=environment,
+            )
+            _run_git(
+                ["commit", "-q", "-m", "trust store"],
+                root,
+                env=environment,
+            )
+            commit = _run_git(["rev-parse", "HEAD"], root, env=environment)
+            trusted = release_acquisition.load_trusted_release_keys(
+                root, expected_commit=commit
+            )
+
+        self.assertEqual(tuple(trusted), ("stable-2026-08",))
+        self.assertEqual(
+            hashlib.sha256(
+                format(trusted["stable-2026-08"].modulus, "x").encode("ascii")
+            ).hexdigest(),
+            "e91d472ef8853c0a76dab741c0318a08"
+            "e4deee7d71f89f79d5620429984d3b82",
+        )
+        self.assertEqual(trusted["stable-2026-08"].exponent, 65537)
+
+        current_manifest = release_contract.parse_release_manifest(
+            {
+                "channel": "stable",
+                "commit": (
+                    "90cd36975573f97ca7e3"
+                    "e72923d21488f65d2dff"
+                ),
+                "key_id": "stable-2026-08",
+                "min_python": "3.12",
+                "published_at": "2026-10-21T07:15:23Z",
+                "release_sequence": 102,
+                "repository_id": "deeppatternai/decision-engine",
+                "schema": 1,
+                "tag": "v0.2.107",
+                "version": "0.2.107",
+            }
+        )
+        current_signature = release_contract.parse_release_signature(
+            {
+                "algorithm": release_contract.RSA_SHA256_ALGORITHM,
+                "key_id": "stable-2026-08",
+                "schema": 1,
+                "signature": (
+                    "hupp3Y9M2IhmDkPKrSqYD2/S4Yr+mh3QC8xHDGJNxTG1DBFuNCY35z8HdBYpCNwn"
+                    "UZi3mLstkcIgA+YTGk6pFAJTW7r7HF+svxZH+d6cx8Vas43yMN05Gx9FD3IcJzal"
+                    "jl83WkO43m/xoV6R9MUM6fuCkqSkjV/KYs/3ceZaix+uHSrdxpNDlLd5B0UMh5Dvh"
+                    "wDhIO/qbEP3Qof1/a4IfGHKuLqK6T2iB0aczPeF0U1OQyw/xdKd81CjJYV6EAq4m"
+                    "0uRFMjGlwv58wi2eZltmxunNJs6uakFdCz9qpZWgPGr3EePPNv6mVsoCxXJb4om86"
+                    "Fw+DxEi4PXwAgEHgUZWSolGzL+NnJtAcdG7CMoTyc95Hjj9+zxGUzuFYdeB628/vy1"
+                    "cz25y6D0QoIkc8v6979RLG63GnmsIGDXxDIbvvj7bOx/1MEmHIj1o/Arpi+dKjxyN"
+                    "XZz5SbmxSa3CDG9e/qq+07eJtk49sZsamRalHerM73snsTunizUPomhMULF"
+                ),
+            }
+        )
+        verified = release_contract.verify_release_signature(
+            current_manifest,
+            current_signature,
+            trusted,
+            expected_repository_id=managed_install.REPOSITORY_ID,
+            expected_channel=managed_install.CHANNEL,
+        )
+        self.assertEqual(verified.key_id, "stable-2026-08")
+
+        legacy_manifest = release_contract.parse_release_manifest(
+            {
+                "channel": "stable",
+                "commit": (
+                    "d746b09d2f904d7fe60a"
+                    "cd4ec94b2ce685d86540"
+                ),
+                "key_id": "test-stable-2026-07",
+                "min_python": "3.12",
+                "published_at": "2026-08-18T02:54:27Z",
+                "release_sequence": 49,
+                "repository_id": "deeppatternai/decision-engine",
+                "schema": 1,
+                "tag": "v0.2.50",
+                "version": "0.2.50",
+            }
+        )
+        legacy_signature = release_contract.parse_release_signature(
+            {
+                "algorithm": release_contract.RSA_SHA256_ALGORITHM,
+                "key_id": "test-stable-2026-07",
+                "schema": 1,
+                "signature": (
+                    "iNvlOUYtxLfpFNk25MsWoHOzk4jSx1GjYE0strUrGxlRWqwJksyw5lswtCroXrtC38"
+                    "vMaE1WaVCyFi+Z5WTf98l8BAPl1j8NPeslgCbPO+i7apSet0weaPg3K1rdzGMZjOT"
+                    "jBJt5f9N8e4+PE6j5TAV36pNEGnuL8FVXwbM53DiF2ylcvUcFzhYIgwXFV201KIaw"
+                    "2WOu1IrUx6AeZ8Hf8nfRA/z8/mzhlH9UMYAnqey+EAKYaQwTeqn2DWfi1yx2HoJ7V"
+                    "6bo4XZ7gNYwiE+CrxrbnlksQ+2Uu7x0J5Nf3JO0x2g8Uaae2uPa0vBkxHt3T4S9zq"
+                    "70sekTH7UbxcMLV1CHGJ9DZh//FJpqFL3HQpJPSnBhVhdNiW62VkZtPRt6f+dPJlKj"
+                    "iND0JwiCKI1psHdZXxgzhRhzE9ZoPoSCjSmz0MHLi4fX8K1ushryabTMfpCju1jOZJ"
+                    "6OPhaskJFvN6Ztxb7OLOCevpmXPu+Yyc5fz2zGAFKiVIT4/tsmv60j"
+                ),
+            }
+        )
+        legacy_entry = entries["test-stable-2026-07"]
+        legacy_key = release_contract.RsaPublicKey(
+            "test-stable-2026-07",
+            int(legacy_entry["modulus_hex"], 16),
+            legacy_entry["exponent"],
+        )
+        release_contract.verify_release_signature(
+            legacy_manifest,
+            legacy_signature,
+            {legacy_key.key_id: legacy_key},
+            expected_repository_id=managed_install.REPOSITORY_ID,
+            expected_channel=managed_install.CHANNEL,
+        )
+        with self.assertRaisesRegex(
+            release_contract.ReleaseContractError, "signing key is not trusted"
+        ):
+            release_contract.verify_release_signature(
+                legacy_manifest,
+                legacy_signature,
+                trusted,
+                expected_repository_id=managed_install.REPOSITORY_ID,
+                expected_channel=managed_install.CHANNEL,
+            )
+
     def test_fetch_child_does_not_inherit_custom_tls_trust_anchors(self):
         process = mock.Mock()
         process.communicate.return_value = (b"{}", b"")
@@ -347,11 +520,46 @@ class ReleaseAcquisitionTests(unittest.TestCase):
         self.assertIn("SameHostHttpsRedirect", popen.call_args.args[0][4])
 
 
-def _run_git(args, cwd) -> str:
+def _empty_git_template(root: Path) -> Path:
+    template = root / ".git-fixture-template"
+    template.mkdir(exist_ok=True)
+    return template
+
+
+def _isolated_git_environment(root: Path) -> dict[str, str]:
+    home = root / ".git-fixture-home"
+    hooks = root / ".git-fixture-hooks"
+    home.mkdir(exist_ok=True)
+    hooks.mkdir(exist_ok=True)
+    environment = {
+        key: value
+        for key, value in os.environ.items()
+        if not key.upper().startswith("GIT_")
+    }
+    environment.update(
+        {
+            "HOME": str(home),
+            "XDG_CONFIG_HOME": str(home / ".config"),
+            "GIT_ATTR_NOSYSTEM": "1",
+            "GIT_CONFIG_NOSYSTEM": "1",
+            "GIT_CONFIG_GLOBAL": os.devnull,
+            "GIT_CONFIG_COUNT": "3",
+            "GIT_CONFIG_KEY_0": "commit.gpgsign",
+            "GIT_CONFIG_VALUE_0": "false",
+            "GIT_CONFIG_KEY_1": "tag.gpgsign",
+            "GIT_CONFIG_VALUE_1": "false",
+            "GIT_CONFIG_KEY_2": "core.hooksPath",
+            "GIT_CONFIG_VALUE_2": str(hooks),
+        }
+    )
+    return environment
+
+
+def _run_git(args, cwd, *, env=None) -> str:
     result = subprocess.run(
         ["git", *args], cwd=str(cwd), check=True,
         stdout=subprocess.PIPE, stderr=subprocess.PIPE,
-        env={**os.environ, "GIT_CONFIG_NOSYSTEM": "1"},
+        env=env or {**os.environ, "GIT_CONFIG_NOSYSTEM": "1"},
     )
     return result.stdout.decode("utf-8", "replace").strip()
 

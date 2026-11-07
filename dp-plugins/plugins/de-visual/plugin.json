@@ -1,0 +1,22 @@
+{
+  "$schema": "https://agent-plugins.org/schemas/1.0.0/plugin.schema.json",
+  "name": "visual",
+  "version": "0.1.0-remote.1",
+  "description": "Hosted Deep Pattern diagrams, infographics, and comics over an isolated remote MCP connection.",
+  "author": {"name": "Deep Pattern"},
+  "license": "MIT",
+  "mcpServers": "./mcp.json",
+  "skills": "./skills/",
+  "extensions": {
+    "com.openai": {
+      "onboardingSkill": "./skills/setup/SKILL.md",
+      "interface": {
+        "displayName": "Deep Pattern Visual",
+        "shortDescription": "Create hosted diagrams, infographics, and comics.",
+        "longDescription": "Connect with browser activation, create Visual artifacts without a local runtime, and inspect progress and output in a protected cross-platform viewer.",
+        "developerName": "Deep Pattern",
+        "category": "Productivity"
+      }
+    }
+  }
+}

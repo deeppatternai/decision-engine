@@ -1,0 +1,9 @@
+{
+  "$schema": "https://agent-plugins.org/schemas/1.0.0/mcp.schema.json",
+  "mcpServers": {
+    "visual": {
+      "type": "http",
+      "url": "https://endpoint.deeppattern.ai/plugin/mcp/v1/visual"
+    }
+  }
+}

@@ -1,6 +1,6 @@
 # Decision Engine
 
-[English](README.md) · **简体中文** · **v0.2.107**
+[English](README.md) · **简体中文** · **v0.2.108**
 
 > **一个你真正敢信的第二意见 —— 因为它来自许多个彼此独立的头脑，而不是一个模型在自我认同。**
 
@@ -321,6 +321,7 @@ macOS 或 Linux：
 ```bash
 bash "$HOME/.deeppattern/decision-engine/dp-doctor.sh"
 bash "$HOME/.deeppattern/decision-engine/dp-doctor.sh" --json
+bash "$HOME/.deeppattern/decision-engine/dp-doctor.sh" --client cursor
 ```
 
 Windows PowerShell：
@@ -328,18 +329,23 @@ Windows PowerShell：
 ```powershell
 powershell.exe -NoProfile -ExecutionPolicy Bypass -File "$HOME\.deeppattern\decision-engine\dp-doctor.ps1"
 powershell.exe -NoProfile -ExecutionPolicy Bypass -File "$HOME\.deeppattern\decision-engine\dp-doctor.ps1" -Json
+powershell.exe -NoProfile -ExecutionPolicy Bypass -File "$HOME\.deeppattern\decision-engine\dp-doctor.ps1" -Client cursor
 ```
 
 它检查：Python 是否 3.12+、skills 是否已 link 进你的 agent、原生弹窗后端（pywebview）
 能否开窗、LibreOffice 是否可用于 Office 转换（没有则 WARN —— 它可选、按需安装）、以及
 本设备是否已激活。全部 PASS 或 WARN 时退出 `0`，真正坏了才退出 `1`，参数错误退出 `2`。
 它**绝不**打印你的 endpoint 或激活码 —— 只报是否已设置。两种正式安装方式都会在安装结尾替你运行检查。
+使用 `--client NAME`（PowerShell：`-Client NAME`）可以只检查一个已配置 Agent 的宿主接线，
+同时保留 Decision Engine 公共组件检查。
 
 ## 安装副本与更新
 
 正式安装会把签名受管副本放在固定路径 `~/.deeppattern/decision-engine`。MCP 条目通过
-`installer.launcher` 运行该副本，并在启动前按有界的 GitHub→Gitee 策略检查和应用已签名的
-`stable` 更新；用户无需保留最初下载的一键安装器。
+`installer.launcher` 运行该副本。**托管自动更新默认关闭**；仅当
+`~/.deeppattern/decision-engine/config.json` 中显式设置 `"auto_update": true` 时，才会在
+后台按有界的 GitHub→Gitee 策略发现并暂存已签名的 `stable` 更新（MCP 存活期间不改 HEAD；
+会话结束后再安装，供下次启动使用；不阻塞 MCP 首连）。用户无需保留最初下载的一键安装器。
 
 旧版安装、迁移失败或恢复场景不要通过手工覆盖安装目录处理；请保留现有文件，并按照 Doctor 或
 安装器给出的恢复提示操作。已安装的 Doctor 会分别显示 installed、target、running 和 last

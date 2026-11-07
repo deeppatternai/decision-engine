@@ -211,6 +211,7 @@ QODER = AgentHostSpec(
     optional_features=frozenset({"local-display", "audit-stop-panel"}),
     onboarding_evidence=("skill",),
     json_config_transform=_qoder_json_config_transform,
+    supported_platforms=frozenset({"darwin", "win32"}),
 )
 
 HOST_SPECS = (QODER,)

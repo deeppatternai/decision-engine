@@ -16,8 +16,12 @@ Run (stdlib only, from the repo root):
 
 from __future__ import annotations
 
+from pathlib import Path
+import tempfile
 import unittest
+from unittest import mock
 
+from client.popup import launcher
 from client.popup.launcher import PopupSpec, render_artifact_html
 
 _SVG = "<svg xmlns=\"http://www.w3.org/2000/svg\"><rect width=\"10\" height=\"10\"/></svg>"
@@ -90,6 +94,22 @@ class FramelessChromeSmoke(unittest.TestCase):
         # the render-failed contract (shared with the server seam) must survive the frameless chrome.
         with self.assertRaises(ValueError):
             render_artifact_html(PopupSpec(kind="ge", title="T"))  # artifact=None
+
+    def test_open_popup_removes_workdir_after_normal_close(self):
+        with tempfile.TemporaryDirectory() as root:
+            workdir = Path(root) / "popup"
+            workdir.mkdir()
+            completed = mock.Mock(returncode=0)
+            with mock.patch.object(launcher.backend, "ensure_webview", return_value=True), \
+                    mock.patch.object(launcher.tempfile, "mkdtemp", return_value=str(workdir)), \
+                    mock.patch.object(launcher, "build_shell_command", return_value=["popup"]), \
+                    mock.patch.object(launcher.subprocess, "run", return_value=completed):
+                outcome = launcher.open_popup(
+                    PopupSpec(kind="ge", title="T"), render=lambda _spec: "<html></html>"
+                )
+
+            self.assertEqual(outcome["outcome"], "closed")
+            self.assertFalse(workdir.exists())
 
 
 if __name__ == "__main__":

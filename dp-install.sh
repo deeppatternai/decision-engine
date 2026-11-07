@@ -4267,8 +4267,8 @@ if [ -n "$catalog_missing_clients" ] \
     || [ "$capability_report_incomplete" -ne 0 ] \
     || [ "$linux_popup_incomplete" -ne 0 ] \
     || [ "$manual_host_action_pending" -ne 0 ]; then
-  printf '%s: PARTIAL: supported components were installed, but one or more detected hosts are unsupported, unconfigured, unverifiable, or awaiting in-app approval.\n' \
-    "$PROGRAM_NAME" >&2
+  printf '%s: PARTIAL: supported components were installed, but one or more detected hosts are unsupported, unconfigured, unverifiable, or awaiting in-app approval.\n%s\n' \
+    "$PROGRAM_NAME" "Deep Pattern is ready to use with each successfully configured Agent integration. Fully restart those Agent applications, then open a new session and verify that the integration works; review the items above for any integration that still needs attention." >&2
   exit "$EXIT_PARTIAL"
 fi
 
@@ -4278,10 +4278,10 @@ if [ "$de_update_deferred" -eq 1 ]; then
       "$PROGRAM_NAME"
     exit 0
   fi
-  printf '%s: PARTIAL: device activation and the signed DE update remain pending; the current verified release and host configuration were preserved.\n' \
-    "$PROGRAM_NAME" >&2
+  printf '%s: PARTIAL: device activation and the signed DE update remain pending; the current verified release and host configuration were preserved.\n%s\n' \
+    "$PROGRAM_NAME" "The current verified Deep Pattern installation remains available. Fully restart the configured Agent applications, then open a new session to use the available integration; rerun this installer after completing activation and the pending update." >&2
   exit "$EXIT_PARTIAL"
 fi
 
-printf '%s: PASS: all selected supported hosts are configured on disk; restart the host applications before runtime verification.\n' \
-  "$PROGRAM_NAME"
+printf '%s: PASS: all selected supported hosts are configured on disk; restart the host applications before runtime verification.\n%s\n' \
+  "$PROGRAM_NAME" "Deep Pattern installation is complete. Fully restart each configured Agent application, then open a new session and verify that the integration works."

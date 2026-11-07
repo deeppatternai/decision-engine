@@ -1720,6 +1720,41 @@ class CursorConfigTestCase(unittest.TestCase):
             self.assertTrue(cursor.skills_check_in_use())
             configured.assert_called_once_with()
 
+    def test_claude_and_codex_doctor_routes_require_explicit_mcp_entries(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            base = Path(tmp)
+            claude_config = base / ".claude.json"
+            claude_skills = base / ".claude" / "skills"
+            codex_config = base / ".codex" / "config.toml"
+            codex_skills = base / ".codex" / "skills"
+            claude_skills.mkdir(parents=True)
+            codex_skills.mkdir(parents=True)
+            environment = {
+                "CLAUDE_CODE_CONFIG": str(claude_config),
+                "CLAUDE_SKILLS_DIR": str(claude_skills),
+                "CODEX_CONFIG": str(codex_config),
+                "CODEX_SKILLS_DIR": str(codex_skills),
+            }
+            with mock.patch.dict(os.environ, environment, clear=False):
+                routes = mcp_config.active_skill_routes(for_doctor=True)
+                self.assertNotIn("claude", routes)
+                self.assertNotIn("codex", routes)
+
+                claude_config.write_text(
+                    json.dumps(
+                        {"mcpServers": {"decision-engine": {"command": "foreign"}}}
+                    ),
+                    encoding="utf-8",
+                )
+                codex_config.write_text(
+                    "[mcp_servers.decision-engine]\ncommand = 'foreign'\n",
+                    encoding="utf-8",
+                )
+                routes = mcp_config.active_skill_routes(for_doctor=True)
+
+        self.assertIn("claude", routes)
+        self.assertIn("codex", routes)
+
     def test_cursor_legacy_probe_keeps_original_path_resolution_call_shape(self):
         configured_path = Path("cursor-config.json")
         with (
@@ -1799,6 +1834,34 @@ assert mcp_config.CLIENT_SPECS == registry.CLIENT_SPECS
 
         guard.assert_called_once_with()
         self.assertEqual(result["warning"], "version-warning")
+
+    def test_config_write_guard_rejects_an_unsupported_registered_platform(self):
+        newcomer = replace(
+            mcp_config.CLIENT_SPECS["cursor"],
+            id="newcomer",
+            host_family="newcomer",
+            config_write_guard=None,
+            supported_platforms=frozenset({"win32"}),
+        )
+        writer = mock.Mock()
+        with (
+            mock.patch.object(mcp_config, "CLIENT_SPECS", {"newcomer": newcomer}),
+            mock.patch.object(mcp_config.sys, "platform", "linux"),
+            mock.patch.object(
+                mcp_config,
+                "agent_config_path",
+                return_value=Path("newcomer.json"),
+            ),
+            mock.patch.object(mcp_config, "_write_json_client", writer),
+            self.assertRaisesRegex(ShellError, "unsupported_newcomer_platform"),
+        ):
+            mcp_config._write_entry_unchecked(
+                "newcomer",
+                cwd=Path("managed-root"),
+                dry_run=True,
+            )
+
+        writer.assert_not_called()
 
     def test_host_owned_config_write_guard_callback_is_dispatched(self):
         callback = mock.Mock(return_value="host-version-unknown")

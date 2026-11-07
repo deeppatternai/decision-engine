@@ -1,0 +1,12 @@
+{
+  "name": "visual",
+  "displayName": "Deep Pattern Visual",
+  "version": "0.1.0-remote.1",
+  "description": "Create hosted diagrams, infographics, and comics with browser activation and a protected viewer.",
+  "author": {"name": "Deep Pattern"},
+  "repository": "https://github.com/deeppatternai/decision-engine",
+  "keywords": ["diagram", "infographic", "comic", "mcp"],
+  "category": "developer-tools",
+  "skills": "./skills/",
+  "mcpServers": "./cursor.mcp.json"
+}

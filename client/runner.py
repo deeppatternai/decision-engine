@@ -833,34 +833,6 @@ def _write_active_run_payload(payload: Dict[str, Any]) -> None:
         _atomic_write_text(path, rendered)
 
 
-def _load_de_lite_active_runs_registry() -> Dict[str, Any]:
-    path = de_lite_active_runs_path()
-    loaded = _read_active_runs_registry(path)
-    if loaded is not None:
-        updated = loaded.get("updated_at")
-        timestamp = float(updated) if isinstance(updated, (int, float)) else 0.0
-        if math.isfinite(timestamp) and timestamp <= time.time() + 300.0:
-            return loaded
-    if path.exists():
-        raise AuditError("no valid DE Lite active-run registry is readable")
-    return _empty_active_runs_registry()
-
-
-def _write_de_lite_active_runs_registry(registry: Dict[str, Any]) -> None:
-    path = de_lite_active_runs_path()
-    registry["schema_version"] = ACTIVE_RUNS_SCHEMA_VERSION
-    if not _active_paths_are_overridden():
-        _ensure_private_dir(path.parent)
-    _atomic_write_text(path, json.dumps(registry, indent=2, sort_keys=True) + "\n")
-
-
-def _write_de_lite_active_run_payload(payload: Dict[str, Any]) -> None:
-    path = de_lite_active_run_path()
-    if not _active_paths_are_overridden():
-        _ensure_private_dir(path.parent)
-    _atomic_write_text(path, json.dumps(payload, indent=2, sort_keys=True) + "\n")
-
-
 def _remove_active_run_projection(run_id: str) -> None:
     """Remove singleton projections for ``run_id`` while the caller holds the dual lock."""
     for path in _active_run_write_paths():

@@ -1,0 +1,22 @@
+{
+  "name": "audit",
+  "version": "0.2.13-remote",
+  "description": "Hosted Deep Pattern audits over an isolated remote MCP connection.",
+  "author": {
+    "name": "Deep Pattern"
+  },
+  "license": "MIT",
+  "mcpServers": "./.mcp.json",
+  "skills": "./skills/",
+  "interface": {
+    "displayName": "Deep Pattern Audit",
+    "shortDescription": "Run Hosted Deep Pattern audits.",
+    "longDescription": "Connect with browser activation, run Hosted audits without a local runtime, and follow progress in a cross-platform Web UI.",
+    "developerName": "Deep Pattern",
+    "category": "Productivity",
+    "capabilities": [
+      "Read",
+      "Write"
+    ]
+  }
+}

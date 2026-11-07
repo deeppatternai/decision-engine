@@ -1602,6 +1602,95 @@ class MergePollTests(unittest.TestCase):
         self.assertEqual(merged["status"], "cancelled")
         self.assertEqual(merged["hidden_after"], self.NOW + panel.FINISHED_LINGER_S)
 
+    def test_terminal_status_only_poll_preserves_authorized_auditor_metadata(self):
+        existing = {
+            "run_id": "a",
+            "status": "running",
+            "profile": "deep",
+            "ui_locale": "en-US",
+            "debug_authorized": True,
+            "auditors": [
+                {"status": "running", "model_id": "model-a", "started_at": 1_010.0,
+                 "completed_at": 1_040.0},
+                {"status": "completed", "model_id": "model-b", "duration_ms": 42_000},
+            ],
+        }
+
+        merged = panel.merge_poll_view(
+            existing,
+            {"status": "completed", "auditors": [
+                {"status": "completed"}, {"status": "completed"},
+            ]},
+            "a", self.NOW,
+        )
+
+        self.assertEqual(merged["auditors"], [
+            {"status": "completed", "model_id": "model-a", "started_at": 1_010.0,
+             "completed_at": 1_040.0},
+            {"status": "completed", "model_id": "model-b", "duration_ms": 42_000},
+        ])
+        rendered = panel._debug_auditor_lines(merged, self.NOW)[0]
+        self.assertIn("model-a", rendered)
+        self.assertIn("30s", rendered)
+        self.assertIn("model-b", panel._debug_auditor_lines(merged, self.NOW)[1])
+        self.assertIn("42s", panel._debug_auditor_lines(merged, self.NOW)[1])
+
+    def test_terminal_roster_mismatch_does_not_reuse_metadata(self):
+        existing = {
+            "run_id": "a", "status": "running", "debug_authorized": True,
+            "auditors": [{"status": "running", "model_id": "old-model", "started_at": 1_010.0}],
+        }
+
+        merged = panel.merge_poll_view(
+            existing, {"status": "completed", "auditors": [
+                {"status": "completed"}, {"status": "failed"},
+            ]}, "a", self.NOW,
+        )
+
+        self.assertEqual(merged["auditors"], [
+            {"status": "completed"}, {"status": "failed"},
+        ])
+
+    def test_terminal_debug_revocation_scrubs_cached_metadata(self):
+        existing = {
+            "run_id": "a", "status": "running", "debug_authorized": True,
+            "auditors": [{"status": "running", "model_id": "secret-model", "duration_ms": 1_000}],
+        }
+
+        merged = panel.merge_poll_view(
+            existing, {"status": "completed", "debug_authorized": False}, "a", self.NOW,
+        )
+
+        self.assertEqual(merged["debug_authorized"], False)
+        self.assertEqual(merged["auditors"], [{"status": "running"}])
+
+    def test_nonterminal_debug_revocation_scrubs_cached_metadata(self):
+        existing = {
+            "run_id": "a", "status": "running", "debug_authorized": True,
+            "auditors": [{"status": "running", "model_id": "secret-model", "duration_ms": 1_000}],
+        }
+
+        merged = panel.merge_poll_view(
+            existing, {"status": "running", "debug_authorized": False}, "a", self.NOW,
+        )
+
+        self.assertEqual(merged["debug_authorized"], False)
+        self.assertEqual(merged["auditors"], [{"status": "running"}])
+
+    def test_nonterminal_auditor_roster_is_bounded_and_validated(self):
+        merged = panel.merge_poll_view(
+            {"run_id": "a", "status": "queued", "debug_authorized": True, "auditors": []},
+            {"status": "running", "auditors": [
+                {"status": "running", "model_id": "model-%d" % index}
+                for index in range(64)
+            ] + [{"status": {}}]},
+            "a", self.NOW,
+        )
+
+        self.assertEqual(len(merged["auditors"]), 64)
+        self.assertEqual(merged["auditors"][0]["model_id"], "model-0")
+        self.assertEqual(merged["auditors"][-1]["model_id"], "model-63")
+
     def test_non_dict_view_leaves_existing(self):
         existing = {"run_id": "a", "status": "running"}
         self.assertEqual(panel.merge_poll_view(existing, None, "a", self.NOW), existing)
@@ -2173,11 +2262,6 @@ class LaunchWiringTests(unittest.TestCase):
         with mock.patch.object(runner, "_active_paths_are_overridden", return_value=False), \
              mock.patch.object(runner, "load_active_runs_registry", return_value=empty), \
              mock.patch.object(runner, "_write_active_runs_registry") as shared_write, \
-             mock.patch.object(
-                 runner,
-                 "_load_de_lite_active_runs_registry",
-                 side_effect=AssertionError("managed DE Lite must use shared registry"),
-             ), \
              mock.patch.object(runner, "_write_active_run_payload"):
             runner.save_local_advisory_run(
                 "local-shared", surface="de_lite", title="Shared window"

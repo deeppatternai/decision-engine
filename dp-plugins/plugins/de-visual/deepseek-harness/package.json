@@ -1,0 +1,82 @@
+{
+  "name": "@deeppattern/de-visual-harness",
+  "version": "0.1.0-remote.2",
+  "description": "Runtime-free Deep Pattern Visual connector for DeepSeek Harness",
+  "type": "module",
+  "main": "./dist/index.js",
+  "types": "./dist/index.d.ts",
+  "exports": {
+    ".": {
+      "types": "./dist/index.d.ts",
+      "default": "./dist/index.js"
+    },
+    "./client": {
+      "types": "./dist/client.d.ts",
+      "default": "./dist/client.js"
+    },
+    "./package.json": "./package.json"
+  },
+  "files": [
+    "cordis.patch.yml",
+    "dist/",
+    "skills/",
+    "README.md"
+  ],
+  "engines": {
+    "node": ">=20",
+    "dsh": "0.2.0-rc.2 || 0.2.1-rc.5 || 0.2.2-rc.1"
+  },
+  "dsh": {
+    "manifestVersion": 1,
+    "bundle": {
+      "patch": "./cordis.patch.yml"
+    },
+    "client": {
+      "platform": "web",
+      "immediately": true,
+      "inject": [
+        "@deepseek-ai/dsh-client-ui-renderer",
+        "@deepseek-ai/dsh-client-ui-tool"
+      ]
+    }
+  },
+  "scripts": {
+    "build": "tsc -p tsconfig.json && tsc -p tsconfig.client.json && node scripts/build-client.mjs",
+    "test": "npm run build && node --test tests/*.test.mjs",
+    "pack:local": "python ../packaging/build_harness_package.py --source-root . --output-dir ./build"
+  },
+  "dependencies": {
+    "@modelcontextprotocol/client": "2.2.0"
+  },
+  "peerDependencies": {
+    "@deepseek-ai/cordis": "4.0.4 || 4.0.5 || 4.1.0",
+    "@deepseek-ai/dsh-credentials": "0.2.0-rc.2 || 0.2.1-rc.5 || 0.2.2-rc.1",
+    "@deepseek-ai/dsh-llm": "0.2.0-rc.2 || 0.2.1-rc.5 || 0.2.2-rc.1",
+    "@deepseek-ai/dsh-mcp-client": "0.2.0-rc.2 || 0.2.1-rc.5 || 0.2.2-rc.1",
+    "@deepseek-ai/dsh-skill-filesystem": "0.2.0-rc.2 || 0.2.1-rc.5 || 0.2.2-rc.1",
+    "@deepseek-ai/dsh-tools": "0.2.0-rc.2 || 0.2.1-rc.5 || 0.2.2-rc.1"
+  },
+  "peerDependenciesMeta": {
+    "@deepseek-ai/cordis": { "optional": true },
+    "@deepseek-ai/dsh-credentials": { "optional": true },
+    "@deepseek-ai/dsh-llm": { "optional": true },
+    "@deepseek-ai/dsh-mcp-client": { "optional": true },
+    "@deepseek-ai/dsh-skill-filesystem": { "optional": true },
+    "@deepseek-ai/dsh-tools": { "optional": true }
+  },
+  "devDependencies": {
+    "@deepseek-ai/cordis": "4.1.0",
+    "@deepseek-ai/dsh-credentials": "0.2.2-rc.1",
+    "@deepseek-ai/dsh-llm": "0.2.2-rc.1",
+    "@deepseek-ai/dsh-mcp-client": "0.2.2-rc.1",
+    "@deepseek-ai/dsh-skill-filesystem": "0.2.2-rc.1",
+    "@deepseek-ai/dsh-tools": "0.2.2-rc.1",
+    "@deepseek-ai/dsh-client-ui-tool": "0.2.2-rc.1",
+    "@types/node": "^22.15.0",
+    "@types/react": "^18.3.0",
+    "react": "^18.2.0",
+    "typescript": "^5.9.3"
+  },
+  "license": "MIT",
+  "private": true
+}

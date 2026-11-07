@@ -121,6 +121,7 @@ QODER_CN_IDE = AgentHostSpec(
     onboarding_evidence=("skill",),
     unverified_lite_stopper=True,
     post_mcp_write=_post_mcp_write,
+    supported_platforms=frozenset({"darwin"}),
 )
 
 HOST_SPECS = (QODER_CN_IDE,)

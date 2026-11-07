@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+import json
 import os
 import shutil
 import subprocess
@@ -110,6 +111,16 @@ class UnixDoctorEntrypointTests(unittest.TestCase):
         arguments = self.capture_args.read_text(encoding="utf-8").splitlines()
         self.assertEqual(arguments[5:], [str(self.managed_root)])
 
+    def test_forwards_one_client_scope_with_json(self) -> None:
+        result = self.run_entrypoint("--client", "cursor", "--json")
+
+        self.assertEqual(result.returncode, 0, result.stderr)
+        arguments = self.capture_args.read_text(encoding="utf-8").splitlines()
+        self.assertEqual(
+            arguments[5:],
+            [str(self.managed_root), "--client", "cursor", "--json"],
+        )
+
     def test_propagates_doctor_exit_code(self) -> None:
         result = self.run_entrypoint(exit_code="1")
         self.assertEqual(result.returncode, 1)
@@ -183,6 +194,16 @@ class WindowsDoctorEntrypointContractTests(unittest.TestCase):
     def setUpClass(cls) -> None:
         cls.source = WINDOWS_ENTRYPOINT.read_text(encoding="utf-8")
 
+    @classmethod
+    def source_with_test_user_home(cls) -> str:
+        source = cls.source.replace(
+            "$userHome = [Environment]::GetFolderPath([Environment+SpecialFolder]::UserProfile)",
+            '$userHome = [Environment]::GetEnvironmentVariable("DP_TEST_USER_HOME")',
+        )
+        if source == cls.source:
+            raise AssertionError("Doctor user-home assignment was not replaced")
+        return source
+
     def test_uses_fixed_managed_paths_and_isolated_module_launch(self) -> None:
         self.assertIn('.deeppattern\\decision-engine', self.source)
         self.assertIn('.deeppattern\\de-python', self.source)
@@ -190,6 +211,8 @@ class WindowsDoctorEntrypointContractTests(unittest.TestCase):
         self.assertIn("-I", self.source)
         self.assertIn("-X", self.source)
         self.assertIn("runpy.run_module", self.source)
+        self.assertIn("runpy.run_module('installer.doctor'", self.source)
+        self.assertNotIn('runpy.run_module("installer.doctor"', self.source)
         self.assertNotIn("Get-Command python", self.source)
         self.assertNotIn("Set-Location", self.source)
 
@@ -203,8 +226,79 @@ class WindowsDoctorEntrypointContractTests(unittest.TestCase):
 
     def test_json_and_usage_contract_are_explicit(self) -> None:
         self.assertIn("-Json", self.source)
+        self.assertIn("-Client", self.source)
         self.assertIn("exit 2", self.source)
         self.assertIn("exit $LASTEXITCODE", self.source)
+
+    def test_error_formatter_passes_both_format_arguments(self) -> None:
+        self.assertIn(
+            '[Console]::'
+            'Error.WriteLine(("{0}: ERROR: {1}" -f $ProgramName, $Message))',
+            self.source,
+        )
+
+    def test_native_fixture_keeps_powershell_source_ascii(self) -> None:
+        source = self.source_with_test_user_home()
+        self.assertTrue(source.isascii())
+        self.assertIn("DP_TEST_USER_HOME", source)
+
+    @unittest.skipUnless(os.name == "nt", "requires native Windows PowerShell 5.1")
+    def test_real_powershell_preserves_python_runner_quotes_and_client_args(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            base = Path(tmp) / "Doctor space \u8def\u5f84"
+            home = base / "home"
+            managed_root = home / ".deeppattern" / "decision-engine"
+            python_root = home / ".deeppattern" / "de-python"
+            (managed_root / "installer").mkdir(parents=True)
+            (managed_root / "installer" / "__init__.py").write_text(
+                "", encoding="utf-8"
+            )
+            (managed_root / "installer" / "doctor.py").write_text(
+                "import json, sys\n"
+                "print(json.dumps({'argv': sys.argv[1:]}))\n",
+                encoding="utf-8",
+            )
+            created = subprocess.run(
+                [sys.executable, "-m", "venv", str(python_root)],
+                capture_output=True,
+                text=True,
+                timeout=60,
+            )
+            self.assertEqual(created.returncode, 0, created.stderr)
+            (python_root / ".deeppattern-python-env").write_text(
+                "schema=1\n", encoding="utf-8"
+            )
+
+            source = self.source_with_test_user_home()
+            entrypoint = base / "dp-doctor.ps1"
+            entrypoint.write_text(source, encoding="utf-8")
+            environment = os.environ.copy()
+            environment["DP_TEST_USER_HOME"] = str(home)
+
+            result = subprocess.run(
+                [
+                    "powershell.exe",
+                    "-NoProfile",
+                    "-ExecutionPolicy",
+                    "Bypass",
+                    "-File",
+                    str(entrypoint),
+                    "-Json",
+                    "-Client",
+                    "cursor",
+                ],
+                cwd=base,
+                env=environment,
+                capture_output=True,
+                text=True,
+                timeout=90,
+            )
+
+        self.assertEqual(result.returncode, 0, result.stderr)
+        self.assertEqual(
+            json.loads(result.stdout)["argv"],
+            ["--json", "--client", "cursor"],
+        )
 
 
 if __name__ == "__main__":

@@ -149,8 +149,7 @@ def _serve_offline(message):
     JSON-RPC envelope the caller receives. Nothing is sent: the probe short-circuits."""
     forwarder = shim.Forwarder("https://hub.example", "tok")
     stdout = io.StringIO()
-    with mock.patch.object(shim, "hub_reachable", return_value=False), \
-            mock.patch.object(shim, "_maybe_self_update"):
+    with mock.patch.object(shim, "hub_reachable", return_value=False):
         shim.serve(forwarder,
                    stdin=io.StringIO(json.dumps(message) + "\n"),
                    stdout=stdout)
@@ -505,13 +504,12 @@ class DELiteExplicitAuditEndToEndTests(unittest.TestCase):
             }},
         }
         stdout = io.StringIO()
-        with mock.patch.object(shim, "_maybe_self_update"):
-            shim.serve(
-                shim.LiteForwarder(),
-                stdin=io.StringIO(json.dumps(completion) + "\n"),
-                stdout=stdout,
-                client_host="codex",
-            )
+        shim.serve(
+            shim.LiteForwarder(),
+            stdin=io.StringIO(json.dumps(completion) + "\n"),
+            stdout=stdout,
+            client_host="codex",
+        )
         completion_out = json.loads(stdout.getvalue().splitlines()[0])
         completion_payload = json.loads(
             completion_out["result"]["content"][0]["text"]

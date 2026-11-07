@@ -22,6 +22,12 @@ def _codex_skills_in_use() -> bool:
     return config.codex_skills_in_use()
 
 
+def _codex_skills_configured() -> bool:
+    from installer import mcp_config
+
+    return mcp_config._client_skills_configured("codex")
+
+
 CODEX = AgentHostSpec(
     id="codex",
     transport="stdio",
@@ -38,7 +44,7 @@ CODEX = AgentHostSpec(
     skill_delivery_mode="managed-copy",
     routing_kind="skill",
     skills_in_use=lambda: _codex_skills_in_use(),
-    skills_check_in_use=lambda: _codex_skills_in_use(),
+    skills_check_in_use=lambda: _codex_skills_configured(),
     skill_route_name="codex",
     repair_skills_on_setup=True,
     client_name_patterns=(r"(?:^|[^a-z0-9])codex(?:$|[^a-z0-9])",),

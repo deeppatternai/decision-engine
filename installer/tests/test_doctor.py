@@ -548,6 +548,82 @@ class CheckTests(unittest.TestCase):
         self.assertEqual(result.status, "FAIL")
         self.assertIn("cursor", result.detail)
 
+    def test_client_scoped_skills_ignore_unrelated_missing_routes(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            base = Path(tmp)
+            cursor = base / "cursor"
+            codex = base / "codex"
+            managed = base / "managed"
+            for skill in doctor.DE_SKILLS:
+                source = managed / "skills" / skill
+                source.mkdir(parents=True)
+                cursor.mkdir(parents=True, exist_ok=True)
+                install._create_skill_route(cursor / skill, source)
+            codex.mkdir()
+            with (
+                mock.patch.dict(
+                    os.environ,
+                    {"DE_CONFIG_PATH": str(managed / "config.json")},
+                ),
+                mock.patch.object(
+                    mcp_config,
+                    "active_skill_routes",
+                    return_value={
+                        "cursor": (cursor, frozenset()),
+                        "codex": (codex, frozenset()),
+                    },
+                ),
+            ):
+                result = doctor.check_skills(client="cursor")
+
+        self.assertEqual(result.status, "PASS")
+        self.assertIn("cursor=", result.detail)
+        self.assertNotIn("codex=", result.detail)
+
+    def test_cursor_only_setup_ignores_unconfigured_claude_and_codex_skills(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            base = Path(tmp)
+            managed = base / "managed"
+            cursor_config = base / ".cursor" / "mcp.json"
+            cursor_skills = base / ".cursor" / "skills"
+            claude_skills = base / ".claude" / "skills"
+            codex_skills = base / ".codex" / "skills"
+            cursor_config.parent.mkdir(parents=True)
+            claude_skills.mkdir(parents=True)
+            codex_skills.mkdir(parents=True)
+            cursor_config.write_text(
+                json.dumps({"mcpServers": {"decision-engine": {"command": "managed"}}}),
+                encoding="utf-8",
+            )
+            for skill in doctor.DE_SKILLS:
+                source = managed / "skills" / skill
+                source.mkdir(parents=True)
+                cursor_skills.mkdir(parents=True, exist_ok=True)
+                install._create_skill_route(cursor_skills / skill, source)
+            environment = {
+                "CLAUDE_CODE_CONFIG": str(base / ".claude.json"),
+                "CLAUDE_SKILLS_DIR": str(claude_skills),
+                "CODEX_CONFIG": str(base / ".codex" / "config.toml"),
+                "CODEX_SKILLS_DIR": str(codex_skills),
+                "CURSOR_CONFIG": str(cursor_config),
+                "CURSOR_SKILLS_DIR": str(cursor_skills),
+                "DE_CONFIG_PATH": str(managed / "config.json"),
+            }
+            specs = {
+                client: mcp_config.CLIENT_SPECS[client]
+                for client in ("claude-code", "codex", "cursor")
+            }
+            with (
+                mock.patch.dict(os.environ, environment, clear=False),
+                mock.patch.object(mcp_config, "CLIENT_SPECS", specs),
+            ):
+                result = doctor.check_skills()
+
+        self.assertEqual(result.status, "PASS")
+        self.assertIn("cursor=", result.detail)
+        self.assertNotIn("claude=", result.detail)
+        self.assertNotIn("codex=", result.detail)
+
     def test_popup_probe_exception_is_warn_not_fail(self):
         # An optional-dep probe that RAISES must degrade to WARN, never escalate to FAIL.
         from client.popup import backend as real_backend
@@ -1016,6 +1092,31 @@ class CheckTests(unittest.TestCase):
         self.assertEqual(r.status, "WARN")
         self.assertIn("claude-code=unreadable", r.detail)
         self.assertNotIn(secret_body, r.detail)
+
+    def test_client_scoped_mcp_ignores_an_unrelated_stale_host(self):
+        with (
+            mock.patch.object(
+                mcp_config,
+                "entry_status",
+                side_effect=lambda client: {
+                    "cursor": "ready",
+                    "xiaomi-mimo": "stale",
+                }[client],
+            ) as status,
+        ):
+            result = doctor.check_mcp_registered(client="cursor")
+
+        self.assertEqual(result.status, "PASS")
+        self.assertIn("cursor", result.detail)
+        self.assertNotIn("xiaomi-mimo", result.detail)
+        status.assert_called_once_with("cursor")
+
+    def test_client_scoped_unconfigured_host_is_not_a_failure(self):
+        with mock.patch.object(mcp_config, "entry_status", return_value="absent"):
+            result = doctor.check_mcp_registered(client="cursor")
+
+        self.assertEqual(result.status, "PASS")
+        self.assertEqual(result.detail, "not configured: cursor")
 
     def test_dev_mode_passes_when_no_client_is_in_dev_root(self):
         with tempfile.TemporaryDirectory() as tmp:
@@ -2322,6 +2423,26 @@ class MainTests(unittest.TestCase):
         self.assertTrue(payload["ok"])
         self.assertEqual(payload["results"][0]["name"], "python")
         self.assertEqual(payload["cursor_states"], ["not_selected"])
+
+    def test_client_scope_is_forwarded_and_reported_in_json(self):
+        results = [doctor.CheckResult("PASS", "python", "3.13")]
+        with (
+            mock.patch.object(doctor, "run_all", return_value=results) as run_all,
+            mock.patch.object(
+                doctor,
+                "cursor_doctor_states_for_machine",
+                return_value=("configured_healthy",),
+            ),
+        ):
+            buf = io.StringIO()
+            with redirect_stdout(buf):
+                code = doctor.main(["--client", "cursor", "--json"])
+
+        self.assertEqual(code, 0)
+        run_all.assert_called_once_with(workspace=None, client="cursor")
+        payload = json.loads(buf.getvalue())
+        self.assertEqual(payload["scope"], {"client": "cursor"})
+        self.assertEqual(payload["cursor_states"], ["configured_healthy"])
 
     def test_public_rerun_command_uses_installed_entrypoint(self):
         with mock.patch.object(sys, "platform", "darwin"):

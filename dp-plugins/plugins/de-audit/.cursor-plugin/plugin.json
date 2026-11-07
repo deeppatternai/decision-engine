@@ -1,0 +1,18 @@
+{
+  "name": "audit",
+  "displayName": "Deep Pattern Audit",
+  "version": "0.2.13-remote",
+  "description": "Run a hosted Deep Pattern audit with browser activation and Web progress.",
+  "author": {
+    "name": "Deep Pattern"
+  },
+  "repository": "https://github.com/deeppatternai/decision-engine",
+  "keywords": [
+    "audit",
+    "code-review",
+    "mcp"
+  ],
+  "category": "developer-tools",
+  "skills": "./skills/",
+  "mcpServers": "./cursor.mcp.json"
+}

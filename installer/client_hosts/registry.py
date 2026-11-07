@@ -71,6 +71,16 @@ CLIENT_SPECS: Mapping[str, AgentHostSpec] = MappingProxyType(
 CLIENTS = tuple(CLIENT_SPECS)
 
 
+def clients_supporting_platform(platform: str) -> tuple[str, ...]:
+    """Return registry-ordered clients whose adapter supports ``platform``."""
+
+    return tuple(
+        client
+        for client, spec in CLIENT_SPECS.items()
+        if platform in spec.supported_platforms
+    )
+
+
 def interactive_setup_blocked_reason() -> Optional[str]:
     """Return the first host-owned reason the setup GUI must not open here."""
 

@@ -11,9 +11,9 @@ Exit codes:
     2 — usage error
 
 Usage:
-    macOS/Linux: bash "$HOME/.deeppattern/decision-engine/dp-doctor.sh" [--json]
+    macOS/Linux: bash "$HOME/.deeppattern/decision-engine/dp-doctor.sh" [--json] [--client NAME]
     Windows: powershell.exe -NoProfile -ExecutionPolicy Bypass -File
-             "$HOME\\.deeppattern\\decision-engine\\dp-doctor.ps1" [-Json]
+             "$HOME\\.deeppattern\\decision-engine\\dp-doctor.ps1" [-Json] [-Client NAME]
 """
 
 from __future__ import annotations
@@ -510,10 +510,17 @@ def check_python() -> CheckResult:
     )
 
 
-def _skill_route_snapshot():
+def _skill_route_snapshot(client: Optional[str] = None):
     # The DE skills are the core client payload, not an optional dependency — a
     # failed link is a genuinely broken install, so FAIL (exit 1), not WARN.
     destinations = mcp_config.active_skill_routes(for_doctor=True)
+    if client is not None:
+        route_name = mcp_config.CLIENT_SPECS[client].skill_route_name
+        destinations = {
+            name: destination
+            for name, destination in destinations.items()
+            if name == route_name
+        }
     expected = {
         client: tuple(skill for skill in DE_SKILLS if skill not in excluded)
         for client, (_directory, excluded) in destinations.items()
@@ -545,14 +552,20 @@ def _skill_route_snapshot():
     return destinations, expected, missing
 
 
-def skill_route_failures() -> Dict[str, List[str]]:
+def skill_route_failures(client: Optional[str] = None) -> Dict[str, List[str]]:
     """Expose missing managed routes by host without parsing display strings."""
-    _destinations, _expected, missing = _skill_route_snapshot()
+    _destinations, _expected, missing = _skill_route_snapshot(client=client)
     return missing
 
 
-def check_skills() -> CheckResult:
-    destinations, expected, missing = _skill_route_snapshot()
+def check_skills(client: Optional[str] = None) -> CheckResult:
+    destinations, expected, missing = _skill_route_snapshot(client=client)
+    if not destinations:
+        return CheckResult(
+            "PASS",
+            "skills",
+            "no configured skill-delivery host in scope",
+        )
     if not missing:
         detail = ", ".join(
             "%s=%s" % (client, directory)
@@ -663,7 +676,7 @@ def check_popup_backend() -> CheckResult:
     )
 
 
-def check_mcp_registered() -> CheckResult:
+def check_mcp_registered(client: Optional[str] = None) -> CheckResult:
     """Report whether detected clients have a current Decision Engine launcher entry.
 
     Presence alone is insufficient: old installs can retain an ``installer.shim``
@@ -680,14 +693,20 @@ def check_mcp_registered() -> CheckResult:
         from installer import host_onboarding, mcp_config
 
         statuses = {}
-        for client in mcp_config.clients_with_doctor_capability(
-            "mcp-entry",
-            detected_only=True,
-        ):
+        if client is None:
+            clients = mcp_config.clients_with_doctor_capability(
+                "mcp-entry",
+                detected_only=True,
+            )
+        elif "mcp-entry" in mcp_config.CLIENT_SPECS[client].doctor_capabilities:
+            clients = (client,)
+        else:
+            clients = ()
+        for scoped_client in clients:
             try:
-                statuses[client] = mcp_config.entry_status(client)
+                statuses[scoped_client] = mcp_config.entry_status(scoped_client)
             except Exception:  # aqg: top-level boundary - one bad client config stays a WARN
-                statuses[client] = "unreadable"
+                statuses[scoped_client] = "unreadable"
         absent = [client for client, status in statuses.items() if status == "absent"]
         onboarding = host_onboarding.onboarding_report(absent)
     except Exception:  # aqg: top-level boundary — any probe failure is a WARN for this optional wiring
@@ -705,8 +724,10 @@ def check_mcp_registered() -> CheckResult:
     # Group by what was actually found, so the detail never claims content a host does not
     # have (Claude Code and Cursor have no routing file of their own).
     by_phrase = {}
-    for client, evidence in onboarding.items():
-        by_phrase.setdefault(host_onboarding.evidence_phrase(evidence), []).append(client)
+    for onboarding_client, evidence in onboarding.items():
+        by_phrase.setdefault(host_onboarding.evidence_phrase(evidence), []).append(
+            onboarding_client
+        )
     onboarded_detail = [
         "%s %s but MCP not wired" % (", ".join(clients), phrase)
         for phrase, clients in by_phrase.items()
@@ -734,6 +755,14 @@ def check_mcp_registered() -> CheckResult:
         if unwired:
             detail += "; not wired: %s" % ", ".join(unwired)
         return CheckResult("PASS", "mcp", detail)
+    if client is not None and unwired:
+        return CheckResult(
+            "PASS",
+            "mcp",
+            "not configured: %s" % ", ".join(unwired),
+        )
+    if not statuses:
+        return CheckResult("PASS", "mcp", "not applicable to selected host")
     return CheckResult(
         "WARN", "mcp", "decision-engine MCP not wired into any agent — hosted tools won't appear",
         fix="Wire it (idempotent, backs up first): python3 -m installer.mcp_config --write   "
@@ -838,7 +867,7 @@ def check_cursor_version() -> CheckResult:
     return CheckResult("WARN", "cursor-version", assessment.detail, fix=fix)
 
 
-def check_dev_mode() -> CheckResult:
+def check_dev_mode(client: Optional[str] = None) -> CheckResult:
     """Surface, visibly, whether any detected client is wired to run this install in EXPLICIT
     developer-checkout mode (``--dev-root``) — installer.launcher's own semantics: no marker, no
     network, no updater, no lease at all. Not an error (a developer checkout is a legitimate,
@@ -848,13 +877,14 @@ def check_dev_mode() -> CheckResult:
         from installer import mcp_config
 
         dev_clients = []
-        for client in mcp_config.detect_clients():
+        clients = (client,) if client is not None else mcp_config.detect_clients()
+        for scoped_client in clients:
             try:
-                entry = mcp_config.read_entry(client)
+                entry = mcp_config.read_entry(scoped_client)
             except Exception:  # aqg: top-level boundary — one bad client config is skipped here;
                 continue      # check_mcp_registered already reports it as unreadable
             if entry and mcp_config.dev_root_from_args(entry.get("args")):
-                dev_clients.append(client)
+                dev_clients.append(scoped_client)
     except Exception:  # aqg: top-level boundary — probe failure must not block other checks
         return CheckResult("WARN", "dev-mode", "could not verify dev-mode wiring")
     if not dev_clients:
@@ -887,7 +917,7 @@ def _probe_interpreter_compatible(command: str) -> bool:
     return result.returncode == 0
 
 
-def check_python_wiring() -> CheckResult:
+def check_python_wiring(client: Optional[str] = None) -> CheckResult:
     """The Python interpreter path RECORDED in each registered MCP entry must still exist and be
     compatible, or the Agent can't even start the launcher. Independent repair path (task 10):
     ``installer.bootstrap_managed_install repair-wiring`` rediscovers the interpreter currently
@@ -897,9 +927,10 @@ def check_python_wiring() -> CheckResult:
         from installer import mcp_config
 
         stale = {}
-        for client in mcp_config.detect_clients():
+        clients = (client,) if client is not None else mcp_config.detect_clients()
+        for scoped_client in clients:
             try:
-                entry = mcp_config.read_entry(client)
+                entry = mcp_config.read_entry(scoped_client)
             except Exception:  # aqg: top-level boundary — check_mcp_registered reports this client
                 continue
             if not entry:
@@ -908,7 +939,7 @@ def check_python_wiring() -> CheckResult:
             if not isinstance(command, str) or not command:
                 continue
             if not _probe_interpreter_compatible(command):
-                stale[client] = mcp_config.dev_root_from_args(entry.get("args"))
+                stale[scoped_client] = mcp_config.dev_root_from_args(entry.get("args"))
     except Exception:  # aqg: top-level boundary — probe failure must not block other checks
         return CheckResult("WARN", "python-wiring", "could not verify recorded interpreter(s)")
     if not stale:
@@ -1404,11 +1435,24 @@ def _run_bounded_process(argv, *, env, timeout, output_limit=GIT_OUTPUT_LIMIT):
     return subprocess.CompletedProcess(argv, returncode), truncated, output
 
 
-def run_all(workspace: Optional[Path] = None) -> List[CheckResult]:
+CLIENT_SCOPED_CHECKS = frozenset(
+    {check_skills, check_mcp_registered, check_dev_mode, check_python_wiring}
+)
+
+
+def run_all(
+    workspace: Optional[Path] = None,
+    client: Optional[str] = None,
+) -> List[CheckResult]:
     results: List[CheckResult] = []
     for fn in CHECKS:
+        if client is not None and fn is check_codex_legacy_routing and client != "codex":
+            continue
         try:
-            results.append(fn())
+            if fn in CLIENT_SCOPED_CHECKS:
+                results.append(fn(client=client))
+            else:
+                results.append(fn())
         except Exception as exc:  # aqg: top-level boundary — one check must never crash the doctor
             results.append(CheckResult("FAIL", fn.__name__, "check crashed: %s" % type(exc).__name__))
     if workspace is not None:
@@ -1438,6 +1482,11 @@ def _render(results: List[CheckResult]) -> str:
 def main(argv: Optional[List[str]] = None) -> int:
     parser = argparse.ArgumentParser(prog="de doctor", description="Decision Engine client diagnostic.")
     parser.add_argument("--json", action="store_true", help="machine-readable output")
+    parser.add_argument(
+        "--client",
+        choices=tuple(mcp_config.CLIENT_SPECS),
+        help="diagnose one Agent host plus common Decision Engine components",
+    )
     cursor_scope = parser.add_mutually_exclusive_group()
     cursor_scope.add_argument(
         "--workspace",
@@ -1450,15 +1499,19 @@ def main(argv: Optional[List[str]] = None) -> int:
         help="run only the redacted Cursor installed/selected version diagnosis",
     )
     args = parser.parse_args(argv)
+    if args.workspace is not None and args.client not in (None, "cursor"):
+        parser.error("--workspace can only be combined with --client cursor")
+    if args.cursor_version and args.client is not None:
+        parser.error("--cursor-version cannot be combined with --client")
 
     if args.cursor_version:
         results = [check_cursor_version()]
         cursor_states = None
     else:
-        results = run_all(workspace=args.workspace)
+        results = run_all(workspace=args.workspace, client=args.client)
         cursor_states = (
             cursor_doctor_states_for_machine(workspace=args.workspace)
-            if args.json
+            if args.json and args.client in (None, "cursor")
             else None
         )
     has_fail = any(r.status == "FAIL" for r in results)
@@ -1470,8 +1523,12 @@ def main(argv: Optional[List[str]] = None) -> int:
         }
         if cursor_states is not None:
             payload["cursor_states"] = list(cursor_states)
+        if args.client is not None:
+            payload["scope"] = {"client": args.client}
         print(json.dumps(payload, ensure_ascii=False))
     else:
+        if args.client is not None:
+            print("Scope: %s" % args.client)
         print(_render(results))
         print()
         print("Decision Engine doctor: %s" % ("FAIL — fix the ✗ above" if has_fail else "OK"))

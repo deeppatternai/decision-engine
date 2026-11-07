@@ -66,6 +66,13 @@ python3 -m installer.bootstrap_managed_install repair-wiring   # rediscover pyth
 checkout instead — no signature verification, no auto-update at all
 (`installer.launcher`'s own explicit developer-mode semantics).
 
+**Update ownership**: the stdio shim never mutates its checkout or starts a
+background `git pull`. Managed installations update only through
+`installer.launcher`, which verifies a signed release manifest, applies the
+update under the managed startup lease, and keeps serving the known-good
+version when discovery or verification fails. The old best-effort shim-side
+Git updater has been removed.
+
 **Lower-level primitive**: `installer.install` itself only lays a body down
 from an already-unpacked bundle root and writes the device config — it does no
 Git, no signature verification, and is what `bootstrap_managed_install` calls
@@ -91,7 +98,7 @@ an owner-issued device activation key.
 | Alibaba Qoder CN Desktop | `qoder-cn` | `~/.qoder-cn/settings.json` | `~/.qoder-cn/skills/` | absolute `installer/mcp_bootstrap.py`; JSON omits `cwd`; omits `type` |
 | Alibaba Qoder IDE | `qoder-ide` | `~/.qoder/mcp.json` | `~/.qoder/skills/` | absolute `installer/mcp_bootstrap.py`; JSON omits `cwd`; omits `type` |
 | Alibaba Qoder CN IDE | `qoder-cn-ide` | `~/.qoder-cn/mcp.json` | `~/.qoder-cn/skills/` | absolute `installer/mcp_bootstrap.py`; JSON omits `cwd`; omits `type` |
-| TRAE Desktop | `trae` | `~/Library/Application Support/Trae/User/mcp.json` | `~/.trae/skills/` | desktop Python (macOS direct); JSON includes `cwd`, omits `type` |
+| TRAE Desktop | `trae` | Windows: `%APPDATA%/Trae/User/mcp.json`<br>macOS: `~/Library/Application Support/Trae/User/mcp.json` | `~/.trae/skills/` | desktop Python (Windows space-safe, macOS direct); JSON includes `cwd`, omits `type` |
 | TRAE Work | `trae-work` | Windows: `%APPDATA%/TRAE SOLO/User/mcp.json`<br>macOS: `~/Library/Application Support/TRAE SOLO/User/mcp.json` | `~/.trae/skills/` | desktop Python (Windows space-safe, macOS direct); JSON includes `cwd`, omits `type` |
 | TRAE CN Desktop | `trae-cn` | Windows: `%APPDATA%/Trae CN/User/mcp.json`<br>macOS: `~/Library/Application Support/Trae CN/User/mcp.json` | `~/.trae-cn/skills/` | desktop Python (Windows space-safe, macOS direct); JSON includes `cwd`, omits `type` |
 | TRAE Work CN | `trae-work-cn` | Windows: `%APPDATA%/TRAE SOLO CN/User/mcp.json`<br>macOS: `~/Library/Application Support/TRAE SOLO CN/User/mcp.json` | `~/.trae-cn/skills/` | desktop Python (Windows space-safe, macOS direct); JSON includes `cwd`, omits `type` |
@@ -264,14 +271,20 @@ installer preserves the token on later reinstalls.
 
 ## Use — wire the launcher into your agent
 
-The launcher performs the bounded managed-update gate and then starts the local
-shim that forwards to the hosted Decision Engine. Add
-it to your agent's MCP config so tools appear in-session. Print a **resolved**
-entry whose command, arguments, environment, optional `cwd`, and optional
-`type` are selected by the registered host's launch/render contracts in the
-table above. Direct-Python hosts use `-m installer.launcher`; the TRAE and
-WorkBuddy adapters use desktop Python (Windows space-safe, macOS direct); Qoder uses the
-checkout-bound absolute `installer/mcp_bootstrap.py` entry.
+The launcher recovers any local update journal, then starts the local shim that
+forwards to the hosted Decision Engine. **Managed auto-update is off by
+default.** Set `"auto_update": true` in
+`~/.deeppattern/decision-engine/config.json` to opt in; when enabled, signed
+discovery/staging runs in a background thread during the session (never
+mutating HEAD while MCP is live), and a staged release is applied only after
+`serve` returns so the next Agent start picks it up. MCP first-connect is not
+blocked on the network update budget. Add the launcher to your agent's MCP
+config so tools appear in-session. Print a **resolved** entry whose command,
+arguments, environment, optional `cwd`, and optional `type` are selected by the
+registered host's launch/render contracts in the table above. Direct-Python
+hosts use `-m installer.launcher`; the TRAE and WorkBuddy adapters use desktop
+Python (Windows space-safe, macOS direct); Qoder uses the checkout-bound
+absolute `installer/mcp_bootstrap.py` entry.
 This requires either a prepared managed install with a valid launcher protocol
 marker or an explicit developer root. The marker confirms that the managed
 launcher is ready; it is separate from server-issued device credentials.
@@ -317,12 +330,13 @@ Qoder or another host; let `installer.mcp_config` render the selected contract:
 ```
 
 The launcher is fail-closed: an old copied install with no managed control plane
-continues to serve without network or Git mutation; a managed install checks for
-an authorized release within one shared acquisition budget. If recovery or an
-update changes HEAD, a fresh child Python interpreter inherits the same MCP stdio
-connection and imports the selected checkout, so no second Agent restart is
-needed and old/new modules are never mixed. Once a filesystem mutation begins it
-must finish or roll back rather than being killed at the acquisition deadline.
+continues to serve without network or Git mutation; a managed install with
+`auto_update` enabled may discover and stage an authorized release in the
+background within one shared acquisition budget (never blocking MCP
+`initialize` on that budget, and never applying under a live shim lease).
+Staged install runs after the MCP session ends; the next Agent start serves the
+new checkout. Once a filesystem mutation begins it must finish or roll back
+rather than being killed at the acquisition deadline.
 For hosted requests, the shim reads
 `~/.deeppattern/decision-engine/config.json`, attaches the device token, and
 communicates with the server's `/mcp` endpoint over HTTPS. It **refuses** to send
@@ -343,6 +357,28 @@ It deliberately refuses when the production
 public key or formal stable/mirror release is absent. It does not guess-reset an
 arbitrary legacy directory; the signed legacy bootstrap remains a release
 prerequisite.
+
+### Release-signing public keys
+
+`installer/release-trust.json` contains public keys used only to verify signed
+release manifests. It contains no signing private key, device credential, audit
+content, or capability to decrypt or submit an audit. A key is admitted for
+release verification only while its `revoked` field is `false`.
+
+The active stable signer is `stable-2026-08`. The
+`test-stable-2026-07` public key signed early release manifests, but is retained
+only as an explicitly revoked historical record; it cannot authorize a release
+in clients that contain this trust table. Keeping the revoked record makes old
+signatures identifiable during support and incident review without preserving
+their authority for new installs or updates.
+
+Revocation is not an online kill switch for every existing installation. It
+takes effect when a client installs a release containing the updated trust
+table. An older client that trusts only the historical key also cannot learn the
+current key merely because newer clients retain that historical record. Such a
+client must follow a separately verified forward-update path or reinstall from
+the official installer; rollback protection and signature verification must not
+be bypassed to recover it.
 
 In practice you don't call this directly — `installer.bootstrap_managed_install`
 is the thing that first produces a "prepared" checkout (clone + verify) and then

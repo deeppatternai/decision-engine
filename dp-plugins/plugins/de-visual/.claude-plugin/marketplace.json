@@ -1,0 +1,16 @@
+{
+  "$schema": "https://anthropic.com/claude-code/marketplace.schema.json",
+  "name": "deeppattern-visual",
+  "owner": {"name": "Deep Pattern"},
+  "description": "Deep Pattern Visual capability plugin.",
+  "plugins": [
+    {
+      "name": "visual",
+      "source": ".",
+      "displayName": "Deep Pattern Visual",
+      "description": "Create hosted diagrams, infographics, and comics.",
+      "version": "0.1.0-remote.1",
+      "strict": true
+    }
+  ]
+}

@@ -190,6 +190,7 @@ QODER_CN = AgentHostSpec(
     onboarding_evidence=("skill",),
     json_config_transform=_qoder_cn_json_config_transform,
     unverified_lite_stopper=True,
+    supported_platforms=frozenset({"darwin"}),
 )
 
 HOST_SPECS = (QODER_CN,)

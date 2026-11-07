@@ -441,6 +441,62 @@ print(json.dumps({"clients": clients}))
     return @($clients)
 }
 
+function Get-PlatformSupportedAgentSnapshot {
+    param(
+        [Parameter(Mandatory = $true)][string]$SourceRoot,
+        [Parameter(Mandatory = $true)][string]$Platform,
+        [Parameter(Mandatory = $true)][string[]]$ValidClients
+    )
+
+    $snapshotScript = @'
+from pathlib import Path
+import json
+import sys
+
+root = Path(sys.argv[1]).resolve(strict=True)
+sys.path.insert(0, str(root))
+from installer import mcp_config
+
+print(json.dumps({"clients": mcp_config.clients_supporting_platform(sys.argv[2])}))
+'@
+    $result = Invoke-PythonScript `
+        -PythonPath $script:PythonPath `
+        -ScriptText $snapshotScript `
+        -ScriptArguments @($SourceRoot, $Platform) `
+        -WorkingDirectory $SourceRoot `
+        -Capture
+    if ($result.ExitCode -ne 0) {
+        Stop-Install "Agent platform support lookup failed before host configuration began." $ExitBlocked
+    }
+    $payload = ($result.Output | ForEach-Object { [string]$_ }) -join ""
+    try {
+        $decoded = ConvertFrom-Json -InputObject $payload
+    }
+    catch {
+        Stop-Install "Agent platform support lookup returned invalid JSON." $ExitBlocked
+    }
+    $properties = @($decoded.PSObject.Properties | ForEach-Object { $_.Name })
+    if ($properties.Count -ne 1 -or $properties[0] -ne "clients") {
+        Stop-Install "Agent platform support lookup returned an invalid JSON object." $ExitBlocked
+    }
+    $clients = @()
+    foreach ($decodedClient in @($decoded.clients)) {
+        if ($decodedClient -isnot [string]) {
+            Stop-Install "Agent platform support lookup returned a non-string client id." $ExitBlocked
+        }
+        $client = [string]$decodedClient
+        if ([string]::IsNullOrWhiteSpace($client) -or
+            $client -match "[\r\n]" -or
+            $client -ne $client.Trim() -or
+            $ValidClients -notcontains $client -or
+            $clients -contains $client) {
+            Stop-Install "Agent platform support lookup returned an invalid client list." $ExitBlocked
+        }
+        $clients += $client
+    }
+    return @($clients)
+}
+
 function Get-AgentDisplayName {
     param([Parameter(Mandatory = $true)][string]$Client)
 
@@ -3359,6 +3415,10 @@ try {
         ) -f $ProgramName)
         exit $ExitPartial
     }
+    $windowsSupportedClients = @(Get-PlatformSupportedAgentSnapshot `
+        -SourceRoot $sourceRoot `
+        -Platform "win32" `
+        -ValidClients $ValidClients)
     $configuredClientsBefore = @(Get-ConfiguredAgentSnapshot `
         -SourceRoot $sourceRoot `
         -InstalledClients $installedClients)
@@ -3792,24 +3852,26 @@ raise SystemExit(1 if failed else 0)
     }
 
     $unsupported = New-Object System.Collections.Generic.List[string]
-    $expectedProducts = @(
+    $windowsProducts = @(
         @{ Path = (Join-Path $env:LOCALAPPDATA "Programs\TRAE SOLO"); Client = "trae-work"; Name = "TRAE Work" },
         @{ Path = (Join-Path $env:LOCALAPPDATA "Programs\TRAE SOLO CN"); Client = "trae-work-cn"; Name = "TRAE Work CN" },
         @{ Path = (Join-Path $env:LOCALAPPDATA "Programs\WorkBuddy"); Client = "workbuddy"; Name = "WorkBuddy" },
-        @{ Path = (Join-Path $env:LOCALAPPDATA "Programs\Qoder"); Client = "qoder"; Name = "Qoder" }
+        @{ Path = (Join-Path $env:LOCALAPPDATA "Programs\Qoder"); Client = "qoder"; Name = "Qoder" },
+        @{ Path = (Join-Path $env:LOCALAPPDATA "Programs\Qoder CN"); Client = "qoder-cn"; Name = "Qoder CN" },
+        @{ Path = (Join-Path $env:LOCALAPPDATA "Programs\Trae"); Client = "trae"; Name = "TRAE Code" },
+        @{ Path = (Join-Path $env:LOCALAPPDATA "Programs\Trae CN"); Client = "trae-cn"; Name = "TRAE Code CN" },
+        @{ Path = (Join-Path $env:LOCALAPPDATA "Programs\WorkBuddy AI"); Client = "workbuddy-ai"; Name = "WorkBuddy AI" }
     )
-    foreach ($product in $expectedProducts) {
-        if ((Test-Path -LiteralPath $product.Path -PathType Container) -and ($installedClients -notcontains $product.Client)) {
-            $unsupported.Add("$($product.Name): installed but not configured by the current signed adapter")
+    foreach ($product in $windowsProducts) {
+        if (-not (Test-Path -LiteralPath $product.Path -PathType Container)) {
+            continue
         }
-    }
-    foreach ($product in @(
-        @{ Path = (Join-Path $env:LOCALAPPDATA "Programs\Qoder CN"); Name = "Qoder CN" },
-        @{ Path = (Join-Path $env:LOCALAPPDATA "Programs\Trae"); Name = "TRAE Code" },
-        @{ Path = (Join-Path $env:LOCALAPPDATA "Programs\Trae CN"); Name = "TRAE Code CN" },
-        @{ Path = (Join-Path $env:LOCALAPPDATA "Programs\WorkBuddy AI"); Name = "WorkBuddy AI" }
-    )) {
-        if (Test-Path -LiteralPath $product.Path -PathType Container) {
+        if ($windowsSupportedClients -contains $product.Client) {
+            if ($installedClients -notcontains $product.Client) {
+                $unsupported.Add("$($product.Name): installed but not configured by the current signed adapter")
+            }
+        }
+        else {
             $unsupported.Add("$($product.Name): Windows DE adapter unavailable in the current signed release")
         }
     }
@@ -3863,7 +3925,7 @@ raise SystemExit(1 if failed else 0)
                 Write-Host $item
             }
         }
-        [Console]::Error.WriteLine(("{0}: PARTIAL: supported components were installed, but host verification or AQG automatic update compatibility remains incomplete." -f $ProgramName))
+        [Console]::Error.WriteLine(("{0}: PARTIAL: supported components were installed, but host verification or AQG automatic update compatibility remains incomplete.`nDeep Pattern is ready to use with each successfully configured Agent integration. Fully restart those Agent applications, then open a new session and verify that the integration works; review the items above for any integration that still needs attention." -f $ProgramName))
         exit $ExitPartial
     }
     if ($script:UpdateDeferred) {
@@ -3871,14 +3933,14 @@ raise SystemExit(1 if failed else 0)
             Write-Host ("{0}: SUCCESS_WITH_RESTART_REQUIRED: device activation and host configuration are complete; the current verified DE release was preserved and its signed update remains pending." -f $ProgramName)
             exit 0
         }
-        [Console]::Error.WriteLine(("{0}: PARTIAL: device activation and the signed DE update remain pending; the current verified release and host configuration were preserved." -f $ProgramName))
+        [Console]::Error.WriteLine(("{0}: PARTIAL: device activation and the signed DE update remain pending; the current verified release and host configuration were preserved.`nThe current verified Deep Pattern installation remains available. Fully restart the configured Agent applications, then open a new session to use the available integration; rerun this installer after completing activation and the pending update." -f $ProgramName))
         exit $ExitPartial
     }
     if ($runtimeRestartRequired) {
-        Write-Host ("{0}: PASS: installation completed; runtime verification requires host restart" -f $ProgramName)
+        Write-Host ("{0}: PASS: installation completed; runtime verification requires host restart`nDeep Pattern installation is complete. Fully restart each configured Agent application, then open a new session and verify that the integration works." -f $ProgramName)
     }
     else {
-        Write-Host ("{0}: PASS: installation completed; no host configuration changed" -f $ProgramName)
+        Write-Host ("{0}: PASS: installation completed; no host configuration changed`nDeep Pattern installation is complete and ready to use. Open a new Agent session and verify that the integration works." -f $ProgramName)
     }
 }
 finally {

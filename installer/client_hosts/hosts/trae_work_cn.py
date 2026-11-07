@@ -183,6 +183,7 @@ TRAE_WORK_CN = AgentHostSpec(
     doctor_capabilities=frozenset({"mcp-entry", "skills", "workspace-shadow"}),
     optional_features=frozenset({"local-display", "audit-stop-panel"}),
     onboarding_evidence=("skill",),
+    supported_platforms=frozenset({"darwin", "win32"}),
 )
 
 HOST_SPECS = (TRAE_WORK_CN,)

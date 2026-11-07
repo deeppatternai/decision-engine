@@ -112,6 +112,46 @@ class ClientHostExtensionConformanceTestCase(unittest.TestCase):
             )
         )
 
+    def test_registry_declares_the_windows_host_support_matrix(self):
+        self.assertEqual(
+            registry.clients_supporting_platform("win32"),
+            (
+                "claude-code",
+                "claude-desktop",
+                "codebuddy",
+                "codex",
+                "cursor",
+                "deepseek-harness",
+                "qoder",
+                "trae",
+                "trae-work",
+                "trae-cn",
+                "trae-work-cn",
+                "workbuddy",
+                "xiaomi-mimo",
+            ),
+        )
+        for client in ("trae", "trae-cn"):
+            with self.subTest(client=client):
+                self.assertIn(
+                    "win32", registry.CLIENT_SPECS[client].supported_platforms
+                )
+
+    def test_registry_rejects_unknown_or_empty_platform_contracts(self):
+        codex = registry.CLIENT_SPECS["codex"]
+        for platforms in (frozenset(), frozenset({"plan9"})):
+            with self.subTest(platforms=platforms), self.assertRaisesRegex(
+                contract.ShellError, "supported platforms"
+            ):
+                contract.validate_host_specs(
+                    {
+                        "codex": replace(
+                            codex,
+                            supported_platforms=platforms,
+                        )
+                    }
+                )
+
     def test_shared_contract_accepts_any_positive_number_of_project_skill_paths(self):
         cursor = registry.CLIENT_SPECS["cursor"]
         for paths in (

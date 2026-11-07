@@ -71,6 +71,7 @@ from installer.client_hosts.renderers import (
 from installer.client_hosts.registry import (
     CLIENTS,
     CLIENT_SPECS as REGISTERED_CLIENT_SPECS,
+    clients_supporting_platform,
 )
 from installer.config import ShellError
 
@@ -504,6 +505,8 @@ def _client_present(client: str, path: Path) -> bool:
     So claude-code needs its config file OR the ``~/.claude`` dir; the other clients keep the
     parent-dir signal (their parents are app-specific: ``~/.codex``, the Claude support dir)."""
     spec = CLIENT_SPECS[client]
+    if sys.platform not in spec.supported_platforms:
+        return False
     if spec.detection == "installation-probe":
         present = False
     elif spec.detection == "file-or-sibling-dir":
@@ -560,8 +563,14 @@ def _cursor_skills_in_use() -> bool:
 def _cursor_skills_configured() -> bool:
     """Compatibility seam retained for callers that patch the legacy probe."""
 
+    return _client_skills_configured("cursor")
+
+
+def _client_skills_configured(client: str) -> bool:
+    """Whether one host has an explicit same-name DE MCP entry to diagnose."""
+
     try:
-        return read_entry("cursor") is not None
+        return read_entry(client) is not None
     except ShellError:
         return False
 
@@ -1447,6 +1456,12 @@ _CONFIG_WRITE_GUARDS = {
 
 
 def _config_write_warning(spec: AgentHostSpec) -> Optional[str]:
+    if sys.platform not in spec.supported_platforms:
+        label = spec.id.replace("-", "_")
+        raise ShellError(
+            f"unsupported_{label}_platform: the registered host adapter does not "
+            "support this platform; nothing was written"
+        )
     if spec.config_write_guard_probe is not None:
         return spec.config_write_guard_probe()
     if spec.config_write_guard is not None:

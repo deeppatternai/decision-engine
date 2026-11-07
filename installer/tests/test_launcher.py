@@ -53,6 +53,106 @@ class LauncherTests(unittest.TestCase):
     def test_default_update_startup_budget_is_sixty_seconds(self):
         self.assertEqual(launcher.STARTUP_UPDATE_BUDGET_SECONDS, 60.0)
 
+    def test_auto_update_config_defaults_to_off(self):
+        (self.root / "config.json").write_text("{}\n", encoding="utf-8")
+        with mock.patch.object(
+            launcher.update_transaction, "_require_protocol_ready"
+        ):
+            self.assertFalse(launcher._updates_enabled(self.root))
+
+    def test_auto_update_config_true_enables_updates_when_protocol_ready(self):
+        (self.root / "config.json").write_text(
+            '{"auto_update": true}\n', encoding="utf-8"
+        )
+        with mock.patch.object(
+            launcher.update_transaction, "_require_protocol_ready"
+        ):
+            self.assertTrue(launcher._updates_enabled(self.root))
+
+    def test_auto_update_rejects_truthy_non_boolean(self):
+        (self.root / "config.json").write_text(
+            '{"auto_update": "true"}\n', encoding="utf-8"
+        )
+        with mock.patch.object(
+            launcher.update_transaction, "_require_protocol_ready"
+        ):
+            self.assertFalse(launcher._updates_enabled(self.root))
+
+    def test_launch_skips_network_update_when_auto_update_disabled(self):
+        with (
+            mock.patch.object(launcher, "_managed_control_present", return_value=True),
+            mock.patch.object(launcher, "_head_commit", return_value="1" * 40),
+            mock.patch.object(launcher, "_finalize_journal", return_value=None),
+            mock.patch.object(launcher, "_updates_enabled", return_value=False),
+            mock.patch.object(launcher, "_schedule_background_update") as schedule,
+            mock.patch.object(launcher, "_attempt_update") as update,
+            mock.patch.object(launcher, "load_trusted_release_keys") as keys,
+            mock.patch.object(launcher, "_serve_shim", return_value=3) as serve,
+        ):
+            result = launcher.launch(self.root, stdin=io.StringIO(), stdout=io.StringIO())
+
+        self.assertEqual(result, 3)
+        schedule.assert_not_called()
+        update.assert_not_called()
+        keys.assert_not_called()
+        serve.assert_called_once()
+
+    def test_launch_schedules_background_update_without_blocking_serve(self):
+        events = []
+
+        def schedule(*_args, **_kwargs):
+            events.append("schedule")
+
+        def serve(*_args, **_kwargs):
+            events.append("serve")
+            return 0
+
+        def apply_after(*_args, **_kwargs):
+            events.append("apply-after")
+
+        with (
+            mock.patch.object(launcher, "_managed_control_present", return_value=True),
+            mock.patch.object(launcher, "_finalize_journal", return_value=None),
+            mock.patch.object(launcher, "_updates_enabled", return_value=True),
+            mock.patch.object(launcher, "_schedule_background_update", side_effect=schedule),
+            mock.patch.object(launcher, "_attempt_update") as update,
+            mock.patch.object(launcher, "_serve_shim", side_effect=serve),
+            mock.patch.object(
+                launcher, "_apply_staged_after_session", side_effect=apply_after
+            ),
+        ):
+            self.assertEqual(
+                launcher.launch(self.root, stdin=io.StringIO(), stdout=io.StringIO()),
+                0,
+            )
+
+        self.assertEqual(events, ["schedule", "serve", "apply-after"])
+        update.assert_not_called()
+
+    def test_launch_applies_staged_only_after_serve_returns(self):
+        events = []
+
+        def serve(*_args, **_kwargs):
+            events.append("serve")
+            return 0
+
+        def apply_after(*_args, **_kwargs):
+            events.append("apply-after")
+
+        with (
+            mock.patch.object(launcher, "_managed_control_present", return_value=True),
+            mock.patch.object(launcher, "_finalize_journal", return_value=None),
+            mock.patch.object(launcher, "_updates_enabled", return_value=True),
+            mock.patch.object(launcher, "_schedule_background_update", return_value=None),
+            mock.patch.object(launcher, "_serve_shim", side_effect=serve),
+            mock.patch.object(
+                launcher, "_apply_staged_after_session", side_effect=apply_after
+            ),
+        ):
+            self.assertEqual(launcher.launch(self.root), 0)
+
+        self.assertEqual(events, ["serve", "apply-after"])
+
     def test_launch_repairs_existing_windows_config_before_admission(self):
         with (
             mock.patch.object(
@@ -113,40 +213,37 @@ class LauncherTests(unittest.TestCase):
         self.assertEqual(result, 0)
         serve.assert_called_once_with(self.root, client_host="unknown-host")
 
-    def test_missing_release_keys_serves_known_good_without_network_or_git_mutation(self):
+    def test_enabled_auto_update_schedules_background_even_without_critical_path_keys(self):
+        """Key loading happens in the background worker, not before serve."""
+
         with (
             mock.patch.object(launcher, "_managed_control_present", return_value=True),
-            mock.patch.object(launcher, "_head_commit", return_value="1" * 40),
             mock.patch.object(launcher, "_finalize_journal", return_value=None),
             mock.patch.object(launcher, "_updates_enabled", return_value=True),
-            mock.patch.object(launcher, "load_trusted_release_keys", return_value={}),
+            mock.patch.object(launcher, "_schedule_background_update") as schedule,
+            mock.patch.object(launcher, "_apply_staged_after_session"),
             mock.patch.object(launcher, "_attempt_update") as update,
             mock.patch.object(launcher, "_serve_shim", return_value=7) as serve,
         ):
             result = launcher.launch(self.root, stdin=io.StringIO(), stdout=io.StringIO())
 
         self.assertEqual(result, 7)
+        schedule.assert_called_once()
         update.assert_not_called()
         serve.assert_called_once()
 
-    def test_release_transport_failure_still_serves_known_good(self):
+    def test_enabled_auto_update_schedules_background_network_check(self):
         with (
             mock.patch.object(launcher, "_managed_control_present", return_value=True),
-            mock.patch.object(launcher, "_head_commit", return_value="1" * 40),
             mock.patch.object(launcher, "_finalize_journal", return_value=None),
             mock.patch.object(launcher, "_updates_enabled", return_value=True),
-            mock.patch.object(
-                launcher, "load_trusted_release_keys", return_value={"production": mock.sentinel.key}
-            ),
-            mock.patch.object(
-                launcher,
-                "_attempt_update",
-                side_effect=launcher.release_acquisition.ReleaseTransportError("offline"),
-            ),
+            mock.patch.object(launcher, "_schedule_background_update") as schedule,
+            mock.patch.object(launcher, "_apply_staged_after_session"),
             mock.patch.object(launcher, "_serve_shim", return_value=8) as serve,
         ):
             result = launcher.launch(self.root)
         self.assertEqual(result, 8)
+        schedule.assert_called_once()
         serve.assert_called_once()
 
     def test_attempt_update_falls_back_to_git_when_anonymous_mirrors_unreachable(self):
@@ -199,56 +296,50 @@ class LauncherTests(unittest.TestCase):
         apply.assert_called_once()
         self.assertIs(result, expected)
 
-    def test_update_transaction_failure_still_serves_known_good(self):
+    def test_post_session_staged_apply_failure_still_returned_serve_status(self):
+        """Exceptions inside post-session apply must not replace the serve exit code.
+
+        ``_apply_staged_after_session`` swallows its own errors; this locks that
+        ``launch`` still returns the shim status when the helper is a no-op.
+        """
+
         with (
             mock.patch.object(launcher, "_managed_control_present", return_value=True),
-            mock.patch.object(launcher, "_head_commit", return_value="1" * 40),
             mock.patch.object(launcher, "_finalize_journal", return_value=None),
             mock.patch.object(launcher, "_updates_enabled", return_value=True),
-            mock.patch.object(
-                launcher, "load_trusted_release_keys", return_value={"production": mock.sentinel.key}
-            ),
-            mock.patch.object(
-                launcher,
-                "_attempt_update",
-                side_effect=launcher.update_transaction.UpdateTransactionError("busy"),
-            ),
+            mock.patch.object(launcher, "_schedule_background_update"),
+            mock.patch.object(launcher, "_apply_staged_after_session"),
             mock.patch.object(launcher, "_serve_shim", return_value=9) as serve,
         ):
             result = launcher.launch(self.root)
         self.assertEqual(result, 9)
         serve.assert_called_once()
 
-    def test_journal_finalization_precedes_network_and_serve(self):
+    def test_journal_finalization_precedes_background_schedule_and_serve(self):
         events = []
 
         @contextlib.contextmanager
         def gate(*_args, **_kwargs):
             events.append("gate-enter")
-            yield
+            yield mock.Mock(waited=False)
             events.append("gate-exit")
 
         def finalize(_root):
             events.append("finalize")
 
-        def update(*_args, **_kwargs):
-            events.append("update")
-            return update_transaction.UpdateResult(
-                "up_to_date", "1" * 40, "1" * 40, None, None,
-            )
+        def schedule(*_args, **_kwargs):
+            events.append("schedule")
 
         with (
             mock.patch.object(launcher, "_managed_control_present", return_value=True),
             mock.patch.object(
                 launcher.update_coordination, "startup_update_gate", side_effect=gate
             ),
-            mock.patch.object(launcher, "_head_commit", return_value="1" * 40),
             mock.patch.object(launcher, "_finalize_journal", side_effect=finalize),
             mock.patch.object(launcher, "_updates_enabled", return_value=True),
-            mock.patch.object(
-                launcher, "load_trusted_release_keys", return_value={"test": mock.sentinel.key}
-            ),
-            mock.patch.object(launcher, "_attempt_update", side_effect=update),
+            mock.patch.object(launcher, "_schedule_background_update", side_effect=schedule),
+            mock.patch.object(launcher, "_apply_staged_after_session"),
+            mock.patch.object(launcher, "_attempt_update") as update,
             mock.patch.object(
                 launcher, "_serve_shim", side_effect=lambda *_a, **_k: events.append("serve") or 0
             ),
@@ -256,8 +347,9 @@ class LauncherTests(unittest.TestCase):
             launcher.launch(self.root, stdin=io.StringIO(), stdout=io.StringIO())
 
         self.assertEqual(
-            events, ["gate-enter", "finalize", "update", "gate-exit", "serve"]
+            events, ["gate-enter", "finalize", "gate-exit", "schedule", "serve"]
         )
+        update.assert_not_called()
 
     def test_startup_update_gate_serializes_concurrent_launchers(self):
         first_entered = threading.Event()
@@ -332,7 +424,6 @@ class LauncherTests(unittest.TestCase):
 
         with (
             mock.patch.object(launcher, "_managed_control_present", return_value=True),
-            mock.patch.object(launcher, "_head_commit", return_value="1" * 40),
             mock.patch.object(
                 launcher.update_coordination,
                 "startup_update_gate",
@@ -340,17 +431,15 @@ class LauncherTests(unittest.TestCase):
             ),
             mock.patch.object(launcher, "_finalize_journal", return_value=None) as finalize,
             mock.patch.object(launcher, "_updates_enabled", return_value=True),
-            mock.patch.object(launcher, "load_trusted_release_keys", return_value={"test": mock.sentinel.key}),
-            mock.patch.object(launcher, "_attempt_update", return_value=update_transaction.UpdateResult(
-                "up_to_date", "1" * 40, "1" * 40, None, None,
-            )) as update,
+            mock.patch.object(launcher, "_schedule_background_update") as schedule,
+            mock.patch.object(launcher, "_apply_staged_after_session"),
             mock.patch.object(launcher, "_serve_shim", return_value=4) as serve,
         ):
             result = launcher.launch(self.root)
 
         self.assertEqual(result, 4)
         finalize.assert_called_once_with(self.root)
-        update.assert_called_once()
+        schedule.assert_called_once()
         serve.assert_called_once()
 
     def test_killed_lock_holder_does_not_suppress_waiting_follower_update(self):
@@ -399,13 +488,10 @@ class LauncherTests(unittest.TestCase):
             mock.patch.object(update_coordination, "startup_update_gate", side_effect=self.native_startup_update_gate),
             mock.patch.object(update_coordination, "_try_lock", side_effect=watched_try_lock),
             mock.patch.object(launcher, "_managed_control_present", return_value=True),
-            mock.patch.object(launcher, "_head_commit", return_value="1" * 40),
             mock.patch.object(launcher, "_finalize_journal", return_value=None),
             mock.patch.object(launcher, "_updates_enabled", return_value=True),
-            mock.patch.object(launcher, "load_trusted_release_keys", return_value={"test": mock.sentinel.key}),
-            mock.patch.object(launcher, "_attempt_update", return_value=update_transaction.UpdateResult(
-                "up_to_date", "1" * 40, "1" * 40, None, None,
-            )) as update,
+            mock.patch.object(launcher, "_schedule_background_update") as schedule,
+            mock.patch.object(launcher, "_apply_staged_after_session"),
             mock.patch.object(launcher, "_serve_shim", return_value=4),
         ):
             thread = threading.Thread(target=follower, name="waiting-follower")
@@ -416,76 +502,117 @@ class LauncherTests(unittest.TestCase):
             thread.join(timeout=10)
         self.assertFalse(thread.is_alive())
         self.assertEqual(result, [4])
-        update.assert_called_once()
+        schedule.assert_called_once()
 
-    def test_waiting_follower_skips_network_after_any_new_completed_receipt(self):
-        @contextlib.contextmanager
-        def waited_gate(*_args, **_kwargs):
-            yield types.SimpleNamespace(waited=True)
+    def test_background_discover_skips_network_after_any_new_completed_receipt(self):
+        """Policy B: launch always schedules; the worker skips when completion moved."""
 
         with (
-            mock.patch.object(launcher, "_managed_control_present", return_value=True),
             mock.patch.object(launcher, "_head_commit", return_value="1" * 40),
-            mock.patch.object(launcher.update_coordination, "startup_update_gate", side_effect=waited_gate),
-            mock.patch.object(launcher, "_finalize_journal", return_value=None),
-            mock.patch.object(launcher, "_updates_enabled", return_value=True),
-            mock.patch.object(launcher, "load_trusted_release_keys", return_value={"test": mock.sentinel.key}),
+            mock.patch.object(launcher, "load_trusted_release_keys") as keys,
+            mock.patch.object(launcher, "_discover_and_stage_only") as discover,
             mock.patch.object(launcher.update_staging, "read_completion") as completion,
-            mock.patch.object(launcher, "_attempt_update") as update,
-            mock.patch.object(launcher, "_serve_shim", return_value=4),
+            mock.patch.object(launcher.startup_diagnostics, "append_event"),
         ):
             for status in ("up_to_date", "candidate_ready", "updated", "deferred_slow_network"):
                 with self.subTest(status=status):
-                    completion.side_effect = [("a" * 32, "up_to_date"), ("b" * 32, status)]
-                    self.assertEqual(launcher.launch(self.root), 4)
-        update.assert_not_called()
+                    keys.reset_mock()
+                    discover.reset_mock()
+                    completion.return_value = ("b" * 32, status)
+                    result = launcher._run_background_discover_and_stage(
+                        self.root,
+                        client_host="codex",
+                        startup_budget_seconds=1.0,
+                        completion_before=("a" * 32, "up_to_date"),
+                    )
+                    self.assertIsNone(result)
+                    keys.assert_not_called()
+                    discover.assert_not_called()
 
-    def test_deferred_update_is_logged_as_deferred_with_blocker_count(self):
+    def test_launch_passes_completion_before_into_background_schedule(self):
+        sampled = ("a" * 32, "up_to_date")
+        with (
+            mock.patch.object(launcher, "_managed_control_present", return_value=True),
+            mock.patch.object(launcher, "_finalize_journal", return_value=None),
+            mock.patch.object(launcher, "_updates_enabled", return_value=True),
+            mock.patch.object(
+                launcher.update_staging, "read_completion", return_value=sampled
+            ),
+            mock.patch.object(launcher, "_schedule_background_update") as schedule,
+            mock.patch.object(launcher, "_apply_staged_after_session"),
+            mock.patch.object(launcher, "_serve_shim", return_value=4),
+        ):
+            self.assertEqual(launcher.launch(self.root), 4)
+        schedule.assert_called_once_with(
+            self.root,
+            client_host=None,
+            startup_budget_seconds=launcher.STARTUP_UPDATE_BUDGET_SECONDS,
+            completion_before=sampled,
+        )
+
+    def test_deferred_staged_apply_is_logged_as_deferred_with_blocker_count(self):
         events = []
+        staged = mock.Mock()
+        staged.manifest = mock.sentinel.manifest
+        staged.signature = mock.sentinel.signature
+        staged.source.name = "github"
         deferred = update_transaction.UpdateResult(
             "deferred_active_session", "1" * 40, None, None, None,
             "live_shim_session", (mock.sentinel.first, mock.sentinel.second),
         )
         with (
-            mock.patch.object(launcher, "_managed_control_present", return_value=True),
             mock.patch.object(launcher, "_head_commit", return_value="1" * 40),
-            mock.patch.object(launcher, "_finalize_journal", return_value=None),
-            mock.patch.object(launcher, "_updates_enabled", return_value=True),
-            mock.patch.object(launcher, "load_trusted_release_keys", return_value={"test": mock.sentinel.key}),
-            mock.patch.object(launcher, "_attempt_update", return_value=deferred),
-            mock.patch.object(launcher, "_serve_shim", return_value=4),
+            mock.patch.object(
+                launcher.update_staging, "load_release", return_value=staged
+            ),
+            mock.patch.object(launcher.update_staging, "begin_attempt", return_value="attempt"),
+            mock.patch.object(
+                launcher.update_transaction, "apply_present_update", return_value=deferred
+            ),
             mock.patch.object(launcher.startup_diagnostics, "append_event", side_effect=lambda *a, **kw: events.append((a[1], kw))),
         ):
-            self.assertEqual(launcher.launch(self.root), 4)
+            result = launcher._apply_staged_release_if_present(
+                self.root,
+                {"test": mock.sentinel.key},
+                deadline=1e18,
+                client_host="codex",
+            )
+        self.assertEqual(result.status, "deferred_active_session")
         completed = [fields for name, fields in events if name == "update_completed"]
         self.assertEqual(len(completed), 1)
         self.assertEqual(completed[0]["outcome"], "deferred")
         self.assertEqual(completed[0]["update_status"], "deferred_active_session")
         self.assertEqual(completed[0]["blocker_count"], 2)
 
-    def test_up_to_date_check_persists_a_successful_completion_receipt(self):
+    def test_up_to_date_background_check_persists_a_successful_completion_receipt(self):
         current = update_transaction.UpdateResult(
             "up_to_date", "1" * 40, "1" * 40, None, None,
         )
         with (
-            mock.patch.object(launcher, "_managed_control_present", return_value=True),
             mock.patch.object(launcher, "_head_commit", return_value="1" * 40),
-            mock.patch.object(launcher, "_finalize_journal", return_value=None),
-            mock.patch.object(launcher, "_updates_enabled", return_value=True),
             mock.patch.object(
                 launcher, "load_trusted_release_keys",
                 return_value={"test": mock.sentinel.key},
             ),
-            mock.patch.object(launcher, "_attempt_update", return_value=current) as update,
-            mock.patch.object(launcher, "_serve_shim", return_value=4),
+            mock.patch.object(
+                launcher.update_staging, "read_completion", return_value=None
+            ),
+            mock.patch.object(
+                launcher, "_discover_and_stage_only", return_value=current
+            ) as discover,
         ):
-            self.assertEqual(launcher.launch(self.root), 4)
-        update.assert_called_once()
+            result = launcher._run_background_discover_and_stage(
+                self.root,
+                client_host="codex",
+                startup_budget_seconds=1.0,
+            )
+        self.assertEqual(result.status, "up_to_date")
+        discover.assert_called_once()
         attempt = launcher.update_staging.read_attempt(self.root)
         self.assertIsNotNone(attempt)
         self.assertEqual(attempt[1], "up_to_date")
 
-    def test_rolled_back_staged_candidate_does_not_block_next_discovery(self):
+    def test_rolled_back_staged_candidate_is_cleared_after_session(self):
         staged = mock.Mock()
         staged.manifest = mock.sentinel.manifest
         staged.signature = mock.sentinel.signature
@@ -493,27 +620,25 @@ class LauncherTests(unittest.TestCase):
         rolled_back = update_transaction.UpdateResult(
             "rolled_back", "1" * 40, "2" * 40, None, None,
         )
-        current = update_transaction.UpdateResult(
-            "up_to_date", "1" * 40, "1" * 40, None, None,
-        )
         with (
-            mock.patch.object(launcher, "_managed_control_present", return_value=True),
             mock.patch.object(launcher, "_head_commit", return_value="1" * 40),
-            mock.patch.object(launcher, "_finalize_journal", return_value=None),
-            mock.patch.object(launcher, "_updates_enabled", return_value=True),
-            mock.patch.object(launcher, "load_trusted_release_keys", return_value={"test": mock.sentinel.key}),
-            mock.patch.object(launcher.update_staging, "load_release", side_effect=[staged, None]),
+            mock.patch.object(launcher.update_staging, "load_release", return_value=staged),
+            mock.patch.object(launcher.update_staging, "begin_attempt", return_value="attempt"),
             mock.patch.object(launcher.update_staging, "clear_release") as clear,
-            mock.patch.object(launcher.update_transaction, "apply_present_update", return_value=rolled_back),
-            mock.patch.object(launcher, "_attempt_update", return_value=current) as network,
-            mock.patch.object(launcher, "_serve_shim", return_value=4),
+            mock.patch.object(
+                launcher.update_transaction, "apply_present_update", return_value=rolled_back
+            ),
         ):
-            self.assertEqual(launcher.launch(self.root), 4)
-            self.assertEqual(launcher.launch(self.root), 4)
+            result = launcher._apply_staged_release_if_present(
+                self.root,
+                {"test": mock.sentinel.key},
+                deadline=1e18,
+                client_host=None,
+            )
+        self.assertEqual(result.status, "rolled_back")
         clear.assert_called_once_with(self.root)
-        network.assert_called_once()
 
-    def test_updated_staged_candidate_is_cleared(self):
+    def test_updated_staged_candidate_is_cleared_after_session(self):
         staged = mock.Mock()
         staged.manifest = mock.sentinel.manifest
         staged.signature = mock.sentinel.signature
@@ -522,100 +647,140 @@ class LauncherTests(unittest.TestCase):
             "updated", "1" * 40, "2" * 40, None, None,
         )
         with (
-            mock.patch.object(launcher, "_managed_control_present", return_value=True),
             mock.patch.object(launcher, "_head_commit", return_value="1" * 40),
-            mock.patch.object(launcher, "_finalize_journal", return_value=None),
-            mock.patch.object(launcher, "_updates_enabled", return_value=True),
-            mock.patch.object(launcher, "load_trusted_release_keys", return_value={"test": mock.sentinel.key}),
             mock.patch.object(launcher.update_staging, "load_release", return_value=staged),
+            mock.patch.object(launcher.update_staging, "begin_attempt", return_value="attempt"),
             mock.patch.object(launcher.update_staging, "clear_release") as clear,
-            mock.patch.object(launcher.update_transaction, "apply_present_update", return_value=updated),
+            mock.patch.object(
+                launcher.update_transaction, "apply_present_update", return_value=updated
+            ),
+        ):
+            result = launcher._apply_staged_release_if_present(
+                self.root,
+                {"test": mock.sentinel.key},
+                deadline=1e18,
+                client_host=None,
+            )
+        self.assertEqual(result.status, "updated")
+        clear.assert_called_once_with(self.root)
+
+    def test_invalid_staged_record_is_cleared_without_blocking_discovery(self):
+        with (
+            mock.patch.object(launcher, "_head_commit", return_value="1" * 40),
+            mock.patch.object(
+                launcher.update_staging,
+                "load_release",
+                side_effect=launcher.update_staging.UpdateStagingError("corrupt"),
+            ),
+            mock.patch.object(launcher.update_staging, "clear_release") as clear,
+        ):
+            result = launcher._apply_staged_release_if_present(
+                self.root,
+                {"test": mock.sentinel.key},
+                deadline=1e18,
+                client_host=None,
+            )
+        self.assertIsNone(result)
+        clear.assert_called_once_with(self.root)
+
+    def test_launch_still_schedules_when_post_session_apply_finds_corrupt_staged(self):
+        with (
+            mock.patch.object(launcher, "_managed_control_present", return_value=True),
+            mock.patch.object(launcher, "_finalize_journal", return_value=None),
+            mock.patch.object(launcher, "_updates_enabled", return_value=True),
+            mock.patch.object(launcher, "_schedule_background_update") as schedule,
+            mock.patch.object(launcher, "_apply_staged_after_session"),
             mock.patch.object(launcher, "_serve_shim", return_value=4),
         ):
             self.assertEqual(launcher.launch(self.root), 4)
-        clear.assert_called_once_with(self.root)
+        schedule.assert_called_once()
 
-    def test_invalid_staged_record_does_not_block_fresh_signed_discovery(self):
-        current = update_transaction.UpdateResult(
-            "up_to_date", "1" * 40, "1" * 40, None, None,
-        )
+    def test_post_session_receipt_write_failure_still_returns_serve_status(self):
+        staged = mock.Mock()
+        staged.manifest = mock.sentinel.manifest
+        staged.signature = mock.sentinel.signature
+        staged.source.name = "github"
         with (
             mock.patch.object(launcher, "_managed_control_present", return_value=True),
-            mock.patch.object(launcher, "_head_commit", return_value="1" * 40),
             mock.patch.object(launcher, "_finalize_journal", return_value=None),
             mock.patch.object(launcher, "_updates_enabled", return_value=True),
-            mock.patch.object(launcher, "load_trusted_release_keys", return_value={"test": mock.sentinel.key}),
-            mock.patch.object(launcher.update_staging, "load_release", side_effect=launcher.update_staging.UpdateStagingError("corrupt")),
-            mock.patch.object(launcher.update_staging, "clear_release") as clear,
-            mock.patch.object(launcher, "_attempt_update", return_value=current) as network,
-            mock.patch.object(launcher, "_serve_shim", return_value=4),
-        ):
-            self.assertEqual(launcher.launch(self.root), 4)
-        network.assert_called_once()
-        clear.assert_called_once_with(self.root)
-
-    def test_receipt_write_failure_still_serves_known_good_shim(self):
-        with (
-            mock.patch.object(launcher, "_managed_control_present", return_value=True),
             mock.patch.object(launcher, "_head_commit", return_value="1" * 40),
-            mock.patch.object(launcher, "_finalize_journal", return_value=None),
-            mock.patch.object(launcher, "_updates_enabled", return_value=True),
-            mock.patch.object(launcher, "load_trusted_release_keys", return_value={"test": mock.sentinel.key}),
-            mock.patch.object(launcher.update_staging, "begin_attempt", side_effect=launcher.update_staging.UpdateStagingError("read only")),
+            mock.patch.object(
+                launcher, "load_trusted_release_keys", return_value={"test": mock.sentinel.key}
+            ),
+            mock.patch.object(launcher.update_staging, "load_release", return_value=staged),
+            mock.patch.object(
+                launcher.update_staging,
+                "begin_attempt",
+                side_effect=launcher.update_staging.UpdateStagingError("read only"),
+            ),
+            mock.patch.object(launcher, "_schedule_background_update") as schedule,
             mock.patch.object(launcher, "_serve_shim", return_value=4) as serve,
         ):
             self.assertEqual(launcher.launch(self.root), 4)
+        schedule.assert_called_once()
         serve.assert_called_once()
 
-    def test_completion_receipt_failure_does_not_misreport_applied_result(self):
+    def test_completion_receipt_failure_does_not_misreport_staged_result(self):
         events = []
-        applied = update_transaction.UpdateResult(
+        staged = update_transaction.UpdateResult(
             "candidate_ready", "1" * 40, "2" * 40, None, None,
         )
         with (
-            mock.patch.object(launcher, "_managed_control_present", return_value=True),
             mock.patch.object(launcher, "_head_commit", return_value="1" * 40),
-            mock.patch.object(launcher, "_finalize_journal", return_value=None),
-            mock.patch.object(launcher, "_updates_enabled", return_value=True),
-            mock.patch.object(launcher, "load_trusted_release_keys", return_value={"test": mock.sentinel.key}),
-            mock.patch.object(launcher, "_attempt_update", return_value=applied),
-            mock.patch.object(launcher.update_staging, "finish_attempt", side_effect=launcher.update_staging.UpdateStagingError("write failed")),
-            mock.patch.object(launcher.startup_diagnostics, "append_event", side_effect=lambda *a, **kw: events.append((a[1], kw))),
-            mock.patch.object(launcher, "_serve_shim", return_value=4),
+            mock.patch.object(
+                launcher, "load_trusted_release_keys", return_value={"test": mock.sentinel.key}
+            ),
+            mock.patch.object(
+                launcher.update_staging, "read_completion", return_value=None
+            ),
+            mock.patch.object(launcher, "_discover_and_stage_only", return_value=staged),
+            mock.patch.object(
+                launcher.update_staging,
+                "finish_attempt",
+                side_effect=launcher.update_staging.UpdateStagingError("write failed"),
+            ),
+            mock.patch.object(
+                launcher.startup_diagnostics,
+                "append_event",
+                side_effect=lambda *a, **kw: events.append((a[1], kw)),
+            ),
         ):
-            self.assertEqual(launcher.launch(self.root), 4)
+            result = launcher._run_background_discover_and_stage(
+                self.root,
+                client_host="codex",
+                startup_budget_seconds=1.0,
+            )
+        self.assertEqual(result.status, "candidate_ready")
         completed = [fields for name, fields in events if name == "update_completed"]
         self.assertEqual(len(completed), 1)
         self.assertEqual(completed[0]["update_status"], "candidate_ready")
         self.assertEqual(completed[0]["outcome"], "ready")
 
-    def test_failed_local_candidate_is_discarded_before_next_discovery(self):
+    def test_failed_local_candidate_is_discarded_by_post_session_apply(self):
         staged = mock.Mock()
         staged.manifest = mock.sentinel.manifest
         staged.signature = mock.sentinel.signature
         staged.source.name = "github"
-        current = update_transaction.UpdateResult(
-            "up_to_date", "1" * 40, "1" * 40, None, None,
-        )
         with (
-            mock.patch.object(launcher, "_managed_control_present", return_value=True),
             mock.patch.object(launcher, "_head_commit", return_value="1" * 40),
-            mock.patch.object(launcher, "_finalize_journal", return_value=None),
-            mock.patch.object(launcher, "_updates_enabled", return_value=True),
-            mock.patch.object(launcher, "load_trusted_release_keys", return_value={"test": mock.sentinel.key}),
-            mock.patch.object(launcher.update_staging, "load_release", side_effect=[staged, None]),
+            mock.patch.object(launcher.update_staging, "load_release", return_value=staged),
+            mock.patch.object(launcher.update_staging, "begin_attempt", return_value="attempt"),
             mock.patch.object(launcher.update_staging, "clear_release") as clear,
             mock.patch.object(
-                launcher.update_transaction, "apply_present_update",
+                launcher.update_transaction,
+                "apply_present_update",
                 side_effect=update_transaction.UpdateTransactionError("local candidate failed"),
             ),
-            mock.patch.object(launcher, "_attempt_update", return_value=current) as network,
-            mock.patch.object(launcher, "_serve_shim", return_value=4),
         ):
-            self.assertEqual(launcher.launch(self.root), 4)
-            self.assertEqual(launcher.launch(self.root), 4)
+            with self.assertRaises(update_transaction.UpdateTransactionError):
+                launcher._apply_staged_release_if_present(
+                    self.root,
+                    {"test": mock.sentinel.key},
+                    deadline=1e18,
+                    client_host=None,
+                )
         clear.assert_called_once_with(self.root)
-        network.assert_called_once()
 
     def test_serve_holds_lease_and_marks_the_actual_running_commit(self):
         events = []
@@ -929,38 +1094,119 @@ class LauncherTests(unittest.TestCase):
             mock.patch.object(launcher, "_managed_control_present", return_value=True),
             mock.patch.object(launcher, "_head_commit", return_value="1" * 40),
             mock.patch.object(launcher, "_finalize_journal", return_value=repair),
+            mock.patch.object(launcher, "_updates_enabled", return_value=True),
             mock.patch.object(launcher, "_attempt_update") as update,
+            mock.patch.object(launcher, "_schedule_background_update") as schedule,
+            mock.patch.object(launcher, "_apply_staged_after_session") as apply_after,
             mock.patch.object(launcher, "_serve_shim", return_value=0),
             mock.patch.object(launcher.startup_diagnostics, "append_event", side_effect=lambda *a, **kw: events.append((a[1], kw))),
         ):
             launcher.launch(self.root, stdin=io.StringIO(), stdout=io.StringIO())
         update.assert_not_called()
+        schedule.assert_not_called()
+        apply_after.assert_not_called()
         recovered = [fields for name, fields in events if name == "recovery_completed"]
         self.assertEqual(recovered[0]["outcome"], "refused")
         self.assertEqual(recovered[0]["update_status"], "repair_required")
 
-    def test_head_change_hands_stdio_to_a_fresh_interpreter(self):
+    def test_launch_joins_background_stage_before_post_session_apply(self):
+        events = []
+        thread = mock.Mock()
+        thread.is_alive.return_value = False
+
+        def schedule(*_args, **_kwargs):
+            events.append("schedule")
+            return thread
+
+        def join_bg(worker, *, timeout_seconds):
+            events.append(("join", timeout_seconds))
+            self.assertIs(worker, thread)
+
+        def apply_after(*_args, **_kwargs):
+            events.append("apply-after")
+
+        def serve(*_args, **_kwargs):
+            events.append("serve")
+            return 0
+
         with (
             mock.patch.object(launcher, "_managed_control_present", return_value=True),
-            mock.patch.object(
-                launcher,
-                "_head_commit",
-                side_effect=["1" * 40, "1" * 40, "2" * 40],
-            ),
+            mock.patch.object(launcher, "_finalize_journal", return_value=None),
+            mock.patch.object(launcher, "_updates_enabled", return_value=True),
+            mock.patch.object(launcher, "_schedule_background_update", side_effect=schedule),
+            mock.patch.object(launcher, "_join_background_update", side_effect=join_bg),
+            mock.patch.object(launcher, "_apply_staged_after_session", side_effect=apply_after),
+            mock.patch.object(launcher, "_serve_shim", side_effect=serve),
+        ):
+            self.assertEqual(launcher.launch(self.root), 0)
+
+        self.assertEqual(
+            events,
+            [
+                "schedule",
+                "serve",
+                ("join", launcher.STARTUP_LEADER_GRACE_SECONDS),
+                "apply-after",
+            ],
+        )
+
+    def test_launch_skips_post_session_apply_while_background_stage_still_running(self):
+        thread = mock.Mock()
+        thread.is_alive.return_value = True
+        with (
+            mock.patch.object(launcher, "_managed_control_present", return_value=True),
+            mock.patch.object(launcher, "_finalize_journal", return_value=None),
+            mock.patch.object(launcher, "_updates_enabled", return_value=True),
+            mock.patch.object(launcher, "_schedule_background_update", return_value=thread),
+            mock.patch.object(launcher, "_join_background_update"),
+            mock.patch.object(launcher, "_apply_staged_after_session") as apply_after,
+            mock.patch.object(launcher, "_serve_shim", return_value=0),
+        ):
+            self.assertEqual(launcher.launch(self.root), 0)
+        apply_after.assert_not_called()
+
+    def test_policy_b_serves_current_head_then_applies_staged_after_session(self):
+        """Policy B: never hand off mid-connect; install staged only after serve."""
+
+        events = []
+        staged = mock.Mock()
+        staged.manifest = mock.sentinel.manifest
+        staged.signature = mock.sentinel.signature
+        staged.source.name = "github"
+        updated = update_transaction.UpdateResult(
+            "updated", "1" * 40, "2" * 40, None, None,
+        )
+
+        def serve(*_args, **_kwargs):
+            events.append("serve")
+            return 6
+
+        def apply_present(*_args, **_kwargs):
+            events.append("apply")
+            return updated
+
+        with (
+            mock.patch.object(launcher, "_managed_control_present", return_value=True),
+            mock.patch.object(launcher, "_head_commit", return_value="1" * 40),
             mock.patch.object(launcher, "_finalize_journal", return_value=None),
             mock.patch.object(launcher, "_updates_enabled", return_value=True),
             mock.patch.object(
                 launcher, "load_trusted_release_keys", return_value={"production": mock.sentinel.key}
             ),
-            mock.patch.object(launcher, "_attempt_update"),
-            mock.patch.object(launcher, "_handoff_to_fresh_launcher", return_value=6) as handoff,
-            mock.patch.object(launcher, "_serve_shim") as serve,
+            mock.patch.object(launcher.update_staging, "load_release", return_value=staged),
+            mock.patch.object(launcher.update_staging, "begin_attempt", return_value="attempt"),
+            mock.patch.object(
+                launcher.update_transaction, "apply_present_update", side_effect=apply_present
+            ),
+            mock.patch.object(launcher, "_schedule_background_update", return_value=None),
+            mock.patch.object(launcher, "_handoff_to_fresh_launcher") as handoff,
+            mock.patch.object(launcher, "_serve_shim", side_effect=serve),
         ):
             result = launcher.launch(self.root)
 
         self.assertEqual(result, 6)
-        handoff.assert_called_once_with(self.root)
-        serve.assert_not_called()
+        self.assertEqual(events, ["serve", "apply"])
+        handoff.assert_not_called()
 
     def test_handoff_child_inherits_protocol_stdio(self):
         completed = mock.Mock(returncode=3)

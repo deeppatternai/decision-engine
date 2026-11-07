@@ -1,0 +1,16 @@
+export declare const PLUGIN_NAME = "deep-pattern-visual";
+export declare const PLUGIN_VERSION = "0.1.0-remote.2";
+export declare const SERVER_NAME = "visual";
+export declare const CLIENT_ID = "deep-pattern-visual-harness";
+export declare const RESOURCE_URL = "https://endpoint.deeppattern.ai/plugin/mcp/v1/visual";
+export declare const CALLBACK_HOST = "127.0.0.1";
+export declare const CALLBACK_PATH = "/deeppattern/oauth/callback";
+export declare const AUTH_SCOPES = "visual:submit visual:read visual:cancel";
+export declare const CREDENTIAL_RECORD_ID = "oauth";
+export declare const TRANSPORT_AUTH_HEADER = "X-DeepPattern-MCP-Auth-Mode";
+export declare const TRANSPORT_AUTH_VALUE = "transport";
+export declare const CALLBACK_TIMEOUT_MS: number;
+export declare const STATUS_WAIT_MAX_MS: number;
+export declare const TOOL_CALL_TIMEOUT_MS: number;
+export declare const VISUAL_TOOL_NAMES: readonly ["visual_submit", "visual_status", "visual_result", "visual_cancel", "visual_open_view"];
+export type VisualToolName = (typeof VISUAL_TOOL_NAMES)[number];

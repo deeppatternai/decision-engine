@@ -1,0 +1,50 @@
+{
+  "schema_version": 1,
+  "plugin_id": "visual@deeppattern",
+  "version": "0.1.0-remote.1",
+  "endpoint": {
+    "resource": "https://endpoint.deeppattern.ai/plugin/mcp/v1/visual",
+    "protected_resource_metadata": "https://endpoint.deeppattern.ai/.well-known/oauth-protected-resource/plugin/mcp/v1/visual",
+    "authorization_server": "https://endpoint.deeppattern.ai/plugin/oauth"
+  },
+  "authorization": {
+    "mode": "oauth_2_1_pkce",
+    "credential_owner": "host_oauth_store",
+    "scopes": ["visual:submit", "visual:read", "visual:cancel"],
+    "audit_scope_inheritance": false,
+    "legacy_device_token_fallback": false,
+    "plugin_contains_runtime": false
+  },
+  "tools": [
+    "visual_submit",
+    "visual_status",
+    "visual_result",
+    "visual_cancel",
+    "visual_open_view"
+  ],
+  "modes": ["diagram", "infographic", "comic"],
+  "lifecycle": {
+    "states": ["queued", "running", "completed", "failed", "cancelled"],
+    "default_wait_seconds": 20,
+    "maximum_wait_seconds": 25,
+    "idempotency_binding": ["subject", "client", "resource", "idempotency_key"],
+    "artifact_bytes_model_visible": false
+  },
+  "presentation": {
+    "platforms": ["macos", "linux", "windows"],
+    "delivery": "mcp_app_with_resource_link_browser_fallback",
+    "mcp_app_resource_uri": "ui://deeppattern/visual-view-v1.html",
+    "ticket_is_single_use": true,
+    "ticket_transport": "url_fragment_not_sent_on_get",
+    "ticket_exchange_method": "same_origin_post",
+    "browser_close_cancels_generation": false,
+    "viewer_capabilities": ["progress", "fit", "zoom", "download", "copy"]
+  },
+  "distribution": {
+    "runtime_required": false,
+    "platform_independent": true,
+    "complete_zip": "de-visual-0.1.0-remote.1.zip",
+    "cowork_zip": "de-visual-cowork-0.1.0-remote.1.zip",
+    "deepseek_harness_entry": "deepseek-harness/"
+  }
+}

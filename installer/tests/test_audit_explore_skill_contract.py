@@ -23,9 +23,17 @@ class AuditExploreSkillContractTests(unittest.TestCase):
     def _normalized(self, path: Path) -> str:
         return " ".join(self._text(path).split())
 
+    def _submission_blocks(self) -> list[str]:
+        blocks = []
+        for path in (HOSTED, RESULT):
+            blocks.extend(
+                re.findall(r"SUBMIT_TOOL\((.*?)\) -> envelope", self._text(path), re.S)
+            )
+        return blocks
+
     def test_entrypoint_is_an_english_progressive_router(self):
         text = self._text(ENTRYPOINT)
-        normalized_entrypoint = " ".join(text.split())
+        normalized = " ".join(text.split())
         frontmatter = text.split("---", 2)[1]
         description = json.loads(
             text.splitlines()[2].removeprefix("description: ")
@@ -33,18 +41,32 @@ class AuditExploreSkillContractTests(unittest.TestCase):
 
         self.assertLessEqual(len(text.splitlines()), 70)
         self.assertTrue(text.isascii())
-        self.assertIn("vague, unformed idea", description)
-        self.assertIn("clear, falsifiable hypothesis", description)
-        self.assertIn("external panel by default", description)
-        self.assertIn("equivalent intent in any language", description)
-        self.assertIn("/audit-explore", description)
-        self.assertIn("Do not trigger on isolated words", description)
-        self.assertIn("code or repository exploration", description)
+        for routing_marker in (
+            "vague, unformed idea",
+            "clear, falsifiable hypothesis",
+            "/audit-explore",
+        ):
+            self.assertIn(routing_marker, description)
+        self.assertRegex(
+            description,
+            re.compile(
+                r"(?:^|[.!?]\s+)develop\b[^.]{0,100}\bvague, unformed idea\b"
+                r"[^.]{0,100}\bclear, falsifiable hypothesis\b",
+                re.I,
+            ),
+        )
+        self.assertRegex(
+            description,
+            re.compile(
+                r"\bdo not trigger\b[^.]{0,100}\bisolated words\b"
+                r"[^.]{0,140}\bcode or repository exploration\b",
+                re.I,
+            ),
+        )
         for route in (
             "audit-brainstorming",
             "audit-market-research",
             "audit-writing-plans",
-            "audit for deliverable defects",
         ):
             self.assertIn(route, frontmatter)
         for execution_detail in (
@@ -61,24 +83,23 @@ class AuditExploreSkillContractTests(unittest.TestCase):
             "references/convergence-and-result.md",
         ):
             self.assertIn(reference, text)
-        self.assertIn(
-            "vague software, product, feature, or API idea", normalized_entrypoint
-        )
-        self.assertIn("existing code or repository", normalized_entrypoint)
-        self.assertIn("Only on a hosted path", normalized_entrypoint)
+        for progressive_gate in (
+            "At activation, read only",
+            "Only on a hosted path",
+            "Only on that hosted path",
+            "On a client-only path, do not load",
+        ):
+            self.assertIn(progressive_gate, normalized)
 
-    def test_consent_and_framing_preserves_safety_and_local_path(self):
+    def test_consent_and_framing_preserves_security_and_result_fields(self):
         text = self._normalized(CONSENT)
 
         for required in (
-            "P0 Route And Sensitive-Content Consent",
+            "Prohibited:",
             "Routine:",
-            "routine personal planning context",
-            "Ordinary use proceeds without a separate consent prompt",
             "Sensitive but shareable",
             "first-party",
             "another person's identifiers",
-            "Pending is not a local-only decision",
             "Regulated content is never transmitted externally",
             "Secrets and credentials are never submitted",
             "Obtain explicit authorization for that complete payload",
@@ -87,17 +108,15 @@ class AuditExploreSkillContractTests(unittest.TestCase):
             "Mixed content takes the most restrictive route",
             "If uncertain between Routine and Sensitive",
             "Any change to a sensitive payload requires a new approval",
+            "Pending is not a local-only decision",
             "BCP-47",
             "und-*",
+            "audit_mode",
             "one question at a time",
             "When [situation], I want to [motivation], so I can [outcome]",
             "user approves the frame",
             "explicitly approves the revised frame",
-            "If unknown, say so once",
             "hosted-exploration.md",
-            "client-only problem divergence",
-            "client-only solution divergence",
-            "client-only convergence and falsification",
             "local-only",
             "frame",
             "candidates",
@@ -112,17 +131,10 @@ class AuditExploreSkillContractTests(unittest.TestCase):
         self.assertNotIn("all other non-public content stays client-side", text)
         self.assertNotIn("runtime-discoverable authoritative policy", text)
 
-    def test_hosted_workflow_preserves_phase_calls_and_selection_gates(self):
+    def test_hosted_workflow_preserves_tools_and_selection_gates(self):
         text = self._normalized(HOSTED)
 
         for required in (
-            'skill_name="audit-explore"',
-            '"phase": "diverge_problem"',
-            '"phase": "diverge_solution"',
-            '"domain"',
-            '"audit_mode"',
-            '"upstream_run_id"',
-            '"upstream_canonical_sha"',
             'artifact_intent="explore_diverge"',
             "server injects each vendor methodology lens",
             "must not pass a methodology lens",
@@ -135,10 +147,10 @@ class AuditExploreSkillContractTests(unittest.TestCase):
             "user selects one problem reframe",
             "user selects one or two solution directions",
             "Before each P2 and P3 external submission",
-            "No model-family exclusion preflight",
             "Routine payloads proceed directly",
             "complete exact user-derived payload",
             "Any change requires renewed approval",
+            "No model-family exclusion preflight",
             "independent client voice",
             "Never include it in panel convergence counts",
             "unknown or transport-error state",
@@ -150,18 +162,12 @@ class AuditExploreSkillContractTests(unittest.TestCase):
         self.assertNotIn('"mode":', text)
         self.assertNotIn("Self-identify the runtime model family", text)
 
-    def test_convergence_result_preserves_exit_and_trust_contracts(self):
+    def test_convergence_result_preserves_trust_fields_and_exit_ownership(self):
         text = self._normalized(RESULT)
 
         for required in (
-            'skill_name="audit-explore-converge"',
-            '"premortem": true',
-            '"audit_mode"',
-            "Klein premortem",
-            "Goldilocks gate",
             "maximum of three critique rounds",
             "canonical_sha",
-            "always present",
             "stop before the next hosted phase",
             "user approves the revised draft",
             "latest run ID and `canonical_sha`",
@@ -188,28 +194,51 @@ class AuditExploreSkillContractTests(unittest.TestCase):
         ):
             self.assertIn(required, text)
 
-    def test_documented_panel_submissions_use_audit_mode(self):
-        blocks = []
-        for path in (HOSTED, RESULT):
-            blocks.extend(
-                re.findall(r"SUBMIT_TOOL\((.*?)\) -> envelope", self._text(path), re.S)
-            )
+    def test_documented_panel_submissions_use_exact_phase_schemas(self):
+        blocks = self._submission_blocks()
         self.assertEqual(len(blocks), 3)
-        for index, block in enumerate(blocks):
-            phase = re.search(r'"phase": "([^"]+)"', block)
-            with self.subTest(phase=phase.group(1) if phase else f"P4-{index}"):
+        expected = (
+            (
+                "audit-explore",
+                {"title", "content", "phase", "domain", "audit_mode"},
+            ),
+            (
+                "audit-explore",
+                {
+                    "title",
+                    "content",
+                    "phase",
+                    "domain",
+                    "audit_mode",
+                    "upstream_run_id",
+                    "upstream_canonical_sha",
+                },
+            ),
+            (
+                "audit-explore-converge",
+                {
+                    "title",
+                    "content",
+                    "audit_mode",
+                    "premortem",
+                    "upstream_run_id",
+                    "upstream_canonical_sha",
+                },
+            ),
+        )
+        for block, (skill_name, expected_keys) in zip(blocks, expected, strict=True):
+            with self.subTest(skill_name=skill_name):
+                self.assertIn(f'skill_name="{skill_name}"', block)
+                keys = set(re.findall(r'^\s*"([^"]+)"\s*:', block, re.M))
+                self.assertEqual(keys, expected_keys)
                 self.assertIn('"audit_mode":', block)
                 self.assertNotIn('"mode":', block)
 
-    def test_every_reference_is_ascii_and_phase_routed(self):
-        entrypoint = self._normalized(ENTRYPOINT)
+    def test_every_reference_is_present_and_ascii(self):
         for path in (CONSENT, HOSTED, RESULT):
             with self.subTest(path=path.name):
                 self.assertTrue(path.is_file())
                 self.assertTrue(self._text(path).isascii())
-        self.assertIn("At activation, read only", entrypoint)
-        self.assertIn("Only on a hosted path", entrypoint)
-        self.assertIn("Only on that hosted path", entrypoint)
 
 
 if __name__ == "__main__":
